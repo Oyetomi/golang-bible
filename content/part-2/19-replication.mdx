@@ -1,0 +1,643 @@
+---
+title: "Replication: Copies, Lag & Quorums"
+part: 2
+order: 19
+type: "course"
+description: "Keeping copies of your data in sync, explained from zero: why you replicate, single-leader vs multi-leader vs leaderless, replication lag and the stale-read problem, read-your-writes consistency, quorum reads and writes (W + R > N), and resolving conflicting writes with last-writer-wins and version vectors — all grounded in replicating Meridian's account balances."
+prerequisites: ["grpc-service-communication"]
+---
+
+<HeroCard label="Part 2 · Chapter 19" title="Replication: Copies, Lag & Quorums">
+
+One database holding every Meridian account balance is a beautiful thing right up until the moment that one machine dies — and then the entire company is down, customers can't see their money, and you're the one explaining it. So you keep **copies**. More than one machine holds the data. That's replication, and it sounds trivial until you realize the copies *disagree with each other* constantly, and now you have to decide which copy is telling the truth.
+
+I'm going to teach you this from absolute zero — no assumed knowledge of databases, distributed systems, or any of the intimidating vocabulary people hide behind. By the end you'll understand exactly why a customer can deposit money and then *not see it* a second later, why two data centers can both think they're right, and the elegant little inequality (`W + R > N`) that lets a pile of unreliable machines give a reliable answer. We'll replicate Meridian's account balances the whole way through. Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Why Replicate", "Single-Leader", "Lag & Stale Reads", "Multi-Leader & Leaderless", "Quorums", "Conflicts & Resolution"]} />
+
+<Scene
+  title="One database is a single point of failure → replicate it"
+  actors={[
+    { id: "client", label: "Client" },
+    { id: "db", label: "Primary DB" }
+  ]}
+  rows={1}
+  cols={4}
+  frames={[
+    {
+      caption: "Meridian runs one database. Every read and write of every account balance goes to this single machine.",
+      beat: "neutral",
+      actors: [{ id: "client", state: "active" }, { id: "db", state: "active" }],
+      cells: [{ id: "A1", state: "active", label: "DB (only copy)" }, { id: "A2", state: "idle", label: "—" }, { id: "A3", state: "idle", label: "—" }, { id: "A4", state: "idle", label: "—" }]
+    },
+    {
+      caption: "The machine dies — disk failure, power loss, a kernel panic. There is no other copy. Every balance is unreachable. Meridian is fully down.",
+      beat: "problem",
+      actors: [{ id: "client", state: "bad" }, { id: "db", state: "bad" }],
+      cells: [{ id: "A1", state: "bad", label: "DB DOWN ✗" }, { id: "A2", state: "idle", label: "no copy" }, { id: "A3", state: "idle", label: "no copy" }, { id: "A4", state: "idle", label: "no copy" }]
+    },
+    {
+      caption: "Replication: the data lives on three machines. One leader takes writes and streams them to two followers. Any one can die and the others serve on.",
+      beat: "solution",
+      actors: [{ id: "client", state: "ok" }, { id: "db", state: "done" }],
+      cells: [{ id: "A1", state: "done", label: "leader" }, { id: "A2", state: "done", label: "follower 1" }, { id: "A3", state: "done", label: "follower 2" }, { id: "A4", state: "ok", label: "survives ✓" }]
+    }
+  ]}
+  caption="Replication trades one machine you fully understand for several machines that disagree. The rest of this chapter is about taming that disagreement."
+/>
+
+## Why Replicate
+
+Let's start with the word itself, no assumptions.
+
+<Define term="Replication" since="Replication (Part 2)">
+**Replication** means keeping a copy of the same data on more than one machine. Each copy is called a **replica**. When data changes, every replica needs to find out about the change so the copies stay (roughly) the same. Why it matters: a single machine *will* fail — hardware breaks, networks drop, someone trips over a cable. Replication is how a system keeps working, and keeps your data alive, when an individual machine doesn't.
+</Define>
+
+You replicate for exactly three reasons. That's it — if a "reason" doesn't reduce to one of these, it's not a real reason:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Stay up (availability)">If one machine dies, another already has the data and keeps serving. Meridian can lose a database server at 3am and customers never notice. Without replication, one dead disk is a company-wide outage.</ConceptCard>
+  <ConceptCard label="Serve more reads (scale)">Reads can be spread across many replicas. If a million customers all check their balance, you don't hammer one machine — you fan the reads out across ten copies. (Writes are harder; we'll see why.)</ConceptCard>
+  <ConceptCard label="Be closer (latency)">Put a replica in each region. A customer in Lagos reads from a Lagos replica instead of waiting on a round trip to Virginia. Physical distance is real latency; a nearby copy erases it.</ConceptCard>
+</ConceptGrid>
+
+<Define term="Leader & follower (primary & replica)" since="Replication (Part 2)">
+In the most common setup, one replica is the **leader** (also called *primary* or *master*): it's the only one allowed to accept **writes** (changes). The others are **followers** (*replicas*, *secondaries*, *standbys*): they receive a stream of the leader's changes and apply them in the same order, and they can serve **reads**. Why it matters: funneling all writes through one leader is the simplest way to keep copies in agreement — there's one authority on what happened and in what order.
+</Define>
+
+If replication were free and instant, this chapter would end here. It isn't. The copies take *time* to agree, and sometimes they're allowed to disagree — and that's where every interesting bug lives.
+
+## Single-Leader
+
+The workhorse. One leader, N followers. Every write goes to the leader; the leader tells the followers; followers apply the changes in order. This is how Postgres, MySQL, and most SQL databases replicate by default — and it's what sits under the read-replica setup from [SQL & Databases in Go](/part-1/sql-databases).
+
+<Define term="Single-leader replication" since="Replication (Part 2)">
+**Single-leader replication**: one replica (the leader) accepts all writes; it streams an ordered log of those changes to the followers, which replay them. Reads can go to the leader or any follower. Why it matters: because every write passes through one leader in one order, there's never a question of "which write happened first" — the leader decides. That single ordering authority is what makes single-leader the simplest and safest model, and why Meridian's ledger uses it.
+</Define>
+
+Here's the write path. Watch where the time goes:
+
+<ExecTimeline
+  title="A write flowing from leader to followers"
+  lanes={[
+    { id: "client", label: "Client" },
+    { id: "leader", label: "Leader" },
+    { id: "f1", label: "Follower 1" },
+    { id: "f2", label: "Follower 2" }
+  ]}
+  steps={[
+    { lane: "client", kind: "run", label: "write: balance = 9000", note: "Client sends a write. It must go to the leader — followers reject writes." },
+    { lane: "leader", kind: "run", label: "apply + append to log", note: "Leader applies the change locally and records it in its replication log (an ordered list of every change)." },
+    { lane: "leader", kind: "done", label: "ACK to client", note: "With ASYNC replication, the leader confirms to the client NOW — before the followers have the change. Fast, but the followers are momentarily behind." },
+    { lane: "f1", kind: "recv", label: "receive + apply (later)", note: "Follower 1 receives the log entry over the network and applies it. This happens a few milliseconds after the client already got its ACK." },
+    { lane: "f2", kind: "recv", label: "receive + apply (later still)", note: "Follower 2 applies it too, maybe even later if it's farther away or busier. For a window, the followers disagree with the leader." }
+  ]}
+  caption="The gap between 'client got its ACK' and 'all followers applied it' is replication lag. With async replication that gap is where stale reads live."
+/>
+
+<UnderTheHood title="Synchronous vs asynchronous replication — the tradeoff you can't escape">
+
+When the leader gets a write, it faces a choice: **wait** for followers to confirm before telling the client "done," or **don't wait**.
+
+- **Synchronous:** the leader waits until at least one follower confirms it has the write, *then* ACKs the client. Upside: that follower is guaranteed up to date, so if the leader dies, no data is lost. Downside: the client waits for the slowest follower in the chain, and if that follower is down, writes *block entirely*.
+- **Asynchronous:** the leader ACKs the client immediately and tells followers whenever it can. Upside: fast writes, and a slow/dead follower never blocks the leader. Downside: if the leader dies before a follower caught up, those last writes are **gone** — a client was told "saved" but the surviving replicas never got it.
+
+Most systems run **semi-synchronous**: one follower is synchronous (your safety net against data loss), the rest are async (for speed). Postgres exposes this exact knob (`synchronous_commit`, `synchronous_standby_names`). For Meridian's ledger, at least one synchronous follower is non-negotiable — we never tell a customer a transfer succeeded and then lose it. Money writes choose safety over speed.
+
+</UnderTheHood>
+
+Let's *see* replication lag — a write that's visible on the leader but not yet on a follower:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// A tiny replicated store: a leader and one follower, each holding a balance.
+// The follower applies the leader's writes a beat LATER — that delay is lag.
+type Store struct {
+	mu      sync.Mutex
+	balance int64 // cents
+}
+
+func (s *Store) set(v int64) { s.mu.Lock(); s.balance = v; s.mu.Unlock() }
+func (s *Store) get() int64  { s.mu.Lock(); defer s.mu.Unlock(); return s.balance }
+
+func main() {
+	leader, follower := &Store{}, &Store{}
+	repl := make(chan int64, 10)
+
+	// The follower applies the leader's stream, but 50ms behind.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done() // (Go 1.25's wg.Go combines Add+go+Done into one call)
+		for v := range repl {
+			time.Sleep(50 * time.Millisecond) // replication lag
+			follower.set(v)
+		}
+	}()
+
+	// Client writes to the leader, then immediately reads the follower.
+	leader.set(9000)
+	repl <- 9000
+	fmt.Println("right after the write:")
+	fmt.Println("  leader   reads:", leader.get())   // 9000 — current
+	fmt.Println("  follower reads:", follower.get()) // 0    — STALE, hasn't caught up
+
+	time.Sleep(80 * time.Millisecond) // wait out the lag
+	fmt.Println("after lag settles:")
+	fmt.Println("  follower reads:", follower.get()) // 9000 — now agrees
+
+	close(repl)
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="When the leader dies: failover and split-brain">
+
+If the leader fails, a follower must be promoted to the new leader — **failover**. This is where systems get hurt: (1) with async replication, the promoted follower may be missing the dead leader's last writes — **data loss**; (2) if the old leader wasn't really dead (just slow or network-partitioned) and comes back thinking it's still leader, you now have **two leaders** accepting conflicting writes — **split-brain**, the nightmare scenario. Real systems prevent this with automated leader election and fencing (a token that locks out the old leader). Failover is never as simple as "promote a follower" — it's the hardest part of running single-leader, which is why managed databases earn their fee.
+
+</Callout>
+
+## Lag & Stale Reads
+
+That `0` the follower returned isn't a bug — it's the defining behavior of replication, and it has a name.
+
+<Define term="Replication lag & eventual consistency" since="Replication (Part 2)">
+**Replication lag** is the delay between a write being applied on the leader and that change reaching a follower — usually milliseconds, but seconds or worse under load. During that window a follower serves a **stale** (out-of-date) read. **Eventual consistency** is the promise that *if writes stop, all replicas eventually converge* to the same value — but it says nothing about *when*. Why it matters: "eventual" can mean the customer who just deposited ₦5,000 reloads and sees their old balance, because their read hit a follower that hadn't caught up. Correct, by the rules — and infuriating to that customer.
+</Define>
+
+This stale-read window breaks specific, predictable user expectations. Each has a name and a fix:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Read-your-writes">You make a change and immediately want to see it. If your read hits a lagging follower, your own change vanishes. Fix: route a user's reads to the leader for a short window after they write — they always see their own work.</ConceptCard>
+  <ConceptCard label="Monotonic reads">You refresh twice and time appears to go backwards — first read hits an up-to-date follower (sees the deposit), second hits a laggy one (deposit gone). Fix: pin each user to one replica so they never see older data than they already saw.</ConceptCard>
+  <ConceptCard label="Consistent prefix">You see an effect before its cause — a reply before the message it answers. Happens when related writes land on followers out of order. Fix: keep causally-related writes in the same partition/order.</ConceptCard>
+</ConceptGrid>
+
+**Read-your-writes** is the one you'll implement most. Here it is — route the writer's own reads to the leader, let everyone else read the (cheaper, lagging) follower:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// After a user writes, send THEIR reads to the leader for a short window, so they
+// never see their own change disappear off a lagging follower. Other users still
+// read followers — it isn't their money, so a little staleness is harmless.
+type Router struct {
+	leaderBalance   int64
+	followerBalance int64  // lags behind the leader
+	recentWriter    string // the user who just wrote
+}
+
+func (r *Router) read(user string) int64 {
+	if user == r.recentWriter {
+		return r.leaderBalance // your own reads go to the up-to-date leader
+	}
+	return r.followerBalance // others read the follower (maybe stale — fine)
+}
+
+func main() {
+	// ada just deposited 9000; the follower hasn't caught up (still 0).
+	r := &Router{leaderBalance: 9000, followerBalance: 0, recentWriter: "ada"}
+
+	fmt.Println("ada reads:", r.read("ada")) // 9000 — sees her own deposit (leader)
+	fmt.Println("bob reads:", r.read("bob")) // 0    — stale follower, but not his account
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="You've already met one slice of this">
+
+[SQL & Databases in Go](/part-1/sql-databases) covered the *read-after-write anomaly* on Postgres read replicas, and its fix — route a user's reads to the primary for a few seconds after they write. That's read-your-writes, the database-specific case. This chapter is the general principle behind it: lag is fundamental to replication, and every consistency guarantee you want is a named technique for taming a specific symptom of lag.
+
+</Callout>
+
+<QuickCheck
+  question="A customer deposits money, sees a success message, then immediately refreshes and their balance shows the OLD amount. The deposit did succeed. What happened?"
+  options={[
+    "The deposit was rolled back",
+    "Their refresh read hit a follower that hadn't yet received the write from the leader — a stale read during replication lag",
+    "The database is corrupted",
+    "The leader lost the write"
+  ]}
+  answer={1}
+  explain="Classic stale read. The write succeeded on the leader, but the customer's refresh was served by a follower still catching up. The deposit isn't lost — the follower is just behind. The fix is read-your-writes: route that customer's reads to the leader for a short window after their deposit."
+/>
+
+## Multi-Leader & Leaderless
+
+Single-leader has one weakness: **one** machine takes all writes. If that leader is far away, or you want two data centers both accepting writes, or you want writes to keep working while offline — you need more than one writer. Two ways to get there, both of which buy write flexibility at the price of **conflicts**.
+
+<Define term="Multi-leader replication" since="Replication (Part 2)">
+**Multi-leader** replication allows more than one replica to accept writes — typically one leader per data center. Each leader applies local writes immediately and replicates them to the others. Why it matters: it keeps writes fast and available across regions (and offline — your phone's calendar editing offline then syncing is multi-leader), but because two leaders can change the *same* record at the *same* time, you inevitably get **write conflicts** that something must resolve.
+</Define>
+
+<Define term="Leaderless replication" since="Replication (Part 2)">
+**Leaderless** replication (Dynamo-style — Cassandra, DynamoDB) has no leader at all. The client (or a coordinator) sends each write to *several* replicas directly, and reads from *several* replicas, using version numbers to figure out which value is newest. Why it matters: there's no leader to fail over, so it tolerates machine failures gracefully — but the client now does the work of deciding what's current, which is where **quorums** come in (next section).
+</Define>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Single-leader">One writer, simple ordering, no write conflicts. Cost: the leader is a bottleneck and a failover risk. Best for: anything needing correctness over write-availability — Meridian's ledger.</ConceptCard>
+  <ConceptCard label="Multi-leader">Writers in every region, fast local writes, survives offline. Cost: concurrent edits to the same data conflict and must be merged. Best for: geo-distributed apps, collaborative editing.</ConceptCard>
+  <ConceptCard label="Leaderless">No leader to fail over; tolerates failures smoothly via quorums. Cost: the client resolves staleness; weaker guarantees. Best for: high-availability stores where some inconsistency is acceptable.</ConceptCard>
+</ConceptGrid>
+
+**On the job:** the question is never "which is best" — it's "what does this data tolerate?" A user's *avatar* can be multi-leader and resolve conflicts sloppily; nobody dies if the wrong photo wins. An *account balance* must be single-leader, because "two leaders both debited the same account and we merged it wrong" is *inventing or destroying money*. Match the replication model to the cost of being wrong about *that specific data*. Meridian uses single-leader for the ledger and can afford leaderless caches around the edges.
+
+## Quorums
+
+Leaderless replication poses a sharp question: if there's no leader and I write to *some* replicas and read from *some* replicas, how do I guarantee my read sees my write? The answer is a small, beautiful piece of arithmetic.
+
+<Define term="Quorum (N, W, R)" since="Replication (Part 2)">
+With **N** replicas holding a piece of data, a **quorum** write waits for acknowledgment from **W** replicas, and a quorum read collects answers from **R** replicas. The rule **W + R > N** guarantees that the set of replicas you wrote to and the set you read from **overlap by at least one**. In the simple case of a completed, versioned write and no concurrent conflict, that overlap gives the read a copy of the newest acknowledged value. Why it matters: it lets a cluster of individually-unreliable machines improve freshness without a single leader, just by counting — but it is not the same thing as linearizability.
+</Define>
+
+Why does `W + R > N` work? Pure **pigeonhole**: if you write to W replicas and read from R replicas out of N total, and W + R is *bigger* than N, the two groups can't be disjoint — they must share at least one replica. For a completed write in this simplified model, that shared replica has your write, and version numbers let the reader pick it as newest. Let's prove it runs:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// quorumOK reports whether the read and write sets are guaranteed to overlap.
+func quorumOK(n, w, r int) bool { return w+r > n }
+
+type replica struct {
+	version int
+	value   int64
+}
+
+// writeQuorum writes (ver,val) to the FIRST w of n replicas.
+func writeQuorum(reps []replica, w, ver int, val int64) {
+	for i := 0; i < w; i++ {
+		reps[i] = replica{ver, val}
+	}
+}
+
+// readQuorum reads the LAST r replicas and returns the newest version it finds.
+func readQuorum(reps []replica, r int) replica {
+	newest := replica{}
+	for i := len(reps) - r; i < len(reps); i++ {
+		if reps[i].version >= newest.version {
+			newest = reps[i]
+		}
+	}
+	return newest
+}
+
+func main() {
+	n, w, r := 3, 2, 2
+	fmt.Printf("N=%d W=%d R=%d -> W+R>N? %v  (overlap guaranteed)\n", n, w, r, quorumOK(n, w, r))
+
+	reps := make([]replica, n)    // 3 empty replicas (version 0)
+	writeQuorum(reps, w, 1, 9000) // write v1=9000 to 2 of 3 (indices 0,1)
+	got := readQuorum(reps, r)    // read 2 of 3 (indices 1,2) -> overlap at index 1
+	fmt.Printf("read sees: %d cents (version %d) — fresh\n", got.value, got.version)
+
+	// Break the rule: W=1, R=1 -> W+R=2, not > 3. Write index 0, read index 2: no overlap.
+	fmt.Printf("\nN=3 W=1 R=1 -> W+R>N? %v  (a read can MISS the latest write)\n", quorumOK(3, 1, 1))
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Tuning W and R, and why 'strict quorum' still isn't linearizable">
+
+`W + R > N` is one equation with room to tune. Common choices for N=3:
+
+- **W=2, R=2** — balanced; survives one replica down for both reads and writes.
+- **W=3, R=1** — fast reads, slow/fragile writes (all replicas must ack). Good for read-heavy data.
+- **W=1, R=3** — fast writes, slow reads. Good for write-heavy data you read rarely.
+
+Two honest caveats people skip. First, quorums tolerate failure but *reduce* it: with W=2 on N=3, one dead replica is fine; two dead and writes stop. Second — and this trips up even strong engineers — a strict quorum is **not** the same as **linearizability** (the illusion of a single, instantly-consistent copy). Edge cases break it: a write that reached only some of its W replicas before failing, reads concurrent with writes, replicas recovering from stale snapshots. Quorums give you *probably fresh, usually*, not *provably the latest, always*. When you genuinely need linearizability — and a ledger sometimes does — you reach for consensus (Raft/Paxos), which is its own chapter. Quorums are a pragmatic sweet spot, not a consistency guarantee you can lean your whole bank on.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="You run N=5 replicas and want reads to always see the latest acknowledged write. You set W=3. What's the smallest R that guarantees overlap?"
+  options={[
+    "R = 1",
+    "R = 2",
+    "R = 3",
+    "R = 5"
+  ]}
+  answer={2}
+  explain="You need W + R > N, i.e. 3 + R > 5, so R > 2, so the smallest integer R is 3. With W=3 and R=3 on N=5, the write set and read set share at least one replica (3+3=6 > 5), so a read after a completed write includes at least one replica carrying that acknowledged write."
+/>
+
+## Conflicts & Resolution
+
+Multi-leader and leaderless both allow two writes to the same data at the same time. When the copies sync up, they disagree — a **conflict** — and something must pick a winner or merge them. This is the hardest part of giving up a single leader, and where you must be most careful with money.
+
+<Define term="Write conflict" since="Replication (Part 2)">
+A **write conflict** happens when two writes modify the same data **concurrently** — neither saw the other before happening — so there's no obvious "which came first." Example: account balance edited on the Lagos leader and the London leader in the same instant. When the two leaders sync, both have a different value and the system must resolve it. Why it matters: conflict resolution decides whether your system silently loses data, and a lost write to a balance is lost money.
+</Define>
+
+The simplest resolution strategy — and the most dangerous one for a ledger:
+
+<Define term="Last-writer-wins (LWW)" since="Replication (Part 2)">
+**Last-writer-wins** resolves a conflict by attaching a timestamp to every write and keeping the one with the latest timestamp; the others are **discarded**. Why it matters: it's dead simple and always converges, but it *throws away data* — the losing writes vanish silently. For a cache or a "last seen" field, fine. For two concurrent deposits to the same account, LWW means **one deposit just disappears** — which is why a ledger never resolves money conflicts this way.
+</Define>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// Two replicas accepted concurrent writes to the same balance. Last-writer-wins
+// keeps the later timestamp and SILENTLY DROPS the other. Watch the lost write.
+type write struct {
+	value int64
+	ts    time.Time
+}
+
+func lww(a, b write) write {
+	if a.ts.After(b.ts) {
+		return a
+	}
+	return b
+}
+
+func main() {
+	t0 := time.Now()
+	lagos := write{value: 5000, ts: t0.Add(10 * time.Millisecond)}  // "deposit, balance 5000"
+	london := write{value: 7000, ts: t0.Add(12 * time.Millisecond)} // "deposit, balance 7000"
+
+	winner := lww(lagos, london)
+	fmt.Printf("LWW winner: %d cents (the later write)\n", winner.value) // 7000
+	fmt.Println("LOST: the 5000 write is gone — acceptable for a cache, FATAL for money")
+}
+```
+
+</GoPlayground>
+
+So what *does* a ledger do? Two answers, and you've already built toward both:
+
+1. **Don't allow the conflict.** Keep money on a **single leader** so two concurrent writes to one account are impossible — they queue in one order. This is exactly why Meridian's ledger is single-leader. Simplicity is a feature when the data is money.
+2. **Make writes that compose, not overwrite.** Model balance changes as an **append-only log of transactions** (debits and credits) rather than an overwrite of a single number. Two concurrent deposits become two log entries that *add up* — there's nothing to conflict because neither replaces the other. This is the double-entry ledger from Part 3, and it's why event-sourced money is conflict-resistant by design.
+
+<Define term="Version vector" since="Replication (Part 2)">
+A **version vector** is a set of counters — one per replica — attached to a value, tracking how many writes each replica has seen. Comparing two version vectors tells you whether one write *happened before* another (safe to drop the older) or whether they were truly **concurrent** (a real conflict needing a merge, not a silent discard). Why it matters: it's how leaderless systems detect *genuine* conflicts instead of guessing with timestamps — letting the application merge concurrent writes (e.g. union two shopping carts) rather than losing one to LWW.
+</Define>
+
+<Callout kind="pro" title="The senior instinct: design conflicts out, don't resolve them in">
+
+Junior engineers reach for clever conflict-resolution algorithms. Senior engineers reach for *data models where the conflict can't occur*. Single-leader removes write conflicts by construction. Append-only/event-sourced models turn overwrites (which conflict) into additions (which don't). Commutative structures (CRDTs — counters and sets that merge in any order) make order irrelevant. The best conflict resolution is the conflict you made impossible. For Meridian: money is single-leader and append-only, so there's no balance conflict to lose sleep — or deposits — over.
+
+</Callout>
+
+## Exercises
+
+Build the primitives. Each one is a real replication mechanism in miniature.
+
+<Exercise n={1} title="Quorum checker" level="easy">
+
+Write `wouldOverlap(n, w, r int) bool` returning whether a read and write quorum are guaranteed to overlap, and print results for N=3 across all valid (W, R) from 1 to 3. Which combinations are safe?
+
+<Solution>
+
+```go
+func wouldOverlap(n, w, r int) bool { return w+r > n }
+
+// For N=3: safe when W+R > 3.
+//   W=1: R=3 ✓        (1+3=4>3)
+//   W=2: R=2 ✓, R=3 ✓ (2+2=4>3)
+//   W=3: R=1 ✓, R=2 ✓, R=3 ✓
+// W=1,R=1 (2) and W=1,R=2 (3) and W=2,R=1 (3) are NOT > 3 — unsafe.
+```
+
+The rule is strict inequality: `W + R` must be *strictly greater* than N. `W + R == N` is not enough — the sets can be exactly disjoint, so a read can miss the latest write.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Detect a stale read" level="easy">
+
+Given a leader value with version `lv` and a follower value with version `fv`, write `isStale(lv, fv int) bool` reporting whether a read from the follower would be stale (behind the leader). Explain why `fv > lv` should never happen in single-leader replication.
+
+<Solution>
+
+```go
+func isStale(lv, fv int) bool { return fv < lv }
+```
+
+A follower is stale when its version is *behind* the leader's. `fv > lv` should be impossible under single-leader replication: the leader assigns versions in order and followers only replay the leader's log, so a follower can be equal to or behind the leader, never ahead. If you ever observe `fv > lv`, something is deeply wrong — a split-brain (two leaders) or a follower that was wrongly promoted.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Last-writer-wins with a tiebreak" level="medium">
+
+LWW must break ties deterministically — if two writes share a timestamp, every replica must pick the *same* winner or they won't converge. Extend `lww` to take a `replicaID string` per write and break timestamp ties by the higher ID.
+
+<Solution>
+
+```go
+type write struct {
+	value     int64
+	ts        time.Time
+	replicaID string
+}
+
+func lww(a, b write) write {
+	if a.ts.After(b.ts) {
+		return a
+	}
+	if b.ts.After(a.ts) {
+		return b
+	}
+	// Equal timestamps: break the tie by replicaID so ALL replicas agree.
+	if a.replicaID > b.replicaID {
+		return a
+	}
+	return b
+}
+```
+
+The tiebreak isn't cosmetic — it's required for convergence. If replicas broke ties differently (or randomly), two replicas resolving the same conflict could pick different winners and never agree. A deterministic tiebreak (highest ID wins) guarantees every replica computes the identical result.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Monotonic-reads router" level="medium">
+
+Implement a router that gives a user **monotonic reads** — they never see data older than they've already seen. Map each user to a fixed replica index by hashing their ID, so every read for that user hits the same replica.
+
+<Solution>
+
+```go
+func replicaFor(user string, n int) int {
+	h := 0
+	for _, b := range []byte(user) {
+		h = h*31 + int(b) // simple deterministic hash
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h % n
+}
+
+// read(user) always uses replicas[replicaFor(user, len(replicas))], so a user
+// is pinned to one replica and can't bounce between a fresh one and a laggy one.
+```
+
+Monotonic reads break when a user's two reads hit different replicas with different lag — the second can be *older* than the first, so time appears to go backward. Pinning each user to one replica (by hashing their ID) guarantees they always read from the same copy, which only moves forward. They might be slightly behind the leader, but never behind *themselves*.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Why append-only beats LWW for money" level="hard">
+
+Model two concurrent deposits to one account two ways: (a) as overwrites resolved by LWW, and (b) as appends to a transaction log. Show that (a) loses a deposit and (b) doesn't. Compute the final balance each way from a start of 0, with deposits of 5000 and 7000.
+
+<Solution>
+
+```go
+// (a) Overwrite + LWW: each write sets the absolute balance. One wins, one is lost.
+//   write A: balance = 5000   write B: balance = 7000 (later)
+//   LWW keeps 7000. Final balance: 7000.  The 5000 deposit VANISHED.
+
+// (b) Append-only log: each deposit is an entry that ADDS to the balance.
+//   log = [+5000, +7000]   final balance = sum(log) = 12000.  Both deposits kept.
+
+func balanceFromLog(entries []int64) int64 {
+	var sum int64
+	for _, e := range entries {
+		sum += e
+	}
+	return sum
+}
+
+// balanceFromLog([]int64{5000, 7000}) == 12000 — correct.
+```
+
+The overwrite model represents a deposit as "set the balance to X," so two concurrent deposits conflict and LWW discards one — the customer loses 5000. The append-only model represents a deposit as "add X," which **commutes**: applying both in any order yields 12000. There's no conflict to resolve because neither write replaces the other. This is the heart of why ledgers are append-only event logs, not mutable balance fields — covered in depth in Part 3's double-entry ledger.
+
+</Solution>
+
+</Exercise>
+
+<Lab
+  title="Build a quorum read/write simulator"
+  archetype="build-it"
+  difficulty="scaffolded"
+  points={75}
+  hintCost={12}
+  objective="Build a leaderless quorum store over N=3 replicas. Implement write(reps, w, version, value) that writes a versioned value to the first w replicas, and read(reps, r) that reads the last r replicas and returns the value with the highest version. Your main runs the provided self-check, which writes with W=2 then reads with R=2 (expecting the fresh value), and also demonstrates that W=1,R=1 can return stale. It prints PASS only when the W=2/R=2 quorum returns the latest write and the overlap check matches W+R>N for both configurations."
+  verify="self-check"
+  starter={`package main
+
+import "fmt"
+
+type Replica struct {
+	Version int
+	Value   int64
+}
+
+// quorumOK reports whether read and write sets must overlap.
+func quorumOK(n, w, r int) bool { return w+r > n }
+
+// TODO: write writes (version, value) to the FIRST w replicas of reps.
+// func write(reps []Replica, w, version int, value int64) { ... }
+
+// TODO: read reads the LAST r replicas and returns the newest by Version.
+// func read(reps []Replica, r int) Replica { ... }
+
+func main() {
+	const n = 3
+	pass := true
+
+	// W=2, R=2 on N=3: overlap guaranteed, read must see the fresh write.
+	reps := make([]Replica, n)
+	write(reps, 2, 1, 9000)
+	got := read(reps, 2)
+	if got.Value != 9000 {
+		pass = false
+		fmt.Printf("FAIL: W=2/R=2 read got %d, want 9000\\n", got.Value)
+	}
+	if !quorumOK(n, 2, 2) {
+		pass = false
+		fmt.Println("FAIL: W=2 R=2 should overlap on N=3")
+	}
+	if quorumOK(n, 1, 1) {
+		pass = false
+		fmt.Println("FAIL: W=1 R=1 should NOT overlap on N=3")
+	}
+
+	if pass {
+		fmt.Println("PASS")
+	}
+}
+`}
+  verifier="Self-check: main prints PASS only when write/read implement a correct quorum — the W=2/R=2 configuration returns the freshly written 9000 (because the write and read sets overlap), and quorumOK correctly reports W+R>N for both the safe (2,2) and unsafe (1,1) cases. Codapi runs go run, so the PASS print is your gate."
+  hints={[
+    "write: loop i from 0 to w-1, set reps[i] = Replica{version, value}. read: loop i from len(reps)-r to len(reps)-1, track the Replica with the highest Version.",
+    "The overlap works by construction: write touches the FIRST w, read touches the LAST r. When w+r>n those index ranges must intersect, so the read sees the write. Trace indices for n=3,w=2,r=2: write hits 0,1; read hits 1,2; shared index is 1.",
+    "Initialize newest := Replica{} (Version 0). In read, use >= so a later replica at the same version still updates — though with a single write all written replicas share the version, any of them is correct."
+  ]}
+  flag="GO{quorum_overlap_w_plus_r_greater_than_n}"
+>
+
+This is the quorum arithmetic made executable. Implement `write` and `read` so the overlap guarantee actually holds, watch the W=2/R=2 read return the fresh value, and confirm the rule rejects W=1/R=1. Get PASS and you've built — in miniature — the core of every leaderless database on earth.
+
+</Lab>
+
+---
+
+<Recap>
+
+You now understand replication from the ground up — the copies, the lag, and the arithmetic that tames them:
+
+- **Replication** keeps copies of data on multiple machines, for three reasons only: **availability** (survive failures), **read scaling** (spread reads), and **latency** (a copy near the user). Each copy is a **replica**.
+- **Single-leader**: one leader takes all writes and streams an ordered log to **followers**. Simplest and safest — one authority on order, no write conflicts. It's what Postgres/MySQL and Meridian's ledger use.
+- **Synchronous vs asynchronous**: sync waits for a follower (no data loss, slower); async ACKs immediately (fast, can lose the last writes if the leader dies). Most run **semi-sync** — one sync follower, the rest async.
+- **Replication lag** causes **stale reads**; **eventual consistency** promises convergence but not *when*. Tame specific symptoms with **read-your-writes** (route a writer's reads to the leader), **monotonic reads** (pin a user to one replica), and **consistent prefix**.
+- **Multi-leader** (a leader per region) and **leaderless** (Dynamo-style, no leader) buy write flexibility at the cost of **write conflicts**.
+- **Quorums**: with N replicas, write to W and read from R; **W + R > N** guarantees the read and write sets overlap. In the simple completed-write case that improves freshness, but a strict quorum is *probably fresh*, not linearizable.
+- **Conflicts** from concurrent writes need resolution. **Last-writer-wins** is simple but *silently drops data* — fatal for money. The senior move is to design conflicts *out*: **single-leader** for money, **append-only/event-sourced** models where writes add instead of overwrite, **version vectors** to detect true concurrency. The best conflict resolution is the conflict you made impossible.
+
+</Recap>
+
+<Scoreboard
+  streak={6}
+  items={[
+    { label: "Quick check — stale read during replication lag", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — smallest R for W=3, N=5 quorum", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — quorum overlap checker", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — detect a stale read", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — LWW with deterministic tiebreak", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — monotonic-reads router", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — append-only beats LWW for money", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Quorum read/write simulator prints PASS", captured: false, points: 75 }}
+/>
+
+Replication — copies, lag, quorums, and the wisdom to keep money on a single leader where no conflict can eat a deposit. You now understand why your balance sometimes lags a second behind reality, and why that's a feature of physics, not a bug in the code. Next in the distributed-data track: **partitioning** — how you split data too big for one machine across many, and route every request to the right shard without losing the plot. The copies were the easy part. Let's go.

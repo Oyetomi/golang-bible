@@ -1,0 +1,1531 @@
+---
+title: "Background Jobs, Scheduling & Async Work"
+part: 2
+order: 13
+type: "course"
+description: "In-process cron and tickers; job queues (Asynq on Redis, River on Postgres); delayed/retryable jobs with backoff and dead-letters; idempotent handlers and draining shutdown; and leader election so a scheduled job fires once across replicas."
+prerequisites: ["reliability-patterns"]
+---
+
+<HeroCard label="Part 2 · Chapter 13" title="Background Jobs, Scheduling & Async Work">
+
+Listen up, because this is where the amateurs get separated from the engineers. Any junior can write a handler that returns a `200`. What they *cannot* do — what trips up nearly everyone who hasn't had the privilege of learning from me — is correctly answer the question: *"What happens to the work that doesn't fit in a request?"*
+
+Nightly reconciliation. Sending receipt emails. Retrying failed webhook deliveries. Jobs that are slow, jobs that should survive a crash, jobs that need one elected runner even when twelve replicas of your service are all screaming to fire simultaneously. That's what this chapter is. Background jobs, scheduling, async work — the quiet engine underneath every serious production service. You'll run it without flinching, and you'll do it correctly. Because I refuse to be associated with dropped work.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Scheduled Work", "Job Queues", "Retries & Resilience", "Distributed Reality"]} />
+
+<Scene
+  title="Naive cron vs. leader election — nightly reconciliation"
+  actors={[
+    { id: "pod-a", label: "pod-a" },
+    { id: "pod-b", label: "pod-b" },
+    { id: "pod-c", label: "pod-c" }
+  ]}
+  cells={[
+    { id: "A1", label: "run A" },
+    { id: "A2", label: "run B" },
+    { id: "A3", label: "run C" }
+  ]}
+  rows={1}
+  cols={3}
+  frames={[
+    {
+      caption: "02:00 UTC. All three replicas have an in-process cron. The reconciliation job is about to fire.",
+      beat: "neutral",
+      actors: [
+        { id: "pod-a", state: "idle" },
+        { id: "pod-b", state: "idle" },
+        { id: "pod-c", state: "idle" }
+      ],
+      cells: [
+        { id: "A1", state: "idle", label: "run A" },
+        { id: "A2", state: "idle", label: "run B" },
+        { id: "A3", state: "idle", label: "run C" }
+      ]
+    },
+    {
+      caption: "No coordination: all three replicas fire simultaneously. Three reconciliation runs hit the same ledger.",
+      beat: "problem",
+      actors: [
+        { id: "pod-a", state: "active" },
+        { id: "pod-b", state: "active" },
+        { id: "pod-c", state: "active" }
+      ],
+      cells: [
+        { id: "A1", state: "warn", label: "3×" },
+        { id: "A2", state: "warn", label: "3×" },
+        { id: "A3", state: "warn", label: "3×" }
+      ]
+    },
+    {
+      caption: "Triple-processing: three sets of mismatch alerts, three on-call pages, three confused engineers.",
+      beat: "problem",
+      actors: [
+        { id: "pod-a", state: "bad" },
+        { id: "pod-b", state: "bad" },
+        { id: "pod-c", state: "bad" }
+      ],
+      cells: [
+        { id: "A1", state: "bad", label: "✕ dupe" },
+        { id: "A2", state: "bad", label: "✕ dupe" },
+        { id: "A3", state: "bad", label: "✕ dupe" }
+      ]
+    },
+    {
+      caption: "Leader election: all three race to acquire a Redis lease. Exactly one wins — pod-a.",
+      beat: "solution",
+      actors: [
+        { id: "pod-a", state: "ok" },
+        { id: "pod-b", state: "idle" },
+        { id: "pod-c", state: "idle" }
+      ],
+      cells: [
+        { id: "A1", state: "done", label: "leader" },
+        { id: "A2", state: "idle", label: "skipped" },
+        { id: "A3", state: "idle", label: "skipped" }
+      ]
+    },
+    {
+      caption: "One replica wins the lease. One reconciliation run, one alert if something's wrong — not three.",
+      beat: "solution",
+      actors: [
+        { id: "pod-a", state: "done" },
+        { id: "pod-b", state: "idle" },
+        { id: "pod-c", state: "idle" }
+      ],
+      cells: [
+        { id: "A1", state: "done", label: "ran ✓" },
+        { id: "A2", state: "idle", label: "—" },
+        { id: "A3", state: "idle", label: "—" }
+      ]
+    }
+  ]}
+  caption="The same scheduled job, two worlds: naive in-process cron fires on every replica (triple-processing, triple alerts); leader election gates it to exactly one."
+/>
+
+## Scheduled Work
+
+Let me paint the picture, sport. You're on the payments team. Every night at 2 a.m. your service has to reconcile your internal ledger against your payment processor's settlement files — compare every transaction, flag mismatches, and wake up the on-call engineer if the books don't balance. It runs on a schedule. It runs on a wall clock. And if it fires more than once you've got a very awkward morning conversation.
+
+We're going to start simple — in-process scheduling — before we earn the right to talk about the distributed version.
+
+<Define term="Cron / Ticker (scheduled work)" since="Time, Clocks &amp; Timers (Part 2)">
+A **ticker** fires at a fixed interval regardless of wall-clock time — "every 5 minutes from when the process started." A **cron** fires at a wall-clock moment — "every day at 02:00 UTC" — using a Unix cron expression. Use a ticker for polling loops; use a cron when the schedule must align to a real clock. Both run inside the process and fire on every replica unless you add coordination (see leader election below).
+</Define>
+
+### time.Ticker: fixed intervals
+
+A `time.Ticker` fires on a fixed interval, independent of when the last tick was handled. It's the heartbeat of a polling loop.
+
+```go title="ticker.go"
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// reconcile simulates a ledger reconciliation job.
+func reconcile(ctx context.Context) {
+	fmt.Println("reconciling ledger:", time.Now().Format(time.RFC3339))
+	// imagine hitting a DB and external API here
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("ticker stopped cleanly")
+			return
+		case t := <-ticker.C:
+			fmt.Println("tick at", t.Format(time.RFC3339))
+			reconcile(ctx)
+		}
+	}
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func reconcile(ctx context.Context) {
+	fmt.Println("reconciling ledger:", time.Now().Format(time.RFC3339))
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Short interval for the playground demo.
+	ticker := time.NewTicker(800 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("done:", ctx.Err())
+			return
+		case <-ticker.C:
+			reconcile(ctx)
+		}
+	}
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="time.Ticker: tick → work → tick → work"
+  lanes={[{ id: "main", label: "main goroutine" }]}
+  steps={[
+    { lane: "main", kind: "run", label: "NewTicker(5s)", note: "A ticker is created. Internally it allocates a buffered channel (capacity 1) and a runtime timer that writes the current time to C every 5 seconds." },
+    { lane: "main", kind: "recv", label: "select: wait", note: "The goroutine blocks in the select. Nothing happens until ctx.Done or ticker.C fires." },
+    { lane: "main", kind: "recv", label: "tick fires", note: "5 seconds elapse. The runtime sends the tick time into ticker.C. The select unblocks on that case." },
+    { lane: "main", kind: "run", label: "reconcile(ctx)", note: "Your work function runs. The ticker keeps counting during this — if your work takes longer than the interval, the next tick is dropped (the channel has capacity 1)." },
+    { lane: "main", kind: "recv", label: "select: wait again", note: "Work done. Back to blocking in select, waiting for the next tick or cancellation." },
+    { lane: "main", kind: "done", label: "ctx.Done() fires", note: "The context is cancelled (e.g. SIGTERM). The select picks ctx.Done(). ticker.Stop() is called via defer. Clean shutdown." }
+  ]}
+  caption="Fixed interval, context-aware. If your work outlasts the interval the tick is silently dropped — that's a drift gotcha you need to know."
+/>
+
+<Callout kind="warn" title="The drift gotcha">
+
+A `time.Ticker` fires every N nanoseconds from the moment it was created, regardless of how long your handler takes. If `reconcile` takes 4s and your ticker fires every 5s, you get 1s of idle time — fine. But if reconcile takes 6s, the *next* tick fired during that run is dropped (the channel's one-slot buffer is already full), so the effective interval is 11s. For jobs where the wall-clock schedule matters (run at 02:00 exactly, not "roughly every 24 hours"), use `robfig/cron` instead.
+
+</Callout>
+
+### robfig/cron: wall-clock schedules
+
+`time.Ticker` is for intervals ("every 5 minutes"). `robfig/cron` is for wall-clock schedules ("every day at 02:00 UTC"). It speaks a Unix cron expression and parks execution until the next scheduled wall-clock moment.
+
+```go title="cron_setup.go"
+// NOTE: requires github.com/robfig/cron/v3 — not runnable in playground.
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/robfig/cron/v3"
+)
+
+func main() {
+	c := cron.New(
+		// WithSeconds enables the 6-field expression (seconds field first).
+		cron.WithSeconds(),
+	)
+
+	// "0 0 2 * * *" — at 02:00:00 UTC every day, every month, every weekday.
+	_, err := c.AddFunc("0 0 2 * * *", func() {
+		fmt.Println("nightly reconciliation at", time.Now().UTC())
+		// call reconcile(ctx) here — but we need an app-level ctx, not a
+		// per-request one. Inject it via closure, not a global.
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	c.Start()            // starts in its own goroutine
+	defer c.Stop()       // blocks until any running job finishes — safe shutdown
+
+	select {} // wait forever (in a real service: wait for SIGTERM)
+}
+```
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="5-field cron">Standard cron: minute hour dom month dow. `"0 2 * * *"` = every day at 02:00.</ConceptCard>
+  <ConceptCard label="6-field cron">robfig/cron with `WithSeconds()`: second minute hour dom month dow. `"0 0 2 * * *"` = same, at the second boundary.</ConceptCard>
+  <ConceptCard label="c.Stop()">Returns a context whose Done channel closes after all running jobs finish. Perfect for graceful shutdown — call it in your signal handler and wait.</ConceptCard>
+  <Gotcha>A naively deployed cron fires on EVERY running replica. Two pods? Two reconciliations. Ten pods? Ten. The fix — leader election — is coming in the Distributed Reality section. Do not ship a cron job without it.</Gotcha>
+</ConceptGrid>
+
+<BeforeAfter
+  badLabel="Global, untracked"
+  goodLabel="Injected, stoppable"
+  bad={`var c = cron.New()
+
+func init() {
+  c.AddFunc("@daily", reconcile)
+  c.Start()
+}
+// can't stop, can't test`}
+  good={`func newCron(fn func()) *cron.Cron {
+  c := cron.New()
+  c.AddFunc("@daily", fn)
+  return c
+}
+// injected, stoppable, testable`}
+/>
+
+<QuickCheck
+  question="You have a ticker with a 5-second interval. Your handler takes 7 seconds. What happens to the tick that fired at t=5s?"
+  options={[
+    "It queues up and fires immediately when the handler finishes",
+    "It is dropped — the one-slot channel buffer is already full",
+    "The ticker pauses until the handler returns",
+    "Go panics with a send on closed channel"
+  ]}
+  answer={1}
+  explain="ticker.C has a buffer of 1. If the buffer is already occupied when a new tick fires, the runtime drops the tick rather than blocking the sender. Your handler effectively ran for 7s and the next scheduled tick is whenever the interval fires again from the original cadence."
+/>
+
+## Job Queues
+
+<Define term="Job Queue (Asynq / River)" since="Messaging &amp; Pub/Sub Foundations (Part 3)">
+A **job queue** is a durable store of units of work ("jobs") that producers enqueue and workers consume asynchronously. The HTTP handler enqueues quickly and returns; a separate worker process picks up the job, executes it, and acknowledges it. If the worker crashes before the ack, the job reappears for retry — that durability is what makes the queue more than just a channel. **Asynq** backs jobs in Redis; **River** stores them in a Postgres table inside your own database, enabling transactional enqueue. Without a queue, slow or flaky work blocks your HTTP response and drops work on crashes.
+</Define>
+
+Now we get to the good stuff. Here's the scenario: a user completes a payment. Your handler records the transaction in the database. It should *also* send a receipt email and notify your fraud-detection pipeline — but those operations are slow, flaky, and if they block the HTTP response the user is sitting there watching a spinner while your email provider has a hiccup. The answer is a **job queue**: enqueue the work as a small serialized record, return the `200` immediately, and let a separate worker process it asynchronously, with retries.
+
+<ExecTimeline
+  title="Job lifecycle: enqueue → queue → worker"
+  lanes={[
+    { id: "handler", label: "HTTP handler" },
+    { id: "queue",   label: "Queue (Redis/Postgres)" },
+    { id: "worker",  label: "Worker goroutine" }
+  ]}
+  steps={[
+    { lane: "handler", kind: "run",   label: "POST /payments",    note: "Request arrives. Handler validates the payload, writes the transaction record to Postgres inside a transaction." },
+    { lane: "handler", kind: "send",  label: "Enqueue receipt job", note: "Handler serializes a ReceiptJob{TxID, UserEmail} and pushes it into the queue. This is a fast, non-blocking write — usually just a Redis LPUSH or an INSERT." },
+    { lane: "handler", kind: "done",  label: "Return 200",         note: "Response sent immediately. The user sees success. Email sending is now someone else's problem." },
+    { lane: "queue",   kind: "block", label: "Job sits in queue",  note: "The job record persists in the queue's backing store. Even if the worker crashes right now, the job survives." },
+    { lane: "worker",  kind: "recv",  label: "Dequeue job",        note: "Worker polls the queue and atomically claims the job, making it invisible to other workers for a visibility-timeout window." },
+    { lane: "worker",  kind: "run",   label: "Send email",         note: "Worker calls the email provider. If this panics or times out, the job is NOT acked — it will reappear after the visibility timeout for a retry." },
+    { lane: "worker",  kind: "done",  label: "Ack → job deleted",  note: "Email sent successfully. Worker sends an explicit ack. The queue permanently deletes the job record." }
+  ]}
+  caption="The handler and the worker are decoupled by a durable queue. The handler is fast; the worker is resilient."
+/>
+
+### Asynq — Redis-backed job queue
+
+**Asynq** (`github.com/hibiken/asynq`) is the de-facto Redis-backed job queue for Go. Workers long-poll a sorted set of pending tasks and execute them with configurable concurrency. It gives you delayed jobs, scheduled cron, per-queue priorities, and a built-in web UI (Asynqmon).
+
+```go title="asynq_enqueue.go"
+// NOTE: requires Redis + github.com/hibiken/asynq — not runnable in playground.
+package payments
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/hibiken/asynq"
+)
+
+const TypeReceiptEmail = "email:receipt"
+
+// ReceiptPayload is the job's serialized payload.
+// Keep it small and self-contained — IDs, not full objects.
+type ReceiptPayload struct {
+	TransactionID string
+	UserEmail     string
+	AmountCents   int64
+}
+
+// EnqueueReceipt pushes a receipt email job onto the queue.
+// Called from the HTTP handler after a successful payment write.
+func EnqueueReceipt(ctx context.Context, client *asynq.Client, p ReceiptPayload) error {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("marshal receipt payload: %w", err)
+	}
+	task := asynq.NewTask(TypeReceiptEmail, payload,
+		asynq.MaxRetry(5),             // retry up to 5 times
+		asynq.Timeout(30*time.Second), // per-execution timeout
+	)
+	info, err := client.EnqueueContext(ctx, task)
+	if err != nil {
+		return fmt.Errorf("enqueue receipt task: %w", err)
+	}
+	slog.InfoContext(ctx, "receipt job enqueued",
+		"id", info.ID,
+		"queue", info.Queue,
+	)
+	return nil
+}
+```
+
+```go title="asynq_worker.go"
+// NOTE: requires Redis + github.com/hibiken/asynq — not runnable in playground.
+package payments
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/hibiken/asynq"
+)
+
+// HandleReceiptEmail is the worker handler for TypeReceiptEmail jobs.
+// It MUST be idempotent — Asynq is at-least-once; this can run twice.
+func HandleReceiptEmail(ctx context.Context, t *asynq.Task) error {
+	var p ReceiptPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("unmarshal receipt payload: %w", err) // won't retry a bad payload
+	}
+
+	// Idempotency: check if we already sent this receipt before calling the
+	// email provider. A Redis SET NX or a DB unique constraint works fine.
+	alreadySent, err := markReceiptSent(ctx, p.TransactionID)
+	if err != nil {
+		return fmt.Errorf("check idempotency: %w", err)
+	}
+	if alreadySent {
+		slog.InfoContext(ctx, "receipt already sent, skipping", "tx_id", p.TransactionID)
+		return nil // returning nil acks the job; duplicate is absorbed
+	}
+
+	return sendEmail(ctx, p.UserEmail, p.AmountCents)
+}
+```
+
+### Sending the actual email — `net/smtp`
+
+The handler above bottoms out in `sendEmail`, which we kept abstract. Here it is for real — and it's the *same* mailer the verification email from **Auth & API Design (Part 1)** needs. Every transactional message at Meridian — verify-address, receipt, settlement notice — funnels through one `Mailer`:
+
+```go title="mailer.go"
+// NOTE: dials a network — not runnable in the playground.
+package payments
+
+import (
+	"context"
+	"fmt"
+	"net/smtp"
+)
+
+// Mailer submits messages to a provider's SMTP endpoint (SES, Postmark, …).
+type Mailer struct {
+	addr string // "smtp.provider.com:587"
+	auth smtp.Auth
+	from string
+}
+
+func NewMailer(host, port, user, pass, from string) *Mailer {
+	return &Mailer{
+		addr: host + ":" + port,
+		auth: smtp.PlainAuth("", user, pass, host),
+		from: from,
+	}
+}
+
+// Send delivers one message. smtp.SendMail negotiates STARTTLS on the
+// submission port (587) automatically. Note: net/smtp predates context — it
+// ignores ctx and can't be cancelled mid-send. That alone is why most teams
+// reach for a provider's context-aware HTTP SDK in production.
+func (m *Mailer) Send(ctx context.Context, to, subject, body string) error {
+	msg := fmt.Sprintf(
+		"From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\n"+
+			"Content-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n",
+		m.from, to, subject, body)
+	if err := smtp.SendMail(m.addr, m.auth, m.from, []string{to}, []byte(msg)); err != nil {
+		return fmt.Errorf("smtp send to %s: %w", to, err)
+	}
+	return nil
+}
+
+// sendEmail formats the receipt. Money is integer cents — format to dollars
+// only at the very edge, on the way out. Never store or compute money as float.
+func sendEmail(ctx context.Context, mailer *Mailer, to string, amountCents int64) error {
+	subject := "Your Meridian payment receipt"
+	body := fmt.Sprintf("We received your payment of $%d.%02d. Thank you.",
+		amountCents/100, amountCents%100)
+	return mailer.Send(ctx, to, subject, body)
+}
+```
+
+The handler holds its `*Mailer` as a dependency (inject it via a handler struct — `mux.HandleFunc(TypeReceiptEmail, h.Handle)` — not a package global). The reason all of this lives behind a queue instead of inline in the payment handler: **sending mail is slow, flaky, and third-party.** Block the HTTP request on it and your checkout p99 becomes your mail provider's p99.
+
+But "behind a queue" means **at-least-once** — the handler *will* sometimes run twice (a retry after a timeout that actually delivered). So the send must be idempotent: record that this receipt went out, and a re-run skips it. That dedup is the part you can actually run:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// receiptBody formats integer cents into a dollar string at the edge.
+func receiptBody(amountCents int64) string {
+	return fmt.Sprintf("We received your payment of $%d.%02d. Thank you.",
+		amountCents/100, amountCents%100)
+}
+
+// sentLedger stands in for a Redis SET NX or a DB unique constraint: it records
+// which transactions we've already emailed, so an at-least-once retry that
+// re-runs the handler does NOT bill the customer's inbox twice.
+type sentLedger struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (s *sentLedger) markSent(txID string) (already bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen[txID] {
+		return true
+	}
+	s.seen[txID] = true
+	return false
+}
+
+func main() {
+	ledger := &sentLedger{seen: map[string]bool{}}
+	// The SAME receipt job runs twice — a retry after a delivery timeout.
+	for attempt := 1; attempt <= 2; attempt++ {
+		if ledger.markSent("tx_42") {
+			fmt.Printf("attempt %d: tx_42 already sent — skip (idempotent)\n", attempt)
+			continue
+		}
+		fmt.Printf("attempt %d: sending → %s\n", attempt, receiptBody(1999))
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="Where retries, backoff, and dead-letters come in">
+
+`smtp.SendMail` returning an error is a *transient* failure most of the time — the provider hiccuped. You don't drop the receipt; you let the queue retry it with exponential backoff, and after max attempts it lands in the dead-letter queue for a human. That machinery is the next section — the email send is precisely the job it's built for.
+
+</Callout>
+
+**On the job:** the receipt and the verification email are the same job shape, but their failure modes differ. A dropped receipt is a support ticket; a dropped verification email is a lost signup. For the verification email, surface a "resend link" button so a transient failure isn't a dead end the user can't escape — the queue retries automatically, but give the human an escape hatch too.
+
+### River — Postgres-backed job queue
+
+**River** (`github.com/riverqueue/river`) stores jobs in a Postgres table inside your application's own database. You get ACID guarantees around enqueue (enqueue inside the same transaction as your business write — the job only exists if the payment row does), Postgres-native job inspection, and zero new infrastructure if you're already on Postgres.
+
+```go title="river_enqueue.go"
+// NOTE: requires Postgres + github.com/riverqueue/river — not runnable in playground.
+package payments
+
+import (
+	"context"
+
+	"github.com/riverqueue/river"
+)
+
+// ReceiptArgs implements river.JobArgs — the job's typed payload.
+type ReceiptArgs struct {
+	TransactionID string `json:"transaction_id"`
+	UserEmail     string `json:"user_email"`
+	AmountCents   int64  `json:"amount_cents"`
+}
+
+func (ReceiptArgs) Kind() string { return "receipt_email" }
+
+// EnqueueReceiptTx enqueues a receipt job inside an existing Postgres transaction.
+// If the outer transaction rolls back, the job is never created. No phantom jobs.
+func EnqueueReceiptTx(ctx context.Context, tx pgx.Tx, client *river.Client[pgx.Tx], args ReceiptArgs) error {
+	_, err := client.InsertTx(ctx, tx, args, &river.InsertOpts{
+		MaxAttempts: 5,
+	})
+	return err
+}
+```
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Asynq (Redis)">Fast, fire-and-forget style. Sub-millisecond enqueue. Best when you already have Redis and want minimal Postgres load. At-least-once via visibility timeout.</ConceptCard>
+  <ConceptCard label="River (Postgres)">Transactional enqueue — the job only exists if your business write commits. Great for payments where the job and the row must be atomic. Uses `SKIP LOCKED` for worker polling.</ConceptCard>
+  <Gotcha>Neither Asynq nor River gives you exactly-once processing — they both guarantee at-least-once. Your handler WILL run more than once on retries or network partitions. Design every handler to be idempotent from day one, not as an afterthought.</Gotcha>
+</ConceptGrid>
+
+<UnderTheHood title="How Redis at-least-once actually works (visibility timeout + ZADD)">
+
+Asynq stores jobs in Redis sorted sets (ZSETs) keyed by state: `asynq:{queue}:pending`, `asynq:{queue}:active`, `asynq:{queue}:scheduled`, and `asynq:{queue}:retry`. When a worker claims a job, Asynq atomically moves the task record from the `pending` ZSET into the `active` ZSET and records a **deadline** — the `score` in the ZSET is a Unix timestamp meaning "if this job is still active past this time, it crashed without an ack." A background goroutine (`reaper`) scans the `active` set for expired entries and moves them back to `pending` (or to `retry` if `MaxRetry` is exhausted, or to `dead` if attempts are exceeded). The worker calls `asynq.Heartbeat` during long jobs to extend the deadline and prevent false recovery. All of the state transitions use Lua scripts executed atomically on the Redis server — no TOCTOU races between worker discovery and reaping.
+
+River uses Postgres's `SELECT ... FOR UPDATE SKIP LOCKED` on a `river_jobs` table. Each worker issues a single query that finds unlocked jobs in state `available`, locks them, and flips their state to `running` in one atomic statement. The row-level lock prevents two workers from claiming the same job. If the worker crashes without committing, Postgres releases the lock and a background rescuer query marks overdue `running` jobs back to `available`. River uses Go 1.24+ generics so your worker handler is typed directly against your `JobArgs` struct — no `interface{}` marshaling boilerplate.
+
+Both systems guarantee **at-least-once** by relying on an explicit acknowledgment: the job is only permanently removed when the worker commits success. Skipping the ack (a panic, a kill signal, a timeout) always results in a retry.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="River enqueues a receipt job inside the same Postgres transaction as the payment INSERT. The transaction rolls back due to a constraint violation. What happens to the job?"
+  options={[
+    "The job fires anyway — River uses a separate connection",
+    "The job is never created — it was part of the rolled-back transaction",
+    "The job lands in the dead-letter queue",
+    "River retries the transaction automatically"
+  ]}
+  answer={1}
+  explain="River's InsertTx participates in your transaction. If the transaction rolls back, the INSERT for the job row is rolled back too. No phantom jobs for payments that never committed."
+/>
+
+## Retries & Resilience
+
+<Define term="Retryable Job (backoff + max attempts)">
+A **retryable job** is a job whose handler, on failure, is automatically re-queued after a delay instead of being dropped. The delay grows exponentially on each attempt (**exponential backoff**) to avoid hammering a recovering downstream. **Max attempts** caps the total tries so a permanently broken job doesn't loop forever. Without retries, a transient email-provider hiccup silently drops the receipt and the user never hears from you.
+</Define>
+
+Your email provider had a hiccup. The fraud API was behind a gateway timeout. These things happen in production every single day. A job queue without retries is just a buffer — a job queue *with* retries is an actual resilience layer.
+
+### Backoff, max-attempts, and dead letters
+
+When a job handler returns a non-nil error, the queue schedules a retry. The retry should not happen immediately (you'd hammer a broken service), and it should not retry forever (a truly broken job shouldn't clog the queue). The standard pattern is **exponential backoff with jitter**.
+
+```go title="backoff.go"
+package jobs
+
+import (
+	"math/rand/v2"
+	"time"
+)
+
+// RetryDelay returns the delay before the nth retry attempt (1-indexed).
+// Base is 1s, max cap is 1 hour. Jitter ±20% prevents thundering herds.
+func RetryDelay(attempt int) time.Duration {
+	base := time.Second
+	exp := time.Duration(1 << min(attempt-1, 10)) // 1s, 2s, 4s … capped at 1024s ≈ 17m
+	delay := base * exp
+	if delay > time.Hour {
+		delay = time.Hour
+	}
+	// Add ±20% jitter.
+	jitter := float64(delay) * 0.2
+	delta := time.Duration(rand.Float64()*jitter*2 - jitter)
+	return delay + delta
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand/v2"
+	"time"
+)
+
+func retryDelay(attempt int) time.Duration {
+	base := time.Second
+	exp := time.Duration(1 << min(attempt-1, 10))
+	delay := base * exp
+	if delay > time.Hour {
+		delay = time.Hour
+	}
+	jitter := float64(delay) * 0.2
+	delta := time.Duration(rand.Float64()*jitter*2 - jitter)
+	return delay + delta
+}
+
+func main() {
+	for i := 1; i <= 8; i++ {
+		fmt.Printf("attempt %d: wait ~%v\n", i, retryDelay(i).Round(time.Millisecond))
+	}
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Job failing twice then succeeding on attempt 3"
+  lanes={[
+    { id: "queue",  label: "Queue" },
+    { id: "worker", label: "Worker" }
+  ]}
+  steps={[
+    { lane: "queue",  kind: "run",   label: "Job enqueued",      note: "Receipt job arrives in the queue with MaxAttempts=3." },
+    { lane: "worker", kind: "recv",  label: "Attempt 1 claimed", note: "Worker dequeues and calls the email provider." },
+    { lane: "worker", kind: "block", label: "Email API timeout",  note: "The provider times out after 30s. Handler returns an error." },
+    { lane: "queue",  kind: "run",   label: "Retry in ~1s",       note: "Queue records attempt=1, schedules retry after backoff (~1s). Job moves to the retry set." },
+    { lane: "worker", kind: "recv",  label: "Attempt 2 claimed",  note: "Worker picks up the job again. Still flaky — returns error." },
+    { lane: "queue",  kind: "run",   label: "Retry in ~2s",       note: "Attempt=2. Backoff doubles: ~2s with jitter. Job re-enters retry set." },
+    { lane: "worker", kind: "done",  label: "Attempt 3 succeeds", note: "Email provider recovered. Handler returns nil. Queue permanently deletes the job." }
+  ]}
+  caption="Exponential backoff means the queue backs off gracefully while the downstream recovers. Jitter staggers retries across many jobs so you don't stampede a recovering service."
+/>
+
+<Define term="Idempotent Handler (job may run twice)" since="Idempotency &amp; Exactly-Once Semantics (Part 3)">
+A **handler is idempotent** if calling it a second time with the same job produces the same outcome as calling it once — no double email, no double charge, no duplicate ledger entry. Job queues are at-least-once: a crash between execution and acknowledgment will re-deliver the job. Every handler must be designed idempotent from day one, not retrofitted later. The standard technique is a **deduplication key**: record that this `txID` was processed; on the second delivery, detect the record and skip the side effect.
+</Define>
+
+### Idempotent handlers
+
+Because retries are guaranteed, a job handler WILL run more than once for the same logical job. An idempotent handler produces the same outcome whether it runs once or ten times. There are two practical techniques:
+
+**Deduplication key in your own store:**
+
+```go title="idempotent_handler.go"
+package jobs
+
+import (
+	"context"
+	"fmt"
+)
+
+// ReceiptStore is the interface our handler depends on — small, consumer-defined.
+type ReceiptStore interface {
+	MarkSent(ctx context.Context, txID string) (alreadySent bool, err error)
+}
+
+// HandleReceipt sends a receipt email exactly once per transaction ID.
+// Safe to call multiple times with the same payload.
+func HandleReceipt(ctx context.Context, store ReceiptStore, mailer Mailer, p ReceiptPayload) error {
+	// Atomic "mark as sent if not already sent" — returns true if we won the race.
+	alreadySent, err := store.MarkSent(ctx, p.TransactionID)
+	if err != nil {
+		return fmt.Errorf("idempotency check: %w", err)
+	}
+	if alreadySent {
+		// Duplicate delivery — absorb it silently.
+		return nil
+	}
+	return mailer.Send(ctx, p.UserEmail, p.AmountCents)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+)
+
+// sent simulates the idempotency store (an in-memory set for demo purposes).
+var (
+	mu   sync.Mutex
+	sent = map[string]bool{}
+)
+
+func markSent(txID string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if sent[txID] {
+		return true // already sent
+	}
+	sent[txID] = true
+	return false
+}
+
+func handleReceipt(ctx context.Context, txID, email string) error {
+	if markSent(txID) {
+		fmt.Printf("duplicate delivery for %s — absorbed\n", txID)
+		return nil
+	}
+	fmt.Printf("sending receipt to %s for tx %s\n", email, txID)
+	return nil
+}
+
+func main() {
+	ctx := context.Background()
+	// Simulate at-least-once: same job delivered twice.
+	_ = handleReceipt(ctx, "tx_001", "alice@example.com")
+	_ = handleReceipt(ctx, "tx_001", "alice@example.com") // duplicate
+	_ = handleReceipt(ctx, "tx_002", "bob@example.com")   // different job
+}
+```
+
+</GoPlayground>
+
+<Define term="Dead-Letter Handling (DLQ)">
+When a job exhausts all retry attempts the queue moves it to the **dead-letter queue (DLQ)** — a separate holding area, not a trash can. The job's payload is preserved for human inspection. A good DLQ has alerting on depth (non-zero depth = something is systematically broken), tooling for manual re-queue after a root-cause fix, and post-incident test coverage for the failure mode. Ignoring the DLQ means silently dropped work — missed receipts, unprocessed settlements, phantom transactions.
+</Define>
+
+### Dead-letter queues
+
+When a job exhausts all retry attempts, it moves to the **dead-letter queue** (DLQ). The DLQ is not a trash can — it is a holding pen for human triage. A good DLQ workflow looks like:
+
+1. Job exceeds `MaxAttempts` → moves to DLQ state.
+2. Alerting fires (monitor the DLQ depth as a metric).
+3. On-call engineer inspects the payload, fixes the root cause, and manually re-queues or discards the job.
+4. Post-incident: add a test for that failure mode.
+
+```go title="dlq_monitor.go"
+// NOTE: Asynq-specific — not runnable in playground.
+package monitoring
+
+import (
+	"context"
+	"log/slog"
+
+	"github.com/hibiken/asynq"
+)
+
+// CheckDLQDepth inspects the dead-letter queue and logs a warning if it's non-empty.
+// Wire this to a Prometheus gauge and alert on it.
+func CheckDLQDepth(ctx context.Context, inspector *asynq.Inspector, queueName string) {
+	info, err := inspector.GetQueueInfo(queueName)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to get queue info", "error", err)
+		return
+	}
+	if info.Dead > 0 {
+		slog.WarnContext(ctx, "dead-letter queue has jobs",
+			"queue", queueName,
+			"dead_count", info.Dead,
+		)
+	}
+}
+```
+
+### Graceful shutdown that drains in-flight jobs
+
+When a SIGTERM arrives (your Kubernetes rolling update, a scale-down), the worst thing you can do is `os.Exit(0)`. A job is running. It's halfway through marking a payment as settled. `os.Exit` kills it mid-flight, the job is not acked, and it reappears for retry in an inconsistent state.
+
+The right move: stop accepting new jobs, finish the ones in flight.
+
+```go title="graceful_shutdown.go"
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/hibiken/asynq"
+)
+
+func main() {
+	srv := asynq.NewServer(
+		asynq.RedisClientOpt{Addr: "localhost:6379"},
+		asynq.Config{
+			Concurrency: 10,
+			// Give in-flight jobs up to 30s to finish after SIGTERM.
+			ShutdownTimeout: 30 * time.Second,
+		},
+	)
+
+	mux := asynq.NewServeMux()
+	mux.HandleFunc(TypeReceiptEmail, HandleReceiptEmail)
+
+	// Start the server in a goroutine.
+	go func() {
+		if err := srv.Run(mux); err != nil {
+			slog.Error("asynq server stopped", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for a shutdown signal.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+
+	slog.Info("shutting down: draining in-flight jobs")
+	// Shutdown stops accepting new tasks and waits for in-flight tasks to finish.
+	srv.Shutdown()
+	slog.Info("all jobs drained, exiting")
+}
+```
+
+<BeforeAfter
+  badLabel="Kills in-flight jobs"
+  goodLabel="Drains then exits"
+  bad={`signal.Notify(quit, syscall.SIGTERM)
+<-quit
+os.Exit(0) // job mid-flight? too bad`}
+  good={`signal.Notify(quit, syscall.SIGTERM)
+<-quit
+srv.Shutdown() // waits for in-flight
+// os.Exit implicit via main return`}
+/>
+
+## Distributed Reality
+
+<Define term="Leader Election (singleton across replicas)">
+**Leader election** is the process by which a fleet of identical replicas agree that exactly one of them — the **leader** — will perform a privileged action (e.g., run the nightly reconciliation job) while the others stand down. All replicas race to acquire a **lease** — a short-TTL key in a shared store (Redis `SET NX`, etcd, or the Kubernetes Lease API). The winner is leader. If the leader crashes, the TTL expires automatically and the next election fires. Without leader election, a scheduled job on a 3-replica service runs three times simultaneously — triple processing, triple alerts, and a very confused on-call rotation.
+</Define>
+
+Here's where the chapter earns its keep, and where a frightening number of engineers stop thinking. You have a nightly reconciliation job. You deploy it. It runs perfectly on one pod. Then you scale to three replicas because traffic is growing. Congratulations. Your reconciliation now fires three times every night, each one trying to reconcile the same ledger against the same settlement files. Three sets of mismatch alerts. Three angry on-call pages. Three very confused engineers. That's not a production system — that's a hazing ritual.
+
+The fix is **leader election**: exactly one replica wins a distributed lock and runs the job. The other replicas see the lock is taken and skip their attempt.
+
+### The lease model
+
+Leader election in a distributed system works by having all replicas race to acquire a **lease** — a key in a shared store (Redis, etcd, or Kubernetes' `coordination.k8s.io/v1 Lease`) with a short TTL. The replica that wins the race owns the lease and is the **leader**. It must **renew** the lease before it expires. If the leader crashes, the lease expires and a new election fires automatically.
+
+```go title="redis_lease.go"
+package election
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	leaseKey = "reconciliation:leader"
+	leaseTTL = 30 * time.Second
+)
+
+// TryAcquireLease attempts to win the leader lease using SET NX EX.
+// Returns true if this instance is now the leader.
+func TryAcquireLease(ctx context.Context, rdb *redis.Client, instanceID string) (bool, error) {
+	ok, err := rdb.SetNX(ctx, leaseKey, instanceID, leaseTTL).Result()
+	if err != nil {
+		return false, fmt.Errorf("redis SET NX: %w", err)
+	}
+	return ok, nil
+}
+
+// RenewLease extends the lease TTL, keeping this instance as leader.
+// Must be called before the TTL expires.
+func RenewLease(ctx context.Context, rdb *redis.Client, instanceID string) error {
+	// Use a Lua script for atomic check-and-extend: only renew if we still own it.
+	script := redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+		end
+		return 0
+	`)
+	ttlMs := leaseTTL.Milliseconds()
+	res, err := script.Run(ctx, rdb, []string{leaseKey}, instanceID, ttlMs).Int()
+	if err != nil {
+		return fmt.Errorf("renew lease script: %w", err)
+	}
+	if res == 0 {
+		return fmt.Errorf("lease lost: another instance owns it")
+	}
+	return nil
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// InMemoryLeaseStore simulates a distributed lease for demo purposes only.
+// In production, use Redis SET NX or the Kubernetes Lease API.
+type InMemoryLeaseStore struct {
+	mu    sync.Mutex
+	owner string
+}
+
+func (s *InMemoryLeaseStore) TryAcquire(instanceID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner == "" {
+		s.owner = instanceID
+		return true
+	}
+	return false
+}
+
+func (s *InMemoryLeaseStore) Release(instanceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner == instanceID {
+		s.owner = ""
+	}
+}
+
+func runReplica(store *InMemoryLeaseStore, id string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if store.TryAcquire(id) {
+		fmt.Printf("[%s] acquired lease — running reconciliation\n", id)
+		// Do the work.
+		store.Release(id)
+	} else {
+		fmt.Printf("[%s] lease taken — skipping this round\n", id)
+	}
+}
+
+func main() {
+	store := &InMemoryLeaseStore{}
+	var wg sync.WaitGroup
+
+	replicas := []string{"pod-a", "pod-b", "pod-c"}
+	for _, id := range replicas {
+		wg.Add(1)
+		go runReplica(store, id, &wg)
+	}
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="3 replicas elect one leader — job fires once"
+  lanes={[
+    { id: "pod-a", label: "pod-a" },
+    { id: "pod-b", label: "pod-b" },
+    { id: "pod-c", label: "pod-c" }
+  ]}
+  steps={[
+    { lane: "pod-a", kind: "send",  label: "SET NX lease",     note: "pod-a attempts SET NX on 'reconciliation:leader' in Redis. Key does not exist yet." },
+    { lane: "pod-b", kind: "send",  label: "SET NX lease",     note: "pod-b races to acquire the same key simultaneously." },
+    { lane: "pod-c", kind: "send",  label: "SET NX lease",     note: "pod-c also races. Redis processes these atomically — exactly one wins." },
+    { lane: "pod-a", kind: "done",  label: "Won — leader",     note: "pod-a's SET NX returned OK (1). It is the leader. It will run reconciliation and renew the lease every 10s." },
+    { lane: "pod-b", kind: "block", label: "Lost — skipping",  note: "pod-b's SET NX returned 0 (key already exists). It skips this round and will retry at the next scheduled window." },
+    { lane: "pod-c", kind: "block", label: "Lost — skipping",  note: "pod-c also lost. Three cron invocations, one job execution. Exactly as designed." },
+    { lane: "pod-a", kind: "run",   label: "Reconcile once",   note: "pod-a runs the reconciliation job, holding the lease. One set of mismatch alerts, one on-call page if things are wrong — not three." }
+  ]}
+  caption="SET NX is atomic in Redis: exactly one caller wins the race. The lease TTL ensures the lock is released automatically if the leader crashes without renewing."
+/>
+
+<UnderTheHood title="How a lease-based election actually works (TTL + renewal + fencing)">
+
+**The core primitive is `SET key value NX PX ttl_ms`** — Redis's atomic "set if not exists with expiry." Only one caller in a fleet succeeds; all others get a null reply. This is implemented inside Redis as a single-threaded operation — there is no concurrent write window.
+
+**The TTL is the safety valve.** If the leader process is OOM-killed, the lease expires automatically after `ttl` milliseconds and a new election fires at the next cron tick. This bounds the outage to at most one missed run window — acceptable for "run once" jobs.
+
+**Renewal keeps the leader healthy.** The leader runs a background goroutine that calls the check-and-extend Lua script every `ttl/3` to keep the lease alive. The Lua script is atomic — it only extends the TTL if the current owner matches, preventing a zombie (a slow leader that lost its lease but woke up later) from reclaiming ownership.
+
+**Fencing tokens for correctness.** In high-stakes scenarios (writing to a database under the leader's authority), a race can still happen: the leader takes a long GC pause, the lease expires, a new leader is elected and starts writing, and *then* the original leader wakes up and also writes. The fix is a **fencing token**: a monotonically increasing integer embedded in the lease (Redis INCR). Workers pass the fencing token with every write; the storage layer rejects any write with a token lower than the last seen. As of Go 1.24, you can implement this cleanly with a thin wrapper around `go-redis` and an atomic Lua increment. This is out of scope for this chapter but is explored in the fintech sections of Part 3 when we handle concurrent balance updates.
+
+**Kubernetes Lease API** (`coordination.k8s.io/v1/leases`) is the cloud-native alternative: the same TTL+renewal model but stored in etcd via the Kubernetes API server. The `k8s.io/client-go/tools/leaderelection` package implements it. Prefer it over a Redis lease if you're already on Kubernetes — it uses your existing auth and audit trail.
+
+</UnderTheHood>
+
+<Callout kind="pro" title="Schedules and concurrency as configuration">
+
+Hard-coding `"0 0 2 * * *"` in source code is a smell. The cron schedule, the worker concurrency, the max-retry count, the lease TTL — these are **operational knobs** that change without requiring a code change or a redeploy. Load them from environment variables or a config file at startup, validate them eagerly, and fail fast if a value is missing or malformed. The full story lives in the Configuration & Secrets chapter, but the principle applies here: every scheduling constant you hardcode is a 2 a.m. redeploy waiting to happen.
+
+</Callout>
+
+<Callout kind="note" title="Ties back to reliability patterns">
+
+The retry-with-backoff and jitter you saw in this chapter is the same pattern as the HTTP retry in the Reliability Patterns chapter — the queue is just the delivery mechanism. The idempotency key is the same concept as HTTP idempotency keys for payment APIs. And the circuit breaker lives between your job handler and the external service it calls. These patterns compose. The queue doesn't replace reliability thinking — it shifts the retry boundary from the caller to the worker.
+
+</Callout>
+
+---
+
+## Exercises
+
+Stop reading. You haven't earned the scoreboard yet.
+
+<Exercise n={1} title="Ticker with context drain" level="easy">
+
+Write a `startPoller` function that accepts a `context.Context` and a `time.Duration` interval. It should spawn a goroutine that ticks at the given interval, printing the tick time, and exits cleanly when the context is cancelled. Demonstrate it running for 2 seconds then shutting down.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func startPoller(ctx context.Context, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Println("poller stopped:", ctx.Err())
+				return
+			case t := <-ticker.C:
+				fmt.Println("tick:", t.Format(time.RFC3339Nano))
+			}
+		}
+	}()
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	startPoller(ctx, 600*time.Millisecond)
+	<-ctx.Done()
+}
+```
+
+The goroutine owns its ticker and defers `Stop()` so the ticker stops firing as soon as the poller exits. The `select` makes cancellation and ticking equally first-class — neither blocks the other.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="In-memory job queue with retry" level="medium">
+
+Implement a minimal in-memory job queue. A `Job` has a `payload string`, an `attempts int`, and a `maxAttempts int`. Implement `Enqueue(j Job)` and `Process()`. `Process()` picks the next job and calls a handler function. If the handler returns an error and `attempts < maxAttempts`, re-enqueue with `attempts` incremented. If `attempts == maxAttempts`, print `dead-lettered: <payload>`. Show it retrying a job that fails twice then succeeds on the third attempt.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Job struct {
+	Payload     string
+	Attempts    int
+	MaxAttempts int
+}
+
+type Queue struct {
+	jobs []Job
+}
+
+func (q *Queue) Enqueue(j Job) {
+	q.jobs = append(q.jobs, j)
+}
+
+func (q *Queue) Process(handler func(Job) error) {
+	if len(q.jobs) == 0 {
+		return
+	}
+	j := q.jobs[0]
+	q.jobs = q.jobs[1:]
+	j.Attempts++
+	err := handler(j)
+	if err != nil {
+		if j.Attempts >= j.MaxAttempts {
+			fmt.Printf("dead-lettered: %s (failed %d times)\n", j.Payload, j.Attempts)
+		} else {
+			fmt.Printf("retry scheduled: %s (attempt %d)\n", j.Payload, j.Attempts)
+			q.Enqueue(j)
+		}
+	} else {
+		fmt.Printf("done: %s (attempt %d)\n", j.Payload, j.Attempts)
+	}
+}
+
+func main() {
+	q := &Queue{}
+	q.Enqueue(Job{Payload: "send_receipt:tx_42", MaxAttempts: 3})
+
+	callCount := 0
+	handler := func(j Job) error {
+		callCount++
+		if callCount < 3 {
+			return errors.New("email provider timeout")
+		}
+		return nil // succeeds on attempt 3
+	}
+
+	for len(q.jobs) > 0 {
+		q.Process(handler)
+	}
+}
+```
+
+The key insight: re-enqueue with the *incremented* attempt count so the dead-letter check works. In production you'd add a delay between retries — that's what the backoff function from the chapter computes.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Idempotent handler with dedup store" level="medium">
+
+Write a `ReceiptHandler` that accepts a `txID string` and uses a provided `DedupStore` interface with a `MarkIfNotSeen(txID string) bool` method. The handler should call an injected `sendEmail(txID string)` func only when `MarkIfNotSeen` returns true (i.e., first time). Verify that calling the handler three times with the same `txID` only triggers `sendEmail` once.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type DedupStore interface {
+	MarkIfNotSeen(txID string) bool
+}
+
+type InMemDedup struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func NewInMemDedup() *InMemDedup {
+	return &InMemDedup{seen: map[string]bool{}}
+}
+
+func (d *InMemDedup) MarkIfNotSeen(txID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.seen[txID] {
+		return false
+	}
+	d.seen[txID] = true
+	return true
+}
+
+type ReceiptHandler struct {
+	store     DedupStore
+	sendEmail func(txID string)
+}
+
+func (h *ReceiptHandler) Handle(txID string) {
+	if !h.store.MarkIfNotSeen(txID) {
+		fmt.Printf("duplicate absorbed: %s\n", txID)
+		return
+	}
+	h.sendEmail(txID)
+}
+
+func main() {
+	dedup := NewInMemDedup()
+	h := &ReceiptHandler{
+		store:     dedup,
+		sendEmail: func(txID string) { fmt.Printf("email sent for %s\n", txID) },
+	}
+
+	for range 3 {
+		h.Handle("tx_007")
+	}
+}
+```
+
+`MarkIfNotSeen` uses a mutex-protected map for thread safety. The `DedupStore` interface is consumer-defined and tiny — easy to swap for a Redis `SET NX` implementation in production or a plain map in tests.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Graceful worker shutdown" level="hard">
+
+Write a `Worker` struct with a `Start(ctx context.Context)` method that processes jobs from a channel in a loop. Each job is a `func()`. The worker must stop accepting new jobs when `ctx` is cancelled, but must finish any currently-running job before returning. Use a `sync.WaitGroup` to track in-flight work.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type Worker struct {
+	jobs chan func()
+}
+
+func NewWorker(buf int) *Worker {
+	return &Worker{jobs: make(chan func(), buf)}
+}
+
+func (w *Worker) Submit(fn func()) {
+	w.jobs <- fn
+}
+
+func (w *Worker) Start(ctx context.Context) {
+	var wg sync.WaitGroup
+	for {
+		select {
+		case <-ctx.Done():
+			// Stop accepting. Wait for the in-flight job to finish.
+			wg.Wait()
+			fmt.Println("worker drained and stopped")
+			return
+		case fn := <-w.jobs:
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				fn()
+			}()
+		}
+	}
+}
+
+func main() {
+	w := NewWorker(5)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go w.Start(ctx)
+
+	w.Submit(func() {
+		time.Sleep(200 * time.Millisecond)
+		fmt.Println("job 1 done")
+	})
+	w.Submit(func() {
+		time.Sleep(100 * time.Millisecond)
+		fmt.Println("job 2 done")
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	cancel() // signal shutdown while jobs are still running
+	time.Sleep(400 * time.Millisecond) // wait for demo output
+}
+```
+
+The critical path: `ctx.Done()` fires, but the `wg.Wait()` call keeps the function alive until both goroutines call `wg.Done()`. No in-flight job is dropped. In a real system replace the `time.Sleep` wait at the end with a done channel or a `sync.WaitGroup` on the outer scope.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Leader election simulation" level="hard">
+
+Simulate leader election for a scheduled job across three replicas using an in-memory store with a TTL-like expiry. Each replica runs a goroutine that tries to acquire the lease, runs the job if it won, and releases the lease afterward. Verify that across 10 election rounds the simulation records one successful lease-holder per round regardless of goroutine scheduling order.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+type LeaseStore struct {
+	mu    sync.Mutex
+	owner string
+}
+
+func (s *LeaseStore) TryAcquire(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner != "" {
+		return false
+	}
+	s.owner = id
+	return true
+}
+
+func (s *LeaseStore) Release(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner == id {
+		s.owner = ""
+	}
+}
+
+func main() {
+	const rounds = 10
+	for round := range rounds {
+		store := &LeaseStore{}
+		var executions atomic.Int32
+
+		var wg sync.WaitGroup
+		for _, id := range []string{"pod-a", "pod-b", "pod-c"} {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				if store.TryAcquire(id) {
+					executions.Add(1)
+					// simulate job work
+					store.Release(id)
+				}
+			}(id)
+		}
+		wg.Wait()
+
+		n := executions.Load()
+		if n != 1 {
+			fmt.Printf("round %d: BUG — job fired %d times\n", round+1, n)
+		} else {
+			fmt.Printf("round %d: ok — fired once\n", round+1)
+		}
+	}
+}
+```
+
+`atomic.Int32` lets us safely count executions across goroutines without a mutex. The outer loop resets the store each round, simulating a new lease window. The assertion `n != 1` is your verifier.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Exercises were practice, sport. This is the real thing. I designed this test personally. I am watching.
+
+<Lab
+  title="Idempotent retryable receipt handler with dead-letter"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={10}
+  objective="Complete the skeleton: a receipt handler that (1) deduplicates by transaction ID so a duplicate job delivery is silently absorbed, (2) retries up to MaxAttempts with the attempt counter tracked in the Job struct, (3) moves a job to the dead-letter queue after MaxAttempts exhausted, and (4) returns the correct result for each case. The verifier will send the same job three times (two duplicates), run a job that fails twice then succeeds on attempt 3, and run a job that fails all 3 attempts and ends up dead-lettered. All three scenarios must behave correctly."
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+// Job represents a unit of work to be processed.
+type Job struct {
+	TxID        string
+	Payload     string
+	Attempts    int
+	MaxAttempts int
+}
+
+// Result is what the queue produces after processing.
+type Result int
+
+const (
+	ResultDone        Result = iota // job succeeded
+	ResultRetry                     // job failed, re-enqueue
+	ResultDead                      // job exhausted all attempts
+	ResultDuplicate                 // job was already processed (idempotent skip)
+)
+
+// DedupStore marks jobs as seen and returns false if already seen.
+type DedupStore struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func NewDedupStore() *DedupStore {
+	return &DedupStore{seen: map[string]bool{}}
+}
+
+func (d *DedupStore) MarkIfNotSeen(txID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// TODO: implement — return true only if this txID has NOT been seen before,
+	// and record it as seen.
+	return false
+}
+
+// ProcessJob runs handler(job) and returns the appropriate Result.
+// It must:
+//   - return ResultDuplicate if the txID has already been processed
+//   - increment job.Attempts before calling handler
+//   - return ResultDone on success
+//   - return ResultRetry on error when attempts < maxAttempts
+//   - return ResultDead on error when attempts >= maxAttempts
+func ProcessJob(job *Job, store *DedupStore, handler func(*Job) error) Result {
+	// TODO: implement
+	return ResultDone
+}
+
+// ---- verifier scaffold below — do not modify ----
+
+func main() {
+	store := NewDedupStore()
+
+	// Scenario 1: duplicate delivery (same txID delivered 3 times)
+	job1 := &Job{TxID: "tx_dup", Payload: "receipt", MaxAttempts: 3}
+	r1a := ProcessJob(job1, store, func(j *Job) error { return nil })
+	r1b := ProcessJob(&Job{TxID: "tx_dup", Payload: "receipt", MaxAttempts: 3}, store, func(j *Job) error { return nil })
+	r1c := ProcessJob(&Job{TxID: "tx_dup", Payload: "receipt", MaxAttempts: 3}, store, func(j *Job) error { return nil })
+	check("dup first", r1a, ResultDone)
+	check("dup second", r1b, ResultDuplicate)
+	check("dup third", r1c, ResultDuplicate)
+
+	// Scenario 2: fails twice, succeeds on attempt 3
+	callCount := 0
+	job2 := &Job{TxID: "tx_retry", Payload: "receipt", MaxAttempts: 3}
+	for {
+		handler := func(j *Job) error {
+			callCount++
+			if callCount < 3 {
+				return errors.New("provider timeout")
+			}
+			return nil
+		}
+		r := ProcessJob(job2, store, handler)
+		if r == ResultDone {
+			fmt.Println("scenario 2: ok — succeeded on attempt 3")
+			break
+		}
+		if r == ResultDead {
+			fmt.Println("scenario 2: BUG — dead before attempt 3")
+			break
+		}
+	}
+
+	// Scenario 3: always fails → dead-letter
+	job3 := &Job{TxID: "tx_dead", Payload: "receipt", MaxAttempts: 3}
+	var lastResult Result
+	for {
+		r := ProcessJob(job3, store, func(j *Job) error {
+			return errors.New("always fails")
+		})
+		lastResult = r
+		if r == ResultDead || r == ResultDone {
+			break
+		}
+	}
+	check("dead-letter", lastResult, ResultDead)
+}
+
+func check(label string, got, want Result) {
+	if got == want {
+		fmt.Printf("%-20s ok\n", label)
+	} else {
+		fmt.Printf("%-20s FAIL: got %d want %d\n", label, got, want)
+	}
+}`}
+  verifier="All three check() calls print 'ok', scenario 2 prints 'succeeded on attempt 3', and scenario 3 prints 'dead-letter ok'. No panics. No race conditions (the verifier runs with -race)."
+  hints={[
+    "MarkIfNotSeen: check d.seen[txID]; if true return false (already seen); otherwise set d.seen[txID]=true and return true.",
+    "ProcessJob: call store.MarkIfNotSeen first. If it returns false, this is a duplicate — return ResultDuplicate immediately without incrementing Attempts.",
+    "After the dedup check, increment job.Attempts BEFORE calling handler. That way Attempts reflects the actual execution count.",
+    "After calling handler: if err==nil return ResultDone. If err!=nil and job.Attempts>=job.MaxAttempts return ResultDead. Otherwise return ResultRetry."
+  ]}
+  flag="GO{idempotent_retry_dead_letter_correct}"
+>
+
+You are building the reliability backbone of a payments service. The same receipt job WILL be delivered twice — at-least-once is the guarantee. A duplicate must be absorbed. A failing job must retry with its attempt count tracked. A job that exhausts all retries must land in dead-letter, not in limbo. Get all three scenarios green and the flag is yours.
+
+</Lab>
+
+<Recap>
+
+- **`time.Ticker`** fires at fixed intervals; if your work outlasts the interval the next tick is silently dropped. Use it for polling. Use **`robfig/cron`** when you need wall-clock schedule precision (daily at 02:00).
+- **Job queues** decouple slow/retryable work from the request path. **Asynq** (Redis-backed, fast enqueue) and **River** (Postgres-backed, transactional enqueue) are the two main options. Both are at-least-once — your handler WILL run more than once.
+- **Idempotent handlers** are not optional. Use a deduplication key (a `SET NX` in Redis or a unique constraint in Postgres) to absorb duplicate deliveries without double-processing.
+- **Exponential backoff with jitter** schedules retries without stampeding a recovering downstream service. `min()/max()` builtins (Go 1.21+) make the cap calculation clean.
+- **Dead-letter queues** are a triage holding pen, not a trash can. Alert on DLQ depth; don't ignore it.
+- **Graceful shutdown** means calling `srv.Shutdown()` (or equivalent drain logic) on SIGTERM — never `os.Exit(0)` with jobs in flight.
+- **Naive in-process cron fires on every replica.** The fix is a distributed **lease** (Redis `SET NX`, etcd, or the Kubernetes Lease API): exactly one replica wins, the others skip. The lease TTL is your safety valve if the leader crashes.
+- **Schedules and concurrency are operational knobs** — load them from config, validate at startup, never hardcode.
+
+</Recap>
+
+<Scoreboard
+  streak={11}
+  items={[
+    { label: "Quick check — ticker drift", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — River transactional enqueue", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Ticker with context drain", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — In-memory job queue with retry", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Idempotent handler with dedup store", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Graceful worker shutdown", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Leader election simulation", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Idempotent retryable receipt handler", captured: false, points: 80 }}
+/>
+
+Not bad, sport. You've got the quiet engine running now — jobs enqueued, workers draining, the elected leader running reconciliation while the other replicas watch from the sideline. It's no *me*, but it's genuinely close. Next we turn the service into an impenetrable fortress: application security, input validation, injection prevention, secrets out of logs — the baseline every service ships with, whether it touches money or not.

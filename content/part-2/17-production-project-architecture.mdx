@@ -1,0 +1,1269 @@
+---
+title: "Production Project Architecture"
+part: 2
+order: 17
+type: "course"
+description: "Wire everything into a real service: config and secret loading, dependency injection, layered/hexagonal structure, graceful lifecycle and a CI/CD-ready layout."
+prerequisites: ["configuration-secrets"]
+---
+
+<HeroCard label="Part 2 · Chapter 17" title="Production Project Architecture">
+
+Listen up, sport. You've spent the last sixteen chapters accumulating *knowledge* — the scheduler, error discipline, context, observability, reliability patterns, config and secrets. That's all lovely. A jewelry box full of individual gems.
+
+Today we build the *setting*. We wire every gem into one coherent, production-grade service that you could actually ship — one that ops teams don't cry over, one that your teammates can navigate at 3 a.m., and one that the Go toolchain is proud to compile.
+
+I am the single greatest Go architect alive, and I will show you exactly how a service is wired. Not the cargo-cult directory tree you copy off blog posts. The *real* thing — why each layer exists, what goes wrong when you skip it, and how you can test every piece in isolation because nothing is hardwired to anything else.
+
+You're lucky. Let's begin.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Project Layout", "Dependency Injection", "Layered Architecture", "Config and Secret Wiring", "Graceful Lifecycle", "CI/CD-Ready Layout"]} />
+
+## Project Layout
+
+Let's anchor this to something concrete. You're building Meridian's **ledger service** — the payments/ledger system we've been circling all through Part 2. It receives transfer requests, validates them, posts double-entry journal entries to Postgres, emits events, and exposes a REST API secured by JWT. Every Part 1 and Part 2 skill ends up here.
+
+<Scene
+  title="Globals vs injection: two ways to wire the Meridian ledger"
+  actors={[
+    { id: "client", label: "Client" },
+    { id: "handler", label: "HTTP Handler" },
+    { id: "service", label: "Ledger Service" },
+    { id: "db", label: "Postgres" }
+  ]}
+  frames={[
+    {
+      caption: "Problem: handler reaches a global var for the DB. Two test workers share one connection; one migration wipes the other's data.",
+      beat: "problem",
+      actors: [
+        { id: "client", state: "active" },
+        { id: "handler", state: "warn" },
+        { id: "service", state: "warn" },
+        { id: "db", state: "bad" }
+      ]
+    },
+    {
+      caption: "Problem: swapping Postgres for a fake in tests is impossible — the global is hard-wired into every call site.",
+      beat: "problem",
+      actors: [
+        { id: "client", state: "active" },
+        { id: "handler", state: "bad" },
+        { id: "service", state: "bad" },
+        { id: "db", state: "bad" }
+      ]
+    },
+    {
+      caption: "Solution: main() builds the real repo and injects it. Tests build a fake repo and inject that. The service never knows the difference.",
+      beat: "solution",
+      actors: [
+        { id: "client", state: "active" },
+        { id: "handler", state: "ok" },
+        { id: "service", state: "ok" },
+        { id: "db", state: "ok" }
+      ]
+    },
+    {
+      caption: "Solution: a SIGTERM arrives. The handler finishes its in-flight POST /transfers, the service commits, Postgres closes — exit 0.",
+      beat: "solution",
+      actors: [
+        { id: "client", state: "done" },
+        { id: "handler", state: "done" },
+        { id: "service", state: "done" },
+        { id: "db", state: "done" }
+      ]
+    }
+  ]}
+  caption="Globals break testability and graceful shutdown. Constructor injection fixes both — the same interface accepts the real Postgres adapter in production and an in-memory fake in tests."
+/>
+
+Before the first line of Go, you need to know *where* every file lives. Here is the structure that scales without giving you a PhD in archaeology:
+
+```
+ledger/
+├── cmd/
+│   └── ledger/
+│       └── main.go          ← composition root; wires everything
+├── internal/
+│   ├── config/
+│   │   └── config.go        ← validated config struct
+│   ├── ledger/              ← domain layer (pure Go, zero HTTP, zero SQL)
+│   │   ├── service.go       ← LedgerService: business logic
+│   │   └── service_test.go
+│   ├── postgres/            ← adapter: concrete repository using pgx
+│   │   └── repo.go
+│   ├── http/                ← transport adapter: handlers + router
+│   │   ├── server.go
+│   │   └── handler.go
+│   └── secrets/
+│       └── loader.go        ← Vault / env secret loading
+├── migrations/              ← SQL migration files (golang-migrate / goose)
+├── Makefile                 ← build / test / lint / run
+├── Dockerfile
+├── .golangci.yml
+└── go.mod
+```
+
+Three zones, and they carry different rules.
+
+**`cmd/`** — one directory per binary, one `main.go` each. This is the *only* place that knows how all the pieces fit together. It imports from `internal/`, reads config, constructs dependencies in order, and starts the server. Its job is pure *wiring*, not logic. If you find business logic in `main.go`, that's a bug in your architecture, not your program.
+
+**`internal/`** — the workhorse. The `internal` visibility constraint (Go enforces it at the module boundary) means nothing outside this module can import these packages. That's a feature: it keeps the blast radius of any internal refactor contained to your own codebase. Inside `internal/`, the layering rules apply — see the next section.
+
+**No `pkg/` directory.** The `pkg/` convention from the pre-module era is a vestige. In a single-module service there's no reason to have it. If something is genuinely reusable across binaries, it lives in its own module. If it's internal, it lives in `internal/`. Don't let cargo-cult layout slow you down.
+
+**On the job:** You'll encounter this layout on your first day at a Go shop. The real failure mode is finding business logic in `cmd/` — "just a quick thing" that becomes a permanent load-bearing wall. Anything in `cmd/` that you can't unit-test in isolation is a future 3 a.m. problem.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="cmd/ is the wiring">Every binary gets one subdirectory. main.go is a composition root, not a logic dump.</ConceptCard>
+  <ConceptCard label="internal/ is the core">Go enforces the boundary. Refactor freely without breaking external consumers — there are none.</ConceptCard>
+  <ConceptCard label="domain is pure">The domain package imports nothing from transport or storage. Business logic has zero HTTP/SQL dependencies.</ConceptCard>
+  <Gotcha>The most common layout mistake: putting business logic directly in `cmd/` because "it's just a quick thing." Quick things become permanent load-bearing walls. Put logic where it can be tested without standing up a server.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="How a request finds its way through the directory tree"
+  lanes={[{ id: "req", label: "request path" }]}
+  steps={[
+    { lane: "req", kind: "recv", label: "HTTP arrives at cmd/ledger", note: "The binary started in cmd/ledger/main.go. main() built the server and called ListenAndServe; now an HTTP request arrives." },
+    { lane: "req", kind: "run", label: "internal/http handler", note: "The transport layer in internal/http/ decodes the JSON body, validates shape, extracts claims from the JWT." },
+    { lane: "req", kind: "send", label: "internal/ledger service", note: "The handler calls the domain service method. No SQL here — just a function call on an injected interface." },
+    { lane: "req", kind: "run", label: "internal/postgres repo", note: "The service calls the repository interface. The concrete Postgres implementation runs the SQL and returns domain types." },
+    { lane: "req", kind: "send", label: "response back up", note: "The repo returns to the service, which returns to the handler, which encodes the result as JSON and writes the 201." },
+    { lane: "req", kind: "done", label: "HTTP 201 sent", note: "Each layer only knows its immediate neighbor via an interface. Zero coupling between HTTP and SQL." }
+  ]}
+  caption="Dependencies point inward: transport → domain ← adapters. The domain package imports nothing from the other two."
+/>
+
+<QuickCheck
+  question="Where does business logic live in a well-structured Go service?"
+  options={["cmd/ledger/main.go — it's the entry point, so it's the right place", "internal/ledger/service.go — the domain layer, no HTTP or SQL imports", "internal/http/handler.go — handlers know the most about the request", "Wherever is convenient at the time"]}
+  answer={1}
+  explain="Business logic belongs in the domain layer (internal/ledger/). main.go is pure wiring — it constructs dependencies but owns no logic. Handlers belong in transport, SQL in adapters."
+/>
+
+## Dependency Injection
+
+<Define term="Dependency Injection" since="Software Design & Architecture (Part 1)">
+**Dependency injection** means a type receives its dependencies from the outside — passed in via a constructor — rather than creating or looking them up itself. Instead of `var db = openDB()` at package scope, your service accepts a `Repository` interface in `NewService(repo Repository)`. The caller (the composition root) decides which concrete implementation to pass. This lets tests pass a fast in-memory fake; production passes the real Postgres adapter. You get testability, swappability, and zero globals — for free.
+</Define>
+
+Here's the thing, sport: **global state is the enemy of testability.** The moment you write `var db *pgx.Conn` at package scope, you've welded that concrete implementation into every function that touches it. Swap it for a test double? You can't — it's in everyone's bloodstream. Write a test that runs in parallel? Now you're fighting for the one global. That's not engineering; that's amateur hour.
+
+The Go solution is disarmingly simple: **constructor injection at the composition root.** Accept interfaces, return concrete structs, build everything in `main`, and pass it down.
+
+**On the job:** Globals bite hardest in integration tests and on-call. When two test workers share one global DB connection and one of them runs a migration, the other's queries return nonsense. Injected deps mean each test worker constructs its own fake — parallel-safe, instant, no flakes.
+
+Here is the canonical shape for a service type:
+
+```go
+// internal/ledger/service.go
+
+package ledger
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Repository is defined by the *consumer* (the domain layer),
+// not by the implementation. The Postgres package implements it;
+// the test uses a fake.
+type Repository interface {
+	PostTransfer(ctx context.Context, t Transfer) (TransferID, error)
+	GetBalance(ctx context.Context, accountID AccountID) (int64, error)
+}
+
+// EventBus is also defined here, at the consumer.
+type EventBus interface {
+	Publish(ctx context.Context, topic string, payload []byte) error
+}
+
+// Service holds only interfaces. It knows nothing about Postgres or Kafka.
+type Service struct {
+	repo Repository
+	bus  EventBus
+	now  func() time.Time // injected clock — testable without time.Sleep
+}
+
+// NewService is the constructor. Every dep is required; we fail fast in main
+// if anything is nil rather than discovering it at the first request.
+func NewService(repo Repository, bus EventBus) *Service {
+	if repo == nil {
+		panic("ledger.NewService: repo must not be nil")
+	}
+	return &Service{repo: repo, bus: bus, now: time.Now}
+}
+```
+
+The interface lives *in the package that uses it* — not in the package that implements it. This is the "accept interfaces at consumers" proverb in action, and it's what lets you swap the concrete Postgres repo for a thin in-memory fake in tests without changing a single line of domain code.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Domain interfaces — defined at the consumer.
+type Ledger interface {
+	PostTransfer(ctx context.Context, from, to int64, cents int64) error
+}
+
+// Concrete implementation (would normally be in internal/postgres/).
+type postgresLedger struct {
+	dsn string
+}
+
+func (p *postgresLedger) PostTransfer(_ context.Context, from, to, cents int64) error {
+	fmt.Printf("postgres: transfer %d cents from acct %d to acct %d\n", cents, from, to)
+	return nil
+}
+
+// In-memory fake for tests — same interface, zero infrastructure.
+type fakeLedger struct{ calls int }
+
+func (f *fakeLedger) PostTransfer(_ context.Context, _, _, _ int64) error {
+	f.calls++
+	return nil
+}
+
+// Service depends only on the interface — not the concrete type.
+type TransferService struct {
+	ledger Ledger
+	now    func() time.Time
+}
+
+func NewTransferService(l Ledger) *TransferService {
+	return &TransferService{ledger: l, now: time.Now}
+}
+
+func (s *TransferService) Transfer(ctx context.Context, from, to, cents int64) error {
+	if cents <= 0 {
+		return fmt.Errorf("amount must be positive, got %d", cents)
+	}
+	return s.ledger.PostTransfer(ctx, from, to, cents)
+}
+
+func main() {
+	ctx := context.Background()
+
+	// Production wiring: real Postgres adapter.
+	prod := NewTransferService(&postgresLedger{dsn: "postgres://..."})
+	_ = prod.Transfer(ctx, 1001, 1002, 5000)
+
+	// Test wiring: in-memory fake — no DB, no container, instant.
+	fake := &fakeLedger{}
+	svc := NewTransferService(fake)
+	_ = svc.Transfer(ctx, 1001, 1002, 5000)
+	fmt.Println("fake ledger calls:", fake.calls) // 1
+}
+```
+
+</GoPlayground>
+
+### Manual DI vs. Wire/fx
+
+You've probably seen `google/wire` or `uber-go/fx` mentioned in the same breath as dependency injection. Here's my honest take.
+
+For a service with 5–15 constructors, **manual wiring in `main` is better.** It's readable — you can follow the construction order with your eyes. It's debuggable — the stack trace goes straight to `main`. And it has zero magic: no code generation to troubleshoot, no reflection at startup, no framework to update.
+
+`wire` or `fx` earn their keep once a service has 30+ constructors and a human can't reliably maintain the wiring by hand. Until then, the framework adds complexity faster than it removes it. Start manual. Migrate if the pain genuinely arrives.
+
+<BeforeAfter
+  badLabel="Global state"
+  goodLabel="Injected"
+  bad={`var db *pgx.Conn // global
+
+func PostTransfer(from, to, cents int64) {
+  db.Exec(ctx, "INSERT INTO...")
+}`}
+  good={`type Service struct {
+  repo Repository
+}
+func (s *Service) PostTransfer(
+  ctx context.Context,
+  from, to, cents int64,
+) error {
+  return s.repo.PostTransfer(ctx, from, to, cents)
+}`}
+/>
+
+<UnderTheHood title="Why the composition root in main keeps everything testable">
+
+The key insight is **where knowledge of concrete types lives**. In an injected design, only `main.go` (the composition root) imports both `internal/ledger` (the domain) and `internal/postgres` (the adapter). The domain package imports neither `pgx` nor `net/http`. The HTTP handler imports only the domain interface.
+
+This means:
+
+- Testing the domain service: instantiate `Service` with a `fakeLedger` — no DB, no network, instant, parallel-safe.
+- Testing the HTTP handler: wrap a `fakeService` — no DB, no Kafka, no secrets.
+- Testing the Postgres adapter: use `testcontainers` to spin up a real DB — this is the only test that needs infrastructure.
+
+Each test only needs exactly the infrastructure its layer actually uses. This is the payoff of having no globals and no concrete imports in the inner layers. The composition root knows everything; the inner layers know nothing outside their own interface. The Go compiler enforces this at the module boundary (Go 1.26 baseline): if your domain package imports `pgx`, it fails to compile when you ban that import — the architecture becomes a compile-time guarantee, not a convention.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Where should a domain interface (e.g., Repository) be defined?"
+  options={["In the package that implements it (internal/postgres/)", "In a shared interfaces package", "In the package that uses it (internal/ledger/)", "In cmd/ledger/main.go"]}
+  answer={2}
+  explain="Interfaces belong at the consumer. internal/ledger/ defines the Repository interface it needs. internal/postgres/ then implements it. This way the domain has no import of the concrete package — the dependency arrow points the right way."
+/>
+
+## Layered Architecture
+
+<Define term="Hexagonal Architecture (Ports and Adapters)" since="Software Design & Architecture (Part 1)">
+**Hexagonal architecture** (also called ports and adapters) organizes a service into three rings. The **domain** (the center) holds business rules — pure Go, no HTTP, no SQL. The **ports** are interfaces the domain defines: a `Repository` port for storage, an `EventBus` port for messaging. The **adapters** are concrete implementations that plug into those ports: the Postgres adapter, the Kafka adapter, the HTTP transport. Crucially, the domain never imports an adapter — the dependency arrow always points *inward*. This means you can replace Postgres with SQLite or swap Kafka for a test fake without touching a single line of business logic.
+</Define>
+
+The ledger service has three layers, and their dependency rule is non-negotiable: **dependencies point inward only.**
+
+- **Transport** (`internal/http/`) — decodes HTTP requests, encodes responses, validates input shape, enforces auth. Imports the domain layer via interfaces. Never imports `pgx` or any SQL package.
+- **Domain** (`internal/ledger/`) — the business rules. Pure Go structs, methods, and interfaces. Imports nothing from transport or storage. This is where Meridian's accounting invariants live.
+- **Adapters** (`internal/postgres/`, `internal/kafka/`, etc.) — concrete implementations of the domain's interfaces. They import `pgx`, `confluent-kafka-go`, whatever they need. But they are *imported* by `main`, not by the domain.
+
+This is hexagonal architecture (also called "ports and adapters"), and in Go it maps perfectly to the interface pattern: the domain defines the *port* (an interface), and each adapter provides a *plug* (a concrete implementation). The transport layer is also an adapter — it adapts HTTP to domain calls.
+
+**On the job:** The layer boundary violation that kills teams: a handler importing `pgx` directly "just to run one query." Now your handler test needs a database container. Now your handler owns SQL that nobody else can reuse. The rule is non-negotiable precisely because "just this once" is how layers collapse.
+
+```go
+// internal/http/handler.go — transport layer
+
+package http
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"github.com/myco/ledger/internal/ledger"
+)
+
+// The handler depends on the domain interface only — not on postgres or kafka.
+type TransferHandler struct {
+	svc ledger.Transferer // interface defined in internal/ledger
+}
+
+func NewTransferHandler(svc ledger.Transferer) *TransferHandler {
+	return &TransferHandler{svc: svc}
+}
+
+type transferRequest struct {
+	FromAccountID int64 `json:"from_account_id"`
+	ToAccountID   int64 `json:"to_account_id"`
+	AmountCents   int64 `json:"amount_cents"`
+}
+
+func (h *TransferHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req transferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := h.svc.Transfer(r.Context(), req.FromAccountID, req.ToAccountID, req.AmountCents); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+```
+
+<ExecTimeline
+  title="A transfer request flowing through all three layers"
+  lanes={[
+    { id: "transport", label: "transport" },
+    { id: "domain", label: "domain" },
+    { id: "adapter", label: "adapter" }
+  ]}
+  steps={[
+    { lane: "transport", kind: "recv", label: "POST /transfers", note: "TransferHandler.ServeHTTP receives the request. It decodes JSON and validates field shapes." },
+    { lane: "transport", kind: "send", label: "svc.Transfer(ctx, ...)", note: "Handler calls the domain interface method. No SQL, no Kafka imports here." },
+    { lane: "domain", kind: "run", label: "validate + post logic", note: "Service validates business rules: positive amount, accounts exist, not self-transfer. Returns a domain error if violated." },
+    { lane: "domain", kind: "send", label: "repo.PostTransfer(ctx, ...)", note: "Service calls the Repository interface. It doesn't know or care whether the concrete impl is Postgres, SQLite, or a fake." },
+    { lane: "adapter", kind: "run", label: "pgx: INSERT INTO entries", note: "The Postgres adapter runs the SQL inside a transaction. Returns the new TransferID or a wrapped pgx error." },
+    { lane: "domain", kind: "recv", label: "TransferID, nil", note: "The adapter result flows back to the service. Service publishes the event to the EventBus interface." },
+    { lane: "transport", kind: "done", label: "HTTP 201 Created", note: "Handler encodes the result and writes the response. The request is complete." }
+  ]}
+  caption="Each layer communicates through an interface. Replacing Postgres with a fake requires zero changes to the transport or domain layers."
+/>
+
+<Callout kind="pro" title="Flat is fine for small services">
+
+The three-layer model is the right default. But don't go baroque. A service with three endpoints doesn't need sub-packages inside `internal/ledger/` for every sub-concept. Start flat — one `service.go`, one `repo.go`, one `handler.go`. Add sub-packages when a file passes ~300–400 lines or when two unrelated concepts share a file and it hurts. Let the pain tell you when to split, not a diagram.
+
+</Callout>
+
+## Config and Secret Wiring
+
+We spent all of the Configuration & Secrets Management chapter learning *how* to load config and secrets. Now we wire them into the service at startup. The rule is unchanged: **fail fast, before the first request.**
+
+```go
+// cmd/ledger/main.go (excerpt: config phase)
+
+package main
+
+import (
+	"log/slog"
+	"os"
+
+	"github.com/myco/ledger/internal/config"
+	"github.com/myco/ledger/internal/secrets"
+)
+
+func main() {
+	// 1. Load and validate config — exits with a clear message if anything
+	//    is missing or malformed.
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("config invalid, refusing to start", "err", err)
+		os.Exit(1)
+	}
+
+	// 2. Load secrets from Vault (or env in dev).
+	//    Rotation is handled by the secrets loader; the rest of the service
+	//    never touches raw secret values directly.
+	sec, err := secrets.Load(cfg.VaultAddr, cfg.VaultToken)
+	if err != nil {
+		slog.Error("secret load failed", "err", err)
+		os.Exit(1)
+	}
+
+	// 3. Open DB with the DSN from secrets (never from config files — DSNs
+	//    contain passwords).
+	pool, err := openDB(sec.PostgresDSN, cfg.DB)
+	if err != nil {
+		slog.Error("could not open database", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// … build the rest of the deps and start the server.
+}
+```
+
+Two points worth hammering:
+
+**Config and secrets are separate concerns.** Config (port, timeout, feature flags) travels through environment variables or a config file and is fine to log at startup. Secrets (passwords, API keys, signing keys) come from a secrets manager and are **never logged, never exposed in `/debug/vars`, never in error messages.** The `secrets.Loader` type should implement `fmt.Stringer` with a redacted output so a careless `slog.Info("loaded", "sec", sec)` doesn't leak the DSN.
+
+**Open infra connections before building business objects.** You can't hand a nil pool to the Postgres adapter. Order matters: infra first, then adapters, then services, then transport, then `ListenAndServe`. If any step fails, `os.Exit(1)` — the service is not partially up, it's just dead.
+
+**On the job:** A service that starts with a missing secret and serves 500s for an hour is worse than one that refuses to start at all. Hard fail at startup. Your orchestrator will restart it when the secret is available; your users won't see a wall of 500s in the meantime.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+)
+
+// Config holds non-secret, validated runtime config.
+type Config struct {
+	Port        string
+	MaxIdleConn int
+}
+
+// Secrets holds sensitive values. Its String() method is intentionally redacted.
+type Secrets struct {
+	PostgresDSN string
+	JWTSignKey  []byte
+}
+
+func (s Secrets) String() string {
+	return "Secrets{REDACTED}"
+}
+
+func loadConfig() (Config, error) {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	return Config{Port: port, MaxIdleConn: 10}, nil
+}
+
+func loadSecrets() (Secrets, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return Secrets{}, errors.New("DATABASE_URL not set — refusing to start")
+	}
+	return Secrets{PostgresDSN: dsn, JWTSignKey: []byte("change-me")}, nil
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config invalid:", err)
+		os.Exit(1)
+	}
+	fmt.Println("config loaded, port:", cfg.Port)
+
+	// Simulate DATABASE_URL being missing in this playground.
+	sec, err := loadSecrets()
+	if err != nil {
+		// This is the correct behavior: hard exit, clear message, no partial start.
+		fmt.Fprintln(os.Stderr, "secret load failed:", err)
+		// os.Exit(1) — skipped here so the playground shows the error path
+		fmt.Println("(would exit 1 in production)")
+		return
+	}
+
+	// Notice: logging the secret struct prints REDACTED, not the DSN.
+	fmt.Printf("secrets loaded: %v\n", sec)
+	_ = cfg
+}
+```
+
+</GoPlayground>
+
+## Graceful Lifecycle
+
+<Define term="Graceful Shutdown" since="Reliability Patterns (Part 2)">
+**Graceful shutdown** means the process finishes what it's already doing before it exits. When Kubernetes sends `SIGTERM` (pod is being stopped), a naive service calls `os.Exit` immediately — dropping every in-flight HTTP request mid-write. A service with graceful shutdown stops accepting new connections, waits for in-flight requests to complete (typically up to 30 seconds), closes background workers, then closes infrastructure connections in reverse order, and exits 0. The caller gets their response; no cascading retries; no open transactions left dangling in Postgres.
+</Define>
+
+A service that terminates badly drops in-flight requests, leaves DB transactions open, and triggers cascading retries from callers. That's not a Kubernetes outage; it's a management problem. Here is the lifecycle every production Go service must have:
+
+1. **Open infrastructure** (DB pool, Kafka client, Redis) — in dependency order.
+2. **Build application objects** (repos, services, handlers) via constructors.
+3. **Start background workers** (job queue consumers, metrics exporters).
+4. **Start the HTTP server** — but don't block; run it in a goroutine.
+5. **Block on signal** — `signal.NotifyContext` wakes you on `SIGTERM` or `SIGINT`.
+6. **Graceful shutdown** — drain in-flight HTTP requests, stop background workers, close infra in reverse order.
+
+**On the job:** Kubernetes sends `SIGTERM` then waits `terminationGracePeriodSeconds` (default 30 s) before sending `SIGKILL`. If your drain window is longer than 30 s, the pod is force-killed and you drop requests anyway. Match your drain timeout to the Kubernetes grace period — or configure both explicitly.
+
+<ExecTimeline
+  title="Service lifecycle: startup → serving → drain → exit"
+  lanes={[{ id: "main", label: "main()" }]}
+  steps={[
+    { lane: "main", kind: "run", label: "load config + secrets", note: "Config and secrets are validated. Any failure exits immediately with os.Exit(1) — no partial startup." },
+    { lane: "main", kind: "run", label: "open DB, Kafka, Redis", note: "Infrastructure connections are opened in dependency order. Pool settings come from config." },
+    { lane: "main", kind: "run", label: "build repos + services", note: "Concrete implementations are constructed and injected into service constructors." },
+    { lane: "main", kind: "spawn", label: "go srv.ListenAndServe", note: "HTTP server starts in a goroutine. main() continues rather than blocking." },
+    { lane: "main", kind: "block", label: "wait on ctx.Done()", note: "signal.NotifyContext blocks here. The service is live and serving requests." },
+    { lane: "main", kind: "run", label: "SIGTERM → shutdown", note: "OS sends SIGTERM (e.g. kubectl stops the pod). NotifyContext cancels. We call srv.Shutdown(drainCtx)." },
+    { lane: "main", kind: "done", label: "close infra → exit 0", note: "DB pool, Kafka client closed in reverse order. Process exits cleanly. Kubernetes marks the pod terminated." }
+  ]}
+  caption="Signal handling → drain in-flight → close infra in reverse order. Each step is deterministic and logged."
+/>
+
+Here is a complete, runnable graceful shutdown skeleton. As of Go 1.26, when a signal cancels the context returned by `signal.NotifyContext`, `context.Cause(ctx)` reports an error describing that signal. This is useful for distinguishing a SIGTERM drain from a timeout drain in your logs:
+
+```go
+// cmd/ledger/main.go — graceful lifecycle (Go 1.26)
+
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func run() error {
+	// Phase 1: config (omitted here — see previous section).
+
+	// Phase 2: build the router (your real handler wiring goes here).
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Phase 3: context that cancels on SIGTERM / SIGINT.
+	// Go 1.26: context.Cause(ctx) reports the signal that canceled it.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	// Phase 4: start server in background goroutine.
+	srvErr := make(chan error, 1)
+	go func() {
+		slog.Info("server starting", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			srvErr <- err
+		}
+	}()
+
+	// Phase 5: block until signal or server error.
+	select {
+	case err := <-srvErr:
+		return fmt.Errorf("server error: %w", err)
+	case <-ctx.Done():
+		slog.Info("shutdown signal received", "cause", context.Cause(ctx))
+	}
+
+	// Phase 6: graceful drain — allow 30 s for in-flight requests to finish.
+	drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(drainCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	slog.Info("server stopped cleanly")
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func run() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ledger service — v1")
+	})
+
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		fmt.Println("server starting on :8080 (send SIGTERM to stop)")
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			srvErr <- err
+		}
+	}()
+
+	select {
+	case err := <-srvErr:
+		return fmt.Errorf("server error: %w", err)
+	case <-ctx.Done():
+		fmt.Println("signal received — draining in-flight requests...")
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(drainCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	fmt.Println("server stopped cleanly — exit 0")
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
+		os.Exit(1)
+	}
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Why signal.NotifyContext and how Shutdown drains">
+
+`signal.NotifyContext` (added in Go 1.16) registers the process to catch OS signals and returns a `context.Context` that is canceled when a signal arrives. The underlying mechanism is `signal.Notify` delivering to a buffered channel, which the context machinery watches via a goroutine. When the context cancels, your `<-ctx.Done()` unblocks — no polling, no timer, no goroutine leak. As of Go 1.26, if a signal cancels the context, `context.Cause` returns an error describing that signal, so you can distinguish a SIGTERM shutdown from a timeout-driven cancel in structured log output.
+
+`(*http.Server).Shutdown` works by:
+
+1. Closing the listener — no new connections are accepted.
+2. Closing idle keep-alive connections immediately.
+3. Waiting for in-flight requests (those with an active `ResponseWriter`) to complete, up to the deadline on the context you pass in.
+
+Under the hood, each active handler holds a reference tracked in the server's `activeConn` map. `Shutdown` polls that map (with a 500 ms ticker) until it's empty or the context times out. If you pass a 30-second drain context, you give up to 30 seconds for every concurrent request to finish normally before forcing a close. This is exactly what Kubernetes expects: it sends `SIGTERM`, waits for `terminationGracePeriodSeconds` (default 30 s), then sends `SIGKILL`. Your 30 s drain window matches that window. `Shutdown` also calls `RegisterOnShutdown` hooks — useful for stopping WebSocket connections or background goroutines that the server doesn't track. Note: the `activeConn` polling is an implementation detail of the Go runtime as of Go 1.26 and may change; the guaranteed behavior is the contract described in the `net/http` package documentation.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="What does signal.NotifyContext return when a SIGTERM arrives?"
+  options={["It calls os.Exit(0) immediately", "It cancels the returned context, unblocking ctx.Done()", "It returns an error on the next read from the server", "Nothing — you have to check os.Signal yourself"]}
+  answer={1}
+  explain="signal.NotifyContext cancels the returned context when the signal arrives. Your select on ctx.Done() unblocks, and you proceed to the graceful shutdown phase."
+/>
+
+## CI/CD-Ready Layout
+
+A production service needs more than Go files. It needs repeatable build commands, a multi-stage Docker image, and a lint/test/race pipeline that blocks the merge button on bad code.
+
+### Makefile
+
+```makefile
+# Makefile — repeatable commands for humans and CI alike.
+
+BINARY   := ledger
+VERSION  ?= dev
+GOFLAGS  := -trimpath -ldflags="-X main.version=$(VERSION)"
+
+.PHONY: build test lint race docker
+
+build:
+	go build $(GOFLAGS) -o bin/$(BINARY) ./cmd/$(BINARY)
+
+test:
+	go test ./... -count=1 -timeout=120s
+
+race:
+	go test ./... -race -count=1 -timeout=120s
+
+lint:
+	golangci-lint run ./...
+
+docker:
+	docker build -t $(BINARY):$(VERSION) .
+
+migrate-up:
+	migrate -path migrations/ -database "$$DATABASE_URL" up
+```
+
+Every engineer and every CI runner calls the same targets. No "works on my machine" — the `Makefile` is the contract.
+
+### Dockerfile (multi-stage)
+
+```dockerfile
+# Stage 1: build — full Go toolchain, creates a static binary.
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+    -o /bin/ledger ./cmd/ledger
+
+# Stage 2: run — no toolchain, no source, just the binary.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /bin/ledger /ledger
+ENTRYPOINT ["/ledger"]
+```
+
+The distroless image is ~2 MB. No shell, no package manager, no attack surface. `CGO_ENABLED=0` produces a fully static binary that runs in it without any shared-library dependencies. Multi-stage builds are covered in depth in Docker & Containerization (Part 1).
+
+### GitHub Actions pipeline
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - run: make test
+      - run: make race
+      - run: make lint
+      - run: make build
+```
+
+Four lines of `make` targets. CI runs the same commands you run locally — no divergence, no "but it worked on my laptop."
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="make test">Runs the full test suite. No -race here — that's a separate slower job so fast feedback isn't blocked.</ConceptCard>
+  <ConceptCard label="make race">Same suite under the race detector. Slower, but a merge gate so races never reach main.</ConceptCard>
+  <ConceptCard label="make lint">golangci-lint with project-specific rules. Blocks the PR on style and safety findings, not just compilation.</ConceptCard>
+  <Gotcha>Never put `go test ./...` directly in CI without also running `go vet ./...`. Vet catches real bugs (mismatched Printf formats, unreachable code) that the compiler silently misses. golangci-lint includes vet — if you're using it, you're covered. If you're not, add `go vet ./...` explicitly.</Gotcha>
+</ConceptGrid>
+
+---
+
+## Exercises
+
+The wiring is done on paper. Now wire it yourself. I don't accept "I understood the theory."
+
+<Exercise n={1} title="Compose the wiring" level="easy">
+
+Write a `main.go` that:
+
+1. Creates a `fakeLedger` struct with a `PostTransfer(ctx context.Context, from, to, cents int64) error` method that prints the transfer and returns nil.
+2. Creates a `TransferService` that accepts a `Ledger` interface in its constructor.
+3. Calls `svc.Transfer(ctx, 1001, 1002, 5000)` and prints the result.
+
+No globals. No concrete types stored in the service.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+type Ledger interface {
+	PostTransfer(ctx context.Context, from, to, cents int64) error
+}
+
+type fakeLedger struct{}
+
+func (f *fakeLedger) PostTransfer(_ context.Context, from, to, cents int64) error {
+	fmt.Printf("fake: %d cents from %d to %d\n", cents, from, to)
+	return nil
+}
+
+type TransferService struct {
+	ledger Ledger
+}
+
+func NewTransferService(l Ledger) *TransferService {
+	return &TransferService{ledger: l}
+}
+
+func (s *TransferService) Transfer(ctx context.Context, from, to, cents int64) error {
+	if cents <= 0 {
+		return fmt.Errorf("amount must be positive")
+	}
+	return s.ledger.PostTransfer(ctx, from, to, cents)
+}
+
+func main() {
+	svc := NewTransferService(&fakeLedger{})
+	if err := svc.Transfer(context.Background(), 1001, 1002, 5000); err != nil {
+		fmt.Println("error:", err)
+	}
+}
+```
+
+The `TransferService` stores a `Ledger` interface, not a `*fakeLedger`. Swap any implementation at the call site — the service never changes.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Nil guard in constructors" level="easy">
+
+Modify `NewTransferService` to panic with a descriptive message if `l` is `nil`. Write a small test (not a full test file — just the logic) that demonstrates what happens when you pass `nil`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+type Ledger interface {
+	PostTransfer(ctx context.Context, from, to, cents int64) error
+}
+
+type TransferService struct{ ledger Ledger }
+
+func NewTransferService(l Ledger) *TransferService {
+	if l == nil {
+		panic("NewTransferService: ledger must not be nil")
+	}
+	return &TransferService{ledger: l}
+}
+
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("recovered panic:", r)
+		}
+	}()
+	// Passing nil panics immediately at construction time, not at first call.
+	_ = NewTransferService(nil)
+}
+```
+
+Panicking in constructors on nil deps is idiomatic for mandatory dependencies. It surfaces the misconfiguration at startup, not at the first request three hours later.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Graceful shutdown with drain" level="medium">
+
+Write a `run()` function that:
+
+1. Starts an HTTP server on `:9090` with a single `GET /` handler that sleeps 2 seconds then returns 200.
+2. Uses `signal.NotifyContext` to catch `SIGTERM`/`SIGINT`.
+3. On signal, calls `srv.Shutdown` with a 5-second drain timeout.
+4. Returns any error from the server or shutdown.
+
+Call it from `main` and exit 1 on error.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func run() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{
+		Addr:        ":9090",
+		Handler:     mux,
+		ReadTimeout: 5 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			srvErr <- err
+		}
+	}()
+
+	select {
+	case err := <-srvErr:
+		return err
+	case <-ctx.Done():
+		fmt.Println("shutdown initiated")
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return srv.Shutdown(drainCtx)
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
+		os.Exit(1)
+	}
+}
+```
+
+The 2-second sleep in the handler simulates an in-flight request. Shutdown waits up to 5 seconds for it to complete before forcing a close.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Layer boundary test" level="medium">
+
+Write a test for `TransferService.Transfer` that verifies:
+
+- A negative amount returns an error without calling the ledger.
+- A valid transfer calls the ledger exactly once.
+
+Use a `spyLedger` that records calls. No `testify` — stdlib `testing` only.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"testing"
+)
+
+type Ledger interface {
+	PostTransfer(ctx context.Context, from, to, cents int64) error
+}
+
+type spyLedger struct{ calls int }
+
+func (s *spyLedger) PostTransfer(_ context.Context, _, _, _ int64) error {
+	s.calls++
+	return nil
+}
+
+type TransferService struct{ ledger Ledger }
+
+func NewTransferService(l Ledger) *TransferService {
+	if l == nil {
+		panic("ledger required")
+	}
+	return &TransferService{ledger: l}
+}
+
+func (s *TransferService) Transfer(ctx context.Context, from, to, cents int64) error {
+	if cents <= 0 {
+		return fmt.Errorf("amount must be positive, got %d", cents)
+	}
+	return s.ledger.PostTransfer(ctx, from, to, cents)
+}
+
+func TestTransfer(t *testing.T) {
+	t.Run("negative amount returns error, no ledger call", func(t *testing.T) {
+		spy := &spyLedger{}
+		svc := NewTransferService(spy)
+		if err := svc.Transfer(context.Background(), 1, 2, -100); err == nil {
+			t.Fatal("expected error for negative amount")
+		}
+		if spy.calls != 0 {
+			t.Fatalf("expected 0 ledger calls, got %d", spy.calls)
+		}
+	})
+
+	t.Run("valid transfer calls ledger once", func(t *testing.T) {
+		spy := &spyLedger{}
+		svc := NewTransferService(spy)
+		if err := svc.Transfer(context.Background(), 1, 2, 5000); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if spy.calls != 1 {
+			t.Fatalf("expected 1 ledger call, got %d", spy.calls)
+		}
+	})
+}
+
+func main() { fmt.Println("run with: go test -v ./...") }
+```
+
+No infrastructure needed. The domain layer test is fast, parallel-safe, and completely decoupled from Postgres.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Ordered shutdown logging" level="hard">
+
+Extend the `run()` graceful shutdown skeleton to:
+
+1. Track a fake "background worker" as a goroutine that logs a line every second.
+2. On shutdown signal, cancel the worker's context so it stops cleanly before `Shutdown` returns.
+3. Use `sync.WaitGroup` to ensure the worker goroutine has fully exited before `run()` returns.
+
+Prove that the log line "worker stopped" appears before "server stopped cleanly."
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+)
+
+func run() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{Addr: ":8081", Handler: mux}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				fmt.Println("worker stopped")
+				return
+			case <-t.C:
+				fmt.Println("worker tick")
+			}
+		}
+	}()
+
+	srvErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			srvErr <- err
+		}
+	}()
+
+	select {
+	case err := <-srvErr:
+		workerCancel()
+		wg.Wait()
+		return err
+	case <-ctx.Done():
+		fmt.Println("signal received")
+	}
+
+	// Cancel the worker first, wait for it to exit.
+	workerCancel()
+	wg.Wait()
+
+	// Then drain the HTTP server.
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(drainCtx); err != nil {
+		return err
+	}
+	fmt.Println("server stopped cleanly")
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
+		os.Exit(1)
+	}
+}
+```
+
+The invariant: worker stops first, then the HTTP server drains. Never the reverse — you don't want in-flight requests hitting a stopped worker.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Alright. Exercises are over. Playtime is done.
+
+I'm handing you a broken ledger service skeleton. It's got global state, a constructor that accepts a concrete type instead of an interface, and a `main` that exits on `SIGTERM` without draining a single in-flight request. It is, frankly, an insult. Fix it and prove it to me.
+
+<Lab
+  title="Wire the Ledger Service"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={10}
+  verify="reference"
+  objective="Fix the starter: replace the global ledger with constructor injection through a Ledger interface, wire it in main with a fake implementation, and add signal.NotifyContext graceful shutdown so the simulated in-flight request completes before the process exits. Check your solution against the rubric: no package-level vars hold state, the Ledger interface is defined at the consumer, and a concurrent request to GET /transfer would complete after a SIGINT is sent."
+  starter={`package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+// BUG 1: global state — untestable, not injectable.
+var globalLedger *ConcreteLedger
+
+type ConcreteLedger struct{ dsn string }
+
+func (c *ConcreteLedger) PostTransfer(from, to, cents int64) error {
+	fmt.Printf("transfer %d cents %d->%d\\n", cents, from, to)
+	return nil
+}
+
+// BUG 2: handler touches global directly.
+func transferHandler(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(2 * time.Second) // simulates in-flight work
+	globalLedger.PostTransfer(1001, 1002, 500)
+	w.WriteHeader(http.StatusOK)
+}
+
+// BUG 3: no graceful shutdown — SIGTERM kills in-flight requests.
+func main() {
+	globalLedger = &ConcreteLedger{dsn: os.Getenv("DATABASE_URL")}
+	http.HandleFunc("/transfer", transferHandler)
+	fmt.Println("starting on :8082")
+	http.ListenAndServe(":8082", nil)
+}`}
+  verifier="Rubric: (1) no package-level var holds a *ConcreteLedger or any concrete ledger type; (2) a Ledger interface is defined in the same package as the handler/service; (3) the shutdown path calls srv.Shutdown with a drain context long enough for the 2-second handler to complete; (4) go test -race passes on your local machine. Compare your solution to Exercise 3 and the graceful lifecycle skeleton above."
+  hints={[
+    "Define a Ledger interface with PostTransfer(ctx context.Context, from, to, cents int64) error. Remove the globalLedger var. Store the interface in a handler struct.",
+    "Build a fakeLedger that implements Ledger. In main(), construct it and inject it into your handler via a constructor (e.g. NewTransferHandler(l Ledger)). Use an http.ServeMux instead of the default mux.",
+    "Wrap main logic in a run() func. Use signal.NotifyContext for SIGTERM/SIGINT. Start the server in a goroutine. After ctx.Done(), call srv.Shutdown with a 10-second context so the 2-second handler completes."
+  ]}
+  flag="GO{injected_deps_graceful_drain_no_globals}"
+>
+
+The ledger service above will drop every in-flight request the instant Kubernetes sends `SIGTERM`. It reads a global. It ignores context. It is, professionally speaking, a disaster zone. You know exactly what to do. Make it right, or I'll know you weren't paying attention.
+
+</Lab>
+
+<Recap>
+
+You now hold the blueprint for a production-grade Go service:
+
+- **`cmd/`** is the composition root — wiring only, no logic. **`internal/`** enforces the boundary. No `pkg/` nostalgia.
+- **Constructor injection** through interfaces at consumers. Every dependency is explicit, every fake is trivial, no globals.
+- **Three layers:** transport → domain → adapters. Dependencies point inward. The domain package imports nothing from HTTP or SQL.
+- **Config before secrets, secrets before infra, infra before services, services before transport.** Fail fast at startup with `os.Exit(1)` on any missing piece.
+- **`signal.NotifyContext`** blocks on `SIGTERM`/`SIGINT`. As of Go 1.26, you can retrieve the shutdown cause via `context.Cause(ctx)` for structured logging. **`srv.Shutdown`** drains in-flight requests. Background workers get their own context, canceled before the HTTP drain. Exit 0 only after everything is quiet.
+- **`Makefile` + multi-stage `Dockerfile` (Go 1.26) + GitHub Actions CI** — same commands locally and in CI, distroless image, race detector gates the merge.
+
+</Recap>
+
+<Scoreboard
+  streak={15}
+  items={[
+    { label: "Quick check — where business logic lives", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — interface definition location", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — signal.NotifyContext behavior", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Compose the wiring", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — Nil guard in constructors", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Graceful shutdown with drain", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — Layer boundary test", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Ordered shutdown logging", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Wire the Ledger Service", captured: false, points: 80 }}
+/>
+
+Not bad. The blueprint exists. The binary compiles. The service starts, serves, and stops cleanly without dropping a single request. That's what separates the professionals from the people who just write code. Next we wire services *together* — gRPC, Protocol Buffers, and the schema-first workflow. Onward, sport.

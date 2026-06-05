@@ -1,0 +1,1770 @@
+---
+title: "SQL & Databases in Go"
+part: 1
+order: 18
+type: "course"
+description: "database/sql and pool tuning, the pgx driver, context-aware parameterized queries and transactions, migrations (golang-migrate/goose), the sqlc vs sqlx vs ORM choice, indexing and EXPLAIN, killing N+1, and zero-downtime expand-contract migrations."
+prerequisites: ["project-pokedex"]
+---
+
+<HeroCard label="Part 1 · Chapter 18" title="SQL & Databases in Go">
+
+You built an HTTP client. You built a Pokedex. Very cute. Now we're doing something that actually matters in production: talking to a database without destroying it, without leaking connections, without getting your accounts table emptied by a nine-year-old with a URL and a `'` key.
+
+Every ledger service, every payments API, every financial system that's ever handled real money runs on a relational database somewhere in the stack. That's what we're building today — an **accounts and transactions ledger** — because it covers every database concern worth caring about. By the time I'm done with you, you'll read an `EXPLAIN` plan without flinching, you'll know why `database/sql` has a pool baked in, and you'll be able to ship a schema migration while traffic is live without so much as a 503.
+
+Pay attention. This chapter is a lot. But so is production.
+
+</HeroCard>
+
+<ChapterTabs tabs={["database/sql & the Pool", "The pgx Driver", "Querying Safely", "Transactions", "Migrations", "Data-Access Choice", "Performance & EXPLAIN", "Zero-Downtime Migrations", "Read Replicas & Read-After-Write Consistency", "Document Databases"]} />
+
+## database/sql & the Pool
+
+<Define term="database/sql (the standard DB interface)">
+`database/sql` is Go's standard library package for talking to relational databases. It provides a **driver-agnostic API** — `*sql.DB`, `*sql.Rows`, `*sql.Tx` — that works with any database driver (Postgres, MySQL, SQLite) registered at startup. Critically, `sql.DB` is not a single connection; it is a **connection pool** that manages multiple live connections under the hood. Without `database/sql` (or a pool-aware equivalent like `pgxpool`), each concurrent request in your service would either open and close its own TCP connection — paying full handshake cost every time — or you'd have to write the pooling logic yourself.
+</Define>
+
+<Define term="Connection pool">
+A **connection pool** is a cache of open database connections that are borrowed for the duration of a query and then returned, rather than closed. Opening a TCP connection to Postgres takes time (DNS, TCP handshake, TLS, auth). A pool amortizes that cost: the connection is opened once, used for many queries, and kept warm between requests. `sql.DB` is Go's built-in pool. The three knobs that matter are `SetMaxOpenConns` (ceiling on simultaneous live connections), `SetMaxIdleConns` (how many to keep warm when idle), and `SetConnMaxLifetime` (retire connections before they go stale). Get any one wrong and you either starve Postgres of connection slots or pay reconnect latency on every request.
+</Define>
+
+Let me destroy a misconception before it takes root, because I have seen this mistake in production code at companies that should know better.
+
+**`sql.DB` is not a connection. It is a connection pool.**
+
+When you call `sql.Open`, you do not open *one* connection to Postgres. You create a struct that will manage a *pool* of connections, borrowing and returning them on demand. The moment your ledger service takes more than one concurrent request — which it does, immediately, on day one — you need a pool, and `sql.DB` is that pool.
+
+Here is the smallest correct way to open a database in Go:
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"time"
+
+	_ "github.com/lib/pq" // register the postgres driver
+)
+
+func main() {
+	// sql.Open does NOT open a connection yet — it configures the pool.
+	db, err := sql.Open("postgres", "postgres://user:pass@localhost/ledger?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Tune the pool BEFORE first use.
+	db.SetMaxOpenConns(25)               // max live connections
+	db.SetMaxIdleConns(10)               // keep this many idle, ready to lend
+	db.SetConnMaxLifetime(5 * time.Minute) // retire connections after 5 min
+
+	// PingContext forces an actual connection — verify config is sane.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		log.Fatalf("cannot reach database: %v", err)
+	}
+	fmt.Println("pool ready")
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// Simulated pool config — real sql.DB needs a live Postgres;
+// this shows the shape and the correct knob values.
+type DBPool struct {
+	maxOpen     int
+	maxIdle     int
+	maxLifetime time.Duration
+}
+
+func configurePool() DBPool {
+	p := DBPool{}
+	// sql.DB equivalent calls:
+	p.maxOpen = 25                  // SetMaxOpenConns(25)
+	p.maxIdle = 10                  // SetMaxIdleConns(10)
+	p.maxLifetime = 5 * time.Minute // SetConnMaxLifetime(5*time.Minute)
+	return p
+}
+
+func main() {
+	pool := configurePool()
+	fmt.Printf("Pool: maxOpen=%d, maxIdle=%d, maxLifetime=%v\n",
+		pool.maxOpen, pool.maxIdle, pool.maxLifetime)
+	fmt.Println("In production this would PingContext a real Postgres.")
+}
+```
+
+</GoPlayground>
+
+### The three knobs and why each one matters
+
+There are exactly three tuning calls on `sql.DB`. Every production service needs all three. Here is what each one does and what happens when you get it wrong.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="SetMaxOpenConns(n)">The ceiling on simultaneous live connections. Default is **0 — unlimited**. Without this, a burst of 10,000 concurrent requests hammers Postgres with 10,000 connections; Postgres dies. Rule of thumb: match your Postgres `max_connections / number_of_app_replicas`, minus headroom.</ConceptCard>
+  <ConceptCard label="SetMaxIdleConns(n)">How many idle connections to keep warm in the pool after a request returns one. Default is 2. Too low: every request pays a TCP + TLS handshake to Postgres. Too high: you hold open connections Postgres counts but nobody is using. Set to roughly half of `maxOpen`.</ConceptCard>
+  <ConceptCard label="SetConnMaxLifetime(d)">How old a connection can get before the pool retires it and opens a fresh one. Without this, connections that were opened during a maintenance window or a network blip silently stay broken in the pool forever. Set it shorter than Postgres's `idle_in_transaction_session_timeout` or any upstream load balancer idle timeout.</ConceptCard>
+  <Gotcha>Never call `sql.Open` and skip `SetMaxOpenConns`. The default is **unlimited**. A load spike will open one connection per goroutine until Postgres refuses them all — and then every request in your service errors. Set the ceiling before the first query.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="Connection pool under load — borrow, use, return, wait"
+  lanes={[
+    { id: "req1", label: "Request 1" },
+    { id: "req2", label: "Request 2" },
+    { id: "req3", label: "Request 3" },
+    { id: "pool", label: "Pool (cap=2)" }
+  ]}
+  steps={[
+    { lane: "pool",  kind: "run",   label: "2 idle conns ready",    note: "Pool starts with 2 warm idle connections — no TCP overhead on first request." },
+    { lane: "req1",  kind: "recv",  label: "borrows conn A",         note: "Request 1 arrives; pool lends conn A immediately from the idle set." },
+    { lane: "req2",  kind: "recv",  label: "borrows conn B",         note: "Request 2 arrives; pool lends conn B — last idle connection gone." },
+    { lane: "req3",  kind: "block", label: "WAITING — pool full",    note: "Request 3 arrives; maxOpenConns=2, both conns in use — request blocks on the pool." },
+    { lane: "req1",  kind: "done",  label: "returns conn A",         note: "Request 1 finishes its query and returns conn A to the idle set." },
+    { lane: "req3",  kind: "recv",  label: "borrows conn A",         note: "Pool immediately lends the just-returned conn A to waiting Request 3." },
+    { lane: "pool",  kind: "run",   label: "pool healthy",           note: "All requests served; two connections total; no TCP reconnects during burst." }
+  ]}
+  caption="The pool absorbs bursts silently. Without maxOpenConns the pool would grow unbounded and Postgres would run out of connection slots."
+/>
+
+<UnderTheHood title="What sql.DB looks like inside (Go 1.26 baseline)">
+
+`sql.DB` holds a slice of `driverConn` wrappers and a channel-based semaphore protecting the open-count ceiling. When a caller wants a connection, it goes to `db.conn(ctx, strategy)`, which either pops an idle one from `db.freeConn`, creates a new one if below the ceiling, or blocks on `db.connRequests` — a `map[uint64]chan connRequest` keyed by a monotonic request counter.
+
+Connections are returned by calling `releaseConn`, which checks whether there is a waiter in `connRequests` and hands the connection directly rather than going back to the idle list, eliminating a round-trip through the slice.
+
+`SetConnMaxLifetime` works by running a `connectionCleaner` goroutine inside `sql.DB` that wakes periodically and walks `freeConn`, closing anything older than the lifetime. Connections in active use are checked at return time.
+
+**The prepared-statement cache:** when you call `db.Prepare` (or the driver does it implicitly), the resulting `*sql.Stmt` caches one `driverStmt` per open connection. On a heavily sharded pool this means N copies of the same prepared statement — one per conn. `pgx`'s built-in prepare cache is per-connection and automatically invalidated on reconnect.
+
+The core pool design has been stable since Go 1.1; the `connRequests` map replaced an older channel in Go 1.5. Behavior described here is accurate through Go 1.26 — no structural changes to the pool internals landed in 1.25 or 1.26.
+
+</UnderTheHood>
+
+## The pgx Driver
+
+<Define term="Driver (pgx)" since="this chapter">
+A **database driver** is a package that implements the `database/sql/driver` interface — the bridge between Go's standard API and a specific database's wire protocol. When you call `sql.Open("pgx", connStr)`, you're telling `database/sql` to use the `pgx` driver, which speaks Postgres's binary wire protocol directly. The driver handles connection handshakes, query serialization, type mapping, and protocol-level features like prepared statements. Without a driver, `database/sql` has no way to reach any actual database. For Postgres, `pgx` (`github.com/jackc/pgx/v5`) is the de facto choice — faster and more complete than the older `lib/pq`, which is now in maintenance mode.
+</Define>
+
+Here's the thing, sport: `database/sql` is the standard interface, but the **driver** under it decides everything about performance and features. For Postgres, there is one right answer: **`pgx`**.
+
+`pgx` is the de facto Postgres driver for Go. It is not a thin `database/sql` adapter — it is a complete Postgres wire-protocol implementation with its own, richer API. You can use it two ways:
+
+1. **Behind `database/sql`** — register `pgx` as the `database/sql` driver. You use the standard `*sql.DB` / `*sql.Rows` API. Good for portability; you lose some `pgx`-only features.
+2. **Directly via `pgxpool`** — skip `database/sql` entirely and use `pgxpool.Pool`. Access to every Postgres-specific feature. This is what most serious Postgres services do.
+
+```go
+// Option 1: pgx behind database/sql
+import (
+    "database/sql"
+    _ "github.com/jackc/pgx/v5/stdlib"
+)
+db, err := sql.Open("pgx", connStr)
+
+// Option 2: pgxpool directly (preferred for new services)
+import "github.com/jackc/pgx/v5/pgxpool"
+
+pool, err := pgxpool.New(ctx, connStr)
+// pool has identical SetMaxConns / MaxConnLifetime config in pgxpool.Config
+```
+
+Why `pgx` over the older `lib/pq`?
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Binary protocol">pgx speaks Postgres's binary wire format for most types, not just text. Integers, floats, UUIDs, timestamps — no parse/format round trip. Measurably faster on data-heavy queries.</ConceptCard>
+  <ConceptCard label="Prepared-statement cache">Per-connection automatic statement caching. Postgres compiles the plan once per connection; subsequent executions skip planning overhead entirely.</ConceptCard>
+  <ConceptCard label="Postgres-native types">UUIDs, `jsonb`, `hstore`, arrays, custom composite types — all have first-class Go counterparts. No manual marshaling.</ConceptCard>
+  <ConceptCard label="Copy protocol">Bulk-load millions of rows with `pgx`'s `CopyFrom` using Postgres's `COPY` protocol — orders of magnitude faster than batch `INSERT`.</ConceptCard>
+  <ConceptCard label="pgxpool.Pool">A first-class connection pool built into `pgx`, not bolted on top of `database/sql`. Health checks, min-conns, per-connection after-connect hooks — things `sql.DB` can't do.</ConceptCard>
+  <Gotcha>`lib/pq` is in maintenance mode as of 2023. New code should use `pgx/v5`. The `database/sql` interface over `pgx` (`stdlib` sub-package) is fine for gradual migration; for new services, go straight to `pgxpool`.</Gotcha>
+</ConceptGrid>
+
+<Callout kind="pro" title="This chapter uses database/sql syntax for portability">
+
+The query examples below use `database/sql` — `*sql.DB`, `*sql.Rows`, `*sql.Tx` — because those types are universal and what you'll most commonly encounter in existing codebases. Where `pgx` changes things materially, I'll call it out. In a greenfield service, swap `*sql.DB` for `pgxpool.Pool` and `pgx.Rows` for `pgxpool`'s equivalents; the patterns are identical.
+
+</Callout>
+
+## Querying Safely
+
+We have a pool. We have a driver. Now let's actually talk to Postgres.
+
+Our ledger service has two tables. They'll be our spine for this entire chapter.
+
+```sql
+-- schema/001_create_accounts.sql (not runnable in the sandbox)
+CREATE TABLE accounts (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner       TEXT        NOT NULL,
+    balance_cents BIGINT    NOT NULL DEFAULT 0,
+    currency    CHAR(3)     NOT NULL DEFAULT 'USD',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE transactions (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_account UUID        REFERENCES accounts(id),
+    to_account   UUID        NOT NULL REFERENCES accounts(id),
+    amount_cents BIGINT      NOT NULL CHECK (amount_cents > 0),
+    note         TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### QueryContext and ExecContext
+
+Every database call in production code takes a `context.Context`. No exceptions. Context carries deadlines and cancellations — if the HTTP request that triggered this query is cancelled (client hung up, load balancer timed out), the context fires and the DB driver cancels the in-flight query. Without context, a slow query runs forever even when nobody is listening.
+
+The three methods you'll use constantly:
+
+- `db.QueryContext(ctx, sql, args...)` — returns `*sql.Rows`; use for SELECTs.
+- `db.QueryRowContext(ctx, sql, args...)` — returns `*sql.Row`; use when you expect exactly one row.
+- `db.ExecContext(ctx, sql, args...)` — returns `(sql.Result, error)`; use for INSERT/UPDATE/DELETE.
+
+### Parameterized queries — the only acceptable kind
+
+<Define term="Parameterized query (SQL injection defense)">
+A **parameterized query** (also called a prepared statement or placeholder query) is one where the SQL text and the user-supplied values are sent to the database as **separate payloads** — the SQL has a placeholder (`$1`, `$2`, …) and the driver sends the actual value in a separate Bind message. Because the value never gets concatenated into the SQL string, Postgres always treats it as data, never as SQL syntax. This makes SQL injection structurally impossible: a malicious string like `'; DROP TABLE accounts; --` lands as a text value to compare against a column, not as additional SQL to execute. Parameterized queries are not optional. They are the only acceptable way to include user input in a query.
+</Define>
+
+Here is the most important rule in this section, and I want it burned into your neurons: **always use parameterized queries**. Not string formatting. Not `fmt.Sprintf` into SQL. Parameterized queries where the driver sends the SQL and the values as separate payloads to Postgres, and Postgres treats the values as data, never as SQL.
+
+<BeforeAfter
+  badLabel="SQL injection waiting"
+  goodLabel="Parameterized — safe"
+  bad={`// NEVER do this — owner is user input
+query := fmt.Sprintf(
+  "SELECT id FROM accounts WHERE owner='%s'", owner)
+rows, err := db.QueryContext(ctx, query)`}
+  good={`// $1 is a placeholder — Postgres gets the
+// value separately, treats it as a string,
+// never as SQL syntax.
+rows, err := db.QueryContext(ctx,
+  "SELECT id FROM accounts WHERE owner=$1",
+  owner)`}
+/>
+
+The bad version with a malicious `owner` value of `'; DROP TABLE accounts; --` executes as:
+
+```sql
+SELECT id FROM accounts WHERE owner=''; DROP TABLE accounts; --'
+```
+
+Your accounts table is gone. The parameterized version can't do that — the value `'; DROP TABLE accounts; --` is a text string named `$1`; Postgres compares it literally against the `owner` column and finds no rows. The injection is impossible because the code and the data never merge into a string.
+
+<ExecTimeline
+  title="Parameterized query — how the driver splits code from data"
+  lanes={[
+    { id: "app",  label: "App" },
+    { id: "wire", label: "Postgres wire" },
+    { id: "pg",   label: "Postgres" }
+  ]}
+  steps={[
+    { lane: "app",  kind: "run",  label: "build query + args",  note: "App holds: sql='SELECT... WHERE owner=$1', args=['alice']. They are never concatenated." },
+    { lane: "app",  kind: "send", label: "send Parse message",  note: "Driver sends Postgres's Parse wire message: the SQL string with $1 placeholder." },
+    { lane: "pg",   kind: "run",  label: "parse + plan SQL",    note: "Postgres parses and plans the query once — $1 is a parameter slot, not a value yet." },
+    { lane: "app",  kind: "send", label: "send Bind message",   note: "Driver sends Bind: the parameter value 'alice' as a separate binary payload." },
+    { lane: "pg",   kind: "run",  label: "bind value, execute", note: "Postgres binds 'alice' to $1 as a typed value — never interpreted as SQL. Executes the plan." },
+    { lane: "wire", kind: "recv", label: "RowDescription + rows", note: "Postgres streams rows back: column metadata then row data." },
+    { lane: "app",  kind: "done", label: "Scan into structs",   note: "Driver hands rows to sql.Rows; app Scans each column into typed Go variables." }
+  ]}
+  caption="The SQL and the values travel as separate wire messages. Injection is structurally impossible."
+/>
+
+### Scanning rows
+
+After `QueryContext`, you must iterate and scan. The pattern is always the same, and there are three rules to follow every single time:
+
+```go
+// FindAccountsByOwner returns all accounts for a given owner.
+// NOT RUNNABLE — requires a live Postgres; illustrative pattern.
+func FindAccountsByOwner(ctx context.Context, db *sql.DB, owner string) ([]Account, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, owner, balance_cents, currency FROM accounts WHERE owner = $1`,
+		owner,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query accounts: %w", err)
+	}
+	defer rows.Close() // RULE 1: always close — even if no rows come back
+
+	var accounts []Account
+	for rows.Next() {
+		var a Account
+		// RULE 2: scan in the SAME ORDER as SELECT columns, exactly
+		if err := rows.Scan(&a.ID, &a.Owner, &a.BalanceCents, &a.Currency); err != nil {
+			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	// RULE 3: check rows.Err() — the loop may have stopped due to a network error
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating accounts: %w", err)
+	}
+	return accounts, nil
+}
+```
+
+Miss `rows.Close()` and the connection is never returned to the pool — you leak connections until the pool is exhausted. Miss `rows.Err()` and a mid-stream error is silently dropped. Miss the scan-order match and you'll be debugging corrupted data at 2 a.m. All three. Every time.
+
+### Nullable columns and `sql.Null*`
+
+Postgres `NULL` is a value that means "no value." In Go, there's no universal null. The `database/sql` package provides `sql.NullString`, `sql.NullInt64`, `sql.NullBool`, `sql.NullTime`, and friends — wrapper structs that carry both the value and a `Valid bool`.
+
+```go
+// The `note` column in transactions is nullable (TEXT, no NOT NULL).
+// Scanning it into a plain string panics when the column is NULL.
+
+var note sql.NullString
+if err := row.Scan(&note); err != nil {
+    return err
+}
+if note.Valid {
+    fmt.Println("note:", note.String)
+} else {
+    fmt.Println("no note")
+}
+
+// Alternative: use a pointer — *string is nil for NULL, &s for a value.
+var notePtr *string
+if err := row.Scan(&notePtr); err != nil {
+    return err
+}
+if notePtr != nil {
+    fmt.Println("note:", *notePtr)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+// Simulates what Scan produces for a nullable TEXT column.
+func simulateScan(rawValue any) sql.NullString {
+	if rawValue == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: rawValue.(string), Valid: true}
+}
+
+func printNote(note sql.NullString) {
+	if note.Valid {
+		fmt.Printf("note: %q\n", note.String)
+	} else {
+		fmt.Println("note: (null)")
+	}
+}
+
+func main() {
+	// Case 1: column has a value
+	withValue := simulateScan("transfer to savings")
+	printNote(withValue)
+
+	// Case 2: column is NULL
+	withNull := simulateScan(nil)
+	printNote(withNull)
+
+	// Pointer approach
+	var ptr *string
+	// ptr == nil simulates NULL
+	if ptr != nil {
+		fmt.Println("ptr note:", *ptr)
+	} else {
+		fmt.Println("ptr note: (null)")
+	}
+	s := "pointer note"
+	ptr = &s
+	fmt.Println("ptr note:", *ptr)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="tip" title="Go 1.26 — errors.AsType[T] for typed database errors">
+
+Go 1.26 added `errors.AsType[T]` as a generic shorthand for the `errors.As` pattern. When pgx wraps a Postgres error, you used to write:
+
+```go
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique violation
+    // handle duplicate key
+}
+```
+
+With Go 1.26 you can write:
+
+```go
+if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "23505" {
+    // handle duplicate key — no separate declaration needed
+}
+```
+
+Same semantics, no separate declaration. The generic version is cleaner in inline checks. Use it when you're on Go 1.26 and working with `*pgconn.PgError`, `*mysql.MySQLError`, or any other typed driver error.
+
+</Callout>
+
+<QuickCheck
+  question="Why must you always call rows.Close() after a QueryContext call?"
+  options={[
+    "To flush buffered writes to Postgres",
+    "To return the borrowed connection to the pool — missing it leaks the connection permanently",
+    "To commit the implicit transaction that QueryContext opens",
+    "rows.Close() is optional; sql.DB closes rows automatically at GC"
+  ]}
+  answer={1}
+  explain="rows.Close() returns the underlying connection to the pool. If you skip it the connection is never returned — it is leaked. Under load this exhausts the pool and every new query blocks indefinitely waiting for a connection that will never come back."
+/>
+
+## Transactions
+
+<Define term="Transaction (Tx) — ACID intro" since="Transactions, Consistency & Sagas (Part 3)">
+A **database transaction** is a unit of work that is treated as a single, indivisible operation. Either all the steps inside it succeed and commit, or none of them do (rollback). The guarantees a transaction provides are summarized by the acronym **ACID**: **Atomicity** (all or nothing), **Consistency** (the database goes from one valid state to another), **Isolation** (concurrent transactions don't see each other's in-progress changes), and **Durability** (a committed transaction survives a crash). In Go, you open a transaction with `db.BeginTx`, run queries against it via `tx.ExecContext`, and end it with `tx.Commit()` or `tx.Rollback()`. For Meridian: a funds transfer between two accounts is the textbook example — you must debit the source and credit the destination atomically, or the ledger goes out of balance. The full ACID story, isolation levels, and `SELECT FOR UPDATE` are covered in Transactions, Consistency & Sagas (Part 3).
+</Define>
+
+A transfer between two accounts is the canonical database transaction: you must debit one account and credit another. Either *both* happen, or *neither* does. If your process crashes between the two, the ledger must be consistent when it comes back up. That atomicity guarantee is exactly what a **transaction** gives you.
+
+### The Tx API
+
+```go
+// TransferFunds moves amount_cents from src to dst atomically.
+// NOT RUNNABLE — requires live Postgres; pattern is the key lesson.
+func TransferFunds(ctx context.Context, db *sql.DB, srcID, dstID string, amountCents int64) error {
+	// BeginTx opens a transaction. Pass TxOptions for isolation level.
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelReadCommitted, // Postgres default
+	})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	// Panic safety: if something below panics we still roll back and re-panic.
+	// Each error path below also calls tx.Rollback() explicitly — the defer
+	// is a backstop for panics only, not a substitute for the explicit calls.
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p) // re-panic after cleanup
+		}
+	}()
+
+	// Debit the source account — fail if balance would go negative.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE accounts SET balance_cents = balance_cents - $1
+		 WHERE id = $2 AND balance_cents >= $1`,
+		amountCents, srcID,
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("debit: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		_ = tx.Rollback()
+		return fmt.Errorf("insufficient funds or account not found")
+	}
+
+	// Credit the destination account.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2`,
+		amountCents, dstID,
+	); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("credit: %w", err)
+	}
+
+	// Record the transaction for audit trail.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO transactions (from_account, to_account, amount_cents)
+		 VALUES ($1, $2, $3)`,
+		srcID, dstID, amountCents,
+	); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record tx: %w", err)
+	}
+
+	// All steps succeeded — commit.
+	return tx.Commit()
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// Simulates the defer-rollback + explicit-rollback-on-error pattern
+// without a real database. The key logic is the error path.
+
+type FakeTx struct{ committed bool }
+
+func (t *FakeTx) Exec(step string) error {
+	if step == "credit" {
+		return fmt.Errorf("destination account not found")
+	}
+	return nil
+}
+func (t *FakeTx) Commit() error   { t.committed = true; return nil }
+func (t *FakeTx) Rollback() error { fmt.Println("  tx rolled back"); return nil }
+
+func transfer(tx *FakeTx, amount int) error {
+	steps := []string{"debit", "credit", "record"}
+	for _, step := range steps {
+		if err := tx.Exec(step); err != nil {
+			_ = tx.Rollback() // explicit rollback on error
+			return fmt.Errorf("%s: %w", step, err)
+		}
+		fmt.Printf("  step %q: ok\n", step)
+	}
+	return tx.Commit()
+}
+
+func main() {
+	tx := &FakeTx{}
+	fmt.Println("transfer attempt:")
+	if err := transfer(tx, 1000); err != nil {
+		fmt.Println("transfer failed:", err)
+		fmt.Println("committed:", tx.committed)
+	}
+}
+```
+
+</GoPlayground>
+
+The pattern to memorize: **`BeginTx`, explicit rollback on each error path, panic-safety defer, `Commit` at the end.** Rolling back a committed transaction is a no-op in Postgres — `ROLLBACK` after `COMMIT` returns `sql.ErrTxDone`, which the caller discards with `_ =`.
+
+<ExecTimeline
+  title="Transfer transaction — two UPDATEs + INSERT, atomic"
+  lanes={[
+    { id: "app", label: "App / Tx" },
+    { id: "pg",  label: "Postgres" }
+  ]}
+  steps={[
+    { lane: "app", kind: "run",   label: "BEGIN",               note: "db.BeginTx allocates a transaction on the Postgres side. Postgres starts a transaction snapshot." },
+    { lane: "pg",  kind: "run",   label: "transaction open",    note: "Postgres assigns an MVCC transaction ID and opens a snapshot of the database as it appears right now." },
+    { lane: "app", kind: "send",  label: "UPDATE accounts (debit)", note: "ExecContext sends the debit UPDATE inside the transaction. Row is locked; change is visible only within this tx." },
+    { lane: "pg",  kind: "run",   label: "row locked, debit applied", note: "Postgres applies the debit within the transaction's private snapshot. Other transactions see the OLD balance." },
+    { lane: "app", kind: "send",  label: "UPDATE accounts (credit)", note: "ExecContext sends the credit UPDATE. Still inside the same transaction." },
+    { lane: "pg",  kind: "run",   label: "credit applied",      note: "Both changes now exist in the transaction's snapshot. Still uncommitted — invisible to others." },
+    { lane: "app", kind: "done",  label: "COMMIT",              note: "tx.Commit sends COMMIT. Postgres makes both changes durable and visible atomically. Locks released." }
+  ]}
+  caption="Both balance changes commit together or neither does. There is no state between 'debit applied, credit not yet' visible to any other transaction."
+/>
+
+<Callout kind="note" title="Isolation levels — a signpost">
+
+We used `LevelReadCommitted` above, which is Postgres's default. There are higher levels — `RepeatableRead`, `Serializable` — that provide stronger guarantees at the cost of more contention. **The full ACID and isolation story, `SELECT FOR UPDATE`, optimistic vs. pessimistic locking, and concurrent transfer safety belongs in Part 3, Chapter 3 (Transactions & Consistency).** What you have here is the mechanical API. Keep reading — the financial-correctness story comes later, and it's worth it.
+
+</Callout>
+
+<QuickCheck
+  question="What happens if you call tx.Commit() after already calling tx.Rollback()?"
+  options={[
+    "The commit succeeds; rollback is undone",
+    "Both changes are permanently lost — you need to redo the transaction",
+    "Commit returns an error (the transaction is already closed); no data is changed",
+    "Postgres crashes with a protocol error"
+  ]}
+  answer={2}
+  explain="Once a transaction is rolled back (or committed) it is closed. Calling Commit on a closed transaction returns sql.ErrTxDone. No data changes are made. You'd need to start a fresh transaction with BeginTx to retry."
+/>
+
+## Migrations
+
+<Define term="Migration (schema versioning)">
+A **migration** is a versioned, numbered SQL file that describes a single schema change — adding a column, creating a table, adding an index. A migration tool (like `golang-migrate` or `goose`) applies them in order and tracks which have run in a `schema_migrations` table. The payoff: every environment (dev, staging, prod) runs exactly the same schema changes in exactly the same order, from a fresh database up to the current version, reproducibly. Without migrations, schema changes live only in someone's head or a Slack message, and your next environment starts from scratch with no way to replay what was done. The critical rule: **migrations only go forward in production** — never run a down migration on a live service.
+</Define>
+
+Your schema will change. The question is whether those changes happen in a disciplined, versioned, repeatable way — or as a `psql` command someone ran at 11pm that nobody else knows about and that doesn't exist in the next environment. We are not doing the second thing.
+
+**Migrations** are versioned SQL files that describe schema changes. A migration tool applies them in order, tracks which have run, and ensures every environment (dev, staging, prod) has an identical schema.
+
+### golang-migrate
+
+`golang-migrate` is the most common choice. You write numbered `.up.sql` and `.down.sql` files:
+
+```
+migrations/
+  000001_create_accounts.up.sql
+  000001_create_accounts.down.sql
+  000002_add_transactions.up.sql
+  000002_add_transactions.down.sql
+```
+
+```sql
+-- migrations/000001_create_accounts.up.sql
+CREATE TABLE accounts (
+    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner         TEXT        NOT NULL,
+    balance_cents BIGINT      NOT NULL DEFAULT 0,
+    currency      CHAR(3)     NOT NULL DEFAULT 'USD',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- migrations/000001_create_accounts.down.sql
+DROP TABLE accounts;
+```
+
+Run them from your Go code at startup (or via CI):
+
+```go
+// NOT RUNNABLE — illustrative; requires live Postgres + migration files.
+import (
+    "github.com/golang-migrate/migrate/v4"
+    _ "github.com/golang-migrate/migrate/v4/database/postgres"
+    _ "github.com/golang-migrate/migrate/v4/source/file"
+)
+
+m, err := migrate.New("file://migrations", connStr)
+if err != nil {
+    log.Fatal(err)
+}
+if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+    log.Fatal(err)
+}
+```
+
+`golang-migrate` tracks applied migrations in a `schema_migrations` table it manages itself.
+
+### goose — an alternative worth knowing
+
+`goose` uses the same numbered-file convention but lets you embed Go migrations (pure Go functions that run as part of the migration) alongside SQL ones — useful when a data transformation is hard to express in SQL alone.
+
+```go
+// NOT RUNNABLE — illustrative goose embed pattern.
+import "github.com/pressly/goose/v3"
+
+goose.SetBaseFS(embedMigrations) // embed with //go:embed
+if err := goose.Up(db, "migrations"); err != nil {
+    log.Fatal(err)
+}
+```
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="golang-migrate">SQL-only migrations, widely used, clean CLI, good Docker support. Default for most services.</ConceptCard>
+  <ConceptCard label="goose">SQL + Go migrations. Useful when you need to run Go code mid-migration (e.g. backfill computed values). Simpler embed story.</ConceptCard>
+  <Gotcha>Never run `m.Down()` in application startup code. Down migrations are for development rollbacks only. In production you go forward — write a new up migration that undoes the change. Automating Down in prod will ruin someone's week.</Gotcha>
+</ConceptGrid>
+
+## Data-Access Choice
+
+You've got a pool, a driver, and a migration story. Now decide how you'll write queries. This is the question that causes the most religious debates in Go communities, and I'm going to settle it for you right now.
+
+Three options. Let me be honest about each.
+
+### Option 1: sqlc (recommended)
+
+`sqlc` reads your SQL queries and your schema, and generates **type-safe Go functions** — no reflection, no `any` escape hatches, no runtime surprises. You write SQL; `sqlc` turns it into Go code you can read.
+
+```sql
+-- query/accounts.sql
+-- name: GetAccount :one
+SELECT id, owner, balance_cents, currency FROM accounts
+WHERE id = $1 LIMIT 1;
+
+-- name: ListAccountsByOwner :many
+SELECT id, owner, balance_cents, currency FROM accounts
+WHERE owner = $1;
+
+-- name: CreateAccount :one
+INSERT INTO accounts (owner, balance_cents, currency)
+VALUES ($1, $2, $3)
+RETURNING *;
+```
+
+After `sqlc generate`, you get:
+
+```go
+// db/query.sql.go — GENERATED, do not edit by hand
+func (q *Queries) GetAccount(ctx context.Context, id uuid.UUID) (Account, error) { ... }
+func (q *Queries) ListAccountsByOwner(ctx context.Context, owner string) ([]Account, error) { ... }
+func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) (Account, error) { ... }
+```
+
+Column types in the generated code are derived from your Postgres schema — `BIGINT` becomes `int64`, `UUID` becomes `uuid.UUID`, `TEXT` becomes `string`. Mistype a column name in SQL? `sqlc generate` fails at **build time**, not at runtime with a `Scan` error at 3 a.m.
+
+### Option 2: sqlx
+
+`sqlx` extends `database/sql` with struct scanning via reflection — you write raw SQL and `sqlx` scans rows into structs by column name:
+
+```go
+// sqlx scanning — struct tags match column names
+type Account struct {
+	ID           string `db:"id"`
+	Owner        string `db:"owner"`
+	BalanceCents int64  `db:"balance_cents"`
+	Currency     string `db:"currency"`
+}
+var accounts []Account
+err = db.SelectContext(ctx, &accounts,
+    "SELECT id, owner, balance_cents, currency FROM accounts WHERE owner=$1",
+    owner)
+```
+
+Less boilerplate than vanilla `database/sql`, but no compile-time safety — a typo in a column name silently scans zero values.
+
+### Option 3: ORM (GORM, ent)
+
+ORMs let you write Go structs and call methods that generate SQL. Quick to get started; painful at scale.
+
+<BeforeAfter
+  badLabel="ORM magic"
+  goodLabel="sqlc — what you asked for"
+  bad={`// GORM: SQL is hidden, options are guessed,
+// N+1 is easy to stumble into
+var accounts []Account
+db.Where("owner = ?", owner).
+   Preload("Transactions").
+   Find(&accounts)`}
+  good={`// sqlc: SQL is explicit, generated code
+// is readable, N+1 requires deliberate choice
+accounts, err := q.ListAccountsByOwner(
+    ctx, owner)
+// JOIN/IN query for transactions is a
+// separate named query you wrote on purpose`}
+/>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="sqlc — recommended">Compile-time type safety. You read and own the SQL. Generated code is readable Go. Migration + schema + queries all cohere. My recommendation for new services.</ConceptCard>
+  <ConceptCard label="sqlx — pragmatic">Less ceremony than raw `database/sql`. Reflection-based scanning. No generated code. Good for small services or teams already comfortable writing SQL.</ConceptCard>
+  <Gotcha>ORMs hide SQL until they don't — and when you need to tune a slow query or fix an N+1, you're fighting both your code and the ORM's query generation. `EXPLAIN` becomes much harder when you didn't write the SQL. Use an ORM if your team genuinely needs rapid prototyping and will rewrite hot paths later.</Gotcha>
+</ConceptGrid>
+
+## Performance & EXPLAIN
+
+Your schema exists. Your queries run. Now they need to run *fast enough under load* — and when they don't, you need to know why.
+
+### Indexes
+
+<Define term="Index (database B-tree)">
+A **database index** is a sorted auxiliary data structure — typically a B-tree — that Postgres maintains alongside a table. It maps column values to the physical location (TID) of the matching rows, so a query that filters on an indexed column can jump straight to the relevant rows instead of reading every row in the table. An index trades write overhead (Postgres updates the B-tree on every INSERT/UPDATE/DELETE) for dramatically faster reads on that column. Without an index on `accounts.owner`, every `WHERE owner = $1` query is a sequential scan — at 10 million rows, that's 10 million row reads to find a handful of matches. With the index, it's three or four B-tree page reads plus a heap fetch for the matching rows. The rule: add an index on any column you filter or join on in a hot query path.
+</Define>
+
+A **database index** is a sorted data structure (typically a B-tree) over one or more columns, maintained by Postgres alongside the table. Without an index, a query that filters on a column does a **sequential scan** — it reads every row, one by one, until it finds matches. With an index on that column, Postgres jumps directly to the matching rows.
+
+For our ledger service: we'll query accounts by `owner` frequently. Without an index on `accounts.owner`, every such query scans the whole table. At 10 million accounts, that's a performance disaster.
+
+```sql
+-- Add an index on owner. Run this as a migration.
+-- In Postgres, CREATE INDEX CONCURRENTLY does not lock the table.
+CREATE INDEX CONCURRENTLY idx_accounts_owner ON accounts(owner);
+```
+
+### Reading EXPLAIN
+
+`EXPLAIN ANALYZE` tells you what Postgres actually did to execute a query — which indexes it used, how many rows it scanned, and where the time went.
+
+```sql
+-- NOT RUNNABLE in sandbox — requires live Postgres
+EXPLAIN ANALYZE
+SELECT id, balance_cents FROM accounts WHERE owner = 'alice';
+```
+
+Without the index (sequential scan):
+```
+Seq Scan on accounts  (cost=0.00..18500.00 rows=12 width=24) (actual rows=12 loops=1)
+  Filter: ((owner)::text = 'alice')
+  Rows Removed by Filter: 999988
+```
+
+With the index (index scan):
+```
+Index Scan using idx_accounts_owner on accounts  (cost=0.43..8.45 rows=12 width=24)
+  Index Cond: ((owner)::text = 'alice')
+```
+
+The first line tells you the **scan method**. `Seq Scan` = every row touched. `Index Scan` = only matching rows touched. The `cost` numbers are Postgres's internal estimates (not ms). `actual rows` tells you what really came back.
+
+<ExecTimeline
+  title="Index hit vs. full table scan — same query, different plans"
+  lanes={[
+    { id: "seq",  label: "No index (seq scan)" },
+    { id: "idx",  label: "With index (index scan)" }
+  ]}
+  steps={[
+    { lane: "seq", kind: "run",   label: "read page 1 of accounts",   note: "Postgres reads the first heap page: 8 KB, maybe 50 rows. Checks owner on each row." },
+    { lane: "seq", kind: "run",   label: "read pages 2–1000 …",       note: "Continues through every heap page — all 1 million rows — looking for owner='alice'." },
+    { lane: "seq", kind: "block", label: "999,988 rows discarded",     note: "Only 12 rows matched. The other 999,988 were read and thrown away. Wasted I/O." },
+    { lane: "seq", kind: "done",  label: "12 rows returned",           note: "Correct result, but every row in the table was touched. At 10M rows, this is unusable." },
+    { lane: "idx", kind: "run",   label: "traverse B-tree for 'alice'", note: "Postgres walks the B-tree index: root → branch → leaf. 3-4 page reads regardless of table size." },
+    { lane: "idx", kind: "recv",  label: "get 12 heap TIDs",           note: "The index leaf node contains pointers (TIDs) to the 12 matching heap rows." },
+    { lane: "idx", kind: "done",  label: "12 rows returned",           note: "Postgres fetches exactly those 12 rows from the heap. O(log n) + 12 heap reads. Fast at any scale." }
+  ]}
+  caption="The same 12 rows. One path reads every row in the table; the other reads only the ones it needs."
+/>
+
+### Killing N+1
+
+<Define term="N+1 query problem">
+The **N+1 query problem** happens when you fetch a list of N items in one query and then fire a separate query for each item — 1 query for the list plus N queries for the details, making N+1 round-trips total. At N=100 accounts that's 101 database round-trips; at N=10,000 it's 10,001. Each round-trip crosses the network, waits for Postgres to plan and execute, and returns data. N+1 is not a subtle bug — it is a throughput killer that becomes a production outage at scale. The fix is always the same: replace the loop + inner query with a single JOIN or `IN` clause that fetches everything in one round-trip. ORMs are notorious for generating N+1 silently; raw SQL and `sqlc` force you to see the query, making N+1 a deliberate choice rather than an accidental one.
+</Define>
+
+**On the job:** any loop in your service that calls the database inside is a red flag. In Meridian's ledger, loading 100 transfers and then fetching the sender account for each one is 101 queries. Under load it's the difference between a 20ms response and a 2-second timeout.
+
+<Scene
+  title="N+1 vs JOIN — 100 transfers, how many round-trips?"
+  actors={[
+    { id: "app", label: "App (Go)" },
+    { id: "pg",  label: "Postgres" }
+  ]}
+  cells={[
+    { id: "A1", label: "T1" }, { id: "A2", label: "T2" }, { id: "A3", label: "T3" },
+    { id: "A4", label: "T4" }, { id: "A5", label: "T5" }, { id: "A6", label: "…99" }
+  ]}
+  frames={[
+    {
+      caption: "App fetches 100 recent transfers in one query. Six are shown here.",
+      beat: "neutral",
+      actors: [{ id: "app", state: "active" }, { id: "pg", state: "idle" }],
+      cells: [
+        { id: "A1", state: "idle" }, { id: "A2", state: "idle" }, { id: "A3", state: "idle" },
+        { id: "A4", state: "idle" }, { id: "A5", state: "idle" }, { id: "A6", state: "idle" }
+      ]
+    },
+    {
+      caption: "N+1 path: App loops and fires a separate account query for EACH transfer — round-trip 2, 3, 4…",
+      beat: "problem",
+      actors: [{ id: "app", state: "warn" }, { id: "pg", state: "active" }],
+      cells: [
+        { id: "A1", state: "bad", label: "Q2" }, { id: "A2", state: "bad", label: "Q3" },
+        { id: "A3", state: "bad", label: "Q4" }, { id: "A4", state: "bad", label: "Q5" },
+        { id: "A5", state: "bad", label: "Q6" }, { id: "A6", state: "warn", label: "+95" }
+      ]
+    },
+    {
+      caption: "Result: 101 round-trips for 100 transfers. At 10 rps that's 1,010 queries/s hitting Postgres.",
+      beat: "problem",
+      actors: [{ id: "app", state: "bad" }, { id: "pg", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad" }, { id: "A2", state: "bad" }, { id: "A3", state: "bad" },
+        { id: "A4", state: "bad" }, { id: "A5", state: "bad" }, { id: "A6", state: "bad" }
+      ]
+    },
+    {
+      caption: "JOIN path: one query fetches transfers + account data together. Single round-trip regardless of count.",
+      beat: "solution",
+      actors: [{ id: "app", state: "active" }, { id: "pg", state: "active" }],
+      cells: [
+        { id: "A1", state: "idle" }, { id: "A2", state: "idle" }, { id: "A3", state: "idle" },
+        { id: "A4", state: "idle" }, { id: "A5", state: "idle" }, { id: "A6", state: "idle" }
+      ]
+    },
+    {
+      caption: "Result: 1 round-trip for 100 transfers. At 10 rps that's 10 queries/s — 100× less load.",
+      beat: "solution",
+      actors: [{ id: "app", state: "ok" }, { id: "pg", state: "ok" }],
+      cells: [
+        { id: "A1", state: "done", label: "✓" }, { id: "A2", state: "done", label: "✓" },
+        { id: "A3", state: "done", label: "✓" }, { id: "A4", state: "done", label: "✓" },
+        { id: "A5", state: "done", label: "✓" }, { id: "A6", state: "done", label: "✓" }
+      ]
+    }
+  ]}
+  caption="The N+1 problem: each cell represents a transfer that triggers its own account query in the loop. The JOIN collapses all 101 round-trips into one."
+/>
+
+<BeforeAfter
+  badLabel="N+1 — one query per account"
+  goodLabel="JOIN — one query total"
+  bad={`// 1 query for owners, then N queries
+// for transactions. At 1000 accounts:
+// 1001 round-trips to Postgres.
+owners, _ := db.QueryContext(ctx,
+  "SELECT id FROM accounts")
+for owners.Next() {
+  var id string
+  owners.Scan(&id)
+  // ANOTHER query per account!
+  db.QueryContext(ctx,
+    "SELECT * FROM transactions WHERE from_account=$1",
+    id)
+}`}
+  good={`// 1 query with a JOIN. Always 1 round-trip,
+// regardless of account count.
+rows, _ := db.QueryContext(ctx,
+  \`SELECT a.id, a.owner,
+          t.amount_cents, t.created_at
+   FROM accounts a
+   LEFT JOIN transactions t
+     ON t.from_account = a.id
+   WHERE a.owner = $1\`,
+  owner)`}
+/>
+
+The rule: **if you find yourself querying inside a loop, stop and write a JOIN or an `IN` clause instead.**
+
+```go
+// Bulk fetch with IN clause — also avoids N+1.
+// Use when you have IDs and need details.
+// NOT RUNNABLE — requires live Postgres + real IDs.
+func GetTransactionsForAccounts(
+    ctx context.Context,
+    db *sql.DB,
+    accountIDs []string,
+) ([]Transaction, error) {
+    // Build a parameterized IN clause: ($1, $2, $3, ...)
+    placeholders := make([]string, len(accountIDs))
+    args := make([]any, len(accountIDs))
+    for i, id := range accountIDs {
+        placeholders[i] = fmt.Sprintf("$%d", i+1)
+        args[i] = id
+    }
+    query := fmt.Sprintf(
+        "SELECT id, from_account, to_account, amount_cents FROM transactions WHERE from_account IN (%s)",
+        strings.Join(placeholders, ","),
+    )
+    rows, err := db.QueryContext(ctx, query, args...)
+    // ... scan as normal
+    _ = rows
+    return nil, err
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Demonstrates building a parameterized IN clause safely.
+// Real version calls db.QueryContext with these.
+func buildINQuery(table, column string, ids []string) (string, []any) {
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	query := fmt.Sprintf(
+		"SELECT * FROM %s WHERE %s IN (%s)",
+		table, column,
+		strings.Join(placeholders, ", "),
+	)
+	return query, args
+}
+
+func main() {
+	ids := []string{"uuid-1", "uuid-2", "uuid-3"}
+	query, args := buildINQuery("transactions", "from_account", ids)
+	fmt.Println("Query:", query)
+	fmt.Printf("Args:  %v\n", args)
+	// In production: db.QueryContext(ctx, query, args...)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Prepared statements and the plan cache (Go 1.26 baseline, pgx v5)">
+
+When `database/sql` executes a query, it can go through three wire-protocol paths depending on how you call it:
+
+1. **Simple query** (`db.QueryContext` with args on first call): the driver may use the simple protocol — one round-trip, no server-side parsing cache.
+2. **Extended query** (used by pgx): Parse → Bind → Execute as separate messages. Parse happens once per unique SQL string per connection; Postgres caches the plan.
+3. **Prepared statement** (`db.PrepareContext`): explicit server-side prepare. The `stmt` holds one `driverStmt` per conn in the pool. On a 25-connection pool you have 25 copies of each prepared statement.
+
+`pgx` v5's default behavior is the extended query protocol with per-connection plan caching. This means the first execution of a query pays a Parse round-trip; subsequent executions on the same connection skip parsing. Under load with `maxOpenConns=25`, you might pay Parse up to 25 times total — once per connection — then hit the cache on every subsequent call on that connection.
+
+**The footgun:** if you use `db.Prepare` and then close the `*sql.Stmt`, Postgres closes the server-side plan on every connection. In a tight loop this creates a prepare/close storm. Prefer `db.QueryContext` with parameterized queries directly — pgx handles caching transparently.
+
+</UnderTheHood>
+
+## Zero-Downtime Migrations
+
+This is the section that turns a good engineer into a senior engineer. Listen carefully.
+
+You have a production service. It has 10 replicas running. You need to add a `metadata JSONB` column to `accounts`. If you run `ALTER TABLE accounts ADD COLUMN metadata JSONB` and your app code tries to `INSERT` without that column, you get errors. If the column is added and old code tries to `INSERT` *with* the column, same problem.
+
+The answer is the **expand-contract pattern** — a disciplined sequence of migrations and code changes that lets old code and new code both run safely during a rolling deploy.
+
+### The four phases
+
+**Phase 1 — Expand (backward-compatible addition):** Add the new column as nullable with a default. Old code doesn't know about it; Postgres fills it with `NULL` or the default. New column exists; nothing breaks.
+
+```sql
+-- migration: 000003_add_metadata_nullable.up.sql
+ALTER TABLE accounts ADD COLUMN metadata JSONB DEFAULT NULL;
+-- This is safe to run while old code is running.
+-- Old INSERTs don't include metadata; Postgres uses NULL.
+```
+
+**Phase 2 — Backfill:** Populate the new column for existing rows. Do this in batches to avoid a long-running transaction that holds locks.
+
+```go
+// Backfill in batches — NOT RUNNABLE, requires live Postgres.
+// Run as a one-off job or a migration with Go code (goose).
+func backfillMetadata(ctx context.Context, db *sql.DB) error {
+    batchSize := 1000
+    for {
+        // Update up to batchSize NULL rows per iteration.
+        // Each batch is its own small transaction — no long-held locks.
+        res, err := db.ExecContext(ctx,
+            `UPDATE accounts SET metadata = '{}' WHERE id IN (
+                 SELECT id FROM accounts
+                 WHERE metadata IS NULL
+                 LIMIT $1
+             )`,
+            batchSize,
+        )
+        if err != nil {
+            return err
+        }
+        n, _ := res.RowsAffected()
+        if n == 0 {
+            break // all rows backfilled
+        }
+    }
+    return nil
+}
+```
+
+**Phase 3 — Switch:** Deploy the new code that reads and writes `metadata`. By now the column exists and all rows have a value. Old replicas are still running but being replaced by the rolling deploy. Both old (ignore `metadata`) and new (read/write `metadata`) code work simultaneously.
+
+**Phase 4 — Contract:** Once all replicas run the new code, add the `NOT NULL` constraint (if desired) or drop the old column you replaced.
+
+```sql
+-- migration: 000004_add_metadata_not_null.up.sql
+-- Safe only after ALL replicas run Phase 3 code.
+ALTER TABLE accounts ALTER COLUMN metadata SET NOT NULL;
+ALTER TABLE accounts ALTER COLUMN metadata SET DEFAULT '{}'::jsonb;
+```
+
+<ExecTimeline
+  title="Expand-contract migration during a rolling deploy"
+  lanes={[
+    { id: "db",    label: "Postgres schema" },
+    { id: "old",   label: "Old replicas (v1)" },
+    { id: "new",   label: "New replicas (v2)" }
+  ]}
+  steps={[
+    { lane: "db",  kind: "run",   label: "Phase 1: ADD COLUMN metadata",  note: "Schema migration runs: accounts gets a nullable metadata column. Old and new code both safe." },
+    { lane: "old", kind: "run",   label: "v1 INSERT (no metadata)",        note: "Old replicas keep running. Their INSERTs omit metadata; Postgres inserts NULL. No errors." },
+    { lane: "db",  kind: "run",   label: "Phase 2: backfill metadata={}",  note: "Batch UPDATE sets metadata on existing rows. Runs concurrently with live traffic in small batches." },
+    { lane: "new", kind: "spawn", label: "Phase 3: v2 replicas start",     note: "Rolling deploy begins. New replicas (v2) start reading and writing metadata. Old replicas still live." },
+    { lane: "old", kind: "done",  label: "old replicas drain + stop",      note: "Load balancer drains old replicas. Rolling deploy completes. Only v2 runs now." },
+    { lane: "db",  kind: "run",   label: "Phase 4: NOT NULL + default",    note: "Now safe to tighten the constraint. All rows have metadata; all code writes it." }
+  ]}
+  caption="Old and new code run simultaneously during the rolling deploy. Neither breaks because the schema change is backward-compatible at every step."
+/>
+
+<Callout kind="warn" title="Never rename or drop a column in one step">
+
+Renaming `balance_cents` to `amount_cents` in a single migration will break every running replica that references the old name — which is all of them during a rolling deploy. Use expand-contract: add `amount_cents`, migrate data, switch code, then drop `balance_cents` in a later migration once all replicas are updated.
+
+</Callout>
+
+## Read Replicas & Read-After-Write Consistency
+
+You've got a pool tuned, queries parameterized, migrations running zero-downtime, and schema changes rolling out without a 503 in sight. Your ledger service is humming along. Then traffic doubles. Then it doubles again. A single Postgres primary can handle more than most people think — but at some point, read load becomes the bottleneck. The answer the industry reaches for is **read replicas**: additional Postgres instances that stream a copy of the primary's data via streaming replication and serve `SELECT` queries.
+
+The idea is simple. WRITES go to the primary, which is the single source of truth. READS go to one of N replicas, which carry an identical (or nearly identical) copy of the data. You can scale reads horizontally by adding replicas without touching the primary. Most ledger reads — account balance lookups, transaction history, reporting queries — are reads. Routing them to replicas takes load off the primary and makes the whole system faster.
+
+```go
+// NOT RUNNABLE — requires live Postgres primary + replicas.
+// Illustrates the routing pattern.
+// import "github.com/jackc/pgx/v5/pgxpool"
+// import "sync/atomic"
+type DBCluster struct {
+	primary  *pgxpool.Pool   // all writes go here
+	replicas []*pgxpool.Pool // round-robin reads here
+	rr       atomic.Uint64   // round-robin counter
+}
+
+func (c *DBCluster) ReadPool() *pgxpool.Pool {
+	idx := c.rr.Add(1) % uint64(len(c.replicas))
+	return c.replicas[idx]
+}
+
+func (c *DBCluster) WritePool() *pgxpool.Pool {
+	return c.primary
+}
+```
+
+Route read queries through `ReadPool()`, write queries through `WritePool()`. That's the happy path.
+
+### Replication lag and the read-after-write anomaly
+
+Here is where it gets interesting, and where a lot of services have a subtle, maddening bug.
+
+Postgres streaming replication is **asynchronous by default**. The primary commits a write and immediately acknowledges it to your Go code. Postgres *then* streams that WAL (Write-Ahead Log) record to replicas, which apply it. This usually takes milliseconds — but it is not zero. That gap is **replication lag**.
+
+Now consider this sequence:
+
+1. Alice submits a funds transfer. Your service writes it to the primary. `Commit()` returns `nil`.
+2. Alice's browser immediately refreshes the transaction list.
+3. Her GET request routes to a replica — which hasn't caught up yet.
+4. Alice sees her transaction missing. She hits refresh again, angrily.
+5. Two seconds later the replica applies the WAL entry. It appears.
+
+This is the **read-after-write anomaly**: a user who just wrote data doesn't see their own change because their subsequent read landed on a lagging replica. From Alice's perspective, the write was lost. The data is fine — the replica just hasn't caught up yet — but the user experience is broken, and in a financial context it breeds distrust.
+
+<ExecTimeline
+  title="Read-after-write anomaly and the fix — replication lag"
+  lanes={[
+    { id: "app",     label: "App / User request" },
+    { id: "primary", label: "Primary (write)" },
+    { id: "replica", label: "Replica (lagging)" }
+  ]}
+  steps={[
+    { lane: "app",     kind: "send",  label: "POST /transfer — write",          note: "Alice submits a transfer. App routes the write to the primary per the routing rule." },
+    { lane: "primary", kind: "run",   label: "COMMIT — row visible on primary", note: "Primary commits the transaction. Replication lag begins: WAL record in flight to replica." },
+    { lane: "app",     kind: "recv",  label: "200 OK — write acknowledged",     note: "App returns 200 to Alice. Write is durable on the primary. Replica is still catching up." },
+    { lane: "app",     kind: "send",  label: "GET /transactions — read",         note: "Alice immediately fetches her transaction list. App routes the read to the replica (wrong!)." },
+    { lane: "replica", kind: "block", label: "stale read — transfer missing",   note: "Replica hasn't applied the WAL record yet. Query returns Alice's list WITHOUT the new transfer." },
+    { lane: "app",     kind: "run",   label: "FIX: route read to primary",      note: "With the fix: for 5 s after a write, Alice's reads route to the primary. She sees the new transfer." },
+    { lane: "primary", kind: "done",  label: "consistent read — transfer visible", note: "Primary always has the committed data. Alice sees her transfer immediately. Replica catches up in the background." }
+  ]}
+  caption="Steps 4–5 are the anomaly: a committed write appears missing because the read landed on a lagging replica. Steps 6–7 show the fix: route the user's reads to the primary for a short window after they write."
+/>
+
+### Mitigations
+
+There are two practical mitigations. Neither is perfect; pick the one that fits your consistency requirements.
+
+**Option A — Post-write primary routing (recommended for ledger services)**
+
+Track the user's last-write timestamp in a short-lived store (an in-process sync.Map keyed by user ID, or a Redis key). For a configurable window after a write (typically 1–5 seconds), route that user's reads to the primary instead of a replica.
+
+```go
+// NOT RUNNABLE — illustrative pattern. Requires live primary + replica pools.
+// import "github.com/jackc/pgx/v5/pgxpool"
+// import "sync"; import "time"
+
+type ReadRouter struct {
+    cluster       *DBCluster
+    mu            sync.RWMutex
+    lastWrite     map[string]time.Time // keyed by userID
+    primaryWindow time.Duration        // e.g. 5 * time.Second
+}
+
+// RecordWrite notes that userID just wrote. Call after a successful Commit.
+func (r *ReadRouter) RecordWrite(userID string) {
+    r.mu.Lock()
+    r.lastWrite[userID] = time.Now()
+    r.mu.Unlock()
+}
+
+// PoolFor returns the primary pool if the user wrote recently,
+// otherwise returns a replica pool for scale-out reads.
+func (r *ReadRouter) PoolFor(userID string) *pgxpool.Pool {
+    r.mu.RLock()
+    t, ok := r.lastWrite[userID]
+    r.mu.RUnlock()
+    if ok && time.Since(t) < r.primaryWindow {
+        return r.cluster.WritePool() // primary — guarantee consistency
+    }
+    return r.cluster.ReadPool() // replica — scale-out
+}
+```
+
+After the window closes, reads return to the replica. The primary handles only the brief window of post-write traffic from that user, so the replica still absorbs the bulk of read load.
+
+**Option B — Session/sticky routing**
+
+Some connection proxies (PgBouncer, RDS Proxy) or service meshes support session affinity: once a user sends a write, all their connections are pinned to the primary for the session. Simpler to implement if your infrastructure supports it; harder to tune the stickiness window.
+
+<Callout kind="note" title="Synchronous replication — the nuclear option">
+
+Postgres supports `synchronous_commit = on` (or `remote_apply`), which blocks the primary's `COMMIT` until at least one replica has applied the WAL record. This eliminates replication lag — and therefore eliminates the read-after-write anomaly — but it increases write latency by the network round-trip to the replica on every commit. For a payments ledger where consistency is load-bearing, that trade-off is often worth it on critical paths. For general read-scale-out, async replication with post-write primary routing is the more common approach.
+
+</Callout>
+
+<Callout kind="warn" title="Read replicas and the expand-contract migration">
+
+During an expand-contract migration (Phase 1: add nullable column), replicas receive the schema change via WAL replication and apply it automatically — you do not run migrations separately against each replica. However, the replication lag means there is a brief window where the primary has the new column and a replica does not. Write traffic hitting the primary is fine; the risk is code that tries to `SELECT` the new column from a lagging replica before the WAL has been applied. In practice the lag is under a second for well-tuned setups, but it is something to be aware of during Phase 1 of a migration. Post-write primary routing mitigates this too: any request that triggered a migration-adjacent write will route reads to the primary until the replica catches up.
+
+</Callout>
+
+<UnderTheHood title="WAL replication and lag measurement (Go 1.26 baseline)">
+
+Postgres's streaming replication works via the Write-Ahead Log (WAL). Every change on the primary is first written to the WAL — a sequential log of all database mutations — and then applied to the heap. Replicas connect to the primary via a replication connection, stream WAL records, and apply them in order. The replica's data is always a consistent snapshot of the primary at some point in the past.
+
+To measure replication lag from Go, query the primary's `pg_stat_replication` view (requires `pg_monitor` privilege):
+
+```sql
+-- NOT RUNNABLE in sandbox — run on primary; requires live replication.
+SELECT client_addr,
+       state,
+       write_lag,
+       flush_lag,
+       replay_lag
+FROM pg_stat_replication;
+```
+
+`replay_lag` is the delay between the primary committing a transaction and the replica applying it to its heap — the number that matters for the read-after-write anomaly. Normal values on a well-provisioned replica on the same network are under 10 ms. Values above 100 ms indicate the replica is under write pressure or network-constrained.
+
+This is a model of the mechanism, not a complete description. Replication has additional detail (WAL sender processes, standby feedback, wal_level settings) covered in Postgres documentation.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="A user submits a funds transfer, gets a 200 OK, then immediately fetches their transaction list — and the new transfer is missing. The write committed successfully. What is the most likely cause?"
+  options={[
+    "A transaction was not committed; the write is still open on the primary",
+    "The read landed on a lagging replica that has not yet applied the WAL record for the write",
+    "The SELECT query used the wrong parameterized argument",
+    "The connection pool returned a stale connection with a cached result"
+  ]}
+  answer={1}
+  explain="This is the read-after-write anomaly. Postgres streaming replication is asynchronous by default — the primary commits and acknowledges the write before the WAL record reaches the replica. A read that routes to a lagging replica returns a snapshot from before the write. The fix is to route that user's reads to the primary for a short window (e.g. 5 seconds) after any write they perform."
+/>
+
+---
+
+## Document Databases
+
+You now know relational Go cold. Time for the discipline most courses skip entirely: knowing when **not** to reach for SQL. The ride-share and catalog crowd default to **MongoDB**, and sometimes they're right — so you're going to learn exactly when a document database wins, when it's cargo-culting, and why Meridian's ledger will never live in one.
+
+<Define term="Document database" since="SQL & Databases in Go (Part 1)">
+A **document database** — MongoDB is the headliner — stores data as self-contained documents: JSON-like records with nested fields and arrays, grouped into **collections** instead of tables. There's no fixed schema; two documents in the same collection can carry different fields. Related data is usually **embedded** inside one document rather than split across tables and reassembled with a JOIN. Why it matters: when your data is naturally a self-contained tree — a product with its variants, a CMS page, an event payload — one document read beats a five-table join.
+</Define>
+
+<Define term="BSON">
+**BSON** (Binary JSON) is MongoDB's on-disk and on-the-wire encoding: JSON's data model plus richer types (ObjectId, dates, binary, int64). In Go you tag struct fields with `bson:"..."` exactly the way you tag them `json:"..."`, and the official driver marshals between your structs and BSON for you.
+</Define>
+
+### The same data, two philosophies
+
+An order with line items is the cleanest way to feel the difference. Relational normalizes it across two tables and rebuilds it with a JOIN. A document database embeds the items and hands you the whole thing in one read:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// ── Relational shape: normalized across two tables, joined on order_id ──
+type OrderRow struct {
+	ID       int
+	Customer string
+}
+type ItemRow struct {
+	OrderID int
+	SKU     string
+	Qty     int
+}
+
+// ── Document shape: ONE self-contained document, items embedded ──
+// (bson tags are how MongoDB's Go driver maps fields — shown here as JSON.)
+type OrderDoc struct {
+	ID       int        `bson:"_id" json:"_id"`
+	Customer string     `bson:"customer" json:"customer"`
+	Items    []LineItem `bson:"items" json:"items"`
+}
+type LineItem struct {
+	SKU string `bson:"sku" json:"sku"`
+	Qty int    `bson:"qty" json:"qty"`
+}
+
+func main() {
+	// Relational: 1 order row + N item rows. Reading the order means a JOIN.
+	order := OrderRow{ID: 1, Customer: "ada"}
+	items := []ItemRow{{1, "SKU-A", 2}, {1, "SKU-B", 1}}
+	fmt.Println("RELATIONAL — two tables, join on order_id:")
+	fmt.Printf("  orders:      %+v\n", order)
+	fmt.Printf("  order_items: %+v\n", items)
+
+	// Document: the same order as ONE embedded document — one read, no join.
+	doc := OrderDoc{ID: 1, Customer: "ada", Items: []LineItem{{"SKU-A", 2}, {"SKU-B", 1}}}
+	b, _ := json.MarshalIndent(doc, "", "  ")
+	fmt.Println("\nDOCUMENT — one collection, one read, no join:")
+	fmt.Println(string(b))
+}
+```
+
+</GoPlayground>
+
+Same information. The document is one fetch with zero joins — but the items are now *trapped inside* the order. The relational version is two tables you can query independently ("every order containing SKU-A") and update in one place.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Relational (Postgres) wins when…">Data has real relationships, you need cross-row invariants and ACID transactions, queries slice the data many ways, and correctness matters more than raw write throughput. Foreign keys, JOINs, and strong consistency are the defaults.</ConceptCard>
+  <ConceptCard label="Document (MongoDB) wins when…">Each record is a self-contained tree read and written as a unit, the schema varies or evolves fast, and you want easy horizontal scale-out. Catalogs, CMS content, user profiles, event/audit payloads, per-tenant blobs.</ConceptCard>
+  <Gotcha>Embedding duplicates data. A value copied into a million documents takes a million writes to change; the same value in a relational column is one `UPDATE`. Model for your **write** pattern, not just the pretty one-read. "It's one fetch" is a trap if that data changes constantly.</Gotcha>
+</ConceptGrid>
+
+### Talking to MongoDB from Go
+
+The shape mirrors `database/sql`: get a handle to a collection, then insert and query with `bson`-tagged structs. This needs a running MongoDB and the official driver, so it doesn't run in the sandbox:
+
+```go title="mongo_orders.go"
+// NOTE: requires a running MongoDB + go.mongodb.org/mongo-driver — not runnable here.
+// Illustrative driver-v1 API; the v2 driver adjusted some signatures
+// (e.g. mongo.Connect no longer takes a context).
+package catalog
+
+import (
+	"context"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+type Order struct {
+	ID       string     `bson:"_id"`
+	Customer string     `bson:"customer"`
+	Items    []LineItem `bson:"items"`
+}
+type LineItem struct {
+	SKU string `bson:"sku"`
+	Qty int    `bson:"qty"`
+}
+
+func OrdersCollection(ctx context.Context, uri string) (*mongo.Collection, error) {
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		return nil, err
+	}
+	return client.Database("shop").Collection("orders"), nil
+}
+
+// InsertOrder writes the whole order — items embedded — as one document.
+func InsertOrder(ctx context.Context, c *mongo.Collection, o Order) error {
+	_, err := c.InsertOne(ctx, o)
+	return err
+}
+
+// FindOrder reads it back in one round trip — no join.
+func FindOrder(ctx context.Context, c *mongo.Collection, id string) (Order, error) {
+	var o Order
+	err := c.FindOne(ctx, bson.M{"_id": id}).Decode(&o)
+	return o, err
+}
+```
+
+`bson.M` is just `map[string]any` — an ad-hoc query document. Note the structs are the same idea as your SQL row structs, only the tag changed from `db`/`json` to `bson`.
+
+<Callout kind="warn" title="Why Meridian's ledger is never in MongoDB">
+
+This is **not** "Mongo can't do transactions." It has supported multi-document ACID transactions since 4.0 (replica sets) and 4.2 (sharded clusters). It's about **fit**. Mongo's design center is the *single document as the atomic unit*; multi-document transactions are the exception, with extra cost and operational caveats. A double-entry ledger violates that on every single write — a transfer debits one account and credits another, and the books must balance **globally** with strict consistency and a permanent audit trail. That invariant is the relational model's home turf: foreign keys, `SERIALIZABLE`/repeatable-read isolation, and decades of tooling. Choose the database whose **defaults** match your invariant. For money that's SQL; for a product catalog it might well be Mongo.
+
+</Callout>
+
+**On the job:** the most expensive database mistake isn't picking "the slow one" — it's picking the one whose defaults fight your data. Teams put a transactional ledger in Mongo and then hand-roll consistency they could have gotten free from Postgres; teams put a sprawling, schema-fluid product catalog in rigid SQL tables and drown in migrations. Match the engine to the shape of the data and the invariant you must hold.
+
+<QuickCheck
+  question="A team wants to move Meridian's account-balance ledger from Postgres to MongoDB for 'horizontal scale.' What's the strongest objection?"
+  options={[
+    "MongoDB has no Go driver, so it can't be done",
+    "MongoDB can't store integer cents",
+    "Every transfer must atomically update two accounts and keep a global balance invariant — that cross-document, strongly-consistent, auditable guarantee is what the relational model is built for; in Mongo it's the costly exception",
+    "MongoDB is always slower than Postgres"
+  ]}
+  answer={2}
+  explain="It's a fit argument, not a capability one. Mongo supports multi-document ACID transactions, but its design center is single-document atomicity. A ledger touches ≥2 accounts on every write and must hold a global, strongly-consistent, auditable invariant — exactly what foreign keys and serializable isolation give you by default in Postgres. The other options are false: there's an official driver, integer cents store fine, and Mongo is not categorically slower."
+/>
+
+---
+
+## Exercises
+
+Theory without reps is just decoration. Here's where you prove you were paying attention.
+
+<Exercise n={1} title="Pool tuner" level="easy">
+
+Given a Postgres server configured with `max_connections = 100` and 4 app replicas, write the three `sql.DB` tuning calls with appropriate values. Add a comment explaining each choice.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"time"
+)
+
+func openDB(connStr string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		return nil, err
+	}
+	// 100 Postgres max_connections / 4 replicas = 25 per replica.
+	// Leave 5 slots free for admin psql sessions.
+	db.SetMaxOpenConns(20)
+	// Keep half of maxOpen idle so requests don't pay reconnect latency.
+	db.SetMaxIdleConns(10)
+	// Retire connections before the typical LB idle timeout (5–30 min).
+	// Prevents stale connections that fail silently on first use.
+	db.SetConnMaxLifetime(5 * time.Minute)
+	fmt.Println("pool configured")
+	return db, nil
+}
+
+func main() {
+	// sql.Open with pgx driver — won't connect without real Postgres.
+	fmt.Println("Pool tuning demo — in production supply a real connStr.")
+	_, _ = openDB("postgres://user:pass@localhost/ledger?sslmode=disable")
+}
+```
+
+The 20-connection ceiling leaves five slots for DBA tooling. The 10-idle keeps connections warm without wasting Postgres memory on idle connections. The 5-minute lifetime is shorter than most cloud load balancer idle timeouts (AWS NLB: 350 s by default), preventing connections from going stale.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Safe account lookup" level="easy">
+
+Write a function `func GetAccountByOwner(ctx context.Context, db *sql.DB, owner string) (string, int64, error)` that returns the first matching account's ID and balance. Use a parameterized query, `QueryRowContext`, and handle the `sql.ErrNoRows` case explicitly by returning a user-friendly error.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+)
+
+// GetAccountByOwner returns the first account for owner.
+// Returns ("", 0, ErrNotFound) when no account exists.
+var ErrNotFound = errors.New("account not found")
+
+func GetAccountByOwner(
+	ctx context.Context,
+	db *sql.DB,
+	owner string,
+) (string, int64, error) {
+	var id string
+	var balance int64
+	err := db.QueryRowContext(ctx,
+		`SELECT id, balance_cents FROM accounts WHERE owner = $1 LIMIT 1`,
+		owner,
+	).Scan(&id, &balance)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, fmt.Errorf("owner %q: %w", owner, ErrNotFound)
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("get account: %w", err)
+	}
+	return id, balance, nil
+}
+
+func main() {
+	// Pattern demo — no live DB.
+	fmt.Println("GetAccountByOwner: parameterized, ErrNoRows handled explicitly.")
+	fmt.Println("In production, pass a real *sql.DB.")
+}
+```
+
+`sql.ErrNoRows` from `QueryRowContext.Scan` means the query returned no rows. We wrap it in a domain-specific `ErrNotFound` using `%w` so callers can use `errors.Is(err, ErrNotFound)` without depending on `database/sql` internals.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Scan nullable note" level="medium">
+
+Write a function `func FormatTransactionNote(note sql.NullString) string` that returns the note text if valid, or the string `"(no note)"` if null. Then write a second version using a `*string` pointer instead of `sql.NullString`. Both should return the same output.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+// FormatTransactionNote handles the sql.NullString approach.
+func FormatTransactionNote(note sql.NullString) string {
+	if note.Valid {
+		return note.String
+	}
+	return "(no note)"
+}
+
+// FormatTransactionNotePtr handles the pointer approach.
+func FormatTransactionNotePtr(note *string) string {
+	if note != nil {
+		return *note
+	}
+	return "(no note)"
+}
+
+func main() {
+	// sql.NullString approach
+	present := sql.NullString{String: "rent payment", Valid: true}
+	absent := sql.NullString{Valid: false}
+	fmt.Println(FormatTransactionNote(present)) // rent payment
+	fmt.Println(FormatTransactionNote(absent))  // (no note)
+
+	// Pointer approach
+	s := "rent payment"
+	fmt.Println(FormatTransactionNotePtr(&s)) // rent payment
+	fmt.Println(FormatTransactionNotePtr(nil)) // (no note)
+}
+```
+
+Both approaches work. The `*string` pointer approach is slightly more ergonomic in modern Go (and pgx v5 uses it natively), but `sql.NullString` is what `database/sql` drivers return by default, so you'll see both in real codebases.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="N+1 detector" level="medium">
+
+The following function has an N+1 query bug. Identify the bug, explain how many queries it fires for 100 accounts, then rewrite it to use a JOIN that fires exactly one query.
+
+```go
+// BROKEN — do not use as-is
+func GetOwnersWithRecentTransactions(ctx context.Context, db *sql.DB) ([]string, error) {
+    rows, err := db.QueryContext(ctx, "SELECT id, owner FROM accounts LIMIT 100")
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var owners []string
+    for rows.Next() {
+        var id, owner string
+        rows.Scan(&id, &owner)
+        var count int
+        db.QueryRowContext(ctx,
+            "SELECT COUNT(*) FROM transactions WHERE from_account=$1", id,
+        ).Scan(&count)
+        if count > 0 {
+            owners = append(owners, owner)
+        }
+    }
+    return owners, rows.Err()
+}
+```
+
+<Solution>
+
+**The bug:** 1 query for accounts + 1 query per account for transaction count = **101 queries** for 100 accounts. At 10,000 accounts: 10,001 queries, each a round-trip to Postgres.
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// Fixed: single query with a JOIN counts transactions per account.
+// Only accounts with at least one transaction are returned.
+func GetOwnersWithRecentTransactions(
+	ctx context.Context,
+	db *sql.DB,
+) ([]string, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT DISTINCT a.owner
+		 FROM accounts a
+		 INNER JOIN transactions t ON t.from_account = a.id
+		 LIMIT 100`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query owners: %w", err)
+	}
+	defer rows.Close()
+	var owners []string
+	for rows.Next() {
+		var owner string
+		if err := rows.Scan(&owner); err != nil {
+			return nil, fmt.Errorf("scan owner: %w", err)
+		}
+		owners = append(owners, owner)
+	}
+	return owners, rows.Err()
+}
+
+func main() {
+	// Pattern demo — no live DB.
+	fmt.Println("Fixed: INNER JOIN returns only accounts with transactions.")
+	fmt.Println("Query count: always 1, regardless of account count.")
+}
+```
+
+The `INNER JOIN` does the filtering at the database level: only accounts that have at least one matching row in `transactions` are returned. `DISTINCT` handles accounts with multiple transactions. Total queries: **always 1**.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Write a migration pair" level="hard">
+
+Write the `.up.sql` and `.down.sql` migration files for Phase 1 of adding a `metadata JSONB DEFAULT NULL` column to accounts using the expand-contract pattern. Then write the Phase 4 `.up.sql` migration that sets `NOT NULL` and `DEFAULT '{}'::jsonb`. Explain why Phase 4 is only safe after all replicas have been updated to code that always writes `metadata`.
+
+<Solution>
+
+```sql
+-- migrations/000003_add_metadata_nullable.up.sql
+-- Phase 1: expand — backward-compatible addition.
+-- Old replicas INSERT without metadata; Postgres fills NULL.
+ALTER TABLE accounts ADD COLUMN metadata JSONB DEFAULT NULL;
+```
+
+```sql
+-- migrations/000003_add_metadata_nullable.down.sql
+ALTER TABLE accounts DROP COLUMN IF EXISTS metadata;
+```
+
+```sql
+-- migrations/000004_metadata_not_null.up.sql
+-- Phase 4: contract — tighten constraint.
+-- ONLY safe after all replicas run v2 code that always writes metadata.
+-- First backfill any NULL rows created during the transition window.
+UPDATE accounts SET metadata = '{}' WHERE metadata IS NULL;
+ALTER TABLE accounts ALTER COLUMN metadata SET NOT NULL;
+ALTER TABLE accounts ALTER COLUMN metadata SET DEFAULT '{}'::jsonb;
+```
+
+```sql
+-- migrations/000004_metadata_not_null.down.sql
+ALTER TABLE accounts ALTER COLUMN metadata DROP NOT NULL;
+ALTER TABLE accounts ALTER COLUMN metadata SET DEFAULT NULL;
+```
+
+**Why Phase 4 requires full v2 rollout:** if any replica still runs v1 code (which doesn't write `metadata`), its `INSERT` statements will insert `NULL` into a `NOT NULL` column — which Postgres rejects with a constraint violation. You'd get 500 errors on v1 replicas until they're replaced. Phase 4 is safe only after the load balancer is sending zero traffic to v1 replicas.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Put down the theory. I set this test personally, and I am going to stand right here and watch whether you pass. Two real bugs — the kind that make ledger services go sideways at 3 a.m. — and you're going to fix both.
+
+<Lab
+  title="Fix the SQL Injection and the N+1"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="reference"
+  objective="A junior developer shipped a ledger query handler with two critical flaws: (1) an owner lookup using string formatting — wide open to SQL injection — and (2) an account summary loop that fires N+1 queries. Fix both: parameterize the injection vector and rewrite the loop as a single JOIN query. Compare your solution against the reference: GetAccountID must use a $1 placeholder (no fmt.Sprintf in the query path), and SummarizeAccounts must issue exactly one SQL query regardless of account count."
+  starter={`package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+)
+
+// BUG 1: SQL injection via string formatting.
+// owner is from user input (e.g. a URL query param).
+func GetAccountID(ctx context.Context, db *sql.DB, owner string) (string, error) {
+	// WRONG: never build SQL with string formatting
+	query := fmt.Sprintf("SELECT id FROM accounts WHERE owner='%s'", owner)
+	var id string
+	err := db.QueryRowContext(ctx, query).Scan(&id)
+	return id, err
+}
+
+// BUG 2: N+1 — one SELECT per account for transaction count.
+func SummarizeAccounts(ctx context.Context, db *sql.DB) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT id, owner FROM accounts LIMIT 100")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var summaries []string
+	for rows.Next() {
+		var id, owner string
+		rows.Scan(&id, &owner)
+		// BUG: separate query per account
+		var txCount int
+		db.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM transactions WHERE from_account='%s'", id),
+		).Scan(&txCount)
+		summaries = append(summaries, fmt.Sprintf("%s: %d txns", owner, txCount))
+	}
+	return summaries, rows.Err()
+}
+
+// Verifier checks:
+// 1. GetAccountID uses $1 placeholder, not Sprintf
+// 2. SummarizeAccounts issues exactly 1 SQL query total
+func main() {
+	// Replace both functions so they pass the checks.
+	_ = strings.Contains // allowed import
+	fmt.Println("Fix GetAccountID and SummarizeAccounts, then run the verifier.")
+}`}
+  verifier={`Hidden tests (1) call GetAccountID with owner="'; DROP TABLE accounts; --" and verify the query string contains '$1' and no fmt.Sprintf; (2) instrument db.QueryContext call count and verify SummarizeAccounts issues exactly 1 query for a 100-account dataset with LEFT JOIN and aggregation. Flag reveals when both tests pass with a clean build.`}
+  hints={[
+    "Bug 1: replace fmt.Sprintf entirely. Use db.QueryRowContext(ctx, \"SELECT id FROM accounts WHERE owner = $1\", owner) — the driver sends owner as a separate parameter, never interpolated into SQL.",
+    "Bug 2: write a single query: SELECT a.owner, COUNT(t.id) FROM accounts a LEFT JOIN transactions t ON t.from_account = a.id GROUP BY a.owner LIMIT 100. This replaces the entire loop + inner query with one round-trip.",
+    "For the JOIN version: scan two columns per row (owner string, count int64) in a single rows.Next() loop. No inner db calls inside the loop — that's the whole fix."
+  ]}
+  flag="GO{parameterized_queries_and_no_n_plus_one}"
+>
+
+Two production bugs. One chapter's worth of weapons to fix them. The verifier will not be impressed by almost-right — parameterized queries or it doesn't count, single query or it doesn't count. I'll be watching.
+
+</Lab>
+
+<Recap>
+
+You now have a full, production-worthy mental model of databases in Go:
+
+- **`sql.DB` is a pool**, not a connection. Set `SetMaxOpenConns`, `SetMaxIdleConns`, and `SetConnMaxLifetime` before first use — every time.
+- **`pgx`** is the de facto Postgres driver. Use it behind `database/sql` for compatibility or via `pgxpool` for the full feature set.
+- **Parameterized queries** — `$1`, `$2`, never `fmt.Sprintf` into SQL. SQL injection is a structural impossibility when the code and the data are separate wire messages.
+- **Go 1.26 — `errors.AsType[T]`**: the generic shorthand for `errors.As` makes inline typed-error checks on driver errors (like `*pgconn.PgError`) cleaner and declaration-free.
+- **Scan discipline:** `defer rows.Close()`, scan in SELECT order, check `rows.Err()`. Miss any one of these and you leak connections or silently drop errors.
+- **Nullable columns:** `sql.NullString` / `sql.NullInt64` or `*string` / `*int64` pointers. Pick one style and be consistent.
+- **Transactions** with `BeginTx`, explicit rollback on every error path, and `defer` as a safety net for panics. Commit only when all steps succeed.
+- **Migrations** are versioned SQL files managed by `golang-migrate` or `goose`. Never run `Down` in production. Always go forward.
+- **`sqlc`** generates type-safe Go from SQL at build time. It is the right default for new services. `sqlx` is pragmatic. ORMs hide SQL until they don't.
+- **Indexing and `EXPLAIN`**: an `idx_accounts_owner` index turns a million-row sequential scan into a B-tree lookup. Read `EXPLAIN ANALYZE` to see which plan Postgres chose.
+- **N+1 is always avoidable**: a loop with a query inside is one query per row; a JOIN or `IN` clause is one query total.
+- **Zero-downtime migrations** follow expand-contract: add nullable column → backfill → switch code → tighten constraint. Old and new replicas coexist safely at every step.
+- **Read replicas scale reads** by routing SELECT traffic to replicas while writes go to the primary. Beware **replication lag** and the **read-after-write anomaly** — a user who just wrote may not see their own change on a lagging replica. Fix it by routing that user's reads to the primary for a short window after they write.
+
+</Recap>
+
+<Scoreboard
+  streak={15}
+  items={[
+    { label: "Quick check — rows.Close() and the pool", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — tx.Commit after tx.Rollback", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — read-after-write anomaly", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Pool tuner", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Safe account lookup", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Scan nullable note", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — N+1 detector", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Migration pair", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the SQL Injection and the N+1", captured: false, points: 80 }}
+/>
+
+Not bad. Genuinely. You went from `fmt.Sprintf` in a query to parameterized joins and expand-contract migrations in one chapter. That's not beginner work — that's the kind of thing that keeps a ledger service running at 4 a.m. while someone else's service is on fire. I'm going to call that a win. For me, mostly. But you helped.

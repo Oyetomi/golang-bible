@@ -1,0 +1,2144 @@
+---
+title: "HTTP Servers: JSON, Streaming & WebSockets"
+part: 1
+order: 19
+type: "course"
+description: "Routing, middleware and handlers; advanced JSON (custom marshalers, RawMessage, omitempty, safe decoding); streaming with json.Encoder and NDJSON; and real-time with server-sent events and WebSockets."
+prerequisites: ["sql-databases"]
+---
+
+<HeroCard label="Part 1 · Chapter 19" title="HTTP Servers: JSON, Streaming & WebSockets">
+
+Listen up, sport. You've got the database humming, the queries are parameterized, and the schema is clean. Now you need to expose all of that to the world — and the world is unforgiving, malicious, and will send you garbage JSON at 3 a.m.
+
+In this chapter I'm going to show you *exactly* how Go's HTTP server works, from the moment a TCP connection lands all the way to the moment you flush the last byte of a WebSocket frame. Routing, middleware, advanced JSON, streaming so your memory stays flat even as your dataset grows, server-sent events, and full-duplex WebSockets. Our running scenario is **Meridian's payments API**: the `POST /transfers` endpoint, a streaming account-statement export, and a live transfer-event feed for the operations dashboard. By the end you'll know every layer of the stack, and you'll know how the dangerous one operates.
+
+You're welcome.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Handlers, Routing & Middleware", "Advanced JSON", "Streaming & NDJSON", "Server-Sent Events", "WebSockets", "Server Hardening"]} />
+
+---
+
+## Handlers, Routing & Middleware
+
+The scenario: Meridian's payments service needs a REST API — account lookups, `POST /transfers`, and a live statement stream. Let's stand it up correctly — no guessing, no cowboy wiring — starting from the one interface that governs everything in `net/http`.
+
+**On the job:** Every production Go HTTP service you'll encounter is built on exactly this interface. Get the wiring wrong and you end up with a global mux, no method matching, and zero middleware — and you discover that at code review, not at 3 a.m.
+
+### The `http.Handler` interface
+
+<Define term="handler / http.Handler" since="HTTP Servers: JSON, Streaming & WebSockets (this chapter)">
+A **handler** is any value that knows how to respond to an HTTP request. In Go, the `http.Handler` interface has one method — `ServeHTTP(ResponseWriter, *Request)` — and everything in `net/http` speaks it: a function, a struct, a middleware chain, the mux itself. You need it because every incoming request needs *something* that takes the request, does the work, and writes the response — and the single interface lets all these shapes be composed and wrapped uniformly.
+</Define>
+
+Every HTTP handler in Go satisfies a single interface:
+
+```go
+// From the standard library — the one interface to rule them all.
+type Handler interface {
+    ServeHTTP(ResponseWriter, *Request)
+}
+```
+
+That's it. One method. `ResponseWriter` is where you write the response; `*Request` carries the incoming request. Anything that has `ServeHTTP(ResponseWriter, *Request)` is a valid HTTP handler — a struct, a closure, a middleware chain — all the same interface.
+
+`http.HandlerFunc` is a function type that satisfies `Handler`:
+
+```go
+// HandlerFunc is a function that IS an http.Handler.
+// You don't implement a struct — you write a func with the right signature.
+type HandlerFunc func(ResponseWriter, *Request)
+
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) { f(w, r) }
+```
+
+So you can write a plain function and adapt it with `http.HandlerFunc(myFunc)`. In practice, `http.HandleFunc` does this for you on the default mux. We'll use our own mux below, which is the correct production approach.
+
+### `ServeMux` and Go 1.22+ routing
+
+<Define term="ServeMux (router)">
+A **ServeMux** is a request multiplexer — a table that maps URL patterns to handlers. When a request arrives, the mux finds the longest matching pattern and calls that handler's `ServeHTTP`. You need one because a real API has tens of routes, and wiring them by hand into a single `ServeHTTP` is a maintenance disaster. Go 1.22's `ServeMux` also matches on HTTP method (`GET /api/accounts/{id}`) and extracts named wildcards via `r.PathValue`.
+</Define>
+
+`http.ServeMux` is Go's built-in router. Before Go 1.22, it was minimal: exact paths and trailing-slash prefix matches. Go 1.22 gave it a major upgrade — **method + path patterns, named wildcards, and precedence rules**.
+
+Go 1.26 changes one existing behavior: ServeMux's automatic subtree-root redirects now use **307 Temporary Redirect** instead of 301. The redirect applies when you register a subtree pattern with a trailing slash (or `...` wildcard) and a client requests the subtree root without the slash. For example, registering `/assets/` redirects `/assets` to `/assets/` unless `/assets` is registered separately.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log/slog"
+    "net/http"
+    "os"
+    "os/signal"
+    "time"
+)
+
+func main() {
+    mux := http.NewServeMux()
+
+    // Go 1.22: "METHOD /path" — method is part of the pattern.
+    mux.HandleFunc("GET /api/accounts/{id}", getAccount)
+    mux.HandleFunc("POST /api/accounts", createAccount)
+
+    // Meridian payments API: transfer creation and lookup.
+    mux.HandleFunc("POST /api/transfers", createTransfer)
+    mux.HandleFunc("GET /api/transfers/{txID}", getTransfer)
+
+    // Wildcard {id} is captured via r.PathValue("id").
+    // A trailing {id...} would match the rest of the path.
+    mux.HandleFunc("GET /api/transactions/{txID}", getTransaction)
+
+    srv := &http.Server{
+        Addr:              ":8080",
+        Handler:           mux,
+        ReadHeaderTimeout: 5 * time.Second,  // Slowloris mitigation — always set
+        ReadTimeout:       10 * time.Second,
+        WriteTimeout:      30 * time.Second,
+        IdleTimeout:       120 * time.Second,
+    }
+
+    // Graceful shutdown: wait for OS signal, then drain in-flight requests.
+    go func() {
+        slog.Info("listening", "addr", srv.Addr)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            slog.Error("server error", "err", err)
+            os.Exit(1)
+        }
+    }()
+
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, os.Interrupt)
+    <-quit
+
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(ctx); err != nil {
+        slog.Error("shutdown error", "err", err)
+    }
+    slog.Info("server stopped cleanly")
+}
+
+func getAccount(w http.ResponseWriter, r *http.Request) {
+    id := r.PathValue("id") // Go 1.22 wildcard extraction
+    fmt.Fprintf(w, "account: %s\n", id)
+}
+
+func createAccount(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusCreated)
+}
+
+func createTransfer(w http.ResponseWriter, r *http.Request) {
+    // Full implementation shown in the Advanced JSON section.
+    w.WriteHeader(http.StatusAccepted)
+}
+
+func getTransfer(w http.ResponseWriter, r *http.Request) {
+    id := r.PathValue("txID")
+    fmt.Fprintf(w, "transfer: %s\n", id)
+}
+
+func getTransaction(w http.ResponseWriter, r *http.Request) {
+    id := r.PathValue("txID")
+    fmt.Fprintf(w, "transaction: %s\n", id)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func getAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	fmt.Fprintf(w, "account: %s", id)
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/accounts/{id}", getAccount)
+
+	// httptest lets us exercise the handler without a real server.
+	req := httptest.NewRequest("GET", "/api/accounts/ACC-42", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	fmt.Println(w.Body.String()) // account: ACC-42
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Go 1.22 ServeMux — routing a GET /api/accounts/ACC-42"
+  lanes={[{ id: "req", label: "request" }, { id: "mux", label: "ServeMux" }, { id: "h", label: "handler" }]}
+  steps={[
+    { lane: "req", kind: "send", label: "GET /api/accounts/ACC-42", note: "Client sends an HTTP/1.1 request over the TCP connection." },
+    { lane: "mux", kind: "run", label: "pattern match", note: "ServeMux checks registered patterns. 'GET /api/accounts/{id}' matches — method and path both match." },
+    { lane: "mux", kind: "run", label: "extract {id}=ACC-42", note: "The wildcard segment is stored in the request context so PathValue('id') retrieves it." },
+    { lane: "h", kind: "spawn", label: "ServeHTTP called", note: "ServeMux calls the matched handler's ServeHTTP in the same goroutine that owns this connection." },
+    { lane: "h", kind: "run", label: "r.PathValue('id')", note: "Handler reads the extracted wildcard — 'ACC-42' — from the request." },
+    { lane: "h", kind: "done", label: "w.Write(...)", note: "Handler writes the response body. ResponseWriter buffers until the handler returns." },
+  ]}
+  caption="One goroutine owns one connection for its lifetime. The mux dispatches inside that goroutine."
+/>
+
+<Callout kind="note" title="Go 1.22+ routing closes the gap">
+
+Before Go 1.22, `ServeMux` had no method matching and no named wildcards — you needed a third-party router like `chi` or `gorilla/mux`. Go 1.22 closed the gap for most use-cases. Go 1.26 keeps the subtree-root slash redirect but changes its status code to 307, preserving the request method. For complex trees (middleware per route-group, nested mounts) third-party routers are still valuable, but the stdlib mux now handles the Meridian API patterns in this chapter natively.
+
+</Callout>
+
+### Middleware — `func(http.Handler) http.Handler`
+
+<Define term="middleware">
+**Middleware** is a function that wraps a handler, runs code before and/or after it, and returns a new handler. The canonical Go signature is `func(http.Handler) http.Handler`. You need it because cross-cutting concerns — authentication, logging, rate limiting, request IDs — belong *outside* your business logic, applied uniformly at the routing layer. Middleware composes like Russian dolls: stack them with a `chain` helper, and they execute in order on every matching request.
+</Define>
+
+Middleware is a function that wraps a handler, runs code before and/or after it, and returns the wrapped handler. The canonical signature is `func(http.Handler) http.Handler`.
+
+```go
+// logging middleware — wraps any handler, logs every request.
+func logging(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(w, r) // call the inner handler
+        slog.Info("request",
+            "method", r.Method,
+            "path", r.URL.Path,
+            "duration", time.Since(start),
+        )
+    })
+}
+
+// auth middleware — checks the Authorization header first.
+func requireAuth(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        token := r.Header.Get("Authorization")
+        if token == "" {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return // short-circuit — inner handler never runs
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+
+// chain applies middleware right-to-left so the first listed runs outermost.
+func chain(h http.Handler, mw ...func(http.Handler) http.Handler) http.Handler {
+    for i := len(mw) - 1; i >= 0; i-- {
+        h = mw[i](h)
+    }
+    return h
+}
+
+// usage: every request hits logging, then auth, then the real handler.
+mux.Handle("GET /api/accounts/{id}", chain(
+    http.HandlerFunc(getAccount),
+    logging,
+    requireAuth,
+))
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func logging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		slog.Info("request", "method", r.Method, "path", r.URL.Path,
+			"duration", time.Since(start))
+	})
+}
+
+func requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func chain(h http.Handler, mw ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(mw) - 1; i >= 0; i-- {
+		h = mw[i](h)
+	}
+	return h
+}
+
+func helloHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "hello from fintech API")
+}
+
+func main() {
+	h := chain(http.HandlerFunc(helloHandler), logging, requireAuth)
+
+	// No auth header — should get 401.
+	req1 := httptest.NewRequest("GET", "/api/accounts/1", nil)
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, req1)
+	fmt.Println("no auth:", w1.Code) // 401
+
+	// With auth header — should get 200.
+	req2 := httptest.NewRequest("GET", "/api/accounts/1", nil)
+	req2.Header.Set("Authorization", "Bearer token123")
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+	fmt.Println("with auth:", w2.Code) // 200
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Middleware chain — request lifecycle"
+  lanes={[{ id: "req", label: "request" }, { id: "log", label: "logging mw" }, { id: "auth", label: "auth mw" }, { id: "h", label: "handler" }]}
+  steps={[
+    { lane: "req", kind: "send", label: "incoming request", note: "HTTP request arrives. ServeMux picks the handler — here the full middleware chain." },
+    { lane: "log", kind: "run", label: "record start time", note: "Logging middleware records the start timestamp, then calls next.ServeHTTP." },
+    { lane: "auth", kind: "run", label: "check Authorization", note: "Auth middleware reads the Authorization header. If missing, writes 401 and returns — handler never runs." },
+    { lane: "h", kind: "run", label: "business logic", note: "Inner handler runs only if auth passed. Reads DB, builds response." },
+    { lane: "auth", kind: "done", label: "auth returns", note: "Auth middleware's call to next returns — execution unwinds back up the chain." },
+    { lane: "log", kind: "done", label: "log duration", note: "Logging middleware computes elapsed time and logs the completed request." },
+  ]}
+  caption="Middleware wraps like an onion. Outermost code runs first on the way in, last on the way out."
+/>
+
+### Graceful shutdown
+
+A production HTTP server must drain in-flight requests before dying. `Server.Shutdown` does it:
+
+```go
+// Shutdown waits up to ctx's deadline for active connections to finish,
+// then closes everything. New connections are refused immediately.
+// Call this after you receive an OS signal.
+ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+defer cancel()
+if err := srv.Shutdown(ctx); err != nil {
+    slog.Error("forced shutdown", "err", err)
+}
+```
+
+The 15-second timeout means: give in-flight requests up to 15 seconds to finish, then hard-close anything that's still open. Wire it to `os.Interrupt` (Ctrl-C) and Kubernetes `SIGTERM` so rolling deploys drain cleanly.
+
+<UnderTheHood title="net/http: one goroutine per connection">
+
+When a new TCP connection is accepted, `net/http` spawns **one goroutine** to own it for its lifetime — the `conn.serve` goroutine. That goroutine reads requests off the connection in a loop, calls your handler's `ServeHTTP` synchronously, and writes the response. For HTTP/1.1, the goroutine handles one request at a time (pipelining is the exception). For HTTP/2, `net/http` runs a multiplexing layer so multiple streams share one connection; each stream gets its own goroutine calling your handler.
+
+`ResponseWriter` is backed by a `bufio.Writer` — writes are buffered until the handler returns or you call `Flush()`. The first call to `Write` or `WriteHeader` freezes the response status; calling `WriteHeader` after `Write` is a no-op (and logs a warning). This is why you must set headers **before** writing the body.
+
+The `Shutdown` method calls `Close` on the underlying `net.Listener` (stops accepting new connections), then polls until all `conn.serve` goroutines finish or the context is cancelled. It uses a `sync.WaitGroup` inside the server to track active connections. Go 1.22+ `Shutdown` also respects HTTP/2 `GOAWAY` graceful close. (Note: this is a conceptual model of the implementation as of Go 1.26; the exact internals are implementation-defined and may change.)
+
+</UnderTheHood>
+
+<QuickCheck
+  question={'In Go 1.22+, what does mux.HandleFunc("GET /api/accounts/{id}", h) do that the pre-1.22 ServeMux could not?'}
+  options={[
+    "It allows the handler to run in its own goroutine automatically",
+    "It matches only GET requests and extracts the {id} wildcard via r.PathValue",
+    "It adds rate limiting to the route",
+    "It handles CORS automatically"
+  ]}
+  answer={1}
+  explain={'Go 1.22 added method+path patterns and named wildcards to ServeMux. The method prefix restricts matching to GET only, and {id} is extracted with r.PathValue("id"). Pre-1.22 ServeMux had neither feature.'}
+/>
+
+---
+
+## Advanced JSON
+
+Meridian's API speaks JSON. But the naive `json.Marshal` / `json.Unmarshal` approach will get you into trouble the moment a field is optional, a payload is polymorphic, or a client sends hostile input. Let's go deeper.
+
+**On the job:** The `POST /transfers` handler is hit by both internal services and third-party integrations. Every one of them is a potential attacker or a misconfigured client. Safe JSON decoding is not optional — it is the first gate.
+
+### Custom `MarshalJSON` and `UnmarshalJSON`
+
+Implement `json.Marshaler` and `json.Unmarshaler` on your types for full control:
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "time"
+)
+
+// Money is an integer number of cents. Never a float.
+// We want JSON to serialize as a decimal string ("12.34"), not an integer.
+// This prevents floating-point rounding errors in client code.
+type Money int64
+
+func (m Money) MarshalJSON() ([]byte, error) {
+    // Render as "12.34" — two decimal places, always.
+    dollars := m / 100
+    cents := m % 100
+    if cents < 0 {
+        cents = -cents
+    }
+    s := fmt.Sprintf("%d.%02d", dollars, cents)
+    return json.Marshal(s) // produces `"12.34"` (quoted string in JSON)
+}
+
+func (m *Money) UnmarshalJSON(data []byte) error {
+    var s string
+    if err := json.Unmarshal(data, &s); err != nil {
+        return fmt.Errorf("Money: expected a quoted decimal string, got: %w", err)
+    }
+    // Strip optional leading minus before parsing magnitude.
+    neg := len(s) > 0 && s[0] == '-'
+    if neg {
+        s = s[1:]
+    }
+    var dollars, cents int64
+    if _, err := fmt.Sscanf(s, "%d.%02d", &dollars, &cents); err != nil {
+        return fmt.Errorf("Money: invalid format %q", s)
+    }
+    v := dollars*100 + cents
+    if neg {
+        v = -v
+    }
+    *m = Money(v)
+    return nil
+}
+
+// Transfer is Meridian's core domain object — the payload for POST /transfers.
+type Transfer struct {
+    ID          string    `json:"id"`
+    FromAccount string    `json:"from_account"`
+    ToAccount   string    `json:"to_account"`
+    Amount      Money     `json:"amount"`
+    CreatedAt   time.Time `json:"created_at"`
+}
+
+func main() {
+    xfer := Transfer{
+        ID:          "TXN-001",
+        FromAccount: "ACC-100",
+        ToAccount:   "ACC-200",
+        Amount:      Money(1234), // $12.34
+        CreatedAt:   time.Now(),
+    }
+    b, _ := json.Marshal(xfer)
+    fmt.Println(string(b))
+    // {"id":"TXN-001","from_account":"ACC-100","to_account":"ACC-200","amount":"12.34","created_at":"..."}
+
+    var xfer2 Transfer
+    _ = json.Unmarshal(b, &xfer2)
+    fmt.Println(xfer2.Amount) // 1234 (cents)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// Money in cents — marshals as a decimal string.
+type Money int64
+
+func (m Money) MarshalJSON() ([]byte, error) {
+	dollars := m / 100
+	cents := m % 100
+	if cents < 0 {
+		cents = -cents
+	}
+	return json.Marshal(fmt.Sprintf("%d.%02d", dollars, cents))
+}
+
+func (m *Money) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("Money: want quoted decimal string: %w", err)
+	}
+	neg := len(s) > 0 && s[0] == '-'
+	if neg {
+		s = s[1:]
+	}
+	var d, c int64
+	if _, err := fmt.Sscanf(s, "%d.%02d", &d, &c); err != nil {
+		return fmt.Errorf("Money: invalid format %q", s)
+	}
+	v := d*100 + c
+	if neg {
+		v = -v
+	}
+	*m = Money(v)
+	return nil
+}
+
+type Tx struct {
+	ID     string `json:"id"`
+	Amount Money  `json:"amount"`
+}
+
+func main() {
+	tx := Tx{ID: "TXN-001", Amount: Money(1234)}
+	b, _ := json.Marshal(tx)
+	fmt.Println(string(b))
+
+	var tx2 Tx
+	_ = json.Unmarshal(b, &tx2)
+	fmt.Printf("decoded cents: %d\n", int64(tx2.Amount))
+}
+```
+
+</GoPlayground>
+
+### `json.RawMessage` for deferred and polymorphic decoding
+
+Sometimes you don't know the shape of a field until you've read another field. `json.RawMessage` lets you defer decoding — capture the raw JSON bytes first, then decode into the right type once you know what it is.
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+)
+
+// Event is a polymorphic envelope. The "type" field tells us
+// what shape "payload" has — we can't decode both in one pass.
+type Event struct {
+    Type    string          `json:"type"`
+    Payload json.RawMessage `json:"payload"` // raw bytes, decoded later
+}
+
+type DepositPayload struct {
+    AccountID string `json:"account_id"`
+    AmountCents int64 `json:"amount_cents"`
+}
+
+type WithdrawalPayload struct {
+    AccountID string `json:"account_id"`
+    AmountCents int64 `json:"amount_cents"`
+    AtmID     string `json:"atm_id"`
+}
+
+func handleEvent(data []byte) error {
+    var ev Event
+    if err := json.Unmarshal(data, &ev); err != nil {
+        return err
+    }
+    switch ev.Type {
+    case "deposit":
+        var p DepositPayload
+        if err := json.Unmarshal(ev.Payload, &p); err != nil {
+            return err
+        }
+        fmt.Printf("deposit: account=%s amount=%d cents\n", p.AccountID, p.AmountCents)
+    case "withdrawal":
+        var p WithdrawalPayload
+        if err := json.Unmarshal(ev.Payload, &p); err != nil {
+            return err
+        }
+        fmt.Printf("withdrawal: account=%s amount=%d atm=%s\n",
+            p.AccountID, p.AmountCents, p.AtmID)
+    default:
+        return fmt.Errorf("unknown event type: %q", ev.Type)
+    }
+    return nil
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type Event struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type DepositPayload struct {
+	AccountID   string `json:"account_id"`
+	AmountCents int64  `json:"amount_cents"`
+}
+
+type WithdrawalPayload struct {
+	AccountID   string `json:"account_id"`
+	AmountCents int64  `json:"amount_cents"`
+	AtmID       string `json:"atm_id"`
+}
+
+func handleEvent(data []byte) error {
+	var ev Event
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return err
+	}
+	switch ev.Type {
+	case "deposit":
+		var p DepositPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			return err
+		}
+		fmt.Printf("deposit: account=%s amount=%d cents\n", p.AccountID, p.AmountCents)
+	case "withdrawal":
+		var p WithdrawalPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			return err
+		}
+		fmt.Printf("withdrawal: account=%s amount=%d atm=%s\n",
+			p.AccountID, p.AmountCents, p.AtmID)
+	default:
+		return fmt.Errorf("unknown event type: %q", ev.Type)
+	}
+	return nil
+}
+
+func main() {
+	depositJSON := []byte(`{"type":"deposit","payload":{"account_id":"ACC-1","amount_cents":5000}}`)
+	withdrawalJSON := []byte(`{"type":"withdrawal","payload":{"account_id":"ACC-1","amount_cents":1000,"atm_id":"ATM-99"}}`)
+
+	_ = handleEvent(depositJSON)
+	_ = handleEvent(withdrawalJSON)
+}
+```
+
+</GoPlayground>
+
+### `omitempty` gotchas and struct embedding
+
+`omitempty` skips a field when it holds the zero value — but the zero value depends on the type:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="int / bool / string → omitted when zero">`omitempty` omits `0`, `false`, and `""`. This is usually what you want.</ConceptCard>
+  <ConceptCard label="pointer → omitted when nil">Use a pointer field (`*string`, `*int64`) when you need to distinguish zero from absent.</ConceptCard>
+  <ConceptCard label="struct → NEVER omitted">`omitempty` does NOT omit a non-pointer struct even if all its fields are zero. Use `*MyStruct` if you need true omission.</ConceptCard>
+  <Gotcha>A `time.Time` zero value (`0001-01-01`) is NOT omitted by `omitempty` because `time.Time` is a struct, not a primitive. Use `*time.Time` or implement `MarshalJSON` to emit `null` for the zero value.</Gotcha>
+</ConceptGrid>
+
+Struct embedding flattens fields into the parent's JSON, but can produce surprises with custom marshalers:
+
+```go
+type Base struct {
+    ID        string    `json:"id"`
+    CreatedAt time.Time `json:"created_at"`
+}
+
+// Embedding Base is fine — its fields are promoted into Transaction's JSON.
+type Transaction struct {
+    Base                    // promoted: id, created_at appear at the top level
+    Amount    Money         `json:"amount"`
+    Reference string        `json:"reference,omitempty"` // omitted when ""
+}
+```
+
+### Decoding untrusted input safely
+
+A client sending you JSON is a client you cannot trust. Three rules for every handler that decodes a request body:
+
+**Rule 1: limit the body size.** Without a size limit, a client sends a 1 GB body and your server allocates 1 GB of memory. Use `http.MaxBytesReader` on the request body before decoding.
+
+**Rule 2: reject unknown fields.** By default, `json.Decoder` silently ignores JSON keys it doesn't recognize. A typo in a field name sends the data into a black hole. Use `d.DisallowUnknownFields()` to return an error instead.
+
+**Rule 3: decode once, into a strict shape.** Never decode into `map[string]interface{}`. Decode into a typed struct with exactly the fields you expect.
+
+```go
+// decodeJSON decodes r.Body into v, applying all three safety rules.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+    // Rule 1: limit body to 1 MiB — adjust per your API contract.
+    r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+    d := json.NewDecoder(r.Body)
+
+    // Rule 2: reject unexpected fields.
+    d.DisallowUnknownFields()
+
+    if err := d.Decode(v); err != nil {
+        http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+        return false
+    }
+    return true
+}
+
+// Usage in a handler — POST /transfers in Meridian's payments API.
+func createTransferHandler(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        FromAccount string `json:"from_account"`
+        ToAccount   string `json:"to_account"`
+        AmountCents int64  `json:"amount_cents"`
+        Reference   string `json:"reference"`
+    }
+    if !decodeJSON(w, r, &req) {
+        return // already wrote the error response
+    }
+    // req is now safe to use — size-bounded and field-validated.
+    w.WriteHeader(http.StatusAccepted)
+    json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	d := json.NewDecoder(r.Body)
+	d.DisallowUnknownFields()
+	if err := d.Decode(v); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func createTransferHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		FromAccount string `json:"from_account"`
+		ToAccount   string `json:"to_account"`
+		AmountCents int64  `json:"amount_cents"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"from_account": req.FromAccount,
+		"to_account":   req.ToAccount,
+		"amount_cents": req.AmountCents,
+	})
+}
+
+func main() {
+	// Good request — POST /transfers to Meridian's payments API.
+	body1 := strings.NewReader(`{"from_account":"ACC-100","to_account":"ACC-200","amount_cents":5000}`)
+	req1 := httptest.NewRequest("POST", "/api/transfers", body1)
+	w1 := httptest.NewRecorder()
+	createTransferHandler(w1, req1)
+	fmt.Printf("good: %d %s\n", w1.Code, w1.Body.String())
+
+	// Unknown field — should get 400.
+	body2 := strings.NewReader(`{"from_account":"ACC-100","to_account":"ACC-200","amount_cents":5000,"evil_field":"pwned"}`)
+	req2 := httptest.NewRequest("POST", "/api/transfers", body2)
+	w2 := httptest.NewRecorder()
+	createTransferHandler(w2, req2)
+	fmt.Printf("unknown field: %d %s\n", w2.Code, w2.Body.String())
+}
+```
+
+</GoPlayground>
+
+<BeforeAfter
+  badLabel="Naive — unsafe decode"
+  goodLabel="Safe — bounded + strict"
+  bad={`func handler(w http.ResponseWriter,
+  r *http.Request) {
+  var body map[string]any
+  json.NewDecoder(r.Body).Decode(&body)
+  // unknown keys silently accepted
+  // body could be 1 GB
+  // no typed validation
+}`}
+  good={`func handler(w http.ResponseWriter,
+  r *http.Request) {
+  var req struct {
+    FromAccount string \`json:"from_account"\`
+    ToAccount   string \`json:"to_account"\`
+    Amount      int64  \`json:"amount_cents"\`
+  }
+  r.Body = http.MaxBytesReader(
+    w, r.Body, 1<<20)
+  d := json.NewDecoder(r.Body)
+  d.DisallowUnknownFields()
+  if err := d.Decode(&req); err != nil {
+    http.Error(w, err.Error(), 400)
+    return
+  }
+}`}
+/>
+
+<Callout kind="note" title="Go 1.25: net/http.CrossOriginProtection">
+
+Go 1.25 added `net/http.CrossOriginProtection` — a middleware that blocks cross-origin requests that aren't legitimately CORS-preflight'd. It rejects `POST`, `PUT`, `PATCH`, and `DELETE` requests that carry a `Content-Type` and originate from a different origin without a matching preflight, catching a class of CSRF attacks that `SameSite=Lax` cookies alone don't prevent. Wrap your state-mutating routes with it:
+
+```go
+// Go 1.25+: built-in CSRF protection for the POST /transfers route.
+cop := http.NewCrossOriginProtection()
+mux.Handle("POST /api/transfers", cop.Handler(http.HandlerFunc(createTransferHandler)))
+```
+
+This is separate from CORS headers (which you still set for legitimate cross-origin callers). Auth & API Design (Part 1, Chapter 17) covers the full CORS/CSRF picture.
+
+</Callout>
+
+<UnderTheHood title="How json.Decoder streams and where it allocates">
+
+`json.Decoder` wraps an `io.Reader` and reads ahead in 512-byte chunks (internally a `bufio.Reader`). It does not load the entire body into memory before parsing — it streams token by token. This is why `MaxBytesReader` is the right tool: it wraps the body's `Read` method and returns an error the moment the byte count exceeds your limit, aborting the decode mid-stream.
+
+`DisallowUnknownFields` adds a check in the decoder's internal `Object` parsing loop: after matching a JSON key to a struct field, if no match is found, it returns an error rather than skipping the key. The decoder uses reflection (via `encoding/json`'s internal `structFields` cache, built lazily and stored in a `sync.Map`) to map JSON keys to struct fields. The cache is built once per type, so the reflection cost is paid only on first use — subsequent decodes into the same struct type are faster. (This is a simplified model of the Go 1.26 implementation; the exact cache strategy is implementation-defined.)
+
+**Forward look — `encoding/json/v2` (Go 1.25, experimental):** Go 1.25 shipped `encoding/json/v2` behind `GOEXPERIMENT=jsonv2`. It redesigns the API around `json.Marshal`/`json.Unmarshal` with stricter defaults (unknown fields rejected by default, deterministic map key ordering, better error messages), improved performance, and a cleaner streaming API. It is not yet the default in Go 1.26 — standard `encoding/json` is still what you ship with. Keep an eye on it; it will likely graduate to stable in a future release.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={'Which combination makes JSON decoding of an HTTP request body safe against untrusted clients?'}
+  options={[
+    "Use json.Unmarshal with a []byte you read manually",
+    "Use json.NewDecoder with DisallowUnknownFields, and wrap r.Body with http.MaxBytesReader first",
+    "Decode into map[string]interface{} and validate the keys yourself",
+    "Set a ReadTimeout on the server — that's enough"
+  ]}
+  answer={1}
+  explain="MaxBytesReader caps the body size so a client can't exhaust your memory. DisallowUnknownFields rejects typo'd or injected keys. Decoding into a typed struct enforces the schema. ReadTimeout alone only caps how long the client takes to send, not how much data."
+/>
+
+---
+
+## Streaming & NDJSON
+
+<Scene
+  title="Meridian statement export: buffered vs streamed"
+  actors={[
+    { id: "srv", label: "Server" },
+    { id: "db", label: "Postgres" },
+    { id: "client", label: "Client" }
+  ]}
+  cells={[
+    { id: "A1", label: "mem" },
+    { id: "A2", label: "mem" },
+    { id: "A3", label: "mem" },
+    { id: "A4", label: "mem" },
+    { id: "B1", label: "row 1" },
+    { id: "B2", label: "row 2" },
+    { id: "B3", label: "row 3" },
+    { id: "B4", label: "row N" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "Buffered: server fetches all 100,000 rows into memory before writing a single byte.",
+      beat: "problem",
+      actors: [{ id: "srv", state: "active" }, { id: "db", state: "active" }, { id: "client", state: "idle" }],
+      cells: [
+        { id: "A1", state: "warn", label: "400MB" },
+        { id: "A2", state: "warn", label: "↑" },
+        { id: "A3", state: "warn", label: "↑" },
+        { id: "A4", state: "warn", label: "OOM?" },
+        { id: "B1", state: "active", label: "row 1" },
+        { id: "B2", state: "active", label: "row 2" },
+        { id: "B3", state: "active", label: "row 3" },
+        { id: "B4", state: "active", label: "row N" }
+      ]
+    },
+    {
+      caption: "Client waits. Memory spikes. A large account OOMs the server before it sends anything.",
+      beat: "problem",
+      actors: [{ id: "srv", state: "warn" }, { id: "db", state: "idle" }, { id: "client", state: "warn" }],
+      cells: [
+        { id: "A1", state: "bad", label: "full" },
+        { id: "A2", state: "bad", label: "full" },
+        { id: "A3", state: "bad", label: "full" },
+        { id: "A4", state: "bad", label: "OOM" },
+        { id: "B1", state: "idle", label: "row 1" },
+        { id: "B2", state: "idle", label: "row 2" },
+        { id: "B3", state: "idle", label: "row 3" },
+        { id: "B4", state: "idle", label: "row N" }
+      ]
+    },
+    {
+      caption: "Streamed: server opens a DB cursor and encodes one row at a time. Memory stays flat.",
+      beat: "solution",
+      actors: [{ id: "srv", state: "active" }, { id: "db", state: "active" }, { id: "client", state: "active" }],
+      cells: [
+        { id: "A1", state: "ok", label: "~4KB" },
+        { id: "A2", state: "idle", label: "free" },
+        { id: "A3", state: "idle", label: "free" },
+        { id: "A4", state: "idle", label: "free" },
+        { id: "B1", state: "done", label: "→ client" },
+        { id: "B2", state: "active", label: "in flight" },
+        { id: "B3", state: "idle", label: "row 3" },
+        { id: "B4", state: "idle", label: "row N" }
+      ]
+    },
+    {
+      caption: "Each row is flushed immediately. Client reads as the DB cursor advances — one row in memory at a time.",
+      beat: "solution",
+      actors: [{ id: "srv", state: "ok" }, { id: "db", state: "ok" }, { id: "client", state: "ok" }],
+      cells: [
+        { id: "A1", state: "ok", label: "~4KB" },
+        { id: "A2", state: "idle", label: "free" },
+        { id: "A3", state: "idle", label: "free" },
+        { id: "A4", state: "idle", label: "free" },
+        { id: "B1", state: "done", label: "done" },
+        { id: "B2", state: "done", label: "done" },
+        { id: "B3", state: "done", label: "done" },
+        { id: "B4", state: "done", label: "done" }
+      ]
+    }
+  ]}
+  caption="Buffered = one giant allocation, client waits, OOM risk. Streamed = flat memory, client reads immediately."
+/>
+
+<Define term="streaming response / NDJSON" since="Batch & Large-File Processing (Part 3)">
+A **streaming response** writes data to the client incrementally as it is produced, rather than buffering the full payload in memory first. **NDJSON** (Newline-Delimited JSON) is the wire format: one complete JSON object per line, separated by `\n`, with no enclosing array. You need it whenever the result set is unbounded or large — Meridian's statement export, a reconciliation dump, a live event feed — because allocating 400 MB per request to build a single JSON array is a month-end outage waiting to happen.
+</Define>
+
+Here's the scenario: Meridian's account-statement endpoint needs to stream up to 100,000 transfers for a monthly report. Naively, you fetch all rows from the database, marshal them into a JSON array, and write the whole thing at once. Your server allocates hundreds of megabytes per request, and the client waits for the entire response before it can show a single row. That's a crime against memory and a crime against UX.
+
+The fix is **streaming**: write rows to the client as they come out of the database. `json.Encoder` lets you marshal one object at a time. NDJSON (newline-delimited JSON) is the format — one JSON object per line, no enclosing array.
+
+**On the job:** Statement export endpoints are almost always written the naive way first. They pass load tests with 10-row accounts and blow up in production when a customer with 80,000 transfers hits the endpoint at month-end. Stream from the start.
+
+### Streaming with `json.Encoder` and NDJSON
+
+```go
+package main
+
+import (
+    "database/sql"
+    "encoding/json"
+    "net/http"
+)
+
+// Transfer is Meridian's domain object — one row in the account statement.
+type Transfer struct {
+    ID          string `json:"id"`
+    AmountCents int64  `json:"amount_cents"`
+    Reference   string `json:"reference"`
+}
+
+// streamStatement fetches Meridian transfer rows from the DB and streams
+// them as NDJSON (one JSON object per line). Memory usage stays flat
+// regardless of how many rows the account has.
+func streamStatement(db *sql.DB) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // Tell the client this is NDJSON — one JSON object per line.
+        w.Header().Set("Content-Type", "application/x-ndjson")
+
+        // Grab the Flusher interface so we can flush each row immediately.
+        flusher, ok := w.(http.Flusher)
+        if !ok {
+            http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+            return
+        }
+
+        accountID := r.PathValue("accountID")
+        rows, err := db.QueryContext(r.Context(),
+            `SELECT id, amount_cents, reference
+               FROM transfers
+              WHERE from_account = $1 OR to_account = $1
+              ORDER BY created_at`,
+            accountID)
+        if err != nil {
+            http.Error(w, "query failed", http.StatusInternalServerError)
+            return
+        }
+        defer rows.Close()
+
+        enc := json.NewEncoder(w) // writes to the ResponseWriter directly
+
+        for rows.Next() {
+            var xfer Transfer
+            if err := rows.Scan(&xfer.ID, &xfer.AmountCents, &xfer.Reference); err != nil {
+                // We've already started writing — can't change the status.
+                // Log the error and close the stream.
+                return
+            }
+            // Encode appends a newline automatically — that's the ND in NDJSON.
+            if err := enc.Encode(xfer); err != nil {
+                return
+            }
+            // Flush pushes this row to the client immediately.
+            // Without this, the ResponseWriter buffers until the handler returns.
+            flusher.Flush()
+        }
+    }
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// Transfer is Meridian's statement row — one entry in the account export.
+type Transfer struct {
+	ID          string `json:"id"`
+	AmountCents int64  `json:"amount_cents"`
+}
+
+// simulateRows returns fake transfers — stand-in for a DB cursor.
+func simulateRows() []Transfer {
+	return []Transfer{
+		{ID: "TXN-001", AmountCents: 5000},
+		{ID: "TXN-002", AmountCents: -1000},
+		{ID: "TXN-003", AmountCents: 25000},
+	}
+}
+
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	flusher, ok := w.(http.Flusher)
+	enc := json.NewEncoder(w)
+	for _, xfer := range simulateRows() {
+		if err := enc.Encode(xfer); err != nil {
+			return
+		}
+		if ok {
+			flusher.Flush()
+		}
+	}
+}
+
+func main() {
+	req := httptest.NewRequest("GET", "/api/accounts/ACC-100/statement", nil)
+	w := httptest.NewRecorder()
+	streamHandler(w, req)
+
+	// Each line is a complete JSON object — NDJSON format.
+	body := w.Body.String()
+	fmt.Print(body)
+
+	// Parse each line independently.
+	dec := json.NewDecoder(w.Body)
+	for dec.More() {
+		var xfer Transfer
+		if err := dec.Decode(&xfer); err != nil {
+			break
+		}
+		fmt.Printf("parsed: id=%s amount=%d\n", xfer.ID, xfer.AmountCents)
+	}
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Buffered vs streamed response — memory over time"
+  lanes={[{ id: "buf", label: "buffered" }, { id: "stream", label: "streamed" }]}
+  steps={[
+    { lane: "buf", kind: "run", label: "fetch all rows", note: "Buffered: DB query returns 100k rows. All loaded into memory as Go structs." },
+    { lane: "buf", kind: "run", label: "marshal to []byte", note: "json.Marshal builds one giant JSON array in memory. Peak allocation: hundreds of MB." },
+    { lane: "buf", kind: "send", label: "write entire body", note: "The whole response is written at once. Client gets nothing until this completes." },
+    { lane: "stream", kind: "run", label: "open DB cursor", note: "Streamed: DB cursor opens. No rows loaded yet. Memory stays near zero." },
+    { lane: "stream", kind: "send", label: "encode + flush row 1", note: "First row scanned, encoded as one JSON line, flushed to client immediately." },
+    { lane: "stream", kind: "send", label: "encode + flush row N", note: "Each subsequent row follows the same path. Memory stays flat — one row in flight at a time." },
+    { lane: "stream", kind: "done", label: "cursor exhausted", note: "Handler returns when rows are done. Client has been reading the whole time." },
+  ]}
+  caption="Streaming keeps memory flat and gets data to the client sooner. The buffered version spikes on every large request."
+/>
+
+<Callout kind="warn" title="You can't write headers after writing the body">
+
+The moment you call `w.Write(...)` or `w.WriteHeader(...)`, the HTTP headers are frozen and sent. If an error occurs mid-stream, you cannot change the 200 status to 500 — the client has already seen the 200. **Log the error and close the connection.** This is why you must handle any setup errors (like the DB query failing) *before* starting to write rows.
+
+</Callout>
+
+<UnderTheHood title="ResponseWriter buffering and http.Flusher">
+
+`http.ResponseWriter` in `net/http` is backed by a `bufio.Writer` (typically 4 KB). Writes go into the buffer and are flushed to the network automatically when the buffer fills or the handler returns. For streaming you need to flush manually: `w.(http.Flusher).Flush()` calls through to `bufio.Writer.Flush()` which calls the underlying TCP `Write` syscall. Go 1.8+ guarantees that the concrete `ResponseWriter` implements `http.Flusher` for HTTP/1.1. For HTTP/2 it also flushes the frame to the network. The type assertion `flusher, ok := w.(http.Flusher)` is the safe way — some testing `ResponseWriter` implementations (like `httptest.Recorder`) implement `Flusher` but don't actually push bytes anywhere, which is fine for tests.
+
+**Prefer `http.ResponseController` (Go 1.20+):** Rather than type-asserting to `http.Flusher` directly, wrap the `ResponseWriter` in an `http.ResponseController`. It exposes `Flush()`, `SetReadDeadline()`, and `SetWriteDeadline()` through a clean API that works correctly with wrapped `ResponseWriter` types (middleware that embeds a `ResponseWriter` sometimes breaks type assertions):
+
+```go
+rc := http.NewResponseController(w)
+enc := json.NewEncoder(w)
+for _, xfer := range rows {
+    enc.Encode(xfer)
+    rc.Flush() // no type assertion needed
+}
+```
+
+</UnderTheHood>
+
+---
+
+## Server-Sent Events
+
+<Define term="server-sent events (SSE)">
+**Server-sent events** are a browser-native protocol for one-way, server-to-client streaming over a plain HTTP connection. The server sets `Content-Type: text/event-stream` and keeps the connection open, writing text frames (`id:`, `event:`, `data:`, blank line) as events happen. The client's `EventSource` API reconnects automatically using the last `id:` it saw. You need SSE when the server pushes data the client only reads — live dashboards, notifications, audit feeds — and you want the simplicity of HTTP (works through proxies and CDNs) without the complexity of WebSockets.
+</Define>
+
+Server-sent events (SSE) give you a **one-way live stream** from server to client. Think: Meridian's operations dashboard showing live transfer events without the client polling every second — new `POST /transfers` completions appear the moment they're processed. The client opens one HTTP connection and keeps reading; the server pushes updates as they happen.
+
+SSE uses plain HTTP with `Content-Type: text/event-stream`. Each event is a few lines of text terminated by a blank line. The browser (or any SSE client) reconnects automatically if the connection drops, using the last `id:` it received.
+
+**On the job:** SSE is the right tool for Meridian's ops dashboard — operations staff watch transfer completions and failure alerts in real time. It is not the right tool for the trading desk where clients also need to send back filter selections. Know which direction data flows before you pick the technology.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "time"
+)
+
+// TransferEvent is a completed Meridian transfer — pushed live to the ops dashboard.
+type TransferEvent struct {
+    ID          string
+    FromAccount string
+    ToAccount   string
+    AmountCents int64
+}
+
+// sseHandler streams live transfer completion events to the operations dashboard.
+func sseHandler(events <-chan TransferEvent) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        flusher, ok := w.(http.Flusher)
+        if !ok {
+            http.Error(w, "SSE not supported", http.StatusInternalServerError)
+            return
+        }
+
+        // SSE headers — these must be set before any Write.
+        w.Header().Set("Content-Type", "text/event-stream")
+        w.Header().Set("Cache-Control", "no-cache")
+        w.Header().Set("Connection", "keep-alive")
+        // CORS if needed: w.Header().Set("Access-Control-Allow-Origin", "*")
+
+        var eventID int
+        for {
+            select {
+            case <-r.Context().Done():
+                // Client disconnected or server shutting down.
+                return
+            case ev, ok := <-events:
+                if !ok {
+                    return // channel closed — stream is over
+                }
+                eventID++
+                // SSE format: id, event type, data, blank line.
+                fmt.Fprintf(w, "id: %d\n", eventID)
+                fmt.Fprintf(w, "event: transfer\n")
+                fmt.Fprintf(w, "data: {\"id\":%q,\"from\":%q,\"to\":%q,\"amount_cents\":%d}\n\n",
+                    ev.ID, ev.FromAccount, ev.ToAccount, ev.AmountCents)
+                flusher.Flush() // push this event to the client NOW
+            }
+        }
+    }
+}
+
+func main() {
+    // In production this channel is fed by Meridian's event bus / DB listener.
+    events := make(chan TransferEvent, 16)
+
+    // Simulate a feed of live transfer completions.
+    go func() {
+        for i := 1; ; i++ {
+            events <- TransferEvent{
+                ID:          fmt.Sprintf("TXN-%04d", i),
+                FromAccount: "ACC-100",
+                ToAccount:   "ACC-200",
+                AmountCents: int64(i * 1000),
+            }
+            time.Sleep(500 * time.Millisecond)
+        }
+    }()
+
+    mux := http.NewServeMux()
+    mux.Handle("GET /api/transfers/events", sseHandler(events))
+    http.ListenAndServe(":8080", mux)
+}
+```
+
+<Callout kind="note" title="SSE in the browser">
+
+The browser's built-in `EventSource` API opens the connection and handles reconnection automatically. `new EventSource('/api/events')` is all you need on the client side. On reconnect, the browser sends `Last-Event-ID` in the request header so your server can resume from where it left off — that's what the `id:` field is for. Long-running SSE connections in Go are cheap: each is one goroutine blocked on a channel select.
+
+</Callout>
+
+<ExecTimeline
+  title="SSE — server pushing live transaction events"
+  lanes={[{ id: "client", label: "client" }, { id: "srv", label: "server" }, { id: "bus", label: "event bus" }]}
+  steps={[
+    { lane: "client", kind: "send", label: "GET /api/transfers/events", note: "Ops dashboard opens one long-lived HTTP connection with Accept: text/event-stream." },
+    { lane: "srv", kind: "run", label: "set SSE headers", note: "Server sets Content-Type: text/event-stream and keeps the connection open." },
+    { lane: "bus", kind: "send", label: "TXN-0001 completes", note: "A transfer completion event is published to the event channel by the payments processor." },
+    { lane: "srv", kind: "send", label: "write event + flush", note: "Server formats the SSE frame (id/event/data) and flushes it to the client immediately." },
+    { lane: "client", kind: "recv", label: "receives event", note: "Dashboard's EventSource fires — transfer row appears in the UI. No polling round-trip." },
+    { lane: "bus", kind: "send", label: "TXN-0002 completes", note: "Next transfer published — the cycle repeats over the same open connection." },
+    { lane: "srv", kind: "done", label: "ctx.Done() → close", note: "On client disconnect or server shutdown, r.Context().Done() fires and the handler returns." },
+  ]}
+  caption="One persistent HTTP connection, Meridian transfer events pushed as they complete. No polling, no WebSocket upgrade."
+/>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="text/event-stream">The MIME type that tells the client this is an SSE stream. Required.</ConceptCard>
+  <ConceptCard label="id: N">The event identifier. Sent as Last-Event-ID on reconnect so the server can resume.</ConceptCard>
+  <ConceptCard label="event: type">Names the event. The client can listen for specific event types. Omit for default 'message'.</ConceptCard>
+  <ConceptCard label="data: ...">The payload — one or more data lines, terminated by a blank line.</ConceptCard>
+  <ConceptCard label="retry: N">Tells the client how many milliseconds to wait before reconnecting. Default ~3s.</ConceptCard>
+  <Gotcha>SSE is one-way — server to client only. If you need the client to send messages back (chat, interactive trades), use WebSockets instead.</Gotcha>
+</ConceptGrid>
+
+---
+
+## WebSockets
+
+<Define term="WebSocket">
+A **WebSocket** is a full-duplex, persistent connection between client and server. After an HTTP upgrade handshake, both ends can send frames at any time over a single TCP connection — no request/response cycle, no polling. You need it when the client and server both send in real time: Meridian's trading desk dealers send filter updates back to the server while the server pushes rate ticks to them. SSE only goes one way; WebSockets go both.
+</Define>
+
+Full-duplex. Bidirectional. One persistent connection, both ends sending whenever they want. For Meridian's trading desk — where dealers send filter updates (which currency pairs to watch) and the server pushes matching rate ticks in real time — this is your tool.
+
+WebSockets start as an HTTP request and upgrade to the WebSocket protocol. After the upgrade, the connection bypasses the normal HTTP request/response cycle entirely.
+
+**On the job:** WebSocket connections linger for hours. A server that doesn't enforce write deadlines will accumulate goroutines blocked on a single slow client. In a payments system, that slow client can be a mobile app on a flaky cellular connection — and it will block your goroutine until the TCP stack times out, which can take minutes.
+
+### The HTTP Upgrade handshake
+
+<Define term="the HTTP upgrade handshake">
+The **HTTP upgrade handshake** is how a plain HTTP connection becomes a WebSocket. The client sends `GET /ws` with `Upgrade: websocket`, `Connection: Upgrade`, and a `Sec-WebSocket-Key` header. The server validates the key and responds `101 Switching Protocols` — after which HTTP is over. The TCP connection is **hijacked** from `net/http` and handed directly to the WebSocket layer; frames (not HTTP packets) now flow in both directions. You need to understand this because after the 101, `net/http`'s `WriteTimeout` no longer applies — the connection is outside its control, and you must enforce deadlines yourself.
+</Define>
+
+```
+Client → GET /ws HTTP/1.1
+         Upgrade: websocket
+         Connection: Upgrade
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+         Sec-WebSocket-Version: 13
+
+Server → HTTP/1.1 101 Switching Protocols
+         Upgrade: websocket
+         Connection: Upgrade
+         Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+After the 101, HTTP is over. The TCP connection is **hijacked** from `net/http` and handed to the WebSocket layer. Frames (not HTTP packets) flow in both directions.
+
+### Using `coder/websocket`
+
+The `coder/websocket` package is context-aware, doesn't require goroutines for lifecycle management, and handles the upgrade cleanly. We'll use it here. (`gorilla/websocket` is the older alternative — battle-tested but not context-aware.)
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "log/slog"
+    "net/http"
+    "time"
+
+    "nhooyr.io/websocket"
+    "nhooyr.io/websocket/wsjson"
+)
+
+// MarketTick is a market-data update pushed to the client.
+type MarketTick struct {
+    Symbol    string  `json:"symbol"`
+    PriceCents int64  `json:"price_cents"`
+    Timestamp int64   `json:"ts"`
+}
+
+// ClientFilter is a message the client sends to adjust what it sees.
+type ClientFilter struct {
+    Symbols []string `json:"symbols"`
+}
+
+func wsHandler(ticks <-chan MarketTick) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // Accept upgrades the connection. Options control origins, compression.
+        c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+            OriginPatterns: []string{"localhost:*"},
+        })
+        if err != nil {
+            slog.Error("ws accept", "err", err)
+            return
+        }
+        defer c.CloseNow() // always clean up
+
+        ctx := r.Context()
+
+        // Read goroutine: receive filter updates from the client.
+        // Use context cancellation so it tears down when the write side dies.
+        readCtx, cancelRead := context.WithCancel(ctx)
+        defer cancelRead()
+
+        filterCh := make(chan ClientFilter, 1)
+        go func() {
+            defer cancelRead()
+            for {
+                var f ClientFilter
+                if err := wsjson.Read(readCtx, c, &f); err != nil {
+                    return // client closed or context done
+                }
+                select {
+                case filterCh <- f:
+                default: // drop if the handler is behind — market data is live
+                }
+            }
+        }()
+
+        // Current filter — starts accepting all symbols.
+        filter := ClientFilter{Symbols: []string{}}
+
+        // Write loop: push market ticks to the client.
+        for {
+            select {
+            case <-readCtx.Done():
+                c.Close(websocket.StatusNormalClosure, "bye")
+                return
+            case f := <-filterCh:
+                filter = f // update the active filter
+            case tick := <-ticks:
+                if !matchesFilter(tick, filter) {
+                    continue
+                }
+                // wsjson.Write encodes v as JSON in a Text frame.
+                writeCtx, cancel := context.WithTimeout(readCtx, 5*time.Second)
+                err := wsjson.Write(writeCtx, c, tick)
+                cancel()
+                if err != nil {
+                    return
+                }
+            }
+        }
+    }
+}
+
+func matchesFilter(tick MarketTick, f ClientFilter) bool {
+    if len(f.Symbols) == 0 {
+        return true // empty filter = accept all
+    }
+    for _, s := range f.Symbols {
+        if s == tick.Symbol {
+            return true
+        }
+    }
+    return false
+}
+```
+
+<Callout kind="note" title="Long-lived WS/SSE can't fully run in the Go Playground">
+
+The handlers above work perfectly under `httptest` for unit tests (shown in the exercises below). The playground sandbox terminates long-lived connections — label SSE and WebSocket code clearly in your tests and run them locally or in a containerized environment.
+
+</Callout>
+
+<GoPlayground>
+
+```go
+package main
+
+// WebSocket upgrade requires nhooyr.io/websocket which is not available
+// in the playground. The httptest-backed unit test below demonstrates
+// the handler logic using a mock connection.
+//
+// To run locally:
+//   go get nhooyr.io/websocket
+//   go test ./... -v
+//
+// The test in Exercise 5 shows the full httptest pattern.
+
+import "fmt"
+
+func main() {
+	fmt.Println("WebSocket handlers: run with 'go test' locally.")
+	fmt.Println("See Exercise 5 for the httptest-backed test pattern.")
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="WebSocket upgrade + bidirectional push"
+  lanes={[{ id: "client", label: "client" }, { id: "http", label: "HTTP layer" }, { id: "ws", label: "WS handler" }]}
+  steps={[
+    { lane: "client", kind: "send", label: "GET /ws (Upgrade)", note: "Client sends an HTTP GET with Upgrade: websocket and Sec-WebSocket-Key headers." },
+    { lane: "http", kind: "run", label: "101 Switching Protocols", note: "Server validates the key, responds 101. The HTTP layer is done — connection is hijacked." },
+    { lane: "ws", kind: "spawn", label: "ws handler + read goroutine start", note: "websocket.Accept returns a *websocket.Conn — the HTTP goroutine is now the WS goroutine — and spawns a separate read goroutine that reads client messages (filter updates) via wsjson.Read." },
+    { lane: "ws", kind: "send", label: "push MarketTick", note: "Write loop sends a market-data tick as a JSON text frame. No HTTP overhead." },
+    { lane: "client", kind: "recv", label: "receives tick", note: "Client receives the frame, updates the UI. Sends a filter update back." },
+    { lane: "ws", kind: "recv", label: "recv filter update", note: "Read goroutine picks up the client's filter message and updates the active filter." },
+    { lane: "ws", kind: "done", label: "close frame", note: "Either side sends a close frame. Handler calls c.Close(StatusNormalClosure). Connection terminates." },
+  ]}
+  caption="After the 101 upgrade, HTTP is gone. Frames flow freely in both directions over one TCP connection."
+/>
+
+### Read/write goroutine model and ping/pong
+
+WebSocket connections need keepalives: `ping` frames from the server, `pong` frames from the client. `coder/websocket` handles ping/pong automatically when you use its built-in `CloseRead` mechanism or set a read deadline. Always set a **write deadline** before writing to prevent a slow client from blocking your goroutine forever:
+
+```go
+// Always set a write deadline — a slow or malicious client holds the goroutine otherwise.
+writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+err := wsjson.Write(writeCtx, c, tick)
+cancel()
+if err != nil {
+    // Client too slow or gone — tear down the handler.
+    return
+}
+```
+
+### When to choose SSE vs WebSockets vs polling
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Polling">Simple. Client asks every N seconds. Works everywhere. Best for low-frequency, low-latency-requirement data (daily reports). Wastes bandwidth at high frequency.</ConceptCard>
+  <ConceptCard label="SSE (text/event-stream)">Server pushes one-way over HTTP. Works through proxies and CDNs. Best for live dashboards, notifications, audit feeds where the client only watches. Auto-reconnect built in.</ConceptCard>
+  <ConceptCard label="WebSockets">Full duplex. Client and server both send freely. Best for interactive real-time features: trading, collaborative editing, chat, multi-player. Proxy-hostile (needs upgrade support).</ConceptCard>
+  <Gotcha>WebSockets are overkill for dashboards that only receive data. SSE is simpler, proxy-friendly, and reconnects automatically. Reach for WebSockets only when the client genuinely needs to send messages back to the server in real time.</Gotcha>
+</ConceptGrid>
+
+<UnderTheHood title="HTTP hijacking and how WebSockets bypass net/http">
+
+When `websocket.Accept` (or `gorilla/websocket`'s `Upgrader.Upgrade`) is called, it uses `http.Hijacker` — an interface that `net/http`'s concrete `ResponseWriter` implements. `Hijack()` returns the raw `net.Conn` and a `bufio.ReadWriter`, removing the connection from `net/http`'s management entirely. From that moment on, `net/http` forgets about that connection: no more buffering, no more request/response framing, no timeout from `WriteTimeout`. The WebSocket library owns the `net.Conn` directly and reads/writes raw WebSocket frames (defined by RFC 6455).
+
+This is why `Server.WriteTimeout` does NOT protect WebSocket connections after the upgrade — the connection is no longer under `net/http`'s control. You must enforce write timeouts manually using `context.WithTimeout` on every write, as shown above. The `ReadTimeout` similarly has no effect post-upgrade; the WebSocket library's own read context handles it.
+
+`http.Hijacker` is only available on HTTP/1.1 connections. HTTP/2 has its own server-push mechanism and cannot be hijacked in the same way. Most WebSocket deployments use HTTP/1.1 for the upgrade specifically because of this. As of Go 1.26, `net/http` does not natively support WebSockets over HTTP/2.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="After a successful WebSocket upgrade (101 Switching Protocols), which net/http feature NO LONGER applies to the connection?"
+  options={[
+    "The ServeMux — it already dispatched the request before the upgrade",
+    "Server.WriteTimeout — the connection is hijacked and net/http no longer owns it",
+    "TLS encryption — WebSockets don't support wss://",
+    "The handler's goroutine — a new goroutine is always spawned post-upgrade"
+  ]}
+  answer={1}
+  explain="http.Hijacker removes the connection from net/http's management. WriteTimeout is enforced by net/http's buffered writer — once the connection is hijacked, that writer is gone. You must use context deadlines on every write yourself. TLS still applies (wss:// is WebSocket over TLS). No new goroutine is spawned — the existing handler goroutine becomes the WS goroutine."
+/>
+
+---
+
+## Server Hardening
+
+You've built the handler. You've wired the middleware. Now you're going to skip the part that every junior engineer skips — and that every security postmortem traces back. The default `http.Server` has **no timeouts**. None. A client that sends one byte per minute will hold a goroutine and a TCP connection open indefinitely. A thousand of them will stop your server from accepting legitimate traffic. This attack has a name: Slowloris. And it works on unprotected Go servers out of the box.
+
+**On the job:** You won't spot this in local dev or in a load test with well-behaved clients. It shows up in a production incident when someone opens 10,000 slow connections and your server stops accepting real traffic. Operations pages you. The postmortem says "no timeouts configured." Senior engineers set these reflexively.
+
+### The timeout knobs
+
+`http.Server` exposes five timeout fields. None of them have a default:
+
+| Field | What it covers | Recommended starting value |
+|---|---|---|
+| `ReadHeaderTimeout` | Time to receive the complete request headers | 5 s — set this first, always |
+| `ReadTimeout` | Time to receive headers + full request body | 10–30 s depending on expected payloads |
+| `WriteTimeout` | Time to write the full response | 30–60 s; for streaming/SSE, set to 0 and control per-write with `context.WithTimeout` |
+| `IdleTimeout` | How long a keep-alive connection may sit idle between requests | 60–120 s |
+| _(body cap)_ | `http.MaxBytesReader` on the request body | 1 MiB for API handlers; 0 for streaming |
+
+`ReadHeaderTimeout` is the cheap, must-set Slowloris mitigation: Go reads headers in a tight loop from the TCP buffer, so this timeout fires before any user-land handler code runs. It costs almost nothing but closes the attack surface.
+
+`ReadTimeout` covers the entire read phase including the body. For handlers that stream large uploads, set `ReadTimeout` to 0 and use `http.MaxBytesReader` to cap individual request bodies instead.
+
+`WriteTimeout` covers the write phase. Set it to 0 for SSE and WebSocket handlers — those connections intentionally live beyond a normal write window, and the handlers control their own deadlines per-write via `context.WithTimeout`.
+
+### Capping request bodies with `http.MaxBytesReader`
+
+Even with `ReadTimeout` set, an attacker can send a 2 GB request body inside the timeout window if your upstream connection is fast. `http.MaxBytesReader` wraps the body's `Read` method and returns an error the moment the byte count exceeds your limit:
+
+```go
+// In every handler that decodes a request body:
+r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB cap
+```
+
+For multipart uploads (file ingestion, NACHA batch files), do not load the entire multipart into memory. Use `r.ParseMultipartForm(maxMemory)` — it spills to a temp file on disk when the in-memory threshold is exceeded — and validate each part's size before reading:
+
+```go
+// Cap multipart memory to 32 MiB; larger parts spill to temp files.
+if err := r.ParseMultipartForm(32 << 20); err != nil {
+    http.Error(w, "bad multipart", http.StatusBadRequest)
+    return
+}
+file, header, err := r.FormFile("upload")
+if err != nil {
+    http.Error(w, "missing file", http.StatusBadRequest)
+    return
+}
+defer file.Close()
+// Validate the stated size — do NOT trust Content-Length alone.
+if header.Size > 100<<20 { // 100 MiB hard cap per file
+    http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
+    return
+}
+```
+
+A client that omits `Content-Length` and streams slowly can still OOM a server that reads multipart naively. Cap every part before reading.
+
+### Secure response headers as middleware
+
+Timeouts and body caps protect the *server*. The next layer protects the *client* — specifically, the browser that renders responses from Meridian's API and its admin console. A handful of response headers tell the browser to refuse a list of attacks it would otherwise happily perform on your users' behalf. They cost nothing to set and they belong in **one** middleware applied to every route — not sprinkled per-handler where someone will forget half of them.
+
+<Define term="secure response headers" since="HTTP Servers: JSON, Streaming & WebSockets (this chapter)">
+**Secure response headers** are HTTP response headers that instruct the browser to enforce a security policy on the content you return — which scripts may run (`Content-Security-Policy`), whether to second-guess your declared content type (`X-Content-Type-Options`), how much referrer information to leak (`Referrer-Policy`), and who may embed your pages in a frame (`X-Frame-Options` / CSP `frame-ancestors`). You need them because the browser's *defaults* are permissive for backwards compatibility, and a single missing header is the difference between an XSS payload that fizzles and one that drains an account.
+</Define>
+
+The four that matter most for a JSON/admin surface like Meridian's:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="X-Content-Type-Options: nosniff">Forbids **MIME sniffing** — the browser guessing a response's type by peeking at its bytes instead of trusting your `Content-Type`. Without it, a JSON endpoint that reflects user input can be coaxed into being interpreted as HTML/JavaScript. `nosniff` makes the browser honor the declared type, full stop.</ConceptCard>
+  <ConceptCard label="Content-Security-Policy">An allowlist of where scripts, styles, images and frames may load from. A strict policy like `default-src 'none'` on a pure JSON API means even if an attacker reflects a `<script>` into a response, the browser refuses to execute it — CSP is the backstop that turns "XSS" into "nothing happened."</ConceptCard>
+  <ConceptCard label="Referrer-Policy">Controls how much of the current URL is sent in the `Referer` header on outbound requests. For a fintech app, a URL can carry an account ID or a one-time token; `no-referrer` or `strict-origin-when-cross-origin` stops that from leaking to third-party domains and analytics.</ConceptCard>
+  <ConceptCard label="X-Frame-Options / frame-ancestors">Stops **clickjacking**: an attacker embedding Meridian's console in an invisible iframe on their own page and tricking a logged-in user into clicking a transfer button. `X-Frame-Options: DENY` (and its modern CSP equivalent `frame-ancestors 'none'`) forbids framing entirely.</ConceptCard>
+  <Gotcha>Set these in middleware, before the handler writes anything. Once a handler calls `w.Write` the headers are frozen and sent — a security-headers middleware that runs *after* the body is written sets nothing. It must wrap the handler and set headers on the way in.</Gotcha>
+</ConceptGrid>
+
+The middleware is tiny — it sets the headers on `w.Header()` and then calls the inner handler. Because it sets headers *before* `next.ServeHTTP` writes the body, the headers are in place when the response is flushed:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// secureHeaders sets defensive response headers on every request, then
+// calls the next handler. It runs on the way IN, so the headers are set
+// before the inner handler writes the body and freezes them.
+func secureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		// Don't MIME-sniff — honor the declared Content-Type.
+		h.Set("X-Content-Type-Options", "nosniff")
+		// Pure JSON API: forbid loading any sub-resource, and forbid framing.
+		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		// Belt-and-braces clickjacking defense for older browsers.
+		h.Set("X-Frame-Options", "DENY")
+		// Don't leak account IDs or tokens in the URL to other origins.
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func getAccount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"account":"ACC-100","balance_cents":420000}`)
+}
+
+func main() {
+	// Wrap the mux once — every route inherits the headers. (Here we wrap a
+	// single handler for a self-contained demo; in production secureHeaders
+	// wraps the whole mux: secureHeaders(mux).)
+	h := secureHeaders(http.HandlerFunc(getAccount))
+
+	req := httptest.NewRequest("GET", "/api/accounts/ACC-100", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	for _, k := range []string{
+		"X-Content-Type-Options",
+		"Content-Security-Policy",
+		"X-Frame-Options",
+		"Referrer-Policy",
+	} {
+		fmt.Printf("%-24s %s\n", k+":", rec.Header().Get(k))
+	}
+	fmt.Println("body:", rec.Body.String())
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="Tune CSP to the surface — a JSON API is not an SPA">
+
+`default-src 'none'` is the correct, locked-down policy for a **pure JSON API** that never renders HTML. The moment you serve an actual web app (the admin console, a docs page), `'none'` will break it — the browser will refuse to load your own scripts and styles. Then you loosen it deliberately: `default-src 'self'; script-src 'self'; frame-ancestors 'none'`, and add explicit origins for any CDN you actually use. The principle is the same as least-privilege scopes in OAuth2 — start at `none`, open exactly what the page needs, and nothing more. Auth & API Design (Chapter 20) covers the CSRF/`SameSite` side of browser hardening that pairs with these headers.
+
+</Callout>
+
+### Hardened server: before and after
+
+<BeforeAfter
+  badLabel="Default — no timeouts (Slowloris bait)"
+  goodLabel="Hardened — all knobs set"
+  bad={`srv := &http.Server{
+  Addr:    ":8080",
+  Handler: mux,
+  // No timeouts. A Slowloris client opens
+  // 10k slow connections and your server
+  // stops accepting real traffic.
+  // GOMAXPROCS goroutines are stuck reading
+  // one byte per minute from attackers.
+}`}
+  good={`srv := &http.Server{
+  Addr:    ":8080",
+  Handler: mux,
+
+  // Slowloris mitigation — must-set.
+  ReadHeaderTimeout: 5 * time.Second,
+
+  // Full read phase including body.
+  ReadTimeout: 30 * time.Second,
+
+  // Write phase. Set 0 for SSE/WS routes
+  // and control per-write via ctx deadline.
+  WriteTimeout: 30 * time.Second,
+
+  // Idle keep-alive connections.
+  IdleTimeout: 120 * time.Second,
+}`}
+/>
+
+<Callout kind="warn" title="WriteTimeout and streaming don't mix">
+
+If you set `WriteTimeout` to 30 s on a server that also handles SSE or WebSocket connections, those handlers will be forcibly closed after 30 seconds — regardless of whether they're still actively pushing data. The fix: use a single `http.Server` for short-lived API routes with a `WriteTimeout`, and a **separate `http.Server`** on a different port (or route prefix) for streaming/WebSocket routes with `WriteTimeout: 0`. The streaming handlers control their own write deadlines per-message via `context.WithTimeout`.
+
+</Callout>
+
+<UnderTheHood title="How net/http enforces timeouts">
+
+Timeouts in `http.Server` are implemented via `net.Conn.SetDeadline` on the underlying TCP connection. When `ReadHeaderTimeout` is set, the `conn.serve` goroutine calls `SetReadDeadline` before entering the header-read loop, then resets it to zero (or applies `ReadTimeout`) after headers are read. When `WriteTimeout` is set, it calls `SetWriteDeadline` before calling `ServeHTTP`. Because these are set on the `net.Conn` directly, they fire at the OS level — blocked `Read` and `Write` calls return `net.Error` with `Timeout() == true`. This is why a `WriteTimeout` fires even if your handler is in a `json.Encode` call — the underlying `Write` syscall times out.
+
+For WebSocket connections, `Hijack()` hands you the raw `net.Conn`, and the server no longer sets deadlines on it. You call `SetDeadline` yourself (or use `context.WithTimeout` which the WebSocket library translates to a deadline under the hood). As of Go 1.26, this behaviour is unchanged from Go 1.22. (This is a conceptual model; exact implementation details are subject to change between Go versions.)
+
+</UnderTheHood>
+
+<Callout kind="pro" title="Cross-ref: reliability patterns">
+
+The timeout values here are starting points, not gospel. The Reliability Patterns chapter (Part 2) covers how to tune `ReadTimeout` and `WriteTimeout` in the context of p99 latency budgets, circuit breakers, and retry back-off — because the right value for a batch-import endpoint is nothing like the right value for a health-check endpoint. See [Reliability Patterns](/part-2/reliability-patterns).
+
+</Callout>
+
+<QuickCheck
+  question={'Which http.Server timeout field is the cheap, must-set Slowloris mitigation — and why?'}
+  options={[
+    "IdleTimeout — it closes connections that sit idle between requests",
+    "WriteTimeout — it limits how long a response can take to send",
+    "ReadHeaderTimeout — it fires before any handler code runs, aborting slow header delivery at the OS level",
+    "ReadTimeout — it covers the full request including the body"
+  ]}
+  answer={2}
+  explain="ReadHeaderTimeout fires before ServeHTTP is ever called, directly on the TCP connection via SetReadDeadline. A Slowloris client sends headers one byte per minute, holding the goroutine in the header-read loop indefinitely. ReadHeaderTimeout caps that loop. It is cheap (no per-request overhead) and correct (the handler never sees the connection). IdleTimeout handles idle keep-alive, not slow header attacks. ReadTimeout also works but is coarser — it resets after headers arrive, leaving a window for a slow-header attack during the header phase."
+/>
+
+---
+
+## Exercises
+
+Stop nodding. Start coding. I set the bar, and the bar does not lower for anyone.
+
+<Exercise n={1} title="Middleware that logs response status codes" level="easy">
+
+Write a `statusLogging` middleware with signature `func(http.Handler) http.Handler`. It must capture the HTTP response status code written by the inner handler and log it with `slog.Info`. Hint: wrap `http.ResponseWriter` in a struct that overrides `WriteHeader`.
+
+<Solution>
+
+```go
+package main
+
+import (
+    "log/slog"
+    "net/http"
+    "net/http/httptest"
+    "fmt"
+)
+
+type statusRecorder struct {
+    http.ResponseWriter
+    status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+    sr.status = code
+    sr.ResponseWriter.WriteHeader(code)
+}
+
+func statusLogging(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+        next.ServeHTTP(rec, r)
+        slog.Info("response", "method", r.Method, "path", r.URL.Path,
+            "status", rec.status)
+    })
+}
+
+func main() {
+    h := statusLogging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusTeapot)
+        fmt.Fprintln(w, "I'm a teapot")
+    }))
+
+    req := httptest.NewRequest("GET", "/brew", nil)
+    w := httptest.NewRecorder()
+    h.ServeHTTP(w, req)
+    fmt.Println("status:", w.Code) // 418
+}
+```
+
+The key insight: `WriteHeader` is the only way to set the status code. If the inner handler never calls it explicitly, the default 200 is used when the first `Write` happens. We initialize `status` to 200 so a handler that skips `WriteHeader` still logs correctly.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Safe JSON decode helper" level="easy">
+
+Write a `decodeJSON[T any](r *http.Request) (T, error)` generic function that limits the body to 512 KB, disallows unknown fields, and returns the decoded value or an error. No `http.ResponseWriter` in the signature — just parse and return.
+
+<Solution>
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http/httptest"
+    "strings"
+)
+
+func decodeJSON[T any](r interface{ Body io.ReadCloser }) (T, error) {
+    var zero T
+    // We can't call MaxBytesReader without a ResponseWriter, so use LimitReader.
+    limited := io.LimitReader(r.Body, 512<<10)
+    d := json.NewDecoder(limited)
+    d.DisallowUnknownFields()
+    var v T
+    if err := d.Decode(&v); err != nil {
+        return zero, fmt.Errorf("decode: %w", err)
+    }
+    return v, nil
+}
+
+type CreateAccountReq struct {
+    OwnerName string `json:"owner_name"`
+    Currency  string `json:"currency"`
+}
+
+func main() {
+    body := strings.NewReader(`{"owner_name":"Alice","currency":"USD"}`)
+    req := httptest.NewRequest("POST", "/api/accounts", body)
+
+    got, err := decodeJSON[CreateAccountReq](req)
+    fmt.Println(err, got) // <nil> {Alice USD}
+
+    // Unknown field — should error.
+    body2 := strings.NewReader(`{"owner_name":"Bob","currency":"USD","evil":true}`)
+    req2 := httptest.NewRequest("POST", "/api/accounts", body2)
+    _, err2 := decodeJSON[CreateAccountReq](req2)
+    fmt.Println("unknown field err:", err2 != nil) // true
+}
+```
+
+Generics make the decode helper reusable for any request shape without reflection tricks or `interface{}`. The caller gets a fully typed result.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Custom JSON marshaler for a Money type" level="medium">
+
+Implement `MarshalJSON` and `UnmarshalJSON` on a `Money int64` type so that `1234` marshals to the string `"12.34"` and back. Negative amounts (`-1234`) should marshal to `"-12.34"`. Write a round-trip test in `main`.
+
+<Solution>
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+)
+
+type Money int64
+
+func (m Money) MarshalJSON() ([]byte, error) {
+    sign := ""
+    v := int64(m)
+    if v < 0 {
+        sign = "-"
+        v = -v
+    }
+    s := fmt.Sprintf("%s%d.%02d", sign, v/100, v%100)
+    return json.Marshal(s)
+}
+
+func (m *Money) UnmarshalJSON(data []byte) error {
+    var s string
+    if err := json.Unmarshal(data, &s); err != nil {
+        return fmt.Errorf("Money: expected string, got: %w", err)
+    }
+    neg := false
+    if len(s) > 0 && s[0] == '-' {
+        neg = true
+        s = s[1:]
+    }
+    var d, c int64
+    if _, err := fmt.Sscanf(s, "%d.%02d", &d, &c); err != nil {
+        return fmt.Errorf("Money: bad format %q", s)
+    }
+    result := d*100 + c
+    if neg {
+        result = -result
+    }
+    *m = Money(result)
+    return nil
+}
+
+func main() {
+    cases := []Money{0, 1234, -1234, 100, 9999}
+    for _, m := range cases {
+        b, err := json.Marshal(m)
+        if err != nil {
+            fmt.Printf("marshal %d: err %v\n", m, err)
+            continue
+        }
+        var m2 Money
+        if err := json.Unmarshal(b, &m2); err != nil {
+            fmt.Printf("unmarshal %s: err %v\n", b, err)
+            continue
+        }
+        ok := m == m2
+        fmt.Printf("% 6d → %s → % 6d  round-trip=%v\n", m, b, m2, ok)
+    }
+}
+```
+
+The negative case is the tricky one: after the sign is stripped, `Sscanf` parses the magnitude, and we negate at the end. Don't try `%d.%02d` on a negative string — the format doesn't handle the sign.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="NDJSON streaming statement handler with httptest" level="medium">
+
+Write an `http.HandlerFunc` that streams a slice of Meridian transfers as NDJSON (the account-statement export), one per line, with a flush after each. Test it using `httptest.NewRecorder`. Parse each line from the response body individually to verify the format is correct.
+
+<Solution>
+
+```go
+package main
+
+import (
+    "bufio"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "net/http/httptest"
+    "strings"
+)
+
+// Transfer is Meridian's statement row.
+type Transfer struct {
+    ID          string `json:"id"`
+    AmountCents int64  `json:"amount_cents"`
+}
+
+func statementHandler(xfers []Transfer) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/x-ndjson")
+        rc := http.NewResponseController(w)
+        enc := json.NewEncoder(w)
+        for _, xfer := range xfers {
+            if err := enc.Encode(xfer); err != nil {
+                return
+            }
+            rc.Flush() // push each row immediately
+        }
+    }
+}
+
+func main() {
+    xfers := []Transfer{
+        {ID: "TXN-001", AmountCents: 1000},
+        {ID: "TXN-002", AmountCents: -500},
+        {ID: "TXN-003", AmountCents: 25000},
+    }
+
+    req := httptest.NewRequest("GET", "/api/accounts/ACC-100/statement", nil)
+    w := httptest.NewRecorder()
+    statementHandler(xfers)(w, req)
+
+    fmt.Println("status:", w.Code) // 200
+
+    scanner := bufio.NewScanner(strings.NewReader(w.Body.String()))
+    var decoded []Transfer
+    for scanner.Scan() {
+        line := scanner.Text()
+        var xfer Transfer
+        if err := json.Unmarshal([]byte(line), &xfer); err != nil {
+            fmt.Println("parse err:", err)
+            continue
+        }
+        decoded = append(decoded, xfer)
+    }
+    fmt.Printf("received %d transfers\n", len(decoded))
+    for _, xfer := range decoded {
+        fmt.Printf("  %s: %d cents\n", xfer.ID, xfer.AmountCents)
+    }
+}
+```
+
+`bufio.Scanner` splits on newlines by default — exactly right for NDJSON. Each scan gives one complete JSON object. Note the use of `http.NewResponseController(w).Flush()` (Go 1.20+) instead of a type assertion to `http.Flusher` — it works correctly even when the `ResponseWriter` is wrapped by middleware. The `httptest.Recorder` implements the interface; the call is a no-op but the pattern is identical to production.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="WebSocket echo server with httptest" level="hard">
+
+Using `nhooyr.io/websocket` (or `gorilla/websocket`), write a WebSocket echo handler that reads a JSON message from the client, appends `" (echoed)"` to a `text` field, and writes it back. Test it with `httptest.NewServer` (WebSocket requires a real TCP listener — `httptest.NewRecorder` won't do). The test should upgrade, send a message, read the echo, and close cleanly.
+
+<Solution>
+
+```go
+// NOTE: run locally with: go get nhooyr.io/websocket
+// This will not compile in the playground — nhooyr.io/websocket is an external dep.
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net/http"
+    "net/http/httptest"
+
+    "nhooyr.io/websocket"
+    "nhooyr.io/websocket/wsjson"
+)
+
+type Msg struct {
+    Text string `json:"text"`
+}
+
+func echoHandler(w http.ResponseWriter, r *http.Request) {
+    c, err := websocket.Accept(w, r, nil)
+    if err != nil {
+        return
+    }
+    defer c.CloseNow()
+    ctx := r.Context()
+
+    var m Msg
+    if err := wsjson.Read(ctx, c, &m); err != nil {
+        return
+    }
+    m.Text += " (echoed)"
+    wsjson.Write(ctx, c, m)
+    c.Close(websocket.StatusNormalClosure, "")
+}
+
+func main() {
+    srv := httptest.NewServer(http.HandlerFunc(echoHandler))
+    defer srv.Close()
+
+    // Convert http:// to ws://
+    wsURL := "ws" + srv.URL[len("http"):]
+
+    ctx := context.Background()
+    c, _, err := websocket.Dial(ctx, wsURL, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer c.CloseNow()
+
+    if err := wsjson.Write(ctx, c, Msg{Text: "hello"}); err != nil {
+        log.Fatal(err)
+    }
+
+    var reply Msg
+    if err := wsjson.Read(ctx, c, &reply); err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(reply.Text) // hello (echoed)
+    c.Close(websocket.StatusNormalClosure, "")
+}
+```
+
+`httptest.NewServer` starts a real TCP listener — required for WebSockets because the upgrade needs an actual connection to hijack. The URL swap from `http://` to `ws://` tells the dialer to speak WebSocket. For TLS, use `httptest.NewTLSServer` and `wss://`.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Right. Exercises were your warmup, sport. This is *my* test. I designed it myself, and I'm personally invested in your failure rate. Don't disappoint me.
+
+<Lab
+  title="Stream it or memory-die"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={10}
+  verify="self-check"
+  objective="Meridian's account-statement export is using json.Marshal on the full transfer result set, spiking to 400 MB per request at month-end. Your job: rewrite it as a streaming NDJSON handler using json.Encoder and http.Flusher. The self-check prints PASS or FAIL for each condition: (1) the response Content-Type is application/x-ndjson, (2) each line is a valid JSON object, (3) the POST /transfers handler rejects unknown fields with 400, and (4) a 1 MB+ body is rejected with 400."
+  starter={`package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+type Transfer struct {
+	ID          string \`json:"id"\`
+	AmountCents int64  \`json:"amount_cents"\`
+	Reference   string \`json:"reference,omitempty"\`
+}
+
+// BUG: marshals everything into memory before writing.
+// Replace with a streaming NDJSON implementation.
+func exportHandler(txs []Transfer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := json.Marshal(txs)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+	}
+}
+
+// BUG: does not limit body size and accepts unknown fields.
+func createTransferHandler(w http.ResponseWriter, r *http.Request) {
+	var req Transfer
+	json.NewDecoder(r.Body).Decode(&req)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func check(label string, ok bool) {
+	if ok {
+		fmt.Printf("PASS  %s\n", label)
+	} else {
+		fmt.Printf("FAIL  %s\n", label)
+	}
+}
+
+func main() {
+	txs := []Transfer{
+		{ID: "TXN-001", AmountCents: 5000},
+		{ID: "TXN-002", AmountCents: -1000},
+	}
+
+	// Check 1: Content-Type is application/x-ndjson
+	req1 := httptest.NewRequest("GET", "/api/accounts/ACC-100/statement", nil)
+	w1 := httptest.NewRecorder()
+	exportHandler(txs)(w1, req1)
+	check("Content-Type is application/x-ndjson",
+		w1.Header().Get("Content-Type") == "application/x-ndjson")
+
+	// Check 2: each line is a valid JSON object
+	scanner := bufio.NewScanner(strings.NewReader(w1.Body.String()))
+	validLines := 0
+	for scanner.Scan() {
+		var t Transfer
+		if json.Unmarshal([]byte(scanner.Text()), &t) == nil {
+			validLines++
+		}
+	}
+	check("each line is a valid JSON object", validLines == len(txs))
+
+	// Check 3: unknown field rejected with 400
+	body3 := strings.NewReader(\`{"id":"TXN-X","amount_cents":100,"evil":true}\`)
+	req3 := httptest.NewRequest("POST", "/api/transfers", body3)
+	w3 := httptest.NewRecorder()
+	createTransferHandler(w3, req3)
+	check("unknown field → 400", w3.Code == http.StatusBadRequest)
+
+	// Check 4: oversized body rejected with 400
+	bigBody := bytes.Repeat([]byte("x"), 1<<20+1)
+	req4 := httptest.NewRequest("POST", "/api/transfers", bytes.NewReader(bigBody))
+	w4 := httptest.NewRecorder()
+	createTransferHandler(w4, req4)
+	check("1MB+ body → 400", w4.Code == http.StatusBadRequest)
+}`}
+  hints={[
+    "exportHandler: set Content-Type to application/x-ndjson. Use json.NewEncoder(w) inside the loop and call flusher.Flush() after each Encode. Get the flusher with: flusher, ok := w.(http.Flusher).",
+    "createTransferHandler: wrap r.Body with http.MaxBytesReader(w, r.Body, 1<<20) before creating the decoder. Then call d.DisallowUnknownFields() on the json.NewDecoder.",
+    "The self-check's exportHandler call uses httptest.ResponseRecorder — it implements http.Flusher, so your type assertion will succeed and Flush() is a no-op. The pattern is identical to production."
+  ]}
+  flag="GO{stream_dont_buffer_reject_unknown_fields}"
+>
+
+The buffered version is a memory time bomb. The safe-decode version is the door you close before the attacker walks through. Make both changes. When all four self-checks print PASS, you've earned the flag. No partial credit.
+
+</Lab>
+
+---
+
+<Recap>
+
+You now own the full HTTP server stack — and the hardening layer that seniors set without being asked:
+
+- **`http.Handler` / `HandlerFunc`** — the one interface; every handler, middleware, and mux satisfies it. Go 1.22's `ServeMux` adds method + path patterns and `r.PathValue` wildcards. Go 1.26 changes automatic subtree-root slash redirects from 301 to 307.
+- **Middleware** as `func(http.Handler) http.Handler` — wraps handlers, runs code before/after, short-circuits with `return`. Chain with a helper; order matters (outermost runs first in, last out).
+- **Graceful shutdown** via `Server.Shutdown(ctx)` — drains in-flight requests, stops accepting new ones; wire to `os.Interrupt` and `SIGTERM`.
+- **Custom JSON marshalers** give you full control over serialization. `json.RawMessage` defers decoding for polymorphic payloads. `omitempty` is a struct footgun — use pointers when you need true absence. `encoding/json/v2` (Go 1.25 experimental) improves performance and strictness; watch its graduation.
+- **Safe JSON decoding**: `http.MaxBytesReader` limits body size, `DisallowUnknownFields` rejects unknown keys, and a typed struct enforces the schema. Three lines that close a class of vulnerabilities. Go 1.25 adds `net/http.CrossOriginProtection` for CSRF on state-mutating routes.
+- **NDJSON streaming** with `json.Encoder` + `http.ResponseController.Flush()` keeps memory flat for large result sets (Meridian's statement export). Each row is encoded and flushed immediately — the client receives data before the query finishes.
+- **SSE** (`text/event-stream`) is one-way server push over plain HTTP — Meridian's ops dashboard uses it for live transfer events. Auto-reconnects via `Last-Event-ID`. One goroutine per connection, blocked on a channel select.
+- **WebSockets** are full-duplex after the HTTP 101 Upgrade handshake. `http.Hijacker` removes the connection from `net/http`'s control — `WriteTimeout` no longer applies. Use context deadlines on every write. Read goroutine + write loop is the standard model.
+- **Server hardening**: `ReadHeaderTimeout` (set this first — Slowloris mitigation), `ReadTimeout`, `WriteTimeout`, `IdleTimeout` — none have defaults. `http.MaxBytesReader` caps request bodies. `ParseMultipartForm` spills large uploads to disk. A separate server instance for streaming routes avoids `WriteTimeout` killing long-lived connections.
+- **Secure response headers** in one middleware: `X-Content-Type-Options: nosniff` (no MIME sniffing), a strict `Content-Security-Policy` (`default-src 'none'` for a pure JSON API), `Referrer-Policy` (don't leak account IDs/tokens), and `X-Frame-Options: DENY` / CSP `frame-ancestors 'none'` (anti-clickjacking). Set them on the way in, before the handler freezes the headers.
+
+</Recap>
+
+<Scoreboard
+  streak={16}
+  items={[
+    { label: "Quick check — Go 1.22 ServeMux routing", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — safe JSON decode combination", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — WebSocket post-upgrade behavior", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — server hardening timeout knobs", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Middleware: log response status", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — Generic safe JSON decode helper", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Custom Money marshaler", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — NDJSON streaming handler", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — WebSocket echo server", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Stream it or memory-die", captured: false, points: 80 }}
+/>
+
+Not bad. Genuinely — that's a lot of surface area and you're still standing. Now go build something that doesn't explode at 40,000 rows. I'll be watching.

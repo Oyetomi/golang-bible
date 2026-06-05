@@ -1,0 +1,1793 @@
+---
+title: "Project: A Blog Aggregator Backend"
+part: 1
+order: 23
+type: "project"
+description: "Tie together HTTP + SQL + auth with deliberate API design and a caching layer into a real backend service, fully tested."
+prerequisites: ["caching-redis"]
+---
+
+<HeroCard label="Part 1 · Chapter 23" title="Project: A Blog Aggregator Backend">
+
+You've been patient. You've sat through HTTP, SQL, auth, API design, concurrency, and caching. All the pieces are on the board. Now we're going to *play the game.*
+
+This chapter is where you build **Gator** — a real backend service that fetches RSS feeds concurrently, stores posts in Postgres, gates everything behind auth, and serves a paginated personal feed with a Redis caching layer. Not a toy. Not a stripped-down demo. A service you could deploy right now.
+
+<Define term="Gator — the blog aggregator">
+**Gator** is a backend service that lets users subscribe to RSS/Atom feeds and read a unified personal post feed. Under the hood a background worker continuously fetches every registered feed, deduplicates posts by URL, and stores them in Postgres. Users authenticate with an API key; the HTTP layer serves their personal feed, paginated and cached. The domain is simple so the **architecture is the lesson**: HTTP + SQL + auth + concurrency + caching, all wired together correctly.
+</Define>
+
+Six stages. Fully tested — table-driven handlers, `httptest` mock feed servers, `-race` on the scraper and cache, golden-file API response tests. I designed this project personally, and I have *very* strong opinions about the final result.
+
+**A note on the scenario:** Gator is deliberately *outside* Meridian's payments domain. It is a standalone project whose sole purpose is to exercise HTTP + SQL + auth + caching + concurrency — the full Part 1 toolkit — on a domain simple enough that the architecture is the lesson, not the business rules. The Meridian ledger resumes in Part 3. Everything you learn here transfers directly.
+
+You're lucky to have me.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Schema and Layout", "Auth Middleware", "HTTP API", "Concurrent Feed Fetcher", "Caching Layer", "Testing Suite"]} />
+
+---
+
+## Schema and Layout
+
+Before a single HTTP handler is written, we need a firm foundation: the database schema, the project layout, and the data-access layer. This is the architectural skeleton — get it wrong here and every layer above wobbles.
+
+### The scenario
+
+Gator lets users register accounts, subscribe to RSS/Atom feeds, and read a personalized post feed. Under the hood a background worker continuously scrapes every registered feed concurrently. The architecture has three concerns that must stay separate: **storage** (Postgres), **transport** (HTTP), and **background work** (the scraper). Our project layout will make those boundaries explicit.
+
+<Scene
+  title="Feed scraper: serial (slow) → bounded worker pool (fast)"
+  actors={[
+    { id: "loop", label: "scrape loop" },
+    { id: "w1", label: "worker 1" },
+    { id: "w2", label: "worker 2" },
+    { id: "w3", label: "worker 3" }
+  ]}
+  cells={[
+    { id: "A1", label: "feed 1" },
+    { id: "A2", label: "feed 2" },
+    { id: "A3", label: "feed 3" },
+    { id: "A4", label: "feed 4" },
+    { id: "A5", label: "feed 5" }
+  ]}
+  rows={1}
+  cols={5}
+  frames={[
+    {
+      caption: "Ticker fires. 5 feeds registered. The scrape loop begins fetching them one at a time.",
+      beat: "problem",
+      actors: [{ id: "loop", state: "active" }],
+      cells: [
+        { id: "A1", state: "active", label: "fetching" },
+        { id: "A2", state: "idle", label: "waiting" },
+        { id: "A3", state: "idle", label: "waiting" },
+        { id: "A4", state: "idle", label: "waiting" },
+        { id: "A5", state: "idle", label: "waiting" }
+      ]
+    },
+    {
+      caption: "Serial: feed 1 must finish before feed 2 starts. A slow server stalls everything behind it.",
+      beat: "problem",
+      actors: [{ id: "loop", state: "warn" }],
+      cells: [
+        { id: "A1", state: "bad", label: "slow!" },
+        { id: "A2", state: "idle", label: "blocked" },
+        { id: "A3", state: "idle", label: "blocked" },
+        { id: "A4", state: "idle", label: "blocked" },
+        { id: "A5", state: "idle", label: "blocked" }
+      ]
+    },
+    {
+      caption: "With a bounded worker pool (3 workers): ticker fires, all 3 slots fill immediately.",
+      beat: "solution",
+      actors: [
+        { id: "loop", state: "ok" },
+        { id: "w1", state: "active" },
+        { id: "w2", state: "active" },
+        { id: "w3", state: "active" }
+      ],
+      cells: [
+        { id: "A1", state: "active", label: "w1" },
+        { id: "A2", state: "active", label: "w2" },
+        { id: "A3", state: "active", label: "w3" },
+        { id: "A4", state: "idle", label: "queued" },
+        { id: "A5", state: "idle", label: "queued" }
+      ]
+    },
+    {
+      caption: "Worker 1 finishes feed 1 and releases its semaphore slot — feed 4 starts immediately.",
+      beat: "solution",
+      actors: [
+        { id: "w1", state: "ok" },
+        { id: "w2", state: "active" },
+        { id: "w3", state: "active" }
+      ],
+      cells: [
+        { id: "A1", state: "done", label: "done" },
+        { id: "A2", state: "active", label: "w2" },
+        { id: "A3", state: "active", label: "w3" },
+        { id: "A4", state: "active", label: "w1" },
+        { id: "A5", state: "idle", label: "queued" }
+      ]
+    },
+    {
+      caption: "All 5 feeds scraped. The semaphore kept concurrency at 3 regardless of feed count.",
+      beat: "solution",
+      actors: [
+        { id: "loop", state: "ok" },
+        { id: "w1", state: "done" },
+        { id: "w2", state: "done" },
+        { id: "w3", state: "done" }
+      ],
+      cells: [
+        { id: "A1", state: "done", label: "done" },
+        { id: "A2", state: "done", label: "done" },
+        { id: "A3", state: "done", label: "done" },
+        { id: "A4", state: "done", label: "done" },
+        { id: "A5", state: "done", label: "done" }
+      ]
+    }
+  ]}
+  caption="The worker pool is the same bounded-parallelism pattern from Concurrency (Part 1, Chapter 4) — applied to outbound HTTP instead of CPU work."
+/>
+
+### Project layout
+
+```
+gator/
+├── cmd/
+│   └── gator/
+│       └── main.go          // wires everything together; graceful shutdown
+├── internal/
+│   ├── database/            // sqlc-generated data-access code
+│   │   ├── db.go
+│   │   ├── models.go
+│   │   ├── accounts.sql.go
+│   │   ├── feeds.sql.go
+│   │   └── posts.sql.go
+│   ├── auth/                // JWT / API-key middleware
+│   │   ├── auth.go
+│   │   └── auth_test.go
+│   ├── api/                 // HTTP handlers and router
+│   │   ├── server.go
+│   │   ├── accounts.go
+│   │   ├── feeds.go
+│   │   ├── posts.go
+│   │   └── handlers_test.go
+│   ├── scraper/             // concurrent feed fetcher
+│   │   ├── scraper.go
+│   │   └── scraper_test.go
+│   └── cache/               // Redis caching layer
+│       ├── cache.go
+│       └── cache_test.go
+├── migrations/              // SQL migration files
+│   ├── 001_create_accounts.sql
+│   ├── 002_create_feeds.sql
+│   └── 003_create_posts.sql
+├── sqlc.yaml
+└── go.mod
+```
+
+This is the clean/hexagonal layout from Software Design & Architecture. `internal/` prevents other modules from importing our guts. The `database` package is generated code — do not edit it by hand. Business logic never touches `database/sql` directly; it only sees the `database.Queries` type. Transport never touches the scraper. Each layer only knows about the one below it.
+
+### Database schema
+
+Three tables. Let's look at all three, then wire the migrations.
+
+```sql
+-- migrations/001_create_accounts.sql
+CREATE TABLE accounts (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    name       TEXT        NOT NULL,
+    api_key    TEXT        NOT NULL UNIQUE DEFAULT (
+                   encode(sha256(random()::text::bytea), 'hex')
+               )
+);
+
+-- migrations/002_create_feeds.sql
+CREATE TABLE feeds (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    name        TEXT        NOT NULL,
+    url         TEXT        NOT NULL UNIQUE,
+    account_id  UUID        NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    last_fetched_at TIMESTAMPTZ
+);
+
+-- migrations/003_create_posts.sql
+CREATE TABLE posts (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    title       TEXT        NOT NULL,
+    url         TEXT        NOT NULL UNIQUE, -- deduplication key
+    description TEXT,
+    published_at TIMESTAMPTZ,
+    feed_id     UUID        NOT NULL REFERENCES feeds(id) ON DELETE CASCADE
+);
+
+-- Index for cursor pagination on the feed endpoint
+CREATE INDEX posts_feed_id_published_at_idx
+    ON posts (feed_id, published_at DESC);
+```
+
+The `url UNIQUE` constraint on `posts` is load-bearing: it's the deduplication guard. The scraper can `INSERT ... ON CONFLICT DO NOTHING` and idempotently re-scrape a feed. No duplicates. No application-layer set operations.
+
+<UnderTheHood title="sqlc: compile-time-safe queries from SQL">
+
+Rather than writing Go boilerplate by hand, we use **sqlc** to generate type-safe Go code from annotated SQL files. You write the query once, in SQL, with a `-- name:` annotation; `sqlc generate` produces a Go function with the exact correct parameter and return types.
+
+```sql
+-- name: GetAccountByAPIKey :one
+SELECT * FROM accounts WHERE api_key = $1;
+
+-- name: CreatePost :one
+INSERT INTO posts (
+    title, url, description, published_at, feed_id
+) VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (url) DO NOTHING
+RETURNING *;
+
+-- name: GetPostsByFeedIDs :many
+SELECT * FROM posts
+WHERE feed_id = ANY($1::uuid[])
+  AND ($2::timestamptz IS NULL OR published_at < $2)
+ORDER BY published_at DESC
+LIMIT $3;
+```
+
+The generated `database.Queries` type wraps a `*sql.DB` and exposes these as real typed methods — `GetAccountByAPIKey(ctx, apiKey string) (Account, error)`. The compiler rejects mismatched types at build time, not at 3 a.m. when a prod query returns the wrong shape.
+
+`sqlc` is not magic: it parses your schema and queries statically. It does not protect against runtime misuse of `context` or connection-pool exhaustion. Those are your job. `SetMaxOpenConns`, `SetMaxIdleConns`, and `SetConnMaxLifetime` on the `*sql.DB` must be set — from config, not hard-coded. Covered in SQL & Databases in Go.
+
+Go 1.26 baseline; sqlc 1.27+.
+
+</UnderTheHood>
+
+### Wiring the dependency graph
+
+The `main.go` wires everything together using dependency injection — no globals, no `init()` side-effects, no package-level singletons. Here is the skeleton:
+
+```go
+// cmd/gator/main.go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	_ "github.com/lib/pq" // postgres driver; side-effect import
+	"github.com/you/gator/internal/api"
+	"github.com/you/gator/internal/cache"
+	"github.com/you/gator/internal/database"
+	"github.com/you/gator/internal/scraper"
+)
+
+func main() {
+	// -- 1. Configuration from env (12-factor, not flags for a service) --------
+	dbURL := mustEnv("DATABASE_URL")
+	redisAddr := mustEnv("REDIS_ADDR")
+	addr := envOr("LISTEN_ADDR", ":8080")
+
+	// -- 2. Storage layer -------------------------------------------------------
+	sqlDB, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+	queries := database.New(sqlDB) // the sqlc-generated wrapper
+
+	// -- 3. Cache layer ---------------------------------------------------------
+	c, err := cache.New(redisAddr)
+	if err != nil {
+		log.Fatalf("redis: %v", err)
+	}
+
+	// -- 4. Scraper (background worker) ----------------------------------------
+	scr := scraper.New(queries, c, scraper.Config{
+		Workers:       5,
+		FetchInterval: 1 * time.Minute,
+	})
+
+	// -- 5. HTTP server ---------------------------------------------------------
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      api.NewRouter(queries, c),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// -- 6. Graceful shutdown ---------------------------------------------------
+	ctx, stop := signal.NotifyContext(
+		context.Background(), syscall.SIGTERM, os.Interrupt,
+	)
+	defer stop()
+
+	go scr.Start(ctx) // scraper runs until ctx is cancelled
+
+	go func() {
+		log.Printf("gator listening on %s", addr)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("server: %v", err)
+		}
+	}()
+
+	<-ctx.Done() // block until signal
+	log.Println("shutting down…")
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Printf("shutdown error: %v", err)
+	}
+	// scr.Start has already returned because ctx is cancelled
+	scr.Wait() // wait for in-flight scrape goroutines to finish
+	log.Println("clean exit")
+}
+
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("required env var %s not set", key)
+	}
+	return v
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+```
+
+<ExecTimeline
+  title="Gator startup — wiring the dependency graph"
+  lanes={[{ id: "main", label: "main()" }]}
+  steps={[
+    { lane: "main", kind: "run", label: "load config from env", note: "All config comes from environment variables. Fail fast if any required var is missing." },
+    { lane: "main", kind: "run", label: "open Postgres + sqlc", note: "sql.Open + connection pool tuning + database.New(sqlDB) to get type-safe Queries." },
+    { lane: "main", kind: "run", label: "connect Redis cache", note: "cache.New(redisAddr) — if Redis is unavailable at startup, fail fast rather than silently serving stale data." },
+    { lane: "main", kind: "spawn", label: "go scr.Start(ctx)", note: "The scraper starts in a goroutine but takes ctx — when main cancels it on SIGTERM, the scraper tears down cleanly." },
+    { lane: "main", kind: "spawn", label: "go srv.ListenAndServe()", note: "HTTP server starts in a goroutine so main can block on the signal channel." },
+    { lane: "main", kind: "block", label: "<-ctx.Done()", note: "Block here until SIGTERM or Ctrl-C arrives. No busy-wait, no polling." },
+    { lane: "main", kind: "done", label: "srv.Shutdown + scr.Wait", note: "Drain in-flight HTTP requests (20s), wait for scrape goroutines to finish, then exit 0." }
+  ]}
+  caption="Dependency injection from the outside in — every layer gets its dependencies explicitly, nothing is global."
+/>
+
+<QuickCheck
+  question="Why does main.go use signal.NotifyContext instead of a raw channel and signal.Notify?"
+  options={[
+    "signal.NotifyContext is faster",
+    "It returns a Context directly, so it integrates cleanly with context-aware APIs like srv.Shutdown and the scraper loop — no custom channel boilerplate",
+    "signal.Notify is deprecated in Go 1.22",
+    "It avoids goroutine leaks from unbuffered signal channels"
+  ]}
+  answer={1}
+  explain="signal.NotifyContext (Go 1.16+) returns a context.Context that is cancelled when the process receives the specified signal. Because all our blocking calls (srv.Shutdown, scraper loops, DB queries) already accept ctx, we get free propagation with no extra plumbing."
+/>
+
+---
+
+## Auth Middleware
+
+Every route in Gator is scoped to an authenticated user. We use API-key auth here — simple, stateless, suitable for a developer-facing aggregator. The pattern is exactly what the Auth & API Design chapter (Part 1, Chapter 17) covered; let's see it applied concretely.
+
+<Define term="Auth middleware (API-key)" since="Auth &amp; API Design (Part 1, Chapter 18)">
+**Auth middleware** is an `http.Handler` wrapper that runs before your business handler on every request. It extracts a credential from the request (here: `Authorization: ApiKey <key>`), validates it against the database, and either stores the resolved identity on the request context (allowing the request through) or returns `401 Unauthorized` immediately. Every protected route is wrapped in it — the default is closed, and you explicitly opt in to public access. Without it, any route you forget to protect is publicly reachable.
+</Define>
+
+**On the job:** In production, skipping auth middleware on a single route is one of the most common security incidents — someone forgets to wrap a new handler, and a privileged endpoint is publicly reachable. The `authed` wrapper function in `NewRouter` makes the default closed: every new handler must explicitly opt in to protection or explicitly opt out.
+
+### Storing a user on the request context
+
+The middleware extracts the `ApiKey` header, loads the account from the DB, and stores it on the request context. Handlers retrieve it with a typed key — never a raw string.
+
+```go
+// internal/auth/auth.go
+package auth
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/you/gator/internal/database"
+)
+
+// contextKey is an unexported type so nobody outside this package
+// can accidentally collide with it on the context. This is the
+// idiomatic Go pattern — not a string key, a typed key.
+type contextKey struct{}
+
+// Authenticate is an http.Handler middleware. It reads the
+// "Authorization: ApiKey <key>" header, loads the matching account,
+// and stores it on the request context. Calls next on success.
+func Authenticate(q *database.Queries, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, err := apiKeyFromHeader(r)
+		if err != nil {
+			http.Error(w, "missing or malformed Authorization header", http.StatusUnauthorized)
+			return
+		}
+		acct, err := q.GetAccountByAPIKey(r.Context(), key)
+		if err != nil {
+			http.Error(w, "invalid API key", http.StatusUnauthorized)
+			return
+		}
+		// Store the resolved account on the context, then forward.
+		ctx := context.WithValue(r.Context(), contextKey{}, acct)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// AccountFromContext retrieves the authenticated account. Panics if
+// the middleware was not applied — a programming error, not a runtime one.
+func AccountFromContext(ctx context.Context) database.Account {
+	acct, ok := ctx.Value(contextKey{}).(database.Account)
+	if !ok {
+		panic("auth: AccountFromContext called on unauthenticated context")
+	}
+	return acct
+}
+
+func apiKeyFromHeader(r *http.Request) (string, error) {
+	h := r.Header.Get("Authorization")
+	parts := strings.Fields(h)
+	if len(parts) != 2 || parts[0] != "ApiKey" {
+		return "", errors.New("expected: Authorization: ApiKey <key>")
+	}
+	return parts[1], nil
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+// Minimal self-contained demo of the middleware pattern.
+// In the real service, contextKey and accountFromContext
+// live in internal/auth and use database.Account.
+
+type contextKey struct{}
+
+type fakeAccount struct{ Name string }
+
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		parts := strings.Fields(h)
+		if len(parts) != 2 || parts[0] != "ApiKey" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// In prod: lookup by parts[1] in the database.
+		// Here: accept any key and pretend it maps to "gator-user".
+		acct := fakeAccount{Name: "gator-user"}
+		ctx := context.WithValue(r.Context(), contextKey{}, acct)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func protectedHandler(w http.ResponseWriter, r *http.Request) {
+	acct := r.Context().Value(contextKey{}).(fakeAccount)
+	fmt.Fprintf(w, "hello, %s", acct.Name)
+}
+
+func main() {
+	handler := authMiddleware(http.HandlerFunc(protectedHandler))
+
+	// Valid key → 200
+	req := httptest.NewRequest("GET", "/feed", nil)
+	req.Header.Set("Authorization", "ApiKey some-key-here")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	fmt.Printf("with key:    %d %s\n", rr.Code, strings.TrimSpace(rr.Body.String()))
+
+	// Missing key → 401
+	req2 := httptest.NewRequest("GET", "/feed", nil)
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+	fmt.Printf("without key: %d %s\n", rr2.Code, strings.TrimSpace(rr2.Body.String()))
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="Context values: typed keys, never strings">
+
+Using a raw string as a context key — `ctx.Value("account")` — is a time bomb. Any package that happens to use the same string collides silently. The unexported `contextKey{}` struct type is only addressable from inside `internal/auth`, so collisions are physically impossible.
+
+</Callout>
+
+---
+
+## HTTP API
+
+With auth in place, we can build the five endpoints that define Gator's public surface. Each endpoint follows the REST conventions and error shapes from HTTP Servers: JSON, Streaming & WebSockets — consistent, versioned, cursor-paginated.
+
+### Router and error helpers
+
+```go
+// internal/api/server.go
+package api
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+
+	"github.com/you/gator/internal/auth"
+	"github.com/you/gator/internal/cache"
+	"github.com/you/gator/internal/database"
+)
+
+// Server holds the shared dependencies every handler needs.
+// Handlers are methods on Server so they share deps without globals.
+type Server struct {
+	queries *database.Queries
+	cache   *cache.Cache
+}
+
+// NewRouter wires the mux and wraps protected routes in auth middleware.
+func NewRouter(q *database.Queries, c *cache.Cache) http.Handler {
+	s := &Server{queries: q, cache: c}
+	mux := http.NewServeMux()
+
+	// Unprotected
+	mux.HandleFunc("POST /v1/accounts", s.handleCreateAccount)
+
+	// Protected — wrapped in auth middleware
+	authed := func(h http.HandlerFunc) http.Handler {
+		return auth.Authenticate(q, h)
+	}
+	mux.Handle("GET /v1/feeds", authed(s.handleListFeeds))
+	mux.Handle("POST /v1/feeds", authed(s.handleAddFeed))
+	mux.Handle("GET /v1/posts", authed(s.handleGetPosts))
+	mux.Handle("DELETE /v1/feeds/{id}", authed(s.handleDeleteFeed))
+
+	return mux
+}
+
+// respondJSON marshals v to JSON and writes it with statusCode.
+func respondJSON(w http.ResponseWriter, statusCode int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("respondJSON encode: %v", err)
+	}
+}
+
+// respondError writes a consistent error shape:
+// {"error": "message"} — every endpoint uses this.
+func respondError(w http.ResponseWriter, statusCode int, msg string) {
+	respondJSON(w, statusCode, struct {
+		Error string `json:"error"`
+	}{Error: msg})
+}
+```
+
+### Cursor-paginated posts endpoint
+
+<Define term="Cursor pagination" since="Auth &amp; API Design (Part 1, Chapter 18)">
+**Cursor pagination** returns the next page by anchoring to the last item seen — here, the `published_at` timestamp of the last post on the previous page — rather than counting rows with `OFFSET`. The client passes `?before=<timestamp>` and the query returns posts published before that point. Why it matters: `OFFSET n` skips `n` rows at query time; if new posts arrive between page 1 and page 2, `OFFSET 20` silently skips posts the user never saw. A timestamp cursor is stable under concurrent inserts. It also uses an index efficiently, where large offsets force a full index scan.
+</Define>
+
+The posts feed is the hot read path. We use **cursor pagination** — a `before` timestamp cursor — not offset pagination. Why? A user scrolling their feed while new posts arrive will get gaps and duplicates with offset pagination; a cursor doesn't move.
+
+**On the job:** The switch from offset to cursor pagination is one of the most impactful backend changes you can make for any feed or timeline product. Offset pagination is fine for admin dashboards with small, static datasets; it breaks visibly for any live, insert-heavy feed.
+
+```go
+// internal/api/posts.go
+package api
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/you/gator/internal/auth"
+	"github.com/you/gator/internal/database"
+)
+
+func (s *Server) handleGetPosts(w http.ResponseWriter, r *http.Request) {
+	acct := auth.AccountFromContext(r.Context())
+
+	// Parse the optional cursor (an ISO-8601 timestamp)
+	var cursor *time.Time
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "invalid before cursor: use RFC3339")
+			return
+		}
+		cursor = &t
+	}
+
+	// Parse limit (default 20, max 100)
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 100 {
+			respondError(w, http.StatusBadRequest, "limit must be 1-100")
+			return
+		}
+		limit = n
+	}
+
+	// Fetch the user's subscribed feed IDs
+	feedIDs, err := s.queries.GetFeedIDsForAccount(r.Context(), acct.ID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "could not fetch feeds")
+		return
+	}
+	if len(feedIDs) == 0 {
+		respondJSON(w, http.StatusOK, []any{})
+		return
+	}
+
+	// Try cache first (hot path: latest 20 posts, no cursor)
+	if cursor == nil && limit == 20 {
+		if posts, ok := s.cache.GetLatestPosts(r.Context(), acct.ID); ok {
+			respondJSON(w, http.StatusOK, posts)
+			return
+		}
+	}
+
+	posts, err := s.queries.GetPostsByFeedIDs(r.Context(), database.GetPostsByFeedIDsParams{
+		FeedIds: feedIDs,
+		Before:  cursor,
+		Limit:   int32(limit),
+	})
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "could not fetch posts")
+		return
+	}
+
+	// Populate cache for next request if this was the default page
+	if cursor == nil && limit == 20 {
+		s.cache.SetLatestPosts(r.Context(), acct.ID, posts)
+	}
+
+	respondJSON(w, http.StatusOK, posts)
+}
+```
+
+<ExecTimeline
+  title="GET /v1/posts — request path from auth to response"
+  lanes={[
+    { id: "mw", label: "auth middleware" },
+    { id: "handler", label: "handleGetPosts" },
+    { id: "cache", label: "Redis cache" },
+    { id: "db", label: "Postgres" }
+  ]}
+  steps={[
+    { lane: "mw", kind: "run", label: "extract ApiKey header", note: "Middleware reads Authorization header, splits on space to extract the raw API key." },
+    { lane: "mw", kind: "run", label: "query DB for account", note: "GetAccountByAPIKey hits the accounts table. Cache miss here is fine — auth lookups are cheap and must be authoritative." },
+    { lane: "mw", kind: "send", label: "store account on ctx", note: "Account stored with typed key; context forwarded to the handler." },
+    { lane: "handler", kind: "run", label: "parse cursor + limit", note: "Validate the before timestamp and limit query params; reject bad input immediately." },
+    { lane: "cache", kind: "recv", label: "GetLatestPosts (hit?)", note: "For the default page (no cursor, limit 20), check Redis first. Cache HIT returns in microseconds." },
+    { lane: "db", kind: "recv", label: "GetPostsByFeedIDs (miss)", note: "On cache MISS, query Postgres with feed IDs and the optional cursor. Uses the published_at index." },
+    { lane: "handler", kind: "done", label: "JSON encode + respond", note: "Posts marshalled and written. Cache populated for the next caller's default-page request." }
+  ]}
+  caption="Auth always hits the DB — account lookups must be authoritative. Only post reads hit the cache."
+/>
+
+<BeforeAfter
+  badLabel="Offset pagination"
+  goodLabel="Cursor pagination"
+  bad={`// OFFSET shifts as posts arrive —
+// gaps and duplicates guaranteed.
+SELECT * FROM posts
+ORDER BY published_at DESC
+LIMIT 20 OFFSET 40;`}
+  good={`-- Cursor is stable under inserts.
+-- Index on (feed_id, published_at DESC)
+-- makes this sub-millisecond.
+SELECT * FROM posts
+WHERE published_at < $1
+ORDER BY published_at DESC
+LIMIT 20;`}
+/>
+
+<QuickCheck
+  question="Why is cursor pagination preferred over offset pagination for a live feed?"
+  options={[
+    "Cursor pagination is always faster",
+    "Offset shifts as new rows are inserted, causing skipped or duplicate posts for a scrolling user; a timestamp cursor is stable",
+    "Postgres does not support OFFSET",
+    "Cursor pagination avoids the need for an index"
+  ]}
+  answer={1}
+  explain="OFFSET n skips n rows at query time. If 3 new posts arrive between page 1 and page 2, your OFFSET 20 now skips 3 posts the user never saw. A timestamp cursor — WHERE published_at < $1 — is anchored to the last item seen, not a row count, so it is stable under concurrent inserts."
+/>
+
+---
+
+## Concurrent Feed Fetcher
+
+<Define term="Concurrent feed scraper (ticker + worker pool)" since="Concurrency: Goroutines, Channels &amp; Select (Part 1, Chapter 4)">
+The **concurrent feed scraper** is a background goroutine that drives periodic feed fetching. A `time.Ticker` fires on a configurable interval (e.g. every minute); on each tick, `scrapeAll` queries every registered feed URL from the database and dispatches each one to a **bounded worker pool** — a buffered channel acting as a counting semaphore that limits how many feeds are fetched simultaneously. Each worker goroutine makes one outbound HTTP GET, parses the RSS/Atom XML, and upserts new posts with `ON CONFLICT DO NOTHING`. When the service receives SIGTERM, context cancellation propagates into every in-flight HTTP request and a `sync.WaitGroup` ensures all workers finish before the process exits. Without the concurrency ceiling, a service with thousands of feeds would exhaust file descriptors and outbound connection slots.
+</Define>
+
+The scraper is the heart of Gator. It must:
+
+1. Fetch all registered feeds on a regular interval
+2. Run multiple fetches concurrently — not one at a time
+3. Respect a concurrency ceiling so we don't hammer every feed server simultaneously
+4. Tear down cleanly when the service stops
+
+This is the worker pool pattern from the Concurrency chapter (Part 1, Chapter 4), wired to a `time.Ticker`, with `context` cancellation threading through every network call.
+
+**On the job:** A scraper without a concurrency ceiling will open one goroutine per registered feed, each making an outbound HTTP connection. At a few hundred feeds that is fine; at tens of thousands you exhaust file descriptors and SNAT ports. The semaphore is not premature optimization — it is a production requirement from day one.
+
+```go
+// internal/scraper/scraper.go
+package scraper
+
+import (
+	"context"
+	"encoding/xml"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/you/gator/internal/cache"
+	"github.com/you/gator/internal/database"
+)
+
+// Config is the tunable knobs for the scraper — injected, never hard-coded.
+type Config struct {
+	Workers       int           // max concurrent feed fetches
+	FetchInterval time.Duration // how often the ticker fires
+}
+
+// Scraper holds the scraper's dependencies.
+type Scraper struct {
+	q    *database.Queries
+	c    *cache.Cache
+	cfg  Config
+	wg   sync.WaitGroup // tracks in-flight fetch goroutines
+}
+
+// New constructs a Scraper. All dependencies injected.
+func New(q *database.Queries, c *cache.Cache, cfg Config) *Scraper {
+	return &Scraper{q: q, c: c, cfg: cfg}
+}
+
+// Start runs the scrape loop until ctx is cancelled.
+// Call it in a goroutine from main.
+func (s *Scraper) Start(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.FetchInterval)
+	defer ticker.Stop()
+
+	sem := make(chan struct{}, s.cfg.Workers) // bounded concurrency semaphore
+
+	for {
+		select {
+		case <-ctx.Done():
+			return // main is shutting down; Wait() will drain in-flight goroutines
+		case <-ticker.C:
+			s.scrapeAll(ctx, sem)
+		}
+	}
+}
+
+// Wait blocks until all in-flight scrape goroutines have finished.
+// Call after Start returns (i.e. after ctx is cancelled).
+func (s *Scraper) Wait() {
+	s.wg.Wait()
+}
+
+// scrapeAll fetches every feed concurrently, bounded by the semaphore.
+func (s *Scraper) scrapeAll(ctx context.Context, sem chan struct{}) {
+	feeds, err := s.q.GetAllFeeds(ctx)
+	if err != nil {
+		log.Printf("scrapeAll: list feeds: %v", err)
+		return
+	}
+
+	for _, feed := range feeds {
+		// Go 1.22+: range variables are per-iteration — no capture bug.
+		// Go 1.25+: wg.Go launches a goroutine and calls wg.Add(1) atomically,
+		// eliminating the Add-before-go boilerplate and the subtle race where
+		// Wait() could return before Add() is called.
+		sem <- struct{}{} // acquire slot; blocks if Workers goroutines are all busy
+		s.wg.Go(func() {
+			defer func() { <-sem }() // release slot when done
+			s.scrapeFeed(ctx, feed)
+		})
+	}
+}
+
+// rssItem is the minimal RSS/Atom shape we care about.
+type rssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+
+type rssFeed struct {
+	Items []rssItem `xml:"channel>item"`
+}
+
+// scrapeFeed fetches one feed URL, parses items, and upserts posts.
+func (s *Scraper) scrapeFeed(ctx context.Context, feed database.Feed) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feed.Url, nil)
+	if err != nil {
+		log.Printf("scrapeFeed %s: build request: %v", feed.Url, err)
+		return
+	}
+	req.Header.Set("User-Agent", "gator/1.0 (RSS aggregator)")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("scrapeFeed %s: fetch: %v", feed.Url, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("scrapeFeed %s: status %d", feed.Url, resp.StatusCode)
+		return
+	}
+
+	// xml.NewDecoder streams the body directly, which is correct for large feeds.
+	// If you need the raw bytes first (e.g. for logging on parse error),
+	// io.ReadAll is noticeably faster in Go 1.26 due to a more efficient
+	// internal buffer growth strategy — prefer it over ioutil.ReadAll (removed in 1.16).
+	var rss rssFeed
+	if err := xml.NewDecoder(resp.Body).Decode(&rss); err != nil {
+		log.Printf("scrapeFeed %s: parse XML: %v", feed.Url, err)
+		return
+	}
+
+	newPosts := 0
+	for _, item := range rss.Items {
+		// ON CONFLICT DO NOTHING means idempotent upserts — re-scraping
+		// a feed never creates duplicates.
+		_, err := s.q.CreatePost(ctx, database.CreatePostParams{
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: &item.Description,
+			FeedID:      feed.ID,
+		})
+		if err == nil {
+			newPosts++
+		}
+	}
+
+	// Invalidate the cache for every user who subscribes to this feed
+	// so they see fresh posts on the next default-page request.
+	if newPosts > 0 {
+		if err := s.c.InvalidatePostsForFeed(ctx, feed.ID); err != nil {
+			log.Printf("cache invalidate feed %s: %v", feed.ID, err)
+		}
+	}
+
+	if err := s.q.MarkFeedFetched(ctx, feed.ID); err != nil {
+		log.Printf("scrapeFeed %s: mark fetched: %v", feed.Url, err)
+	}
+}
+```
+
+<ExecTimeline
+  title="Concurrent scrape loop — 5 feeds, 3 workers"
+  lanes={[
+    { id: "ticker", label: "time.Ticker" },
+    { id: "w1", label: "worker 1" },
+    { id: "w2", label: "worker 2" },
+    { id: "w3", label: "worker 3" }
+  ]}
+  steps={[
+    { lane: "ticker", kind: "run", label: "ticker fires", note: "time.Ticker fires. scrapeAll is called. It queries all 5 feed URLs." },
+    { lane: "w1", kind: "spawn", label: "acquire sem, go feed 1", note: "Semaphore slot acquired. Goroutine launched for feed 1. HTTP GET in flight." },
+    { lane: "w2", kind: "spawn", label: "acquire sem, go feed 2", note: "Second slot acquired. Goroutine for feed 2. Now 2 concurrent fetches." },
+    { lane: "w3", kind: "spawn", label: "acquire sem, go feed 3", note: "Third slot acquired. Goroutine for feed 3. Semaphore is now full." },
+    { lane: "w1", kind: "done", label: "feed 1 done, release sem", note: "Feed 1 parsed and posts upserted. Slot released. Feed 4 can now start." },
+    { lane: "w2", kind: "done", label: "feed 2 done, release sem", note: "Feed 2 done. Slot released. Feed 5 starts." },
+    { lane: "w3", kind: "done", label: "feeds 3-5 done", note: "All feeds scraped. wg.Wait() returns. Scraper idles until next tick." }
+  ]}
+  caption="The semaphore limits concurrency to 3 regardless of how many feeds are registered. The ticker is the only clock."
+/>
+
+<UnderTheHood title="The semaphore + wg.Go: two tools, two jobs (Go 1.26 baseline)">
+
+The buffered channel `sem := make(chan struct{}, workers)` acts as a **counting semaphore**. Sending into it acquires a slot (`sem <- struct{}{}`); if all `workers` slots are full, the send blocks until a goroutine releases one (`<-sem`). This is idiomatic Go — you don't need `golang.org/x/sync/semaphore` for the common case; a buffered channel is both correct and easy to reason about. This is a simplification of a general semaphore — it works because each goroutine acquires exactly one slot.
+
+The `sync.WaitGroup` is separate and orthogonal: it tracks how many goroutines are *alive*, not how many are *running at once*. On shutdown, `s.Wait()` (which calls `s.wg.Wait()`) ensures we don't exit with an in-flight HTTP fetch that's halfway through writing to the database. The two tools solve different problems. Don't conflate them.
+
+**`wg.Go` (new in Go 1.25):** Before 1.25, you had to call `wg.Add(1)` *before* launching the goroutine — forgetting the `Add`, or calling it inside the goroutine, was a classic bug where `wg.Wait()` could return before the goroutine started. `wg.Go(f)` is atomic: it increments the counter and launches the goroutine as one operation. The old `wg.Add(1) / go func() { defer wg.Done(); ... }()` pattern still works; `wg.Go` is the cleaner idiom going forward.
+
+**Go 1.22:** Range variables in `for _, v := range ...` became per-iteration (not shared across iterations), so the old `v := v` capture fix is no longer needed. You will still see it in pre-1.22 codebases.
+
+</UnderTheHood>
+
+---
+
+## Caching Layer
+
+The scraper calls `c.InvalidatePostsForFeed(ctx, feedID)` after every successful scrape. The handler calls `c.GetLatestPosts` and `c.SetLatestPosts`. Here's the cache package that backs those calls.
+
+<Define term="Cache-aside (lazy population)" since="Caching &amp; Redis (Part 1, Chapter 20)">
+**Cache-aside** means the application code — not the cache itself — decides when to read from and write to the cache. On a read: check the cache first; on a miss, fetch from the database, store the result in the cache, then return it. On a write (new posts scraped): explicitly delete the relevant cache entries so the next read repopulates with fresh data. The TTL is a backstop — staleness is bounded even if explicit invalidation is missed. Cache-aside is correct for *derived, reconstructable* data (latest posts); it is wrong for *authoritative* data (account existence, permissions, monetary balances) where staleness equals incorrectness.
+</Define>
+
+The strategy is **cache-aside (lazy)**: we populate the cache only after a cache miss, and we invalidate on writes. We never cache anything **authoritative** — auth lookups are always live, balances (if this were a fintech service) would always be live. Only the *derived, reconstructable* hot read — the latest posts page — is cached.
+
+**On the job:** The most common caching mistake is caching the wrong things — specifically, caching data that must be authoritative (account existence, permissions, monetary values). A 2-minute stale permissions check is a 2-minute authorization bypass window. Decide up front which data can tolerate staleness; document it in code.
+
+```go
+// internal/cache/cache.go
+package cache
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/you/gator/internal/database"
+	"github.com/google/uuid"
+)
+
+const latestPostsTTL = 2 * time.Minute
+
+// Cache wraps a Redis client with domain-specific helpers.
+type Cache struct {
+	rdb *redis.Client
+}
+
+// New returns a Cache connected to addr. Returns an error if Redis
+// is unreachable — we fail fast rather than silently cache-miss forever.
+func New(addr string) (*Cache, error) {
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("cache: ping redis at %s: %w", addr, err)
+	}
+	return &Cache{rdb: rdb}, nil
+}
+
+// latestPostsKey builds the cache key for a user's default posts page.
+// Per-user keys prevent cross-user data leaks in the cache.
+func latestPostsKey(accountID uuid.UUID) string {
+	return fmt.Sprintf("gator:posts:latest:%s", accountID)
+}
+
+// feedSubscribersKey builds a Redis Set key holding the account IDs
+// that subscribe to a given feed. Used for targeted invalidation.
+func feedSubscribersKey(feedID uuid.UUID) string {
+	return fmt.Sprintf("gator:feed:subs:%s", feedID)
+}
+
+// GetLatestPosts returns cached posts for the default page, if present.
+// The second return value is false on a cache miss.
+func (c *Cache) GetLatestPosts(
+	ctx context.Context,
+	accountID uuid.UUID,
+) ([]database.Post, bool) {
+	raw, err := c.rdb.Get(ctx, latestPostsKey(accountID)).Bytes()
+	if err != nil {
+		return nil, false // miss or error — caller falls back to DB
+	}
+	var posts []database.Post
+	if err := json.Unmarshal(raw, &posts); err != nil {
+		return nil, false
+	}
+	return posts, true
+}
+
+// SetLatestPosts writes the default posts page to the cache with a TTL.
+func (c *Cache) SetLatestPosts(
+	ctx context.Context,
+	accountID uuid.UUID,
+	posts []database.Post,
+) {
+	raw, err := json.Marshal(posts)
+	if err != nil {
+		return // best-effort; log in prod but never fail the request
+	}
+	// EX TTL means the key auto-expires — no manual cleanup needed.
+	c.rdb.Set(ctx, latestPostsKey(accountID), raw, latestPostsTTL)
+}
+
+// InvalidatePostsForFeed deletes the latest-posts cache entry for every
+// account subscribed to the given feed. Called by the scraper on new posts.
+func (c *Cache) InvalidatePostsForFeed(
+	ctx context.Context,
+	feedID uuid.UUID,
+) error {
+	// Get the set of subscribers for this feed.
+	members, err := c.rdb.SMembers(ctx, feedSubscribersKey(feedID)).Result()
+	if err != nil {
+		return fmt.Errorf("InvalidatePostsForFeed: smembers: %w", err)
+	}
+	if len(members) == 0 {
+		return nil
+	}
+	// Build the list of cache keys to delete.
+	keys := make([]string, 0, len(members))
+	for _, m := range members {
+		id, err := uuid.Parse(m)
+		if err != nil {
+			continue
+		}
+		keys = append(keys, latestPostsKey(id))
+	}
+	return c.rdb.Del(ctx, keys...).Err()
+}
+
+// TrackSubscription records that accountID subscribes to feedID,
+// so InvalidatePostsForFeed can find them. Call when a user adds a feed.
+func (c *Cache) TrackSubscription(
+	ctx context.Context,
+	feedID, accountID uuid.UUID,
+) error {
+	return c.rdb.SAdd(ctx, feedSubscribersKey(feedID), accountID.String()).Err()
+}
+```
+
+<Callout kind="warn" title="Never cache authoritative data">
+
+`GetLatestPosts` is safe to cache because a missed or stale post is a display annoyance, not a correctness failure — the user just sees posts that are 2 minutes old. **Never** cache things where staleness = incorrectness: API key validity, user permissions, account existence, or — if this were a fintech service — any monetary balance. Those always hit the authoritative store.
+
+</Callout>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Cache-aside (lazy)">Populate on miss; invalidate on write. Simple, flexible. The handler controls when to read and write.</ConceptCard>
+  <ConceptCard label="Per-user keys">Every user gets their own cache key. Never share a key across users — that's a data-leak waiting to happen.</ConceptCard>
+  <ConceptCard label="TTL as a safety net">Even without explicit invalidation, the 2-minute TTL means staleness is bounded. The scraper's explicit invalidation makes it faster in practice.</ConceptCard>
+  <Gotcha>The subscriber set (`feedSubscribersKey`) must be kept consistent with the feeds table. If a user deletes a feed subscription without calling `TrackSubscription` in reverse (`SRem`), stale invalidation happens — harmless here but a correctness issue in stricter systems. In production, a Lua script or a transaction would keep them atomic.</Gotcha>
+</ConceptGrid>
+
+---
+
+## Testing Suite
+
+Here's where the professional separates from the hobbyist: the test suite is not an afterthought. It is a first-class deliverable. Let me walk you through every layer of testing Gator deserves.
+
+**On the job:** A concurrent service without a `-race` test is a service with unknown correctness. The race detector has caught real production bugs — double-incremented counters, corrupted maps, subscriber sets with missing entries — that code review missed entirely. Run `go test -race ./...` in CI. No exceptions.
+
+<Callout kind="note" title="testing/synctest (Go 1.25) — for deterministic concurrency tests">
+
+Go 1.25 added `testing/synctest`, a package for testing concurrent code deterministically by controlling a fake clock and goroutine scheduling. It is particularly useful for testing ticker-driven loops (like `Scraper.Start`) without wall-clock delays. For this project the `-race` + `httptest.Server` approach is sufficient; `testing/synctest` becomes essential when you need to test time-dependent behavior (backoff, rate limiting, TTL expiry) without `time.Sleep` in tests. See the Time, Clocks & Timers chapter (Part 2, Chapter 4) for the full treatment.
+
+</Callout>
+
+### Handler tests with `httptest`
+
+No live database needed. We stub `database.Queries` behind an interface and use `httptest.NewRecorder`.
+
+```go
+// internal/api/handlers_test.go
+package api_test
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/you/gator/internal/api"
+	"github.com/you/gator/internal/database"
+)
+
+// stubCache is a no-op cache that always misses,
+// so handler tests exercise the DB-fallback path.
+type stubCache struct{}
+
+func (s *stubCache) GetLatestPosts(_ context.Context, _ uuid.UUID) ([]database.Post, bool) {
+	return nil, false
+}
+func (s *stubCache) SetLatestPosts(_ context.Context, _ uuid.UUID, _ []database.Post) {}
+func (s *stubCache) InvalidatePostsForFeed(_ context.Context, _ uuid.UUID) error      { return nil }
+func (s *stubCache) TrackSubscription(_ context.Context, _, _ uuid.UUID) error        { return nil }
+
+// stubQueries provides a table-driven-friendly stub for DB calls.
+type stubQueries struct {
+	posts []database.Post
+}
+
+func (s *stubQueries) GetFeedIDsForAccount(_ context.Context, _ uuid.UUID) ([]uuid.UUID, error) {
+	ids := make([]uuid.UUID, len(s.posts))
+	for i, p := range s.posts {
+		ids[i] = p.FeedID
+	}
+	return ids, nil
+}
+
+func (s *stubQueries) GetPostsByFeedIDs(
+	_ context.Context, _ database.GetPostsByFeedIDsParams,
+) ([]database.Post, error) {
+	return s.posts, nil
+}
+
+func TestHandleGetPosts(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []struct {
+		name     string
+		posts    []database.Post
+		wantCode int
+		wantLen  int
+	}{
+		{
+			name:     "no subscribed feeds returns empty slice",
+			posts:    []database.Post{},
+			wantCode: http.StatusOK,
+			wantLen:  0,
+		},
+		{
+			name: "returns posts in order",
+			posts: []database.Post{
+				{ID: uuid.New(), Title: "Post A", Url: "https://a.test/1", PublishedAt: &now},
+				{ID: uuid.New(), Title: "Post B", Url: "https://b.test/1", PublishedAt: &now},
+			},
+			wantCode: http.StatusOK,
+			wantLen:  2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel() // table-driven subtests run in parallel
+
+			router := api.NewRouter(&stubQueries{posts: tc.posts}, &stubCache{})
+
+			req := httptest.NewRequest(http.MethodGet, "/v1/posts", nil)
+			// In the real flow, auth middleware injects the account.
+			// Here we inject a test account directly onto the context.
+			req = req.WithContext(contextWithTestAccount(req.Context()))
+			rr := httptest.NewRecorder()
+
+			router.ServeHTTP(rr, req)
+
+			if rr.Code != tc.wantCode {
+				t.Errorf("status: got %d, want %d", rr.Code, tc.wantCode)
+			}
+
+			var got []database.Post
+			if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if len(got) != tc.wantLen {
+				t.Errorf("post count: got %d, want %d", len(got), tc.wantLen)
+			}
+		})
+	}
+}
+```
+
+### Scraper test against a mock feed server
+
+The scraper makes real HTTP requests — we test it against an `httptest.Server` that serves a canned RSS response:
+
+```go
+// internal/scraper/scraper_test.go
+package scraper_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/you/gator/internal/database"
+	"github.com/you/gator/internal/scraper"
+)
+
+const sampleRSS = `<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Hello Gator</title>
+      <link>https://example.com/posts/1</link>
+      <description>A great post about Go.</description>
+      <pubDate>Mon, 02 Jan 2006 15:04:05 MST</pubDate>
+    </item>
+    <item>
+      <title>Another Post</title>
+      <link>https://example.com/posts/2</link>
+      <description>Another great post.</description>
+      <pubDate>Tue, 03 Jan 2006 15:04:05 MST</pubDate>
+    </item>
+  </channel>
+</rss>`
+
+func TestScrapeFeed_ParsesAndUpserts(t *testing.T) {
+	// Spin up an httptest server serving our canned RSS.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		w.Write([]byte(sampleRSS))
+	}))
+	defer srv.Close()
+
+	// Track which posts were created.
+	var created []string
+	q := &recordingQueries{onCreatePost: func(url string) { created = append(created, url) }}
+	c := &noopCache{}
+
+	scr := scraper.New(q, c, scraper.Config{Workers: 1, FetchInterval: time.Minute})
+
+	feed := database.Feed{
+		ID:  uuid.New(),
+		Url: srv.URL, // point the feed at our test server
+	}
+
+	ctx := context.Background()
+	scr.ExposedScrapeFeed(ctx, feed) // test-only exported wrapper
+
+	if len(created) != 2 {
+		t.Errorf("expected 2 posts created, got %d", len(created))
+	}
+	if created[0] != "https://example.com/posts/1" {
+		t.Errorf("unexpected first URL: %s", created[0])
+	}
+}
+```
+
+### Golden-file test for the API response shape
+
+We lock down the exact JSON shape of the posts endpoint so a schema change is a deliberate, reviewed decision:
+
+```go
+// internal/api/golden_test.go
+package api_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/you/gator/internal/database"
+)
+
+func TestGetPostsGolden(t *testing.T) {
+	published := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	posts := []database.Post{
+		{
+			ID:          uuid.MustParse("11111111-0000-0000-0000-000000000001"),
+			Title:       "Hello Gator",
+			Url:         "https://example.com/posts/1",
+			PublishedAt: &published,
+			FeedID:      uuid.MustParse("22222222-0000-0000-0000-000000000002"),
+		},
+	}
+
+	router := api.NewRouter(&stubQueries{posts: posts}, &stubCache{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/posts", nil)
+	req = req.WithContext(contextWithTestAccount(req.Context()))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	got := rr.Body.Bytes()
+	goldenPath := filepath.Join("testdata", "get_posts.golden.json")
+
+	// UPDATE_GOLDEN=1 go test ./... regenerates golden files.
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		_ = os.MkdirAll("testdata", 0o755)
+		os.WriteFile(goldenPath, got, 0o644)
+		return
+	}
+
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (run UPDATE_GOLDEN=1 to create it)", goldenPath, err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("response does not match golden file\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+```
+
+### Race-detector test on the concurrent scraper and cache
+
+The most important test in the suite — run `go test -race ./...` and this must be silent:
+
+```go
+// internal/scraper/race_test.go
+package scraper_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/you/gator/internal/database"
+	"github.com/you/gator/internal/scraper"
+)
+
+// TestScraperRace runs 10 goroutines all calling scrapeAll concurrently
+// while another goroutine is invalidating the cache.
+// The race detector MUST be silent: go test -race ./internal/scraper/...
+func TestScraperRace(t *testing.T) {
+	srv := startCannedRSSServer(t) // httptest.Server helper
+	q := &safeRecordingQueries{}
+	c := &threadSafeStubCache{}
+
+	scr := scraper.New(q, c, scraper.Config{Workers: 3, FetchInterval: time.Minute})
+	feed := database.Feed{ID: uuid.New(), Url: srv.URL}
+	q.AddFeed(feed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	// 5 concurrent scrape-all calls
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			scr.ScrapeAllOnce(ctx) // test-exported method
+		}()
+	}
+	// 5 concurrent cache invalidations
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.InvalidatePostsForFeed(ctx, feed.ID)
+		}()
+	}
+	wg.Wait()
+
+	// No posts should be duplicated — ON CONFLICT DO NOTHING is the guard.
+	if q.DuplicateCount() > 0 {
+		t.Errorf("detected %d duplicate post insertions", q.DuplicateCount())
+	}
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+// Self-contained race-detector demo: a shared counter
+// incremented by N goroutines, protected correctly with sync/atomic.
+// Run this as: go test -race (the playground sandboxes correctly).
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+func main() {
+	var counter int64
+	var wg sync.WaitGroup
+	for range 1000 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			atomic.AddInt64(&counter, 1) // race-safe
+		}()
+	}
+	wg.Wait()
+	fmt.Println("counter:", counter) // exactly 1000 — no races, no lost updates
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="How the race detector works — and why -race is mandatory in CI">
+
+The Go race detector (available since Go 1.1) instruments every memory access at compile time using **ThreadSanitizer (TSan)**. When two goroutines access the same memory address concurrently — and at least one write is involved — TSan logs the access locations, goroutine stacks, and the specific variable.
+
+The cost: programs compiled with `-race` run roughly 2–20x slower and use 5–10x more memory. That is why you don't ship `-race` binaries; you run them in CI. `go test -race ./...` is non-negotiable for any concurrent service. A race that TSan catches in a test is a bug that would corrupt data silently in production.
+
+The scraper specifically needs `-race` testing because it writes to `database.Post` rows from N goroutines while the cache is being read and invalidated. Without the semaphore and the correct use of `sync.WaitGroup`, these accesses overlap. TSan catches exactly this class of bug — don't let it surprise you at 3 a.m.
+
+Go 1.26 baseline (race detector available since Go 1.1; overhead figures are stable across recent releases).
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+Every exercise below builds directly on the Gator codebase. No throwaway puzzles — each one is a real feature request or production concern.
+
+<Exercise n={1} title="Add a DELETE /v1/feeds/{id} endpoint" level="easy">
+
+The `NewRouter` already registers `DELETE /v1/feeds/{id}` but `handleDeleteFeed` is a stub. Implement it: extract the `{id}` path value with `r.PathValue("id")`, parse it as a UUID, verify the feed belongs to the authenticated user (don't let them delete someone else's feed), and call `q.DeleteFeed(ctx, feedID)`. Return 204 No Content on success.
+
+<Solution>
+
+```go
+func (s *Server) handleDeleteFeed(w http.ResponseWriter, r *http.Request) {
+	acct := auth.AccountFromContext(r.Context())
+
+	rawID := r.PathValue("id")
+	feedID, err := uuid.Parse(rawID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid feed id")
+		return
+	}
+
+	// Fetch the feed to verify ownership before deleting.
+	feed, err := s.queries.GetFeedByID(r.Context(), feedID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "feed not found")
+		return
+	}
+	if feed.AccountID != acct.ID {
+		// Return 403, not 404. The user knows the feed exists — we just
+		// refuse to let them delete it. 404 leaks ownership info; 403 is honest.
+		respondError(w, http.StatusForbidden, "not your feed")
+		return
+	}
+
+	if err := s.queries.DeleteFeed(r.Context(), feedID); err != nil {
+		respondError(w, http.StatusInternalServerError, "could not delete feed")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+The 403 vs 404 choice is a deliberate API design decision: `404` here would leak that the feed ID exists. Return `403` when the resource exists but the caller can't touch it — that is what the status code means. See HTTP Servers: JSON, Streaming & WebSockets.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Deduplicate posts at the application layer" level="medium">
+
+The database's `UNIQUE` constraint on `posts.url` is the source of truth for deduplication, but the scraper still sends N insert attempts per re-scrape. Add a `url.NormalizeURL(raw string) (string, error)` helper in a new `internal/urlutil` package that:
+
+1. Parses the URL.
+2. Lowercases the scheme and host.
+3. Removes the trailing slash from the path.
+4. Strips `utm_*` tracking query parameters.
+
+Write a table-driven test covering at least five cases (trailing slash, mixed-case host, UTM params, invalid URL).
+
+<Solution>
+
+```go
+// internal/urlutil/urlutil.go
+package urlutil
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
+
+// NormalizeURL canonicalizes a URL for deduplication.
+// It lowercases scheme+host, removes trailing slash,
+// and strips utm_* tracking parameters.
+func NormalizeURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse %q: %w", raw, err)
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.Path = strings.TrimRight(u.Path, "/")
+
+	q := u.Query()
+	for k := range q {
+		if strings.HasPrefix(k, "utm_") {
+			delete(q, k)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// internal/urlutil/urlutil_test.go
+package urlutil_test
+
+import "testing"
+
+func TestNormalizeURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://Example.COM/posts/", "https://example.com/posts"},
+		{"https://a.io/p?utm_source=x&utm_medium=y", "https://a.io/p"},
+		{"HTTP://A.IO/", "http://a.io"},
+		{"https://a.io/p?keep=1&utm_source=x", "https://a.io/p?keep=1"},
+		{"https://a.io/p", "https://a.io/p"},
+	}
+	for _, tc := range cases {
+		got, err := NormalizeURL(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("NormalizeURL(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+}
+```
+
+Call `NormalizeURL` in `scrapeFeed` before the `CreatePost` call. The DB constraint is still the ultimate guard, but normalization eliminates a whole class of near-duplicate URLs.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Add an endpoint count to the metrics" level="medium">
+
+Add a `GET /v1/healthz` endpoint that returns a JSON object with:
+
+```json
+{"status": "ok", "db": "ok", "redis": "ok"}
+```
+
+where `"db"` pings the database with `sqlDB.PingContext(ctx)` and `"redis"` calls `rdb.Ping(ctx)`. If a dependency is unhealthy, that field should be `"degraded"` and the overall status should be `"degraded"` too. The endpoint must respond in under 3 seconds regardless — set a context deadline.
+
+<Solution>
+
+```go
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2500*time.Millisecond)
+	defer cancel()
+
+	type health struct {
+		Status string `json:"status"`
+		DB     string `json:"db"`
+		Redis  string `json:"redis"`
+	}
+	h := health{Status: "ok", DB: "ok", Redis: "ok"}
+
+	if err := s.sqlDB.PingContext(ctx); err != nil {
+		h.DB = "degraded"
+		h.Status = "degraded"
+	}
+	if err := s.rdb.Ping(ctx).Err(); err != nil {
+		h.Redis = "degraded"
+		h.Status = "degraded"
+	}
+
+	code := http.StatusOK
+	if h.Status == "degraded" {
+		code = http.StatusServiceUnavailable
+	}
+	respondJSON(w, code, h)
+}
+```
+
+Kubernetes readiness probes hit this endpoint. A `503` tells the load balancer to stop routing traffic to this instance — critical for zero-downtime deployments (Deployment & Infra: CI/CD + Kubernetes, Part 1).
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Wire singleflight to the cache miss path" level="hard">
+
+When Gator starts cold and N users all request their default posts page simultaneously, each gets a cache miss and each fires a `GetPostsByFeedIDs` query — the thundering herd. Fix it: use `golang.org/x/sync/singleflight` in the `handleGetPosts` path so that concurrent identical requests (same account, no cursor, limit 20) only hit the database once. The in-flight query's result is shared with all waiting callers.
+
+<Solution>
+
+```go
+// Add to Server struct:
+//   group singleflight.Group
+
+func (s *Server) handleGetPosts(w http.ResponseWriter, r *http.Request) {
+	acct := auth.AccountFromContext(r.Context())
+	// ... cursor/limit parsing unchanged ...
+
+	if cursor == nil && limit == 20 {
+		if posts, ok := s.cache.GetLatestPosts(r.Context(), acct.ID); ok {
+			respondJSON(w, http.StatusOK, posts)
+			return
+		}
+		// singleflight key = account ID (per-user, so callers share results
+		// only within the same user — never across users).
+		key := acct.ID.String()
+		v, err, _ := s.group.Do(key, func() (any, error) {
+			feedIDs, err := s.queries.GetFeedIDsForAccount(r.Context(), acct.ID)
+			if err != nil {
+				return nil, err
+			}
+			return s.queries.GetPostsByFeedIDs(r.Context(), database.GetPostsByFeedIDsParams{
+				FeedIds: feedIDs,
+				Limit:   20,
+			})
+		})
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "could not fetch posts")
+			return
+		}
+		posts := v.([]database.Post)
+		s.cache.SetLatestPosts(r.Context(), acct.ID, posts)
+		respondJSON(w, http.StatusOK, posts)
+		return
+	}
+	// ... paginated path unchanged ...
+}
+```
+
+`singleflight.Group.Do` deduplicates identical in-flight calls. The third return value (the `bool`) tells you if this result was shared — useful for metrics. Note the key is per-account: we never want User A's posts to be returned to User B, even if they happen to trigger a singleflight at the same moment. The key must encode everything that differentiates requests.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Benchmark the hot read path" level="hard">
+
+Write a benchmark (`BenchmarkGetPosts`) in `internal/api/handlers_test.go` that:
+
+1. Seeds the stub with 100 posts.
+2. Runs `b.N` iterations of the `GET /v1/posts` handler.
+3. Runs with both the cache stub (miss path) and a hit-path stub.
+4. Reports allocations with `b.ReportAllocs()`.
+
+What does `go test -bench=. -benchmem ./internal/api/...` tell you? Where are the allocations coming from?
+
+<Solution>
+
+```go
+func BenchmarkGetPostsCacheMiss(b *testing.B) {
+	posts := make([]database.Post, 100)
+	for i := range posts {
+		posts[i] = database.Post{
+			ID:    uuid.New(),
+			Title: fmt.Sprintf("Post %d", i),
+			Url:   fmt.Sprintf("https://example.com/p/%d", i),
+		}
+	}
+	router := api.NewRouter(&stubQueries{posts: posts}, &stubCache{})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N { // Go 1.22+: range over integer; never mutate b.N directly
+		req := httptest.NewRequest(http.MethodGet, "/v1/posts", nil)
+		req = req.WithContext(contextWithTestAccount(req.Context()))
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+	}
+}
+```
+
+`b.ReportAllocs()` exposes that most allocations live in `json.Marshal` (encoding 100 posts) and `httptest.NewRecorder` (internal byte buffer). The cache hit path has far fewer allocations — the marshal cost is paid once per TTL period, not once per request.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+You've built the whole thing stage by stage. Now I'm watching. Live. Under load.
+
+<Lab
+  title="Make Gator correct under concurrent scraping and pagination"
+  archetype="load"
+  difficulty="unscaffolded"
+  points={120}
+  hintCost={15}
+  objective="The starter service has three bugs that surface only under load: (1) the scraper has a race on the post counter, (2) the cache invalidation is missing a lock and corrupts its subscriber set under concurrent writes, and (3) the pagination cursor is parsed but never applied to the DB query — so page 2 returns the same 20 posts as page 1. Fix all three so the verifier's go test -race passes with zero data races, the post counter matches the DB after 50 concurrent scrapes, and two sequential requests with a cursor return non-overlapping post sets."
+  starter={`package scraper
+
+import (
+	"context"
+	"log"
+	"sync"
+)
+
+// BUG 1: postCount is accessed from multiple goroutines without
+// synchronization. The race detector will catch this.
+var postCount int // shared mutable state — not protected
+
+// BUG 2: subscriberMap is mutated and read concurrently without a lock.
+var subscriberMap = make(map[string][]string) // feedID -> []accountID
+
+func incrementPostCount() {
+	postCount++ // DATA RACE: multiple goroutines call this concurrently
+}
+
+func addSubscriber(feedID, accountID string) {
+	// DATA RACE: no lock protecting subscriberMap
+	subscriberMap[feedID] = append(subscriberMap[feedID], accountID)
+}
+
+func invalidateSubscribers(feedID string, _ func(string)) {
+	for _, id := range subscriberMap[feedID] {
+		log.Printf("invalidating cache for account %s", id)
+	}
+}
+
+// BUG 3: cursor is parsed from the query string but the DB call
+// always passes nil — page 2 returns the same results as page 1.
+func fetchPage(ctx context.Context, q interface {
+	GetPosts(ctx context.Context, before *string, limit int) ([]string, error)
+}, before *string) ([]string, error) {
+	// BUG: before is ignored — always passes nil
+	return q.GetPosts(ctx, nil, 20)
+}
+
+// Stub WaitGroup and mutex for the real implementation.
+var wg sync.WaitGroup
+`}
+  verify="self-check"
+  hints={[
+    "Bug 1: replace the bare postCount++ with sync/atomic.AddInt64 or protect it behind a sync.Mutex. The variable must be unexported or a struct field to scope the fix correctly.",
+    "Bug 2: add a sync.RWMutex field to whichever struct owns subscriberMap. Use RLock/RUnlock for reads, Lock/Unlock for writes — the subscriber lookup in invalidateSubscribers is a read, addSubscriber is a write.",
+    "Bug 3: change fetchPage so it passes the before argument directly to GetPosts instead of nil. Then in the handler, parse the cursor from the query string and thread it through — don't parse and then forget it."
+  ]}
+  flag="GO{race_free_scraper_correct_cursor_pagination}"
+>
+
+Three bugs. One goal: a correct, race-free backend under concurrent load.
+
+Self-check (verify tier: self-check — Codapi runs plain `go run`, not `go test -race`): add a `main()` to the starter that launches 50 goroutines calling `incrementPostCount`, calls `wg.Wait()`, and prints `PASS` if `postCount == 50` or `FAIL: got N` if not. Run it locally with `go test -race ./...` to confirm zero races. Two sequential `fetchPage` calls — the first with `nil`, the second with the last URL from the first result — must return non-overlapping URL sets; add an assertion that prints `PASS` or `FAIL` accordingly.
+
+I designed this personally. I am watching your counter. Do not disappoint me.
+
+</Lab>
+
+<Recap>
+
+You built **Gator** from the ground up — and it is not a toy:
+
+- **Schema and layout**: three normalized tables, sqlc-generated queries, and a clean hexagonal project layout where each layer only knows about the one below it. Migrations are versioned, explicit, and safe to re-run.
+- **Auth middleware**: API-key extraction, per-request account resolution via a typed context key, and the only-hit-the-DB pattern for authoritative auth. Context value collisions are physically impossible.
+- **HTTP API**: `NewRouter` wires five endpoints; cursor pagination with a stable `published_at` cursor avoids the skip/duplicate problem that offset pagination causes on a live feed. Every error response has the same JSON shape.
+- **Concurrent feed fetcher**: a `time.Ticker` drives `scrapeAll`, a buffered-channel semaphore caps concurrent fetches, and `sync.WaitGroup.Go` (Go 1.25) launches goroutines with an atomic add — no more `Add(1)`/`defer Done()` split. `ON CONFLICT DO NOTHING` makes re-scrapes idempotent.
+- **Caching layer**: cache-aside with per-user Redis keys and explicit invalidation when the scraper finds new posts. The TTL is a safety net; the explicit invalidation is the fast path. Auth lookups are never cached.
+- **Testing suite**: table-driven handler tests with stub dependencies and `httptest.Recorder`, a scraper test against an `httptest.Server` mock feed, a golden-file test that locks the response shape, and a `-race` test that hammers the scraper and cache concurrently. `go test -race ./...` is the minimal CI bar.
+
+The architectural throughline: **dependencies injected everywhere, nothing global, context threaded through every I/O call, every error surfaced and handled**. That is not bureaucracy — that is what a service looks like that you can actually debug at 3 a.m.
+
+</Recap>
+
+<Scoreboard
+  streak={20}
+  items={[
+    { label: "Quick check — signal.NotifyContext", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — cursor vs offset pagination", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — DELETE /v1/feeds/{id}", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — URL deduplication", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3 — /v1/healthz endpoint", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — singleflight on cache miss", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 5 — benchmark the hot path", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Race-free scraper + correct cursor pagination", captured: false, points: 120 }}
+/>
+
+Not bad. That's a real backend. Schema, auth, HTTP, concurrency, caching, testing — all of it wired together the way it's *supposed* to be. You didn't build a demo. You built something you could actually ship. It's no *me*, but… honestly? I'm almost impressed. Microservices are next, and I have very strong opinions about distributed systems. Buckle up, sport.

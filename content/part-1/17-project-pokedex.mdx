@@ -1,0 +1,1820 @@
+---
+title: "Project: A Pokedex CLI (API Consumer)"
+part: 1
+order: 17
+type: "project"
+description: "Build an API-consuming app with caching and pagination — a Pokedex-style CLI — with a full test suite."
+prerequisites: ["http-clients"]
+---
+
+<HeroCard label="Part 1 · Chapter 17" title="Project: A Pokedex CLI">
+
+Here's the thing, sport. You've absorbed the concepts. You know how HTTP clients work, you know Go's type system, and you've watched me explain goroutines like the world's most patient genius. *Now* you build something real.
+
+We're making a Pokedex CLI — a REPL-style tool that talks to a paginated REST API, caches responses in-memory with a TTL reaper, and ships a full test suite that I personally will not be embarrassed by. By the time you're done, you'll have a working program you actually *earned*. Not bad. It's no *me*, but — well, let's see, shall we?
+
+Every project chapter follows the same law: build in stages, test each stage, never ship a function without understanding what it does. Onward.
+
+</HeroCard>
+
+<Scene
+  title="Paging the API — without and with a cache"
+  actors={[
+    { id: "repl", label: "REPL" },
+    { id: "api", label: "API" },
+  ]}
+  rows={2}
+  cols={6}
+  frames={[
+    {
+      caption: "No cache. User types 'map' three times — every call fires a fresh HTTP request to the API.",
+      beat: "problem",
+      actors: [{ id: "repl", state: "active" }, { id: "api", state: "warn" }],
+      cells: [
+        { id: "A1", state: "idle", label: "—" },
+        { id: "A2", state: "idle", label: "—" },
+        { id: "A3", state: "idle", label: "—" },
+        { id: "A4", state: "idle", label: "—" },
+        { id: "A5", state: "idle", label: "—" },
+        { id: "A6", state: "idle", label: "—" },
+      ],
+    },
+    {
+      caption: "First 'map': cache is empty, so the REPL hits the API. Slow round-trip. Page 1 stored in slot A1.",
+      beat: "problem",
+      actors: [{ id: "repl", state: "active" }, { id: "api", state: "active" }],
+      cells: [{ id: "A1", state: "active", label: "pg1" }],
+    },
+    {
+      caption: "User types 'mapb' then 'map' again — same page 1 URL. Still no cache: two more API round-trips. Rate-limit counter climbs.",
+      beat: "problem",
+      actors: [{ id: "repl", state: "warn" }, { id: "api", state: "bad" }],
+      cells: [
+        { id: "A1", state: "warn", label: "pg1" },
+        { id: "A2", state: "warn", label: "pg1" },
+      ],
+    },
+    {
+      caption: "With a TTL cache: 'map' fires once, fills slot A1. Slots A2–A6 hold other pages as the session continues.",
+      beat: "solution",
+      actors: [{ id: "repl", state: "active" }, { id: "api", state: "idle" }],
+      cells: [
+        { id: "A1", state: "done", label: "pg1" },
+        { id: "A2", state: "done", label: "pg2" },
+        { id: "A3", state: "done", label: "pg3" },
+        { id: "A4", state: "idle", label: "—" },
+        { id: "A5", state: "idle", label: "—" },
+        { id: "A6", state: "idle", label: "—" },
+      ],
+    },
+    {
+      caption: "User pages back to page 1 — cache hit. Zero network round-trips. API sees silence. TTL keeps entries fresh.",
+      beat: "solution",
+      actors: [{ id: "repl", state: "ok" }, { id: "api", state: "idle" }],
+      cells: [
+        { id: "A1", state: "ok", label: "HIT" },
+        { id: "A2", state: "done", label: "pg2" },
+        { id: "A3", state: "done", label: "pg3" },
+      ],
+    },
+  ]}
+  caption="Each cache slot is one URL → []byte entry. The reaper goroutine evicts stale slots after the TTL expires."
+/>
+
+<ChapterTabs tabs={["REPL Scaffold", "API Client", "Pagination", "The Cache", "Test Suite"]} />
+
+## REPL Scaffold
+
+<Define term="REPL (read-eval-print loop)" since="Concurrency: Goroutines, Channels & Select (Part 1)">
+A **REPL** is an interactive shell: it **R**eads a line of user input, **E**valuates it (looks the command up and runs it), **P**rints the result, and **L**oops back. Every interactive CLI — from the Python shell to `psql` to this Pokedex — is a REPL. Without it you'd have to restart the process for every command. The Pokedex REPL is a single `for` loop around a `bufio.Scanner`.
+</Define>
+
+Before you touch a network, you need a shell. A REPL — **Read, Eval, Print, Loop** — is the heartbeat of any interactive CLI: read a line of input, figure out which command it maps to, run it, print the result, and loop. The Pokedex CLI lives entirely inside one of these.
+
+Here's the real-world framing: a developer-tools team is building an internal catalog browser. The catalog is a paginated API. The team wants a local CLI so engineers can page through locations, look up entries, and poke around without firing up a browser or crafting `curl` commands. That's your Pokedex. Same shape, different domain skin.
+
+### The command registry
+
+Every command gets an entry in a `map[string]cliCommand`. This is the idiomatic Go approach — no giant `switch` on strings, no reflection magic. A map of function values, keyed by name.
+
+```go
+// main.go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"strings"
+)
+
+// cliCommand holds one registered command — its name, a short description,
+// and the function to call when the user types it.
+type cliCommand struct {
+	name        string
+	description string
+	callback    func(cfg *config, args ...string) error
+}
+
+// config is the shared mutable state threaded through every command.
+// No globals — we pass this explicitly so every command is testable.
+type config struct {
+	// pagination cursors (filled in the Pagination section)
+	nextURL string
+	prevURL string
+
+	// the typed API client (filled in the API Client section)
+	client *PokeClient
+
+	// caught Pokemon by name (filled in Exercise 2)
+	caught map[string]PokemonResp
+}
+
+// getCommands builds the command registry. It's a function, not a package-level
+// var, so the registry can reference its own entries (e.g. the help command
+// lists all commands) without initialization-order headaches.
+func getCommands() map[string]cliCommand {
+	return map[string]cliCommand{
+		"help": {
+			name:        "help",
+			description: "Display a help message",
+			callback:    commandHelp,
+		},
+		"exit": {
+			name:        "exit",
+			description: "Exit the Pokedex",
+			callback:    commandExit,
+		},
+		"map": {
+			name:        "map",
+			description: "Display next page of locations",
+			callback:    commandMap,
+		},
+		"mapb": {
+			name:        "mapb",
+			description: "Display previous page of locations",
+			callback:    commandMapb,
+		},
+		"explore": {
+			name:        "explore",
+			description: "Explore a location area for Pokemon",
+			callback:    commandExplore,
+		},
+		"catch": {
+			name:        "catch",
+			description: "Attempt to catch a Pokemon",
+			callback:    commandCatch,
+		},
+		"inspect": {
+			name:        "inspect",
+			description: "Inspect a caught Pokemon",
+			callback:    commandInspect,
+		},
+		"pokedex": {
+			name:        "pokedex",
+			description: "List all caught Pokemon",
+			callback:    commandPokedex,
+		},
+	}
+}
+
+// startREPL is the main loop. It reads a line, splits it into words,
+// looks the first word up in the registry, and calls the matching command.
+func startREPL(cfg *config) {
+	commands := getCommands()
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for {
+		fmt.Print("Pokedex > ")
+		if !scanner.Scan() {
+			break // EOF or error — clean exit
+		}
+		words := cleanInput(scanner.Text())
+		if len(words) == 0 {
+			continue
+		}
+		name := words[0]
+		args := words[1:]
+
+		cmd, ok := commands[name]
+		if !ok {
+			fmt.Println("Unknown command. Type 'help' for options.")
+			continue
+		}
+		if err := cmd.callback(cfg, args...); err != nil {
+			fmt.Println("Error:", err)
+		}
+	}
+}
+
+// cleanInput trims whitespace and splits on any whitespace run.
+// Returns lowercase tokens — this is your command parser.
+func cleanInput(text string) []string {
+	lowered := strings.ToLower(strings.TrimSpace(text))
+	if lowered == "" {
+		return nil
+	}
+	return strings.Fields(lowered)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Minimal self-contained demo: the parser and a stub registry.
+type cliCommand struct {
+	name        string
+	description string
+}
+
+func getCommands() map[string]cliCommand {
+	return map[string]cliCommand{
+		"help":    {name: "help", description: "Display help"},
+		"exit":    {name: "exit", description: "Exit the Pokedex"},
+		"map":     {name: "map", description: "List next locations"},
+		"mapb":    {name: "mapb", description: "List previous locations"},
+		"explore": {name: "explore", description: "Explore a location"},
+		"catch":   {name: "catch", description: "Catch a Pokemon"},
+		"inspect": {name: "inspect", description: "Inspect caught Pokemon"},
+		"pokedex": {name: "pokedex", description: "List all caught Pokemon"},
+	}
+}
+
+func cleanInput(text string) []string {
+	low := strings.ToLower(strings.TrimSpace(text))
+	if low == "" {
+		return nil
+	}
+	return strings.Fields(low)
+}
+
+func main() {
+	commands := getCommands()
+
+	inputs := []string{"help", "Map", "  EXPLORE  pallet-town  ", "badcmd", ""}
+	for _, raw := range inputs {
+		tokens := cleanInput(raw)
+		if len(tokens) == 0 {
+			fmt.Println("(empty input, skipping)")
+			continue
+		}
+		cmd, ok := commands[tokens[0]]
+		if !ok {
+			fmt.Printf("Unknown command: %q\n", tokens[0])
+			continue
+		}
+		fmt.Printf("Dispatching: %s — %s\n", cmd.name, cmd.description)
+		if len(tokens) > 1 {
+			fmt.Printf("  args: %v\n", tokens[1:])
+		}
+	}
+}
+```
+
+</GoPlayground>
+
+Let me animate exactly how the REPL dispatches a command — from raw input through the parser and into the callback:
+
+<ExecTimeline
+  title="REPL command dispatch: user types 'explore pallet-town'"
+  lanes={[{ id: "repl", label: "REPL loop" }]}
+  steps={[
+    { lane: "repl", kind: "run", label: "scanner.Scan()", note: "bufio.Scanner blocks waiting for the user to press Enter. When they do, it returns the raw line string." },
+    { lane: "repl", kind: "run", label: "cleanInput(line)", note: "Lowercase, trim, split on whitespace. 'explore pallet-town' → ['explore', 'pallet-town']." },
+    { lane: "repl", kind: "run", label: "words[0] = 'explore'", note: "The first token is the command name. Remaining tokens are arguments passed to the callback." },
+    { lane: "repl", kind: "run", label: "commands['explore']", note: "Map lookup. O(1). Found — returns the cliCommand struct holding the callback function." },
+    { lane: "repl", kind: "run", label: "cmd.callback(cfg, args...)", note: "Call the explore handler, passing the shared config and ['pallet-town'] as the args slice." },
+    { lane: "repl", kind: "done", label: "loop again", note: "Handler returns. Print 'Pokedex > ' and block on the next Scan(). The loop continues until EOF or 'exit'." }
+  ]}
+  caption="One map lookup, one function call. The registry keeps the switch-statement off your hands forever."
+/>
+
+### The stub command handlers
+
+Stub everything out so the REPL compiles and loops correctly before any real logic goes in. This is the discipline: a runnable scaffold at every stage.
+
+```go
+// commands.go
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func commandHelp(cfg *config, args ...string) error {
+	fmt.Println("Welcome to the Pokedex!")
+	fmt.Println("Usage:")
+	for _, cmd := range getCommands() {
+		fmt.Printf("  %-10s %s\n", cmd.name, cmd.description)
+	}
+	return nil
+}
+
+func commandExit(cfg *config, args ...string) error {
+	fmt.Println("Closing the Pokedex... Goodbye!")
+	os.Exit(0)
+	return nil
+}
+
+// Stubs — real logic comes in later sections.
+func commandMap(cfg *config, args ...string) error {
+	fmt.Println("map: not yet implemented")
+	return nil
+}
+func commandMapb(cfg *config, args ...string) error {
+	fmt.Println("mapb: not yet implemented")
+	return nil
+}
+func commandExplore(cfg *config, args ...string) error {
+	fmt.Println("explore: not yet implemented")
+	return nil
+}
+func commandCatch(cfg *config, args ...string) error {
+	fmt.Println("catch: not yet implemented")
+	return nil
+}
+func commandInspect(cfg *config, args ...string) error {
+	fmt.Println("inspect: not yet implemented")
+	return nil
+}
+func commandPokedex(cfg *config, args ...string) error {
+	fmt.Println("pokedex: not yet implemented")
+	return nil
+}
+```
+
+<Callout kind="note" title="No globals for state">
+
+Notice `config` is injected into every callback — not stored in a package-level variable. This isn't ceremony. It means every command handler is a pure function of its inputs, which means every command handler is **testable without any global setup**. The testing section will thank you for this.
+
+</Callout>
+
+<QuickCheck
+  question="Why does getCommands() return a new map each call instead of using a package-level var?"
+  options={[
+    "Maps are not safe to read concurrently, so we avoid sharing them",
+    "The help command needs to reference the registry, and a function call avoids initialization-order issues",
+    "Go does not allow maps at package level",
+    "It makes the map immutable"
+  ]}
+  answer={1}
+  explain="A package-level var cliCommands could reference commandHelp before getCommands itself is done initializing. A function sidesteps Go's init-order constraints entirely — and it's cleaner."
+/>
+
+## API Client
+
+<Define term="API client (typed JSON decode)" since="HTTP Clients (Part 1)">
+An **API client** is a thin wrapper around `http.Client` that knows one server's URL scheme and turns its raw JSON bodies into typed Go structs. "Typed JSON decode" means you define a Go struct whose fields mirror the JSON keys exactly, then call `json.NewDecoder(resp.Body).Decode(&result)` — the decoder fills the struct from the stream. If a field is missing in JSON you get its zero value; if the JSON has an extra field, Go ignores it. The payoff: callers get strongly typed data with compile-time safety instead of `map[string]any` soup.
+</Define>
+
+The catalog lives behind a real REST API. We need typed structs to hold the responses, an `http.Client` with a timeout, and a JSON decoder. This is the HTTP-clients chapter made concrete — if any of this feels new, flip back to HTTP Clients.
+
+### The response types
+
+The catalog API returns paginated location pages and location-area details. Define typed structs that match the JSON exactly:
+
+```go
+// api.go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+// LocationAreaResp is what the /location-area endpoint returns.
+// The JSON fields must match exactly — Go's decoder is case-insensitive
+// for simple names, but json tags are explicit and safer.
+type LocationAreaResp struct {
+	Count    int     `json:"count"`
+	Next     *string `json:"next"`     // pointer: null in JSON → nil in Go
+	Previous *string `json:"previous"` // same
+	Results  []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	} `json:"results"`
+}
+
+// ExploreResp is what /location-area/{name} returns.
+type ExploreResp struct {
+	PokemonEncounters []struct {
+		Pokemon struct {
+			Name string `json:"name"`
+		} `json:"pokemon"`
+	} `json:"pokemon_encounters"`
+}
+
+// PokemonResp is what /pokemon/{name} returns.
+type PokemonResp struct {
+	Name           string `json:"name"`
+	BaseExperience int    `json:"base_experience"`
+	Height         int    `json:"height"`
+	Weight         int    `json:"weight"`
+	Stats          []struct {
+		BaseStat int `json:"base_stat"`
+		Stat     struct {
+			Name string `json:"name"`
+		} `json:"stat"`
+	} `json:"stats"`
+	Types []struct {
+		Type struct {
+			Name string `json:"name"`
+		} `json:"type"`
+	} `json:"types"`
+}
+```
+
+### The API client
+
+A thin wrapper around `http.Client`. It owns the base URL, the HTTP client (with timeout), and the cache. Every method takes a `context.Context` first — the standard rule for anything that does I/O.
+
+```go
+// PokeClient wraps http.Client and the response cache.
+// No globals: inject the cache so tests can supply a fake.
+type PokeClient struct {
+	baseURL    string
+	httpClient *http.Client
+	cache      *Cache
+}
+
+// NewPokeClient constructs a client with a sane timeout.
+// interval is the cache TTL — passed through to NewCache.
+func NewPokeClient(interval time.Duration) PokeClient {
+	return PokeClient{
+		baseURL: "https://pokeapi.co/api/v2",
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		cache: NewCache(interval),
+	}
+}
+
+// GetLocationAreas fetches the paginated /location-area list.
+// url is the full URL (including query params); passing "" uses the first page.
+func (c *PokeClient) GetLocationAreas(ctx context.Context, url string) (LocationAreaResp, error) {
+	if url == "" {
+		url = c.baseURL + "/location-area"
+	}
+
+	// cache hit — return immediately without a network round-trip
+	if data, ok := c.cache.Get(url); ok {
+		var result LocationAreaResp
+		if err := json.Unmarshal(data, &result); err != nil {
+			return LocationAreaResp{}, fmt.Errorf("unmarshal cached: %w", err)
+		}
+		return result, nil
+	}
+
+	resp, err := c.get(ctx, url)
+	if err != nil {
+		return LocationAreaResp{}, err
+	}
+	defer resp.Body.Close()
+
+	var result LocationAreaResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return LocationAreaResp{}, fmt.Errorf("decode location areas: %w", err)
+	}
+
+	// cache the raw bytes so future calls don't hit the network
+	raw, _ := json.Marshal(result)
+	c.cache.Add(url, raw)
+	return result, nil
+}
+
+// GetExplore fetches /location-area/{name} and returns Pokemon encounters.
+func (c *PokeClient) GetExplore(ctx context.Context, name string) (ExploreResp, error) {
+	url := c.baseURL + "/location-area/" + name
+
+	if data, ok := c.cache.Get(url); ok {
+		var result ExploreResp
+		if err := json.Unmarshal(data, &result); err != nil {
+			return ExploreResp{}, fmt.Errorf("unmarshal cached explore: %w", err)
+		}
+		return result, nil
+	}
+
+	resp, err := c.get(ctx, url)
+	if err != nil {
+		return ExploreResp{}, err
+	}
+	defer resp.Body.Close()
+
+	var result ExploreResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ExploreResp{}, fmt.Errorf("decode explore: %w", err)
+	}
+
+	raw, _ := json.Marshal(result)
+	c.cache.Add(url, raw)
+	return result, nil
+}
+
+// GetPokemon fetches /pokemon/{name}.
+func (c *PokeClient) GetPokemon(ctx context.Context, name string) (PokemonResp, error) {
+	url := c.baseURL + "/pokemon/" + name
+
+	if data, ok := c.cache.Get(url); ok {
+		var result PokemonResp
+		if err := json.Unmarshal(data, &result); err != nil {
+			return PokemonResp{}, fmt.Errorf("unmarshal cached pokemon: %w", err)
+		}
+		return result, nil
+	}
+
+	resp, err := c.get(ctx, url)
+	if err != nil {
+		return PokemonResp{}, err
+	}
+	defer resp.Body.Close()
+
+	var result PokemonResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return PokemonResp{}, fmt.Errorf("decode pokemon: %w", err)
+	}
+
+	raw, _ := json.Marshal(result)
+	c.cache.Add(url, raw)
+	return result, nil
+}
+
+// get is a shared helper that builds and fires the HTTP request.
+func (c *PokeClient) get(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http get %s: %w", url, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("unexpected status %d for %s", resp.StatusCode, url)
+	}
+	return resp, nil
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// Self-contained demo: parse a mock API response — no network needed.
+type LocationAreaResp struct {
+	Count    int     `json:"count"`
+	Next     *string `json:"next"`
+	Previous *string `json:"previous"`
+	Results  []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	} `json:"results"`
+}
+
+func main() {
+	payload := `{
+		"count": 1056,
+		"next": "https://pokeapi.co/api/v2/location-area?offset=20&limit=20",
+		"previous": null,
+		"results": [
+			{"name": "canalave-city-area", "url": "https://pokeapi.co/api/v2/location-area/1/"},
+			{"name": "eterna-city-area",   "url": "https://pokeapi.co/api/v2/location-area/2/"}
+		]
+	}`
+
+	var resp LocationAreaResp
+	if err := json.NewDecoder(strings.NewReader(payload)).Decode(&resp); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Total locations: %d\n", resp.Count)
+	if resp.Next != nil {
+		fmt.Printf("Next page: %s\n", *resp.Next)
+	}
+	for _, r := range resp.Results {
+		fmt.Printf("  - %s\n", r.Name)
+	}
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Why *string for nullable JSON fields">
+
+When you decode JSON `null` into a `*string`, Go sets the pointer to `nil`. When you decode a real string, Go allocates a new string and points to it. A plain `string` field has no way to distinguish `null` from `""` — they both become the empty string. The pointer carries the distinction. This has worked this way since Go 1.0; it is not version-specific behaviour.
+
+You can also use `any` or a custom type implementing `json.Unmarshaler`, but `*string` is the zero-ceremony idiom the standard library itself uses. The cost is one heap allocation per non-null field, which for rare pagination cursors is completely inconsequential.
+
+`json.NewDecoder(resp.Body).Decode(&result)` streams the HTTP response body through the decoder without buffering the whole body into a `[]byte` first. For large responses this means lower peak memory. `json.Unmarshal` requires the full bytes in memory — fine for cached data, but prefer the streaming decoder for live network responses. (As of Go 1.26, `io.ReadAll` is faster than earlier releases when you do need to materialise a body into `[]byte`, but for JSON decoding the streaming path is still preferable.)
+
+</UnderTheHood>
+
+<QuickCheck
+  question="What happens when json.Decode writes a JSON null into a *string field?"
+  options={[
+    "It panics — you cannot assign null to a pointer",
+    "It sets the pointer to nil, cleanly distinguishing null from an empty string",
+    "It sets the pointer to point at an empty string",
+    "It returns a decode error"
+  ]}
+  answer={1}
+  explain="JSON null → Go nil pointer. That's the whole point: a *string can represent three states — nil (null), &empty string, and &non-empty string — while a plain string collapses null and empty into the same value."
+/>
+
+## Pagination
+
+<Define term="Pagination (cursor / next-URL)" since="Auth & API Design (Part 1)">
+**Pagination** is how an API returns a large dataset in small, sequential pages instead of one huge response. **Cursor-style pagination** gives you an opaque `next` URL in each response — you follow that URL to get the next page, instead of computing `?offset=40` yourself. The server controls what "next" means: it can encode a database cursor, a timestamp, or a sort key inside the URL. You can't skip to page 10; you can only walk forward. The trade-off is predictable latency and stability under concurrent writes (no row-skip/duplicate problem that offset pagination has). If `next` is `null`, you're on the last page.
+</Define>
+
+The catalog API is cursor-style: every page tells you the next page's URL. Your `config` tracks two cursors — `nextURL` and `prevURL` — updated every time you call `map` or `mapb`. By this section `config` also holds `client *PokeClient`; make sure it's wired up in `main`.
+
+### Cursor-style pagination vs. offset pagination
+
+Offset pagination (`?offset=20&limit=20`) is simple but breaks under concurrent writes: if a row is inserted before your next fetch, you get a duplicate or skip an entry. Cursor-based pagination follows opaque URLs the server mints — you can't compute them yourself, which means you can't skip pages, but every page is stable.
+
+```go
+// commands.go (updated map / mapb)
+// Add "context" and "fmt" to your import block if not already present.
+
+func commandMap(cfg *config, args ...string) error {
+	ctx := context.Background()
+	// nextURL starts empty → first page; subsequent calls use the cursor
+	resp, err := cfg.client.GetLocationAreas(ctx, cfg.nextURL)
+	if err != nil {
+		return fmt.Errorf("map: %w", err)
+	}
+
+	// advance the cursors — next call to map uses resp.Next,
+	// and mapb can now go back via resp.Previous
+	if resp.Next != nil {
+		cfg.nextURL = *resp.Next
+	} else {
+		cfg.nextURL = "" // last page — map will start over
+	}
+	if resp.Previous != nil {
+		cfg.prevURL = *resp.Previous
+	} else {
+		cfg.prevURL = ""
+	}
+
+	for _, loc := range resp.Results {
+		fmt.Println(loc.Name)
+	}
+	return nil
+}
+
+func commandMapb(cfg *config, args ...string) error {
+	if cfg.prevURL == "" {
+		fmt.Println("You're on the first page.")
+		return nil
+	}
+	ctx := context.Background()
+	resp, err := cfg.client.GetLocationAreas(ctx, cfg.prevURL)
+	if err != nil {
+		return fmt.Errorf("mapb: %w", err)
+	}
+
+	if resp.Next != nil {
+		cfg.nextURL = *resp.Next
+	}
+	if resp.Previous != nil {
+		cfg.prevURL = *resp.Previous
+	} else {
+		cfg.prevURL = ""
+	}
+
+	for _, loc := range resp.Results {
+		fmt.Println(loc.Name)
+	}
+	return nil
+}
+```
+
+<ExecTimeline
+  title="Three map calls — cursor advancing through pages"
+  lanes={[{ id: "repl", label: "REPL" }, { id: "api", label: "API" }]}
+  steps={[
+    { lane: "repl", kind: "run", label: "map (nextURL = '')", note: "First call: nextURL is empty, so we request /location-area with no offset. This is always page 1." },
+    { lane: "api", kind: "recv", label: "GET /location-area", note: "Server returns page 1: results + next='...?offset=20' + previous=null." },
+    { lane: "repl", kind: "run", label: "update cursors", note: "nextURL = '...?offset=20', prevURL = '' (previous was null). Print the 20 names." },
+    { lane: "repl", kind: "run", label: "map (nextURL = '...?offset=20')", note: "Second call uses the cursor from the previous response — not a computed offset." },
+    { lane: "api", kind: "recv", label: "GET /location-area?offset=20", note: "Server returns page 2: results + next='...?offset=40' + previous='...?offset=0'." },
+    { lane: "repl", kind: "run", label: "update cursors", note: "nextURL = '...?offset=40', prevURL = '...?offset=0'. mapb is now usable." },
+    { lane: "repl", kind: "done", label: "mapb (prevURL)", note: "mapb uses prevURL to go back to page 1. The server, not the client, controls what 'previous' means." }
+  ]}
+  caption="Cursors flow from server to client to next request — the client never computes page numbers."
+/>
+
+<Callout kind="pro" title="Why context.Background() here?">
+
+These REPL commands run in the main goroutine with no parent deadline. `context.Background()` is correct. In a server handler you'd propagate the request's context — the handler's `ctx` carries the client's timeout. In a REPL, the user set no deadline, so `Background` is honest. Always ask: *who should cancel this?* If nobody, use `Background`.
+
+</Callout>
+
+## The Cache
+
+<Define term="In-memory cache + TTL" since="Caching & Redis (Part 1)">
+An **in-memory cache** stores the results of expensive operations (here: HTTP round-trips) in a `map` inside the process, so the same request can be answered from RAM in microseconds instead of going to the network. A **TTL (time-to-live)** is a maximum age for each entry — after `interval` has passed the entry is stale and must be re-fetched. Without a TTL the cache grows unbounded and serves forever-old data; without the cache every `explore` hammers the same API endpoint, burning your rate-limit budget and adding hundreds of milliseconds of latency per REPL command. The combination — fast reads, bounded staleness — is why caches exist at all.
+</Define>
+
+Here's where this project earns its concurrency stripes. You don't want to hammer the catalog API for the same location every time the user types `explore`. You want a cache: fast, in-memory, with a TTL so entries don't live forever.
+
+This is a preview of the Caching & Redis chapter (coming later in Part 1), but we're building a real one right now because the Pokedex needs it today, not in five chapters.
+
+### The Cache struct
+
+```go
+// cache.go
+package main
+
+import (
+	"sync"
+	"time"
+)
+
+// cacheEntry holds one cached value and the wall time it was added.
+type cacheEntry struct {
+	createdAt time.Time
+	val       []byte
+}
+
+// Cache is a TTL cache backed by a map, protected by a mutex.
+// The reap goroutine runs in the background and evicts stale entries.
+// Zero value is NOT usable — call NewCache.
+type Cache struct {
+	mu       sync.Mutex
+	entries  map[string]cacheEntry
+	interval time.Duration
+}
+
+// NewCache creates a cache with the given TTL interval and starts
+// the background reaping goroutine. The goroutine runs for the
+// lifetime of the process (no stop channel here — see the exercise
+// for the lifecycle version with a stop channel).
+func NewCache(interval time.Duration) *Cache {
+	c := &Cache{
+		entries:  make(map[string]cacheEntry),
+		interval: interval,
+	}
+	go c.reapLoop()
+	return c
+}
+
+// Add stores val under key. If key already exists, it is overwritten.
+// Safe for concurrent use.
+func (c *Cache) Add(key string, val []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = cacheEntry{
+		createdAt: time.Now(),
+		val:       val,
+	}
+}
+
+// Get retrieves val for key. Returns (val, true) on hit, (nil, false) on miss.
+// Safe for concurrent use.
+func (c *Cache) Get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	return e.val, true
+}
+
+// reapLoop runs forever, waking up every interval to delete entries
+// older than interval. It holds the mutex only long enough to scan
+// and delete — it does not block Add/Get for the full sleep.
+func (c *Cache) reapLoop() {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.reap()
+	}
+}
+
+func (c *Cache) reap() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	deadline := time.Now().Add(-c.interval)
+	for k, e := range c.entries {
+		if e.createdAt.Before(deadline) {
+			delete(c.entries, k)
+		}
+	}
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+type cacheEntry struct {
+	createdAt time.Time
+	val       []byte
+}
+
+type Cache struct {
+	mu       sync.Mutex
+	entries  map[string]cacheEntry
+	interval time.Duration
+}
+
+func NewCache(interval time.Duration) *Cache {
+	c := &Cache{
+		entries:  make(map[string]cacheEntry),
+		interval: interval,
+	}
+	go c.reapLoop()
+	return c
+}
+
+func (c *Cache) Add(key string, val []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = cacheEntry{createdAt: time.Now(), val: val}
+}
+
+func (c *Cache) Get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	return e.val, true
+}
+
+func (c *Cache) reapLoop() {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.reap()
+	}
+}
+
+func (c *Cache) reap() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	deadline := time.Now().Add(-c.interval)
+	for k, e := range c.entries {
+		if e.createdAt.Before(deadline) {
+			delete(c.entries, k)
+		}
+	}
+}
+
+func main() {
+	c := NewCache(100 * time.Millisecond)
+
+	c.Add("location-1", []byte("pallet-town-area"))
+	c.Add("location-2", []byte("viridian-city-area"))
+
+	if v, ok := c.Get("location-1"); ok {
+		fmt.Printf("HIT  location-1: %s\n", v)
+	}
+
+	// wait for TTL to expire
+	time.Sleep(150 * time.Millisecond)
+
+	if _, ok := c.Get("location-1"); !ok {
+		fmt.Println("MISS location-1: evicted by reaper")
+	}
+	fmt.Println("Done.")
+}
+```
+
+</GoPlayground>
+
+<Define term="Cache reaper goroutine">
+The **reaper** is a background goroutine started once by `NewCache`. It sleeps on a `time.Ticker`, wakes up every `interval`, acquires the mutex, scans every entry, and deletes those whose `createdAt` timestamp is older than `interval`. Without it, a TTL is just a policy on paper — entries never actually leave. The reaper is the enforcement mechanism. It runs for the process lifetime in this CLI; in a server that creates and destroys caches you'd add a stop channel so the goroutine can exit cleanly and not leak (see Exercise 4).
+</Define>
+
+Now watch the cache's lifecycle — from a new entry being added, through a hit, to the reaper firing and cleaning up:
+
+<ExecTimeline
+  title="Cache hit, miss, and TTL reap"
+  lanes={[{ id: "main", label: "main goroutine" }, { id: "reap", label: "reap goroutine" }]}
+  steps={[
+    { lane: "main", kind: "spawn", label: "NewCache → go reapLoop()", note: "NewCache returns immediately; the reap goroutine starts concurrently and blocks on ticker.C." },
+    { lane: "main", kind: "run", label: "Add('location-1', data)", note: "Lock mu → write entry with createdAt=now → unlock. Takes microseconds." },
+    { lane: "main", kind: "run", label: "Get('location-1') → HIT", note: "Lock mu → entry found, not expired → return (val, true) → unlock. Pure in-memory, no network." },
+    { lane: "reap", kind: "recv", label: "ticker fires after interval", note: "The time.Ticker delivers a tick. reapLoop calls reap(), which locks the mutex." },
+    { lane: "reap", kind: "block", label: "lock mu, scan + delete stale entries", note: "reap holds the lock for the duration of the scan, deleting any entry whose createdAt is before (now - interval). Add/Get block during this window." },
+    { lane: "reap", kind: "done", label: "unlock mu, wait for next tick", note: "Mutex released. main goroutine can Add/Get again. Reaper blocks until the next tick." },
+    { lane: "main", kind: "run", label: "Get('location-1') → MISS", note: "Entry was deleted. Returns (nil, false). The API client will now do a real HTTP request." }
+  ]}
+  caption="Two goroutines sharing one mutex. The reaper holds it briefly; the rest of the time Get/Add run freely."
+/>
+
+<UnderTheHood title="sync.Mutex internals and the reap goroutine lifecycle (Go 1.26 baseline)">
+
+`sync.Mutex` is a two-word struct: a `state` int32 and a `sema` uint32. The `state` word packs several bit fields: whether the mutex is locked, whether it's in starvation mode, and the count of goroutines waiting. When `Lock()` is called on an unlocked mutex, it's a single atomic CAS on `state` — no syscall, no kernel involvement. Fast.
+
+When a goroutine calls `Lock()` on an *already-locked* mutex, it first spins briefly (calling `runtime_doSpin`) hoping the holder releases before the spin budget runs out. If it doesn't, the goroutine is parked on a semaphore (`runtime_SemacquireMutex`) — it goes to sleep and its M (OS thread) is freed to run other goroutines. No thread is wasted waiting.
+
+**Starvation mode** (added in Go 1.9, still present in Go 1.26): if a goroutine has been waiting for more than 1 ms, the mutex enters starvation mode, where incoming `Lock()` callers are placed at the back of the wait queue rather than the front. This prevents convoy formation where a hot goroutine perpetually wins the lock over older waiters. The 1 ms threshold is an implementation detail — do not rely on it in application logic.
+
+The **reap goroutine** runs for the process lifetime in this implementation. That's fine for a CLI. A server would want a stop channel or a `context.Context` so the goroutine can be torn down cleanly during graceful shutdown — see Exercise 4.
+
+`time.Ticker` allocates a channel and an internal runtime timer. Ticks are delivered on the channel by the runtime. `defer ticker.Stop()` is mandatory for a live `Cache`: without it, a reachable ticker keeps scheduling ticks after the cache should be stopped. Since Go 1.23, unreachable tickers can be garbage-collected, but long-lived services should still stop tickers when their owner shuts down.
+
+</UnderTheHood>
+
+## Test Suite
+
+This is the part that separates the engineers I'm proud of from the ones who just *ship* things and hope for the best. We test the parser, the pagination state, and the cache — with an `httptest.Server` so no real network is hit, and under `-race` so the concurrent cache is proven safe.
+
+### Testing the command parser
+
+Table-driven, subtests, no ceremony:
+
+```go
+// cleaninput_test.go
+package main
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestCleanInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "empty string",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "single word lowercase",
+			input: "map",
+			want:  []string{"map"},
+		},
+		{
+			name:  "uppercase is lowercased",
+			input: "MAP",
+			want:  []string{"map"},
+		},
+		{
+			name:  "command with argument",
+			input: "explore pallet-town",
+			want:  []string{"explore", "pallet-town"},
+		},
+		{
+			name:  "extra whitespace trimmed",
+			input: "  catch   pikachu  ",
+			want:  []string{"catch", "pikachu"},
+		},
+		{
+			name:  "mixed case with spaces",
+			input: "  INSPECT   Charizard  ",
+			want:  []string{"inspect", "charizard"},
+		},
+		{
+			name:  "whitespace only",
+			input: "   ",
+			want:  nil,
+		},
+		{
+			name:  "tab separated",
+			input: "explore\tpallet-town",
+			want:  []string{"explore", "pallet-town"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanInput(tc.input)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("cleanInput(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+```
+
+### Testing pagination state
+
+Test that `commandMap` advances the cursors correctly without ever touching the real network. We supply a fake client backed by `httptest.NewServer`:
+
+```go
+// commands_test.go
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+// newTestClient spins up an httptest.Server with the given handler,
+// registers t.Cleanup to close it, and returns a *PokeClient whose
+// baseURL points at the local server.
+func newTestClient(t *testing.T, handler http.Handler) *PokeClient {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	c := NewPokeClient(5 * time.Minute)
+	c.baseURL = srv.URL
+	return &c
+}
+
+func TestCommandMapAdvancesCursors(t *testing.T) {
+	// Build the fake response inside the handler so we can reference srv.URL.
+	// We use a closure that reads nextURL from a variable set after the server starts.
+	var nextPageURL string
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := LocationAreaResp{
+			Count: 100,
+			Next:  &nextPageURL,
+			Results: []struct {
+				Name string `json:"name"`
+				URL  string `json:"url"`
+			}{
+				{Name: "pallet-town-area", URL: "http://example.com/1"},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	client := newTestClient(t, handler)
+	// Set the next-page cursor to a URL that belongs to this test server.
+	nextPageURL = client.baseURL + "/location-area?offset=20"
+
+	cfg := &config{client: client}
+
+	if err := commandMap(cfg); err != nil {
+		t.Fatalf("commandMap returned error: %v", err)
+	}
+
+	if cfg.nextURL == "" {
+		t.Error("nextURL should be set after first map call")
+	}
+	if cfg.prevURL != "" {
+		t.Errorf("prevURL should be empty on first page, got %q", cfg.prevURL)
+	}
+}
+```
+
+### Testing the cache with httptest — the right way
+
+This is the critical test. We never hit `pokeapi.co` in CI. We spin up a local server, count requests, and assert that the second fetch is served from cache — no second HTTP request.
+
+```go
+// cache_test.go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestCacheHitSkipsNetwork(t *testing.T) {
+	var requestCount atomic.Int64 // safe across goroutines
+
+	page := LocationAreaResp{
+		Count: 10,
+		Results: []struct {
+			Name string `json:"name"`
+			URL  string `json:"url"`
+		}{
+			{Name: "test-area", URL: "http://example.com/1"},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(page)
+	}))
+	defer srv.Close()
+
+	client := NewPokeClient(5 * time.Minute) // long TTL — entries won't expire
+	client.baseURL = srv.URL
+	ctx := context.Background()
+
+	// First call — should hit the server
+	_, err := client.GetLocationAreas(ctx, "")
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// Second call — same URL → should hit the cache, NOT the server
+	_, err = client.GetLocationAreas(ctx, "")
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	if got := requestCount.Load(); got != 1 {
+		t.Errorf("expected exactly 1 HTTP request (cache should serve the second), got %d", got)
+	}
+}
+
+func TestCacheExpiresEntries(t *testing.T) {
+	var requestCount atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		resp := LocationAreaResp{Count: 1, Results: []struct {
+			Name string `json:"name"`
+			URL  string `json:"url"`
+		}{{Name: "x", URL: "y"}}}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	// Very short TTL — 50ms
+	client := NewPokeClient(50 * time.Millisecond)
+	client.baseURL = srv.URL
+	ctx := context.Background()
+
+	_, err := client.GetLocationAreas(ctx, "")
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// Wait for TTL to expire and reaper to fire
+	time.Sleep(200 * time.Millisecond)
+
+	_, err = client.GetLocationAreas(ctx, "")
+	if err != nil {
+		t.Fatalf("second call after expiry: %v", err)
+	}
+
+	if got := requestCount.Load(); got != 2 {
+		t.Errorf("expected 2 HTTP requests (first + re-fetch after expiry), got %d", got)
+	}
+}
+
+// TestCacheRace verifies the cache is safe under concurrent Add/Get.
+// Run with: go test -race ./...
+func TestCacheRace(t *testing.T) {
+	c := NewCache(1 * time.Second)
+	done := make(chan struct{})
+
+	// Writer goroutine
+	go func() {
+		for i := 0; i < 500; i++ {
+			c.Add("key", []byte("value"))
+		}
+		close(done)
+	}()
+
+	// Reader goroutines
+	for i := 0; i < 4; i++ {
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					c.Get("key")
+				}
+			}
+		}()
+	}
+
+	<-done
+}
+
+// TestCacheAddGet is a straightforward correctness test.
+func TestCacheAddGet(t *testing.T) {
+	c := NewCache(5 * time.Minute)
+
+	cases := []struct {
+		key string
+		val []byte
+	}{
+		{"url-1", []byte("location-data-1")},
+		{"url-2", []byte("location-data-2")},
+		{"url-3", []byte(`{"name":"test"}`)},
+	}
+
+	for _, tc := range cases {
+		c.Add(tc.key, tc.val)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			got, ok := c.Get(tc.key)
+			if !ok {
+				t.Fatalf("Get(%q): expected hit, got miss", tc.key)
+			}
+			if string(got) != string(tc.val) {
+				t.Errorf("Get(%q) = %q, want %q", tc.key, got, tc.val)
+			}
+		})
+	}
+
+	// Key that was never added must miss
+	if _, ok := c.Get("nonexistent"); ok {
+		t.Error("Get on nonexistent key should return false")
+	}
+}
+```
+
+<UnderTheHood title="Why httptest.Server beats testing against the live API">
+
+Testing against the live PokeAPI fails in a dozen ways that have nothing to do with your code: the API is rate-limited, it changes its schema, CI has no outbound internet, the response takes 2 seconds and flakes the test run. These failures break your build in ways you can't control, can't reproduce locally, and can't fix.
+
+`httptest.NewServer(handler)` spins up a real TCP server on `127.0.0.1` with a random port, right in your process. Your HTTP client dials it over a real socket — no mocking at the transport layer, no monkey-patching, no fake `http.RoundTripper`. The full `net/http` stack runs. What changes is *only* the server being dialed. When you override `baseURL = srv.URL`, every request goes to your handler instead of the internet.
+
+This means you test exactly what ships — the real `http.Client`, the real `json.NewDecoder`, the real error paths — while keeping tests hermetic, deterministic, and fast. This is idiomatic Go testing, not a shortcut.
+
+The `atomic.Int64` request counter is deliberate: the test server handler runs on its own goroutine (the `httptest` server has its own goroutine pool), so a plain `int` would be a data race under `-race`. `sync/atomic` gives you lock-free, race-safe increments.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={"Why do TestCacheHitSkipsNetwork and TestCacheExpiresEntries use an atomic.Int64 for the request counter rather than a plain int?"}
+  options={[
+    "atomic.Int64 is faster than a plain int in all cases",
+    "The httptest handler runs on a separate goroutine, so a plain int would be a data race under -race",
+    "Go does not allow plain int in test files",
+    "atomic.Int64 automatically prints the count when the test ends"
+  ]}
+  answer={1}
+  explain="The httptest server dispatches each request on its own goroutine. Incrementing a plain int from multiple goroutines without synchronization is a data race. atomic.Int64.Add is an atomic operation — no mutex needed for a simple counter."
+/>
+
+### Running the full test suite
+
+```bash
+# Run all tests with the race detector
+go test -race ./...
+
+# Run with verbose output to see each subtest
+go test -race -v ./...
+
+# Run only the cache tests
+go test -race -run TestCache ./...
+
+# Run with coverage — you want to see the cache and client paths lit
+go test -race -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+```
+
+<BeforeAfter
+  badLabel="Naive: test against the live API"
+  goodLabel="Idiomatic: httptest server"
+  bad={`// Hits pokeapi.co in CI — flaky, slow, rate-limited
+func TestGetLocations(t *testing.T) {
+  c := NewPokeClient(5*time.Minute)
+  _, err := c.GetLocationAreas(
+    context.Background(), "",
+  )
+  if err != nil {
+    t.Fatal(err)
+  }
+}`}
+  good={`// Hermetic: local server, zero network
+func TestGetLocations(t *testing.T) {
+  srv := httptest.NewServer(
+    http.HandlerFunc(func(
+      w http.ResponseWriter,
+      r *http.Request,
+    ) {
+      json.NewEncoder(w).Encode(
+        LocationAreaResp{Count: 1})
+    }),
+  )
+  defer srv.Close()
+  c := NewPokeClient(5*time.Minute)
+  c.baseURL = srv.URL
+  _, err := c.GetLocationAreas(
+    context.Background(), "",
+  )
+  if err != nil { t.Fatal(err) }
+}`}
+/>
+
+---
+
+## Exercises
+
+Stop reading and start building. Five exercises, escalating difficulty. The first two you should feel confident about; the last one will make you think.
+
+<Exercise n={1} title="Implement commandHelp correctly" level="easy">
+
+The current `commandHelp` prints command names in map-iteration order, which is unspecified and may vary. Fix `commandHelp` so it prints commands in sorted alphabetical order.
+
+**Hint:** `sort.Strings` on a slice of keys, then loop the sorted slice.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+)
+
+func commandHelp(cfg *config, args ...string) error {
+	commands := getCommands()
+	fmt.Println("Welcome to the Pokedex!")
+	fmt.Println("Usage:")
+
+	// collect and sort the keys
+	keys := make([]string, 0, len(commands))
+	for k := range commands {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		cmd := commands[k]
+		fmt.Printf("  %-10s %s\n", cmd.name, cmd.description)
+	}
+	return nil
+}
+```
+
+Map iteration order in Go is not specified by the language, and the standard runtime deliberately varies it so programs do not accidentally rely on a specific order. Sort the keys yourself before printing — always.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add a 'caught' store to config" level="easy">
+
+Add a `caught` field to `config` of type `map[string]PokemonResp` to hold Pokemon the user has caught. Implement `commandCatch` to: (1) require exactly one argument (the Pokemon name); (2) call `cfg.client.GetPokemon` with it; (3) use `math/rand` to decide if the catch succeeds — lower base experience means higher catch chance; (4) store the Pokemon in `cfg.caught` on success. Implement `commandInspect` to print a caught Pokemon's stats, and `commandPokedex` to list all caught names.
+
+<Solution>
+
+```go
+// config addition:
+// caught map[string]PokemonResp
+
+func commandCatch(cfg *config, args ...string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: catch <pokemon-name>")
+	}
+	name := args[0]
+	ctx := context.Background()
+	pokemon, err := cfg.client.GetPokemon(ctx, name)
+	if err != nil {
+		return fmt.Errorf("catch %s: %w", name, err)
+	}
+
+	fmt.Printf("Throwing a Pokeball at %s...\n", pokemon.Name)
+	// Higher base_experience → harder to catch.
+	// rand.Intn(pokemon.BaseExperience) == 0 succeeds more often for weak Pokemon.
+	if rand.Intn(pokemon.BaseExperience) < 40 {
+		fmt.Printf("%s was caught!\n", pokemon.Name)
+		cfg.caught[pokemon.Name] = pokemon
+	} else {
+		fmt.Printf("%s escaped!\n", pokemon.Name)
+	}
+	return nil
+}
+
+func commandInspect(cfg *config, args ...string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: inspect <pokemon-name>")
+	}
+	p, ok := cfg.caught[args[0]]
+	if !ok {
+		return fmt.Errorf("you have not caught %s", args[0])
+	}
+	fmt.Printf("Name: %s\nHeight: %d\nWeight: %d\n", p.Name, p.Height, p.Weight)
+	fmt.Println("Stats:")
+	for _, s := range p.Stats {
+		fmt.Printf("  - %s: %d\n", s.Stat.Name, s.BaseStat)
+	}
+	fmt.Println("Types:")
+	for _, ty := range p.Types {
+		fmt.Printf("  - %s\n", ty.Type.Name)
+	}
+	return nil
+}
+
+func commandPokedex(cfg *config, args ...string) error {
+	if len(cfg.caught) == 0 {
+		fmt.Println("Your Pokedex is empty. Go catch some Pokemon!")
+		return nil
+	}
+	fmt.Println("Your Pokedex:")
+	for name := range cfg.caught {
+		fmt.Printf("  - %s\n", name)
+	}
+	return nil
+}
+```
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Test commandCatch with a deterministic fake" level="medium">
+
+`commandCatch` uses `math/rand` for the catch-rate decision, which makes it non-deterministic and hard to test. Refactor the function to accept a `randFn func(n int) int` parameter (or add it to `config`), so tests can supply a deterministic version. Write two subtests: one where the fake always returns 0 (always catches), one where it returns `n-1` (never catches).
+
+<Solution>
+
+```go
+// Add to config:
+// randIntn func(n int) int
+
+// commandCatch uses cfg.randIntn instead of rand.Intn directly.
+func commandCatch(cfg *config, args ...string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: catch <pokemon-name>")
+	}
+	// ... fetch pokemon ...
+	if cfg.randIntn(pokemon.BaseExperience) < 40 {
+		cfg.caught[pokemon.Name] = pokemon
+		fmt.Printf("%s was caught!\n", pokemon.Name)
+	} else {
+		fmt.Printf("%s escaped!\n", pokemon.Name)
+	}
+	return nil
+}
+
+// Test:
+func TestCommandCatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(PokemonResp{
+			Name:           "pikachu",
+			BaseExperience: 112,
+		})
+	}))
+	defer srv.Close()
+
+	t.Run("always catches when rand returns 0", func(t *testing.T) {
+		client := NewPokeClient(5 * time.Minute)
+		client.baseURL = srv.URL
+		cfg := &config{
+			client:   &client,
+			caught:   make(map[string]PokemonResp),
+			randIntn: func(n int) int { return 0 }, // always catches
+		}
+		if err := commandCatch(cfg, "pikachu"); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cfg.caught["pikachu"]; !ok {
+			t.Error("expected pikachu to be caught")
+		}
+	})
+
+	t.Run("never catches when rand returns n-1", func(t *testing.T) {
+		client := NewPokeClient(5 * time.Minute)
+		client.baseURL = srv.URL
+		cfg := &config{
+			client:   &client,
+			caught:   make(map[string]PokemonResp),
+			randIntn: func(n int) int { return n - 1 }, // never catches
+		}
+		if err := commandCatch(cfg, "pikachu"); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cfg.caught["pikachu"]; ok {
+			t.Error("expected pikachu to escape")
+		}
+	})
+}
+```
+
+Injecting the random function through `config` is the dependency injection pattern: the production code uses `math/rand.Intn`, and tests supply a deterministic fake. No mocking framework, no monkey-patching — just a function value.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Add a stop channel to NewCache" level="medium">
+
+The current `reapLoop` goroutine runs for the process lifetime. In a server that creates and discards caches (e.g. per-tenant caches that are torn down when a tenant is removed), this leaks goroutines and the underlying `time.Ticker`. Add a `Stop()` method to `Cache` that signals the reap goroutine to exit cleanly. Use a `chan struct{}` for the signal. The goroutine must exit within one ticker interval of `Stop()` being called. Write a test that verifies the goroutine exits.
+
+<Solution>
+
+```go
+type Cache struct {
+	mu       sync.Mutex
+	entries  map[string]cacheEntry
+	interval time.Duration
+	stopCh   chan struct{}
+}
+
+func NewCache(interval time.Duration) *Cache {
+	c := &Cache{
+		entries:  make(map[string]cacheEntry),
+		interval: interval,
+		stopCh:   make(chan struct{}),
+	}
+	go c.reapLoop()
+	return c
+}
+
+func (c *Cache) Stop() {
+	close(c.stopCh) // closing a channel signals all receivers simultaneously
+}
+
+func (c *Cache) reapLoop() {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.reap()
+		case <-c.stopCh:
+			return // exit the goroutine — no more work to do
+		}
+	}
+}
+
+// Test:
+func TestCacheStopExitsGoroutine(t *testing.T) {
+	// Use a very short interval so the test is fast
+	c := NewCache(10 * time.Millisecond)
+	c.Add("k", []byte("v"))
+
+	c.Stop()
+
+	// After Stop, the reap goroutine should exit. Wait longer than two intervals
+	// and verify that a new Add/Get still works (the lock shouldn't be held forever).
+	time.Sleep(50 * time.Millisecond)
+
+	c.Add("k2", []byte("v2"))
+	if _, ok := c.Get("k2"); !ok {
+		t.Error("cache should still work after Stop")
+	}
+}
+```
+
+`close(c.stopCh)` is the idiomatic Go broadcast signal: closing a channel unblocks *all* goroutines receiving on it simultaneously. Sending on the channel would only unblock one goroutine. For a single reap goroutine either works, but `close` is the canonical idiom for "everybody stop."
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Add LRU eviction to the cache" level="hard">
+
+The current cache grows unbounded until the TTL fires. In production, a cache serving many unique Pokemon entries could grow very large. Add a `maxEntries int` field to `Cache`. When `Add` is called and the cache is already at capacity, evict the **least-recently-used** entry before inserting the new one. Track recency by updating a `lastUsed time.Time` on every `Get` and `Add`. Write table-driven tests for eviction order.
+
+<Solution>
+
+```go
+// Add to cacheEntry:
+// lastUsed time.Time
+
+func (c *Cache) Add(key string, val []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		// evict the entry with the oldest lastUsed timestamp
+		var oldest string
+		var oldestTime time.Time
+		for k, e := range c.entries {
+			if oldest == "" || e.lastUsed.Before(oldestTime) {
+				oldest = k
+				oldestTime = e.lastUsed
+			}
+		}
+		delete(c.entries, oldest)
+	}
+	c.entries[key] = cacheEntry{
+		createdAt: now,
+		lastUsed:  now,
+		val:       val,
+	}
+}
+
+func (c *Cache) Get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	// update lastUsed — this is what makes it LRU
+	e.lastUsed = time.Now()
+	c.entries[key] = e
+	return e.val, true
+}
+
+// Test (abbreviated):
+func TestCacheLRUEviction(t *testing.T) {
+	c := &Cache{
+		entries:    make(map[string]cacheEntry),
+		interval:   5 * time.Minute,
+		maxEntries: 2,
+		stopCh:     make(chan struct{}),
+	}
+
+	c.Add("a", []byte("A"))
+	time.Sleep(time.Millisecond) // ensure distinct timestamps
+	c.Add("b", []byte("B"))
+	c.Get("a") // touch 'a' — now 'b' is the LRU
+
+	// Adding 'c' should evict 'b' (LRU)
+	c.Add("c", []byte("C"))
+
+	if _, ok := c.Get("b"); ok {
+		t.Error("'b' should have been evicted as LRU")
+	}
+	if _, ok := c.Get("a"); !ok {
+		t.Error("'a' should still be present — it was accessed recently")
+	}
+	if _, ok := c.Get("c"); !ok {
+		t.Error("'c' should be present — it was just added")
+	}
+}
+```
+
+This is O(n) eviction — fine for small caches. A production LRU uses a doubly-linked list (`container/list`) and a map so eviction is O(1). The standard library's `container/list` docs are your next stop.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Alright, sport. The scaffolding is gone. Now you prove to me — personally — that you understand what you built. I've got a broken cache. Your job is to make it correct under concurrent load. I'll be watching the race detector. It better be silent.
+
+<Lab
+  title="Make the cache race-free and TTL-correct"
+  archetype="load"
+  difficulty="guided"
+  points={100}
+  hintCost={15}
+  verify="self-check"
+  objective="The starter cache below has two bugs: (1) it has a data race — the map is accessed without a lock in at least one code path, and (2) the TTL reaper compares timestamps incorrectly, so entries are never evicted. Fix both bugs. The self-check main() will print PASS or FAIL for each condition — both lines must print PASS. To verify race-safety fully, run go test -race ./... locally (Codapi runs go run only, so the inline check covers correctness; race-detector verification is a local step)."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+type cacheEntry struct {
+	createdAt time.Time
+	val       []byte
+}
+
+type Cache struct {
+	mu       sync.Mutex
+	entries  map[string]cacheEntry
+	interval time.Duration
+}
+
+func NewCache(interval time.Duration) *Cache {
+	c := &Cache{
+		entries:  make(map[string]cacheEntry),
+		interval: interval,
+	}
+	go c.reapLoop()
+	return c
+}
+
+func (c *Cache) Add(key string, val []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = cacheEntry{
+		createdAt: time.Now(),
+		val:       val,
+	}
+}
+
+// BUG 1: Get does not hold the lock while reading the map.
+func (c *Cache) Get(key string) ([]byte, bool) {
+	e, ok := c.entries[key] // DATA RACE: no lock held
+	if !ok {
+		return nil, false
+	}
+	return e.val, true
+}
+
+func (c *Cache) reapLoop() {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.reap()
+	}
+}
+
+// BUG 2: deadline comparison is inverted — this deletes entries that are
+// YOUNGER than the interval, not older. Entries that should expire never do.
+func (c *Cache) reap() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	deadline := time.Now().Add(-c.interval)
+	for k, e := range c.entries {
+		if e.createdAt.After(deadline) { // BUG: should be Before
+			delete(c.entries, k)
+		}
+	}
+}
+
+// Self-check: fix the two bugs above, then run this. Both lines must print PASS.
+func main() {
+	// Check 1: basic Get/Add correctness (also exercises the lock path).
+	c1 := NewCache(5 * time.Minute)
+	c1.Add("k", []byte("v"))
+	if val, ok := c1.Get("k"); ok && string(val) == "v" {
+		fmt.Println("PASS: Get returns correct value")
+	} else {
+		fmt.Println("FAIL: Get returned wrong result")
+	}
+
+	// Check 2: TTL expiry — entry must be gone after the interval elapses.
+	c2 := NewCache(60 * time.Millisecond)
+	c2.Add("x", []byte("data"))
+	time.Sleep(200 * time.Millisecond)
+	if _, ok := c2.Get("x"); !ok {
+		fmt.Println("PASS: entry evicted after TTL")
+	} else {
+		fmt.Println("FAIL: entry still present after TTL (check the Before/After comparison)")
+	}
+}`}
+  hints={[
+    "Bug 1 is in Get: add c.mu.Lock() / defer c.mu.Unlock() before reading c.entries, exactly like Add does.",
+    "Bug 2 is the comparison operator in reap(): e.createdAt.After(deadline) deletes fresh entries. Flip it to e.createdAt.Before(deadline) to delete stale ones.",
+    "After fixing both, run locally: go test -race -v -run TestCache ./... — you should see PASS on TestCacheAddGet, TestCacheHitSkipsNetwork, TestCacheExpiresEntries, and TestCacheRace."
+  ]}
+  flag="GO{mutex_every_read_before_means_expired}"
+>
+
+Two bugs. One missing lock, one flipped comparison. Neither one is subtle — but you have to *see* them under the race detector's eye, not just guess. Fix the cache, run the self-check until both lines print PASS, then verify locally with `go test -race ./...`. The flag is yours when it's done. I'll know if you just pasted it in.
+
+</Lab>
+
+<Recap>
+
+You built a real CLI from scratch — not a toy. Here's what you earned:
+
+- A **REPL scaffold** with a command registry — a `map[string]cliCommand` with a clean dispatch loop. No globals; `config` is injected so every handler is testable.
+- A **typed API client** with `http.Client`, a 30-second timeout, proper `context.Context` threading, and structured error wrapping. `*string` fields distinguish JSON null from empty strings.
+- **Cursor-style pagination** where next/previous URLs are tracked in `config` and updated on every response. The server controls the cursors; the client just follows them.
+- A **concurrent TTL cache** with `sync.Mutex` protecting every map access, and a `time.Ticker` reap goroutine running in the background. The mutex holds the lock on every read and every write — no exceptions.
+- A **full test suite**: table-driven parser tests, command tests against `httptest.Server` (zero real network), cache correctness tests, and a `-race` concurrent access test. The race detector is the final word on concurrent correctness — and it ran silent.
+
+The pattern you'll use again and again: **inject dependencies through a config struct, test with httptest instead of the live API, and let the race detector catch the concurrency bugs before your users do.**
+
+The Caching & Redis chapter takes the in-memory cache you built here and shows you `singleflight` for stampede prevention, Redis for distributed caching, and the full invalidation story. You've already got the intuition — next time you'll get the production armor.
+
+</Recap>
+
+<Scoreboard
+  streak={14}
+  items={[
+    { label: "Quick check — why getCommands() is a function", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — JSON null into *string", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — atomic.Int64 in the test server handler", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — commandHelp with sorted output", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — caught store + inspect + pokedex", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — deterministic catch test", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — Stop() channel for the reaper", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — LRU eviction", kind: "exercise", points: 30, done: false }
+  ]}
+  flag={{ label: "Lab — Make the cache race-free and TTL-correct", captured: false, points: 100 }}
+/>
+
+You built a real API consumer, a concurrent cache, and a test suite that proves it works. Not bad at all, sport. It's no *me*, but — genuinely, not bad. The Caching chapter is waiting. It knows you're coming.

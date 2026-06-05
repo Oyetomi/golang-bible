@@ -1,0 +1,975 @@
+---
+title: "Go Mistakes: Concurrency"
+part: "appendix"
+order: 17
+type: "course"
+description: "The concurrency mistakes that cause the worst production bugs: confusing concurrency with parallelism, assuming concurrency is always faster, choosing channels vs mutexes, data races vs race conditions and the Go memory model, context propagation and cancellation, goroutine leaks, nondeterministic select, notification and nil channels, channel sizing, WaitGroup and sync.Cond misuse, errgroup, data races from append, and the copied-mutex trap that go vet catches."
+prerequisites: ["mistakes-functions-methods-errors"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Go Mistakes #55–74" title="Go Mistakes: Concurrency">
+
+Here's the thing, sport. Everything in this course so far has been a warm-up. The mistakes were *embarrassing* — a shadowed variable, an append that clobbers its neighbor — but they were honest, single-threaded embarrassment. You could stare at the code and *see* the bug. Those days are over.
+
+This is concurrency. This is where a bug doesn't live in the code — it lives in the **timing**. The program runs ten thousand times and passes. It runs the ten-thousand-and-first time, on a busy production box, with two requests arriving a microsecond apart, and it corrupts a customer's balance, or leaks a goroutine every minute until the box falls over at 3 a.m. and nobody can reproduce it. These are the bugs that get people *paged*. I don't get paged. I'm going to teach you how to not get paged.
+
+We go bug → *why* → idiomatic fix, grounded in Meridian's backend, where two transfers racing on one account is not a thought experiment. I will make the interleavings so concrete you can watch them. Read every timeline. Run every snippet. The compiler will not save you here — and neither will hope. Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Concurrency vs Parallelism", "Races & the Memory Model", "Context & Cancellation", "Goroutine Leaks", "Channels & select", "sync, WaitGroup & errgroup"]} />
+
+<Scene
+  title="Two transfers race on one balance — and ₦50,000 vanishes"
+  actors={[
+    { id: "g1", label: "Goroutine A (deposit)" },
+    { id: "g2", label: "Goroutine B (deposit)" }
+  ]}
+  rows={1}
+  cols={4}
+  frames={[
+    {
+      caption: "Account balance is ₦100,000. Two deposits land at the same instant: A adds ₦30,000, B adds ₦50,000. Both run `balance = balance + amount` with no lock.",
+      beat: "neutral",
+      actors: [{ id: "g1", state: "active" }, { id: "g2", state: "active" }],
+      cells: [{ id: "A1", state: "active", label: "bal=100k" }, { id: "A2", state: "idle", label: "+30k" }, { id: "A3", state: "idle", label: "+50k" }, { id: "A4", state: "idle", label: "?" }]
+    },
+    {
+      caption: "Both goroutines READ balance=100,000 before either writes. A computes 130,000, B computes 150,000 — each from the same stale read. This is the lost-update race.",
+      beat: "problem",
+      actors: [{ id: "g1", state: "warn" }, { id: "g2", state: "warn" }],
+      cells: [{ id: "A1", state: "warn", label: "A reads 100k" }, { id: "A2", state: "warn", label: "B reads 100k" }, { id: "A3", state: "bad", label: "both stale" }, { id: "A4", state: "bad", label: "₦50k lost" }]
+    },
+    {
+      caption: "B writes 150,000, then A writes 130,000 last. Final balance is ₦130,000 — should be ₦180,000. One whole deposit silently overwritten. The books don't balance.",
+      beat: "problem",
+      actors: [{ id: "g1", state: "bad" }, { id: "g2", state: "bad" }],
+      cells: [{ id: "A1", state: "done", label: "150k" }, { id: "A2", state: "bad", label: "130k wins" }, { id: "A3", state: "bad", label: "₦130k" }, { id: "A4", state: "bad", label: "WRONG" }]
+    },
+    {
+      caption: "Fix: guard the balance with a mutex (or serialize via a channel). Now the read-modify-write is atomic. A then B (or B then A) — either way the final balance is ₦180,000.",
+      beat: "solution",
+      actors: [{ id: "g1", state: "ok" }, { id: "g2", state: "ok" }],
+      cells: [{ id: "A1", state: "done", label: "lock" }, { id: "A2", state: "done", label: "+30k" }, { id: "A3", state: "done", label: "+50k" }, { id: "A4", state: "ok", label: "₦180k ✓" }]
+    }
+  ]}
+  caption="Every concurrency mistake in this chapter is a variation on this: the program is correct for one schedule and wrong for another. Your job is to make it correct for ALL schedules — and that takes a synchronization primitive, never luck."
+/>
+
+## Concurrency vs Parallelism
+
+Before a single channel, the two foundational confusions. People use "concurrency" and "parallelism" as synonyms. They are not, and getting this wrong is why people reach for goroutines that make their code *slower*.
+
+<Define term="Concurrency vs parallelism" since="Go Mistakes (Appendix)">
+**Concurrency** is about *structure*: dealing with many things at once — decomposing a program into independently-executing tasks (goroutines) that can make progress in overlapping time windows. **Parallelism** is about *execution*: doing many things at the same instant — tasks literally running on separate CPU cores. Concurrency is a design property; parallelism is a runtime property. Why it matters: concurrency *enables* parallelism but doesn't guarantee it. You can have concurrency on a single core (the scheduler interleaves goroutines), and a well-structured concurrent program will *scale* to more cores — but a badly-structured one won't, no matter how many cores you throw at it. As Rob Pike put it: concurrency is dealing with lots of things at once; parallelism is doing lots of things at once.
+</Define>
+
+The second confusion is the dangerous one for performance: **assuming concurrency is always faster** (#56). Goroutines aren't free. Each one costs a stack, scheduling overhead, and — if it communicates — synchronization. For a *small* workload, that overhead dwarfs the work, and the concurrent version loses to the plain sequential loop.
+
+The classic demonstration is parallel merge sort. The naive "spin a goroutine for every recursive split" version is *slower* than sequential sort, because you spawn goroutines to sort two-element slices:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Naive parallel merge sort">A goroutine per recursive call. At the leaves you're spawning goroutines to sort 1–2 elements — pure overhead. Often slower than the sequential version on real inputs.</ConceptCard>
+  <Gotcha>⚠ Concurrency adds cost: stack allocation, scheduling, and synchronization. Below a threshold, it never pays for itself. Parallelize only when the *work per task* exceeds the *overhead per task*.</Gotcha>
+</ConceptGrid>
+
+The fix is a **threshold**: parallelize only the large splits, and fall back to a sequential sort once a sub-slice is small. Above the threshold the work dominates the overhead; below it, you skip the goroutine entirely.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+)
+
+const threshold = 2048 // below this, sequential beats the goroutine overhead
+
+func parallelSort(s []int) {
+	if len(s) <= threshold {
+		sort.Ints(s) // small slice: do it sequentially, no goroutine
+		return
+	}
+	mid := len(s) / 2
+	var wg sync.WaitGroup
+	wg.Add(2) // Go 1.25's wg.Go(fn) bundles Add+go+Done; shown portable here
+	go func() { defer wg.Done(); parallelSort(s[:mid]) }()
+	go func() { defer wg.Done(); parallelSort(s[mid:]) }()
+	wg.Wait()
+	merge(s, mid)
+}
+
+func merge(s []int, mid int) {
+	left := append([]int(nil), s[:mid]...) // copy so we don't read while writing
+	right := s[mid:]
+	i, j, k := 0, 0, 0
+	for i < len(left) && j < len(right) {
+		if left[i] <= right[j] {
+			s[k] = left[i]
+			i++
+		} else {
+			s[k] = right[j]
+			j++
+		}
+		k++
+	}
+	for i < len(left) {
+		s[k] = left[i]
+		i, k = i+1, k+1
+	}
+}
+
+func main() {
+	data := []int{9, 3, 7, 1, 8, 2, 6, 4, 5, 0}
+	parallelSort(data)
+	fmt.Println(data) // sorted; this tiny input stays sequential (< threshold)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="#59 — match the goroutine count to the workload type">
+
+How many goroutines you should run depends on whether the work is **CPU-bound** or **I/O-bound**.
+
+- **CPU-bound** (hashing, sorting, crypto): the work *is* the CPU. More goroutines than cores just adds context-switching. Bound your worker pool to `GOMAXPROCS` (whose Go 1.25+ default considers logical CPUs, CPU affinity, and Linux cgroup CPU quota — see Under the Hood).
+- **I/O-bound** (calling Meridian's payment processor, querying Postgres, reading a socket): each goroutine spends most of its life *blocked*, not computing. The scheduler parks blocked goroutines for free, so you can run *thousands* — the limit is set by the external system (connection pool size, downstream rate limits), not the CPU count.
+
+The mistake is using one number for both: a 4-goroutine pool throttles 10,000 concurrent I/O calls to a crawl, and a 10,000-goroutine pool for CPU work thrashes the scheduler. See [Concurrency Patterns](/part-2/concurrency-patterns).
+
+</Callout>
+
+<QuickCheck
+  question="You parallelize a function across goroutines and it gets SLOWER on an 8-core machine. The work per task is tiny (summing a handful of integers). Most likely cause?"
+  options={[
+    "The machine doesn't support parallelism",
+    "The per-task work is smaller than the per-goroutine overhead (stack, scheduling, synchronization), so spawning goroutines costs more than it saves — concurrency is not free and isn't always faster",
+    "You need more than 8 goroutines",
+    "Go can't sum integers concurrently"
+  ]}
+  answer={1}
+  explain="Concurrency adds overhead: each goroutine needs a stack and scheduling, and coordinating results needs synchronization. When the work per task is tiny, that overhead dominates and the concurrent version loses to a plain sequential loop. The fix is a threshold — only go concurrent when the work per task is large enough to amortize the overhead (the parallel-merge-sort pattern). Concurrency enables parallelism; it doesn't guarantee a speedup."
+/>
+
+## Races & the Memory Model
+
+The heart of the chapter. Two terms people use interchangeably — and they are *not* the same bug.
+
+<Define term="Data race vs race condition" since="Go Mistakes (Appendix)">
+A **data race** occurs when two or more goroutines access the *same* memory location *concurrently*, at least one access is a *write*, and there's no synchronization ordering the accesses. Data races are serious program errors: Go may report the race and terminate, and otherwise the memory model gives only limited guarantees about what a racing read may observe. A **race condition** is broader: the program's *correctness* depends on the relative *timing* or *interleaving* of goroutines, even if every individual access is properly synchronized. Why it matters: you can eliminate every data race (lock everything) and *still* have a race condition (the lost-update bug from the Scene — each access is atomic, but the read-modify-write as a whole isn't). Fixing data races is mechanical (synchronize). Fixing race conditions requires thinking about *which interleavings are valid*.
+</Define>
+
+Here's the lost-update race condition as an interleaving. Both goroutines synchronize each individual read and write — there's no *data* race — yet the result is still wrong, because the read and the write aren't atomic *together*:
+
+<ExecTimeline
+  title="A race condition: the lost update on Meridian's balance"
+  lanes={[
+    { id: "a", label: "Goroutine A (+30k)" },
+    { id: "b", label: "Goroutine B (+50k)" }
+  ]}
+  steps={[
+    { lane: "a", kind: "recv", label: "read balance = 100k", note: "A reads the balance: 100,000. It hasn't written anything yet." },
+    { lane: "b", kind: "recv", label: "read balance = 100k", note: "B reads the SAME 100,000 — A's write hasn't happened. Both now hold a stale base." },
+    { lane: "a", kind: "run", label: "compute 130k", note: "A adds its 30,000 to the stale 100,000 → 130,000 (in its own register)." },
+    { lane: "b", kind: "run", label: "compute 150k", note: "B adds its 50,000 to the stale 100,000 → 150,000." },
+    { lane: "b", kind: "send", label: "write 150k", note: "B stores 150,000 into balance." },
+    { lane: "a", kind: "send", label: "write 130k (last)", note: "A stores 130,000 LAST, overwriting B's 150,000. B's whole deposit is gone." },
+    { lane: "a", kind: "done", label: "balance = 130k ✗", note: "Final: 130,000. Correct answer was 180,000. ₦50,000 vanished — and no error, no panic, no log." }
+  ]}
+  caption="A mutex around the WHOLE read-modify-write makes it atomic: A finishes (130k) before B starts, or vice versa, and the result is always 180,000. Atomic individual accesses are not enough — the compound operation must be atomic."
+/>
+
+Now the load-bearing point most people miss: **why** is the unsynchronized version undefined and not just "sometimes wrong"? Because of the **Go memory model**.
+
+<Define term="The Go memory model & happens-before" since="Go Mistakes (Appendix)">
+The **Go memory model** specifies when a read of a variable in one goroutine is *guaranteed* to observe a write from another goroutine. The key relation is **happens-before**: if event A happens-before event B, then B is guaranteed to see A's effects. Within a single goroutine, happens-before is just program order. *Across* goroutines, you only get a happens-before edge from an explicit synchronization: a channel send happens-before the corresponding receive completes; a `sync.Mutex` Unlock happens-before a later Lock; `wg.Done` happens-before a `wg.Wait` that it releases; the start of a goroutine happens-before its body runs. Why it matters: with **no** happens-before edge between a write and a read, the read may see the old value, a partially-written value, or nothing — *even on x86*, because the compiler and CPU are free to reorder. "It worked on my machine" means "the schedule happened to give me an order"; it is **not** a guarantee.
+</Define>
+
+The synchronized fix — a mutex makes the read-modify-write atomic, and Unlock/Lock establishes happens-before so every goroutine sees the latest balance:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Account guards its balance with a mutex. The mutex makes deposit's
+// read-modify-write atomic AND establishes happens-before between goroutines.
+type Account struct {
+	mu      sync.Mutex
+	balance int64 // kobo (minor units) — never a float
+}
+
+func (a *Account) Deposit(amount int64) {
+	a.mu.Lock()
+	a.balance += amount // read-modify-write, now atomic as a whole
+	a.mu.Unlock()
+}
+
+func main() {
+	acc := &Account{balance: 100_000}
+	var wg sync.WaitGroup
+	// 100 goroutines each deposit 1,000 — 100 * 1,000 = 100,000 added.
+	for range 100 {
+		wg.Add(1)
+		go func() { defer wg.Done(); acc.Deposit(1_000) }()
+	}
+	wg.Wait()
+	fmt.Println("final balance:", acc.balance) // always 200000 — never less
+}
+```
+
+</GoPlayground>
+
+Run that under `go run -race ./...` (the **race detector**) and the *unsynchronized* version lights up red; the locked version is silent. The detector is your single most important concurrency tool — wire it into CI, because a data race that doesn't fire today fires under production load tomorrow.
+
+<Callout kind="note" title="Codapi runs plain `go run` — no -race here">
+
+The playground runner executes `go run` without the `-race` flag, so it won't *report* a data race; it'll just print whatever value the schedule produced. That's why the snippets above are written to show the **correct deterministic result** (the locked version always prints 200000). To actually *catch* races, run locally with `-race`. Every concurrency snippet in this chapter is built to terminate cleanly under plain `go run` — the teaching is in the result and the timelines, not in the detector firing.
+
+</Callout>
+
+### #57 — channels or mutexes?
+
+Both synchronize. Choosing wrong makes code awkward, not incorrect — but the awkwardness compounds. The rule of thumb:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Mutex — guard shared state">Use a `sync.Mutex` (or `RWMutex`) when goroutines access **shared memory in place**: a counter, a cache map, a balance. The data stays put; you serialize access to it. Smallest, fastest tool for "many goroutines touch one struct."</ConceptCard>
+  <ConceptCard label="Channel — transfer ownership / coordinate">Use a channel when you're **passing data between** goroutines, signaling, or orchestrating a pipeline/stages. "Don't communicate by sharing memory; share memory by communicating" — when the design is about *flow* and ownership handoff, a channel is clearer than locks.</ConceptCard>
+  <Gotcha>⚠ A channel is not a "better mutex." Using a buffered channel of size 1 as a lock works but is slower and obscures intent. Guarding a plain field? Reach for the mutex.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="Two goroutines run `counter++` on a shared int with no synchronization. The race detector flags it. Is this a data race, a race condition, or both?"
+  options={[
+    "Only a race condition — the value is just sometimes wrong",
+    "Both: it's a DATA race (concurrent unsynchronized access where at least one is a write, flagged by -race), and the resulting lost-update is a race condition (correctness depends on interleaving). Synchronizing the whole increment fixes both",
+    "Only a data race; race conditions don't exist in Go",
+    "Neither — `counter++` is atomic in Go"
+  ]}
+  answer={1}
+  explain="`counter++` is a read-modify-write, not atomic. Two goroutines doing it without synchronization is the textbook data race: concurrent access, a write, no ordering — an invalid program execution the race detector catches. The visible symptom (a final count lower than expected) is the lost-update race condition. A mutex (or atomic.Int64.Add) around the whole increment establishes happens-before and makes it atomic, fixing both at once."
+/>
+
+## Context & Cancellation
+
+A `context.Context` is how Go propagates **deadlines, cancellation, and request-scoped values** across API boundaries and goroutines. Misunderstanding it (#60) and propagating the *wrong* one (#61) are two of the most common real-world concurrency bugs.
+
+<Define term="context.Context — cancellation signal" since="Go Mistakes (Appendix)">
+A **context** carries three things down a call tree: a **deadline** (cancel automatically at a time / after a duration), a **cancellation** signal (cancel manually via a `cancel` func, e.g. the client disconnected), and **request-scoped values** (a request ID, an auth subject). The cancellation arrives as a channel: `ctx.Done()` returns a receive-only channel that's *closed* when the context is cancelled or its deadline passes; `ctx.Err()` then tells you which. Why it matters: any function doing blocking work (a DB query, an HTTP call, a long loop) should take `ctx` as its **first argument** and watch `ctx.Done()`, so when the caller gives up, the work stops instead of running to completion against a client that's already gone.
+</Define>
+
+The whole point is the `select` on `ctx.Done()` — it lets a blocking operation bail out the instant the context is cancelled:
+
+<ExecTimeline
+  title="Cancellation propagating through Done()"
+  lanes={[
+    { id: "caller", label: "Handler (caller)" },
+    { id: "work", label: "fetchQuote goroutine" }
+  ]}
+  steps={[
+    { lane: "caller", kind: "spawn", label: "ctx, cancel := WithTimeout(2s)", note: "Handler creates a 2-second context and calls fetchQuote(ctx, ...)." },
+    { lane: "work", kind: "run", label: "select on result vs Done()", note: "fetchQuote calls a slow pricing API and selects between the result channel and ctx.Done()." },
+    { lane: "caller", kind: "block", label: "client disconnects", note: "The client hangs up. The handler's defer cancel() fires (or the 2s deadline passes)." },
+    { lane: "caller", kind: "send", label: "close(ctx.Done())", note: "Cancelling the context CLOSES the Done channel — a broadcast every selecting goroutine sees at once." },
+    { lane: "work", kind: "recv", label: "<-ctx.Done() wins", note: "fetchQuote's select unblocks on Done(), abandons the slow API call, and returns ctx.Err() (context.Canceled / DeadlineExceeded)." },
+    { lane: "work", kind: "done", label: "goroutine returns", note: "No work done against a dead client; no leaked goroutine waiting on a reply nobody wants." }
+  ]}
+  caption="ctx.Done() is a notification channel that's CLOSED on cancellation. Closing broadcasts to every receiver simultaneously — which is exactly why cancellation fans out down a whole call tree at once."
+/>
+
+Now the subtle one — **#61, propagating an inappropriate context.** A request's context is cancelled when the request ends. So if your handler kicks off a *background* job (write to an audit log, publish a Kafka event) using the *request's* context, that job gets cancelled the moment you return the HTTP response — it dies half-done.
+
+<BeforeAfter
+  bad={`// Handler returns -> request ctx is
+// cancelled -> the audit write is KILLED
+// mid-flight. Audit log silently drops rows.
+func handle(w http.ResponseWriter, r *http.Request) {
+  ctx := r.Context()
+  pay(ctx)
+  go writeAudit(ctx, evt) // dies on return!
+  w.WriteHeader(200)
+}`}
+  good={`// Background job gets its OWN context,
+// detached from the request's lifecycle
+// (carry values via context.WithoutCancel).
+func handle(w http.ResponseWriter, r *http.Request) {
+  ctx := r.Context()
+  pay(ctx)
+  bg := context.WithoutCancel(ctx) // Go 1.21
+  go writeAudit(bg, evt) // survives return
+  w.WriteHeader(200)
+}`}
+  badLabel="Request ctx leaks into background job"
+  goodLabel="Detached ctx for background work"
+/>
+
+<Callout kind="pro" title="context.WithoutCancel (Go 1.21) — keep the values, drop the cancellation">
+
+Before Go 1.21 you had to build a fresh `context.Background()` and manually copy over request-scoped values (request ID, trace span). `context.WithoutCancel(ctx)` does it cleanly: the returned context **keeps the parent's values** but is **never cancelled** by the parent. Perfect for "fire this off and let it finish even though the request is over." Give the background job its *own* timeout if it needs one (`context.WithTimeout(bg, 30*time.Second)`). Full treatment: [The context Package, In Depth](/part-1/context-package).
+
+</Callout>
+
+## Goroutine Leaks
+
+The signature concurrency bug. Goroutines are so cheap to start that people start them without a plan for when they *stop* (#62) — and a goroutine that never stops is a leak.
+
+<Define term="Goroutine leak" since="Go Mistakes (Appendix)">
+A **goroutine leak** is a goroutine that never terminates — it's blocked forever on a channel send/receive, a mutex, or an infinite loop with no exit. Why it matters: each leaked goroutine pins its stack (minimum 2 KB, growable) *plus* every variable it references on the heap *plus* any resources it holds open — a DB connection, an HTTP body, a file. A handler that leaks one goroutine per request leaks memory and file descriptors *linearly with traffic*, until the process is OOM-killed or runs out of FDs. Leaks don't crash on the test that creates them; they crash the box hours later under load, far from the cause. Every goroutine you start must have a guaranteed exit path.
+</Define>
+
+The classic leak: a goroutine sends on an unbuffered channel, but the receiver gave up early (returned on an error, or its context was cancelled). With no one to receive, the sender blocks on that send **forever**:
+
+<ExecTimeline
+  title="A goroutine leak — blocked send, no receiver"
+  lanes={[
+    { id: "main", label: "Handler (receiver)" },
+    { id: "worker", label: "Worker goroutine (sender)" }
+  ]}
+  steps={[
+    { lane: "main", kind: "spawn", label: "ch := make(chan Result)", note: "Handler makes an UNBUFFERED channel and starts a worker to compute a result." },
+    { lane: "worker", kind: "run", label: "compute slow result", note: "Worker does a slow computation, intending to send the result on ch when done." },
+    { lane: "main", kind: "block", label: "return early on timeout", note: "The handler's context times out first. It returns an error to the client and STOPS receiving from ch." },
+    { lane: "worker", kind: "send", label: "ch <- result (blocks)", note: "Worker finishes and tries to send. The channel is unbuffered and nobody is receiving. The send blocks." },
+    { lane: "worker", kind: "block", label: "blocked forever ✗", note: "No receiver will ever come — the handler is gone. This goroutine is leaked: stack + result + any held resources, pinned permanently." }
+  ]}
+  caption="Fix options: give ch a buffer of 1 so the send never blocks (the worker fits its result and exits), OR have the worker select on ctx.Done() so it abandons the send when the receiver is gone. Either guarantees an exit."
+/>
+
+Here's the leak and both fixes, made runnable. We detect the leak deterministically with a counter — no `-race` needed:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
+
+var finished atomic.Int64 // counts workers that actually reached their exit
+
+// LEAKY: sends on an unbuffered channel; if the receiver is gone, blocks forever.
+func leaky(ch chan int) {
+	time.Sleep(10 * time.Millisecond)
+	ch <- 42        // blocks forever when nobody receives — never reaches the next line
+	finished.Add(1) // unreachable in the leak case
+}
+
+// FIXED: selects on ctx.Done() so it abandons the send if the receiver gave up.
+func fixed(ctx context.Context, ch chan int) {
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case ch <- 42: // delivered to a waiting receiver
+	case <-ctx.Done(): // receiver gone — bail out instead of blocking forever
+	}
+	finished.Add(1) // always reached: either branch completes
+}
+
+func main() {
+	// Leaky worker: we "give up" by never receiving. The goroutine blocks on send.
+	go leaky(make(chan int))
+
+	// Fixed worker: same "give up", but it exits via ctx.Done().
+	ctx, cancel := context.WithCancel(context.Background())
+	go fixed(ctx, make(chan int))
+	cancel() // receiver gives up immediately
+
+	time.Sleep(50 * time.Millisecond) // let both attempt their send
+	fmt.Println("workers that reached their exit:", finished.Load())
+	fmt.Println("(leaky never increments; only the ctx-aware worker exits cleanly)")
+}
+```
+
+</GoPlayground>
+
+<BeforeAfter
+  bad={`// No exit path: goroutine runs forever,
+// nothing can stop it. One per request =
+// linear goroutine + memory leak.
+func watch(events chan Event) {
+  go func() {
+    for e := range events {
+      handle(e)
+    } // leaks if events is never closed
+  }()
+}`}
+  good={`// ctx gives a guaranteed exit. When the
+// caller cancels, the goroutine returns.
+func watch(ctx context.Context, events chan Event) {
+  go func() {
+    for {
+      select {
+      case e := <-events:
+        handle(e)
+      case <-ctx.Done():
+        return // guaranteed exit
+      }
+    }
+  }()
+}`}
+  badLabel="No stop signal (leaks)"
+  goodLabel="ctx-cancelled (exits)"
+/>
+
+<Callout kind="pro" title="#63 — loop variables and goroutines (the bug Go 1.22 deleted)">
+
+For years, the most-stepped-on Go landmine was capturing a loop variable in a goroutine. Pre-1.22, the loop variable was **shared across all iterations**, so `for _, id := range ids { go func() { process(id) }() }` would have every goroutine read whatever `id` happened to be when it *ran* — usually the last value, processing the same record N times. The old fix was the `id := id` shadow inside the loop.
+
+**As of Go 1.22, loop variables are per-iteration** — each iteration gets a fresh `id`, so the capture does the right thing and the `id := id` dance is gone. But you still meet the old pattern in pre-1.22 code and in interview questions, so know *why* it was wrong: a goroutine captures a variable by *reference*, and the old loop reused one variable. Targeting Go 1.26, you can delete the shadow. See [Concurrency: Goroutines, Channels & Select](/part-1/concurrency).
+
+</Callout>
+
+## Channels & select
+
+Channels are the part everyone thinks they understand and quietly doesn't. Four mistakes that bite even experienced people.
+
+**#64 — `select` with multiple ready channels is nondeterministic.** People write the "priority" case first and assume it wins. It doesn't: when more than one case is ready, `select` picks one via a **uniform pseudo-random selection**. Ordering the cases means nothing.
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	// Both channels are ready (buffered and pre-filled). One might expect the
+	// "first" case to always win — it does NOT. select chooses at random.
+	high := make(chan string, 1)
+	low := make(chan string, 1)
+	high <- "HIGH"
+	low <- "low"
+
+	counts := map[string]int{}
+	for range 1000 {
+		// Re-fill each round so both are always ready.
+		select {
+		case v := <-high:
+			counts[v]++
+			high <- "HIGH"
+		case v := <-low:
+			counts[v]++
+			low <- "low"
+		}
+	}
+	// Roughly 50/50 — proof that case order does NOT imply priority.
+	fmt.Printf("HIGH picked %d times, low picked %d times\n", counts["HIGH"], counts["low"])
+	fmt.Println("(near 50/50: select is uniformly random among ready cases)")
+}
+```
+
+</GoPlayground>
+
+To get real priority, you nest selects: try the high-priority channel alone first (with a `default`), then fall back to selecting on both.
+
+**#65 — use a notification channel (`chan struct{}`) for signals with no data.** When a channel exists only to *signal* an event — "shutdown now," "this is done" — the value carried is meaningless. Don't use `chan bool` (a reader wonders: does `false` mean something?). Use the empty struct.
+
+<Define term="Notification channel" since="Go Mistakes (Appendix)">
+A **notification channel** is a channel used purely for *signaling*, carrying no data — declared `chan struct{}`. The empty struct `struct{}` occupies **zero bytes**, so the channel communicates only the *fact* of a send or, more often, a *close*. The idiom: `close(done)` to broadcast a one-time signal to every receiver at once (a closed channel is *always* receivable, immediately, for all goroutines). Why it matters: `chan struct{}` documents intent — "no payload, just a signal" — where `chan bool` invites the reader to hunt for a meaning in the value that isn't there. This is exactly what `context.Done()` returns: `<-chan struct{}`.
+</Define>
+
+**#66 — a nil channel blocks forever, and that's *useful*.** Receiving from or sending to a `nil` channel blocks the goroutine permanently. Most people learn this as a bug. The pro move: in a `select`, a `nil` channel case is *never selected* — so setting a channel variable to `nil` **disables that case** dynamically. The canonical use is merging two channels and "turning off" each one as it closes, so you don't busy-loop on a closed channel that's always ready.
+
+<ExecTimeline
+  title="A nil channel disables a select case"
+  lanes={[
+    { id: "merge", label: "merge loop" },
+    { id: "ch1", label: "ch1 (closes first)" }
+  ]}
+  steps={[
+    { lane: "merge", kind: "run", label: "select ch1, ch2", note: "We read from both ch1 and ch2 and forward to an output channel." },
+    { lane: "ch1", kind: "send", label: "ch1 produces values", note: "ch1 sends values; the select's ch1 case fires and forwards them." },
+    { lane: "ch1", kind: "done", label: "ch1 closes", note: "A closed channel is ALWAYS ready — `v, ok := <-ch1` returns ok=false instantly, forever. Left as-is, the select spins on it (busy loop)." },
+    { lane: "merge", kind: "block", label: "set ch1 = nil", note: "On `ok==false`, assign ch1 = nil. A nil channel case is NEVER selected — the busy loop stops." },
+    { lane: "merge", kind: "recv", label: "select ch2 only", note: "Now the select effectively waits on ch2 alone. No CPU burned, no extra boolean flag needed." },
+    { lane: "merge", kind: "done", label: "both nil → return", note: "When ch2 also closes and is set to nil, both cases are dead; close the output and return." }
+  ]}
+  caption="Setting a channel to nil removes its select case — a clean state machine with no extra bookkeeping. nil channels block forever ON PURPOSE; that's the feature, not a bug."
+/>
+
+**#67 — channel size: default to unbuffered.** An unbuffered channel (`make(chan T)`) is a **synchronization point** — send and receive rendezvous, giving you a happens-before guarantee. A buffered channel (`make(chan T, n)`) decouples sender and receiver up to `n` queued items. The mistake is picking a buffer size by feel.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Unbuffered (default)">Send blocks until a receiver is ready — a rendezvous *and* a happens-before edge. Your default: it's the most synchronized and the easiest to reason about. Choose this unless you can *name* why you need a buffer.</ConceptCard>
+  <ConceptCard label="Buffered = 1">A single slot. Useful to avoid a leak on a send when the receiver may have left (the worker fits its one result and exits), or for a "latest value" / signal that mustn't block the sender once.</ConceptCard>
+  <ConceptCard label="Buffered = N">Only when N is a *justified* number: a worker pool of N, a known batch size, a rate-limit token bucket of N. An arbitrary `make(chan T, 100)` is a guess that hides backpressure problems until the buffer fills.</ConceptCard>
+</ConceptGrid>
+
+<Gotcha>⚠ A buffer doesn't make backpressure disappear — it *delays* it. When the buffer fills, the sender blocks anyway. A too-large buffer just means you discover the overload later, with more in-flight work to lose. Size buffers to a real quantity, not a vibe.</Gotcha>
+
+**#68 — string-formatting side effects.** A subtle data race that bit etcd: a `String()` method (or any code in a logging/format path) that reads shared state *without* the lock can race with a writer — or, if it grabs a lock the caller *already holds*, deadlock. The lesson: methods on the formatting path must be side-effect-free and lock-aware. Don't read mutable shared state inside `String()` without synchronization.
+
+<QuickCheck
+  question="You're merging two input channels into one output channel with a `for { select { ... } }` loop. When ch1 closes, your loop starts spinning at 100% CPU. Why, and what's the idiomatic fix?"
+  options={[
+    "A closed channel panics; recover from it",
+    "A closed channel is always ready to receive (returns zero, ok=false immediately), so its select case fires nonstop — a busy loop. Set the channel variable to nil after it closes; a nil channel's case is never selected, disabling it cleanly",
+    "You must call close() on the output channel first",
+    "Buffered channels can't be merged"
+  ]}
+  answer={1}
+  explain="Receiving from a closed channel never blocks — `v, ok := <-ch1` returns immediately with ok=false, forever. In a select, that case is therefore always ready and keeps firing, burning CPU. Assigning `ch1 = nil` on close turns that case off, because a nil channel blocks forever and a nil-channel case is never chosen. The select then waits only on the still-open channel — no flag, no busy loop. This is the headline use of nil channels."
+/>
+
+## sync, WaitGroup & errgroup
+
+The `sync` package and its friends. Powerful, and full of foot-shaped holes.
+
+**#71 — misusing `sync.WaitGroup`: call `Add` in the parent, before the goroutine.** A `WaitGroup` waits for *n* operations. The classic bug is calling `wg.Add(1)` *inside* the goroutine — which races with `wg.Wait()`: if `Wait` runs before the goroutine's `Add`, the counter is still 0 and `Wait` returns immediately, before the work is done.
+
+<BeforeAfter
+  bad={`// Add(1) runs INSIDE the goroutine — it
+// races with Wait(). Wait may see counter 0
+// and return before the work even starts.
+for range 3 {
+  go func() {
+    wg.Add(1)        // TOO LATE — races Wait
+    defer wg.Done()
+    work()
+  }()
+}
+wg.Wait()`}
+  good={`// Go 1.25: wg.Go does Add(1) in the parent
+// (before the goroutine starts) and Done on
+// return. No race, no manual bookkeeping.
+for range 3 {
+  wg.Go(func() {
+    work()
+  })
+}
+wg.Wait()`}
+  badLabel="Add inside goroutine (races Wait)"
+  goodLabel="wg.Go (Add before spawn)"
+/>
+
+As of Go 1.25, `wg.Go(func(){...})` is the idiom: it increments the counter **before** launching the goroutine and calls `Done` when the function returns, so the "Add too late" race is impossible by construction. The Go 1.25 `vet` `waitgroup` analyzer also flags an `Add` call inside a goroutine.
+
+**#72 — forgetting `sync.Cond`.** Sometimes you need to *broadcast* "this condition changed" to *many* waiting goroutines, repeatedly. A channel send goes to only **one** receiver (round-robin), so it can't fan out an update to N listeners. A `close` broadcasts but only *once*. `sync.Cond` is the right tool: waiters call `Wait()` (which atomically releases the lock and sleeps), and the updater calls `Broadcast()` to wake them all.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Donation goal tracker: many listeners wait for the balance to cross a goal.
+// sync.Cond lets the updater BROADCAST each change to all waiters at once —
+// something a single channel send (one receiver) can't do.
+type Donation struct {
+	cond    *sync.Cond
+	balance int
+}
+
+func main() {
+	d := &Donation{cond: sync.NewCond(&sync.Mutex{})}
+	var wg sync.WaitGroup
+
+	listen := func(goal int) {
+		d.cond.L.Lock()
+		for d.balance < goal { // re-check in a loop: Wait can wake spuriously
+			d.cond.Wait() // releases the lock, sleeps, re-acquires on wake
+		}
+		fmt.Printf("goal %d reached at balance %d\n", goal, d.balance)
+		d.cond.L.Unlock()
+	}
+	wg.Add(2)
+	go func() { defer wg.Done(); listen(10) }()
+	go func() { defer wg.Done(); listen(15) }()
+
+	// Updater: bump the balance and broadcast to every waiter.
+	for range 15 {
+		d.cond.L.Lock()
+		d.balance++
+		d.cond.L.Unlock()
+		d.cond.Broadcast() // wake ALL waiters; each re-checks its goal
+	}
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+**#73 — not using `errgroup`.** When you fan out N goroutines that can each fail and you want the *first* error plus automatic cancellation of the rest, hand-rolling that with a `WaitGroup` + an error channel + a context is fiddly and easy to get wrong. `golang.org/x/sync/errgroup` does exactly this: `g.Go(func() error {...})`, and `g.Wait()` returns the first non-nil error; the `errgroup.WithContext` variant cancels the shared context on the first failure so siblings stop early.
+
+<BeforeAfter
+  bad={`// Manual: WaitGroup + error channel +
+// sync.Once + context, all hand-wired.
+// Easy to leak or drop the first error.
+var wg sync.WaitGroup
+errCh := make(chan error, len(ids))
+for _, id := range ids {
+  wg.Go(func() {
+    errCh <- fetch(ctx, id)
+  })
+}
+wg.Wait()
+close(errCh)
+// ...drain errCh, find first non-nil...`}
+  good={`// errgroup: first error wins, ctx cancels
+// the rest, Wait returns that error.
+g, ctx := errgroup.WithContext(ctx)
+for _, id := range ids {
+  g.Go(func() error {
+    return fetch(ctx, id)
+  })
+}
+if err := g.Wait(); err != nil {
+  return err // the first failure
+}`}
+  badLabel="Hand-rolled fan-out"
+  goodLabel="errgroup.WithContext"
+/>
+
+**#74 — copying a `sync` type (the bug `go vet` catches).** `sync.Mutex`, `sync.WaitGroup`, `sync.Cond`, `sync.Once` and friends **must not be copied after first use** — a copy duplicates the lock's internal state, so the copy and the original are *different* locks that don't exclude each other. The trap hides in plain sight: copying a *struct that contains* a mutex (passing it by value, returning it, ranging over a slice of them) copies the lock.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Counter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *Counter) Inc() { // pointer receiver — operates on the original's mutex
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+}
+
+func main() {
+	c := &Counter{}
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Add(1)
+		go func() { defer wg.Done(); c.Inc() }() // all share ONE Counter, ONE mutex — correct
+	}
+	wg.Wait()
+	fmt.Println("count:", c.n) // always 100
+
+	// The TRAP (don't do this): a value receiver, or `copy := *c`, would copy
+	// the mutex. `go vet` reports: "assignment copies lock value to copy: Counter
+	// contains sync.Mutex". vet catches it at build time — heed it.
+}
+```
+
+</GoPlayground>
+
+<Gotcha>⚠ Always use a **pointer receiver** on methods that lock, and pass mutex-bearing structs by **pointer**. If `go vet` says "copies lock value," you have a copied mutex — that's not a false positive, it's a real broken lock. The `copylocks` analyzer is in the default `go vet` set, so it fires on every build that runs vet.</Gotcha>
+
+**#69 — data races with `append` on a shared slice**, and **#70 — mutexes that don't actually protect slices/maps.** Two slice-flavored races. First: a slice header copied across goroutines shares the *same backing array*, so concurrent `append`s race on that memory even though each goroutine has "its own" slice variable. Second: copying a struct that holds a mutex *and* a slice — the mutex copy doesn't exclude, and worse, the slice header copy still points at shared backing memory, so you've "locked" two different locks over one piece of data.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="#69 append races">A `[]T` value is a 3-word header over a shared array. Passing it to multiple goroutines and appending concurrently races on the backing array (and the length word). Give each goroutine its own slice, or guard the shared one with a mutex, or collect results via a channel.</ConceptCard>
+  <ConceptCard label="#70 'protecting' a slice by value">A mutex guards memory only if every accessor uses the *same* mutex over the *same* memory. Copy the struct (mutex + slice header) and you get two locks over one backing array — the lock protects nothing. Keep the mutex and the data behind one pointer.</ConceptCard>
+</ConceptGrid>
+
+<UnderTheHood title="The race detector, happens-before, container-aware GOMAXPROCS, and the tools that find leaks">
+
+**How `-race` works.** The race detector compiles in *shadow memory* and instruments every memory access and synchronization event to build a happens-before graph at runtime (the ThreadSanitizer algorithm). When it sees two accesses to the same address, at least one a write, with **no** happens-before edge between them, it reports a race with both stacks. It has near-zero false positives — if `-race` fires, you *have* a race — but it only catches races on *executed* schedules, so it's as good as your test coverage. Cost is real (≈2–20× slower, more memory), so run it in CI and load tests, not production.
+
+**Why happens-before is the whole game.** The memory model gives the clean DRF-SC guarantee only to data-race-free programs. Synchronization edges come from channel ops, mutexes, `sync.Once`, `sync/atomic`, `wg.Wait`, and goroutine start. Absent one of those edges between a write and a read, the program has a race; the implementation may report and halt, and otherwise the read has only the limited guarantees spelled out by the memory model. "Works on x86" is meaningless; the compiler can still reorder.
+
+**Container-aware `GOMAXPROCS` (Go 1.25).** Historically `GOMAXPROCS` defaulted to the host's logical CPU count, which was *wrong* in a container limited to, say, 2 CPUs on a 64-core node — the runtime exposed far more Ps than the container could use efficiently. The fix used to be the third-party `uber/automaxprocs`. **As of Go 1.25, the runtime considers logical CPUs, CPU affinity, and Linux cgroup CPU quota, then updates the default dynamically if those limits change** — so `automaxprocs` is no longer needed for Go 1.25+ services. Opt out with `GODEBUG=containermaxprocs=0`; override programmatically with `runtime.SetDefaultGOMAXPROCS`.
+
+**Finding leaks.** Beyond `pprof`'s goroutine profile (`/debug/pprof/goroutine?debug=2` shows every goroutine's stack — a pile blocked on the same line is your leak), Go 1.26 ships an **experimental `goroutineleak` pprof profile** (`/debug/pprof/goroutineleak`) that reports goroutines the runtime believes are permanently blocked. For *tests*, **`testing/synctest` (Go 1.25)** runs concurrent code in a virtual-time "bubble" where the fake clock only advances when every goroutine is blocked — making timeout/cancellation tests deterministic and instant instead of flaky and slow. Deep dives: [Advanced Concurrency & Correctness](/part-2/advanced-concurrency-correctness) and [Concurrency Patterns](/part-2/concurrency-patterns).
+
+</UnderTheHood>
+
+## Exercises
+
+<Exercise n={1} title="Lost update → atomic" level="easy">
+
+This `Counter.Inc` has a data race and loses increments. Fix it two ways: with a `sync.Mutex`, and with `sync/atomic`.
+
+```go
+type Counter struct{ n int }
+func (c *Counter) Inc() { c.n++ } // racy read-modify-write
+```
+
+<Solution>
+
+```go
+// Option A: mutex around the whole read-modify-write.
+type Counter struct {
+	mu sync.Mutex
+	n  int
+}
+func (c *Counter) Inc() {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+}
+
+// Option B: a lock-free atomic counter (simpler when you only need a counter).
+type AtomicCounter struct{ n atomic.Int64 }
+func (c *AtomicCounter) Inc() { c.n.Add(1) }
+```
+
+`c.n++` is a read, an add, and a write — three steps, not atomic. Two goroutines can both read the old value and both write back `old+1`, losing one increment (the lost-update race). The mutex makes the whole sequence atomic *and* establishes happens-before. `atomic.Int64.Add` does the read-modify-write as one indivisible hardware operation — fewer moving parts when a counter is all you need. Either is correct under `-race`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Plug the goroutine leak" level="medium">
+
+`fetch` starts a goroutine that sends the result on an unbuffered channel, but the caller returns on timeout without receiving — leaking the goroutine. Fix it so the goroutine always exits.
+
+```go
+func fetch(ctx context.Context) (int, error) {
+	ch := make(chan int)
+	go func() { ch <- slowWork() }() // leaks if ctx times out first
+	select {
+	case v := <-ch:
+		return v, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+```
+
+<Solution>
+
+```go
+func fetch(ctx context.Context) (int, error) {
+	ch := make(chan int, 1) // buffer of 1: the send never blocks
+	go func() { ch <- slowWork() }()
+	select {
+	case v := <-ch:
+		return v, nil
+	case <-ctx.Done():
+		return 0, ctx.Err() // goroutine's send still fits in the buffer; it exits
+	}
+}
+```
+
+The bug: when `ctx.Done()` wins the `select`, the function returns and stops receiving, but the goroutine still tries `ch <- slowWork()` on an *unbuffered* channel with no receiver — it blocks forever. Giving `ch` a **buffer of 1** lets that send complete into the buffer even with no receiver, so the goroutine reaches its end and is collected. (Alternative: have the goroutine `select` its send against `ctx.Done()`.) A buffer of 1 is the textbook fix for "send to a receiver that might have left."
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Disable a select case with nil" level="hard">
+
+Merge `a` and `b` into `out`, closing `out` when both inputs are closed — and don't busy-loop when one closes early. Use the nil-channel trick.
+
+<Solution>
+
+```go
+func merge(a, b <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for a != nil || b != nil { // loop until BOTH are drained
+			select {
+			case v, ok := <-a:
+				if !ok {
+					a = nil // disable this case; a nil channel is never selected
+					continue
+				}
+				out <- v
+			case v, ok := <-b:
+				if !ok {
+					b = nil
+					continue
+				}
+				out <- v
+			}
+		}
+	}()
+	return out
+}
+```
+
+A closed channel is *always* ready (`ok=false` instantly), so without intervention its `select` case fires nonstop — a 100%-CPU busy loop. Setting the variable to `nil` on close makes that case unselectable (a nil channel blocks forever, so `select` skips it), and the loop condition `a != nil || b != nil` exits once both are nil. No boolean flags, no spin. This is *the* idiomatic merge.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="errgroup fan-out" level="medium">
+
+You must fetch quotes for several symbols concurrently; if any fetch fails, cancel the rest and return the first error. Write it with `errgroup`.
+
+<Solution>
+
+```go
+func fetchAll(ctx context.Context, symbols []string) ([]Quote, error) {
+	g, ctx := errgroup.WithContext(ctx)
+	quotes := make([]Quote, len(symbols)) // index-per-goroutine: no shared append
+	for i, sym := range symbols {
+		g.Go(func() error {
+			q, err := fetchQuote(ctx, sym)
+			if err != nil {
+				return err // first error cancels ctx, stopping siblings
+			}
+			quotes[i] = q // distinct index — safe without a lock
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return quotes, nil
+}
+```
+
+`errgroup.WithContext` gives a group whose context is cancelled the instant any `g.Go` returns a non-nil error, so the other in-flight fetches see `ctx.Done()` and bail. `g.Wait()` returns that first error. Each goroutine writes a **distinct index** of `quotes`, so there's no shared-`append` data race and no mutex needed — the classic safe pattern for "collect N results in order." (Loop variables are per-iteration as of Go 1.22, so no `i := i` shadow is needed.)
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Spot the copied mutex" level="medium">
+
+Why does `go vet` flag this, and what's the fix?
+
+```go
+type Registry struct {
+	mu      sync.Mutex
+	entries map[string]int
+}
+func (r Registry) Add(k string) { // value receiver
+	r.mu.Lock()
+	r.entries[k]++
+	r.mu.Unlock()
+}
+```
+
+<Solution>
+
+```go
+func (r *Registry) Add(k string) { // pointer receiver — operate on the original
+	r.mu.Lock()
+	r.entries[k]++
+	r.mu.Unlock()
+}
+```
+
+The **value receiver** `(r Registry)` copies the whole struct — including the `sync.Mutex` — on every call. `go vet` reports "Add passes lock by value: Registry contains sync.Mutex" via the `copylocks` analyzer. The copy's mutex is a *different* lock from any other caller's, so it excludes nothing: two goroutines can lock their own copies and stomp the shared `entries` map (which, being a reference type, *is* shared even through a struct copy — so you get an unprotected concurrent map write, which Go panics on). Switching to a **pointer receiver** makes every call lock the same mutex over the same map. Rule: methods that lock take a pointer receiver, always.
+
+</Solution>
+
+</Exercise>
+
+<Lab
+  title="Stop the leak — make the worker exit"
+  archetype="fix-it"
+  difficulty="scaffolded"
+  points={90}
+  hintCost={15}
+  objective={'Fix a real goroutine leak. spawnWorker starts a goroutine that sends its result on an UNBUFFERED channel, but the caller gives up (its context is cancelled) and never receives — so the worker blocks forever on the send and leaks. Repair spawnWorker so the worker ALWAYS reaches its exit (incrementing the `exited` counter) even when the receiver is gone. The provided main cancels the receiver, then checks that every worker exited; it prints PASS only when none leaked.'}
+  verify="self-check"
+  starter={`package main
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
+
+var exited atomic.Int64 // counts workers that reached their exit point
+
+// BUG: the worker sends on an UNBUFFERED channel. If the receiver gave up
+// (ctx cancelled), the send blocks forever and the worker never increments
+// exited — it's leaked. Fix it so the worker always exits.
+func spawnWorker(ctx context.Context) {
+	ch := make(chan int) // TODO: unbuffered — the send can block forever
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		ch <- 42 // TODO: blocks forever when nobody receives
+		exited.Add(1)
+	}()
+	// The "receiver" gives up immediately (ctx is already cancelled).
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
+func main() {
+	const n = 50
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // every receiver gives up right away
+
+	for range n {
+		spawnWorker(ctx)
+	}
+	time.Sleep(60 * time.Millisecond) // give every worker time to attempt its send
+
+	got := exited.Load()
+	if got == n {
+		fmt.Printf("all %d workers exited cleanly\\nPASS\\n", n)
+	} else {
+		fmt.Printf("FAIL: only %d/%d workers exited — %d leaked on the blocked send\\n", got, n, n-int64(got))
+	}
+}
+`}
+  verifier={'Self-check: main spawns 50 workers whose receiver gives up immediately, then asserts all 50 reached their exit (exited == 50) and prints PASS. A leaked worker (blocked forever on an unbuffered send) never increments the counter, so the count falls short and main prints FAIL. Codapi runs go run, so the PASS print is your gate — no -race needed.'}
+  hints={[
+    "The send `ch <- 42` blocks forever when nobody receives. Easiest fix: make ch buffered with capacity 1 — `make(chan int, 1)` — so the send always fits and the worker reaches exited.Add(1).",
+    "Alternative fix: keep ch unbuffered but make the worker abandon the send via select — `select { case ch <- 42: case <-ctx.Done(): }` — then exited.Add(1). Either branch completes, so the worker always exits.",
+    "Whichever fix you choose, exited.Add(1) must be UNCONDITIONALLY reachable after the send attempt. With a buffer of 1 the send never blocks; with the select, ctx.Done() provides the escape. Then all 50 workers exit and main prints PASS."
+  ]}
+  flag="GO{buffered_one_or_select_done_no_leak}"
+>
+
+The bug that takes down boxes at 3 a.m., shrunk to fifty workers you can watch. The receiver walks away; the worker is left holding a value nobody will take, blocked forever. Give the send a buffer of one — or an escape hatch via `ctx.Done()` — and every worker finds its exit. Burn it in: a goroutine you start without a guaranteed way to stop is a leak with a delay timer on it.
+
+</Lab>
+
+---
+
+<Recap>
+
+The concurrency mistakes — the ones that pass every test and then page you at 3 a.m.:
+
+- **Concurrency ≠ parallelism** (#55): concurrency is structure, parallelism is execution. Concurrency *enables* a speedup; it doesn't guarantee one (#56) — below a threshold, goroutine overhead loses to a sequential loop. Match goroutine count to workload (#59): CPU-bound → ~`GOMAXPROCS`; I/O-bound → many.
+- **Data race vs race condition** (#58): a data race is unsynchronized concurrent access (≥1 write) — a serious memory-model violation caught by `-race`; a race condition is correctness depending on interleaving. The **memory model**'s *happens-before* edges come from synchronization. **Channels** transfer/coordinate; **mutexes** guard shared state (#57).
+- **Context** (#60): take `ctx` first, watch `ctx.Done()`. Don't leak a request ctx into a background job (#61) — detach with `context.WithoutCancel`.
+- **Goroutine leaks** (#62): every goroutine needs a guaranteed exit (buffer of 1, or `select` on `ctx.Done()`). Loop-variable capture (#63) is fixed in Go 1.22+ (per-iteration).
+- **Channels/select**: `select` among ready cases is **random** (#64) — order ≠ priority. Use `chan struct{}` for signals (#65); a **nil** channel disables a select case (#66); default to **unbuffered** (#67); keep `String()` side-effect-free and lock-aware (#68).
+- **sync & friends**: `wg.Add` in the parent before the goroutine — or just use **`wg.Go`** (#71); `sync.Cond.Broadcast` to wake many waiters (#72); **`errgroup`** for fail-fast fan-out (#73); never **copy a sync type** — `go vet`'s `copylocks` catches it (#74). Watch shared-`append` races (#69) and "protecting" a slice through a struct copy (#70).
+
+</Recap>
+
+<Scoreboard
+  streak={5}
+  items={[
+    { label: "Quick check — concurrency isn't always faster", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — data race vs race condition", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — nil channel disables a case", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — lost update to atomic", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — plug the goroutine leak", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — nil-channel merge", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — errgroup fan-out", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — spot the copied mutex", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Stop the leak prints PASS", captured: false, points: 90 }}
+/>
+
+Twenty more mistakes down, and these were the ones that bite back. You can now read an interleaving instead of guessing, you know that "it worked" means "the schedule was kind," and you'll never start a goroutine again without asking how it dies. Channels coordinate, mutexes guard, contexts cancel, and `go vet` and `-race` find what your eyes can't. Next, we leave timing behind and take on the **standard library, testing, and optimizations**: the JSON unmarshal that silently drops a field, the SQL `Rows` you forgot to `Close`, the HTTP body that leaks a connection, benchmarks that lie, CPU caches and false sharing, the GC, and `GOMAXPROCS` in containers done right. Bring your best. I always do. Let's go.

@@ -1,0 +1,1373 @@
+---
+title: "Messaging & Pub/Sub Foundations"
+part: 3
+order: 5
+type: "course"
+description: "The broker-agnostic mental model: queues vs topics, producers/consumers, push vs pull, delivery guarantees, ordering, acks and dead-letter queues."
+prerequisites: ["idempotency-exactly-once"]
+---
+
+<HeroCard label="Part 3 · Chapter 5" title="Messaging & Pub/Sub Foundations">
+
+Listen up, sport. You've got a payment service that fires off a `payment.completed` event — and your ledger service, your notifications service, and your analytics pipeline all need to hear about it *right now*. The naive move? Call all three directly, in sequence, from inside the payment handler. Then one of them is slow. Or down. Suddenly a perfectly good payment is timing out, or worse, half your side effects ran and half didn't.
+
+That's not a system. That's a house of cards in a hurricane. A message broker exists specifically to save you from that fate. By the end of this chapter you'll understand *exactly* how it does that — queues, topics, delivery guarantees, acknowledgements, dead-letter queues, and back-pressure — without needing to name a single vendor. These are the concepts Kafka, RabbitMQ, NATS, and every other broker are built on. Learn the foundation here, and those tools become obvious.
+
+You're exceptionally lucky I'm the one teaching you this.
+
+</HeroCard>
+
+<ChapterTabs tabs={["What a Broker Is", "Queues vs Topics", "Producers, Consumers & Delivery", "Delivery Guarantees", "Ordering & Acknowledgements", "Dead-Letter Queues & Back-pressure"]} />
+
+## What a Broker Is
+
+Let's nail the problem before we build the solution. Here's the scene:
+
+Your payments service just settled a `payment.completed` event for order `#ORD-7823`. Three things need to happen:
+
+1. The **ledger service** posts the double-entry accounting lines.
+2. The **notification service** emails the customer.
+3. The **analytics pipeline** records the conversion.
+
+The synchronous version — calling each service directly from the payment handler — looks like this:
+
+```go
+// payments/handler.go — the naive way (do NOT ship this)
+func (h *Handler) CompletePayment(ctx context.Context, p Payment) error {
+	if err := h.ledger.Post(ctx, p); err != nil {
+		return err // notification and analytics never ran
+	}
+	if err := h.notifier.Send(ctx, p); err != nil {
+		return err // analytics never ran; ledger already did
+	}
+	if err := h.analytics.Record(ctx, p); err != nil {
+		return err // partially applied — a nightmare to reconcile
+	}
+	return nil
+}
+```
+
+That `err` chain is a lie dressed as safety. If `notifier.Send` is down for a rolling deploy, you've got ledger entries with no notifications. If `analytics.Record` times out at 2 a.m., you've got a partially applied side-effect set with no idempotency key to replay safely. You've tightly **coupled** three independent services behind a single synchronous call chain.
+
+**On the job:** You hit this pattern the moment your payment handler has more than one downstream side effect. The failure mode — partial execution with no clean retry path — is one of the most expensive bugs to debug in production, because the ledger and the notification system are now out of sync with no record of why.
+
+<Define term="Message broker" since="Event-Driven Architecture & Kafka (Part 3)">
+A **message broker** is an intermediary that accepts messages from producers and delivers them to consumers. The producer publishes once; the broker holds the message reliably and delivers it to every interested consumer on their own schedule. If a consumer is temporarily down, the message waits. This decouples the producer from its downstream dependencies entirely — the payment service doesn't know or care whether the ledger service is up right now.
+</Define>
+
+A message broker breaks that coupling. Instead of calling the downstream services, the payment handler *publishes a message* to the broker and returns immediately. Each downstream service *independently* reads that message on its own schedule. The broker holds the message reliably — if the notification service is temporarily down, the message waits. When it comes back up, it picks up right where it left off.
+
+<Scene
+  title="Tightly-coupled calls vs. a message broker"
+  actors={[
+    { id: "pay", label: "payment svc" },
+    { id: "ledger", label: "ledger svc" },
+    { id: "notif", label: "notif svc" },
+    { id: "anal", label: "analytics" }
+  ]}
+  frames={[
+    {
+      caption: "payment.completed fires. The handler calls ledger, then notif, then analytics — all in sequence.",
+      beat: "problem",
+      actors: [
+        { id: "pay", state: "active" },
+        { id: "ledger", state: "active" },
+        { id: "notif", state: "idle" },
+        { id: "anal", state: "idle" }
+      ]
+    },
+    {
+      caption: "notif svc is mid-deploy. The handler blocks, then returns an error. Analytics never ran; ledger already committed.",
+      beat: "problem",
+      actors: [
+        { id: "pay", state: "bad" },
+        { id: "ledger", state: "done" },
+        { id: "notif", state: "bad" },
+        { id: "anal", state: "idle" }
+      ]
+    },
+    {
+      caption: "With a broker: payment svc publishes one event and returns 200. Consumers read independently.",
+      beat: "solution",
+      actors: [
+        { id: "pay", state: "done" },
+        { id: "ledger", state: "idle" },
+        { id: "notif", state: "idle" },
+        { id: "anal", state: "idle" }
+      ]
+    },
+    {
+      caption: "Each consumer processes the event at its own pace. notif svc comes back up and picks up the queued message.",
+      beat: "solution",
+      actors: [
+        { id: "pay", state: "done" },
+        { id: "ledger", state: "done" },
+        { id: "notif", state: "done" },
+        { id: "anal", state: "done" }
+      ]
+    }
+  ]}
+  caption="Tightly-coupled synchronous calls break on any downstream failure. A broker decouples producer from consumers — the payment handler is done before any consumer has even started."
+/>
+
+Three properties that make this work:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Decoupling">The producer (payment service) doesn't know or care which consumers exist. Add a new downstream service? Subscribe it to the broker — no changes to the producer.</ConceptCard>
+  <ConceptCard label="Load smoothing">A payment burst at noon spikes your event rate. Consumers drain the queue at their own pace. The broker absorbs the burst; consumers aren't overwhelmed.</ConceptCard>
+  <ConceptCard label="Resilience">A consumer going down doesn't lose data. Messages persist in the broker until acknowledged. When the consumer recovers, it picks up the backlog.</ConceptCard>
+  <Gotcha>A broker is not a replacement for a transaction. The payment service must persist its own state *before* publishing. Publishing and database commit are two separate operations — use the transactional outbox pattern (covered in Idempotency & Exactly-Once Semantics) to make them atomic.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="Synchronous calls vs. a message broker"
+  lanes={[{ id: "pay", label: "payment svc" }, { id: "broker", label: "broker" }, { id: "ledger", label: "ledger svc" }]}
+  steps={[
+    { lane: "pay", kind: "run", label: "CompletePayment()", note: "Payment is settled in the DB. Now we need to tell downstream services." },
+    { lane: "pay", kind: "send", label: "Publish(payment.completed)", note: "The payment service publishes one message to the broker and returns immediately. No blocking on ledger or notifications." },
+    { lane: "broker", kind: "recv", label: "message stored", note: "The broker durably stores the message. It will hold it until every subscriber has acknowledged it." },
+    { lane: "pay", kind: "done", label: "handler returns 200", note: "The payment handler is already done — decoupled from everything downstream." },
+    { lane: "ledger", kind: "recv", label: "consume message", note: "The ledger service reads the message from the broker at its own pace, posts accounting lines, then acks." },
+    { lane: "broker", kind: "run", label: "mark delivered → ledger", note: "The broker records that the ledger subscriber has acknowledged. Other subscribers are independent." }
+  ]}
+  caption="Decoupling via a broker: the producer is done before any consumer has even started."
+/>
+
+## Queues vs Topics
+
+Here's where most developers get confused. A broker can operate in two fundamentally different modes, and knowing which one you want is the difference between a system that works and one that loses data silently.
+
+<Define term="Queue (point-to-point)" since="Event-Driven Architecture & Kafka (Part 3)">
+A **queue** is a point-to-point channel where each message is delivered to **exactly one consumer** from a competing pool. Multiple workers read from the same queue; each message goes to whichever worker has capacity. Use a queue when you want to distribute work across a pool — receipt emails, report generation, image resizing — and each job should be done once, not N times.
+</Define>
+
+<Define term="Topic (publish/subscribe)" since="Event-Driven Architecture & Kafka (Part 3)">
+A **topic** is a publish/subscribe channel where each message is delivered to **every subscriber independently**. Each subscriber gets its own copy; the broker tracks each subscriber's progress separately. Use a topic when multiple independent downstream services all need the same event — a `payment.completed` event that ledger, notifications, and analytics all need to handle.
+</Define>
+
+<Define term="Fan-out">
+**Fan-out** is what a topic does: one published message is copied and delivered to every subscriber. It's the messaging equivalent of broadcasting — the producer sends once, N consumers each receive once. Contrast with a queue, where one message goes to exactly one of N consumers.
+</Define>
+
+**On the job:** Choosing queue vs topic is the first decision you make when designing a messaging system. Getting it wrong means either double-processing work (using a topic when you needed a queue) or silently dropping deliveries to downstream systems (using a queue when you needed fan-out).
+
+### The Work Queue: one message, one worker
+
+In a **work queue** (also called a point-to-point queue), a message is consumed by **exactly one worker**. You have multiple workers competing for messages; each message goes to one of them. This is load distribution.
+
+Picture Meridian's receipt-email job queue. You enqueue one job per completed payment. You run three worker pods. Each job gets picked up by whichever pod has capacity — you don't want all three workers processing the same email.
+
+<ExecTimeline
+  title="Work queue — one message, one worker"
+  lanes={[
+    { id: "prod", label: "producer" },
+    { id: "q", label: "queue" },
+    { id: "w1", label: "worker 1" },
+    { id: "w2", label: "worker 2" },
+    { id: "w3", label: "worker 3" }
+  ]}
+  steps={[
+    { lane: "prod", kind: "send", label: "enqueue job A", note: "Producer pushes job A (send receipt email for order #7823) into the queue." },
+    { lane: "prod", kind: "send", label: "enqueue job B", note: "Producer pushes job B (order #7824). Both jobs now sit in the queue." },
+    { lane: "q", kind: "run", label: "2 jobs pending", note: "Queue holds both messages durably. Workers compete to pull from it." },
+    { lane: "w1", kind: "recv", label: "pull job A", note: "Worker 1 polls the queue and wins job A. Workers 2 and 3 are idle — job A belongs to worker 1 alone." },
+    { lane: "w2", kind: "recv", label: "pull job B", note: "Worker 2 wins job B. Worker 3 still idle. The two jobs are processed in parallel, never duplicated." },
+    { lane: "w1", kind: "send", label: "ack job A", note: "Worker 1 finishes sending the email and acks job A. The broker discards it." },
+    { lane: "w2", kind: "send", label: "ack job B", note: "Worker 2 acks job B. Queue is empty." }
+  ]}
+  caption="Work queue: competing consumers, each delivery attempt is owned by one worker. Ack/retry and idempotency handle crash safety."
+/>
+
+### The Topic: one message, every subscriber
+
+In a **topic** (publish/subscribe), a message is delivered to **every subscriber independently**. This is fan-out.
+
+Back to Meridian's `payment.completed` event: ledger, notifications, and analytics all need it. They're independent subscribers on the same topic. Each gets their own copy of the message.
+
+<ExecTimeline
+  title="Topic fan-out — one message, every subscriber"
+  lanes={[
+    { id: "prod", label: "payment svc" },
+    { id: "topic", label: "topic" },
+    { id: "ledger", label: "ledger svc" },
+    { id: "notif", label: "notif svc" },
+    { id: "anal", label: "analytics" }
+  ]}
+  steps={[
+    { lane: "prod", kind: "send", label: "publish payment.completed", note: "Payment service publishes one event. It has no idea who is listening." },
+    { lane: "topic", kind: "run", label: "fan-out to 3 subscribers", note: "The broker creates an independent delivery cursor for each subscriber. All three get the same message." },
+    { lane: "ledger", kind: "recv", label: "consume event", note: "Ledger service reads and processes the event: posts the accounting entries." },
+    { lane: "notif", kind: "recv", label: "consume event", note: "Notification service reads the same event independently: sends the confirmation email." },
+    { lane: "anal", kind: "recv", label: "consume event", note: "Analytics pipeline reads it too: records the conversion. All three run concurrently." },
+    { lane: "ledger", kind: "send", label: "ack", note: "Each subscriber acks independently. The topic tracks per-subscriber progress." }
+  ]}
+  caption="Topic fan-out: every subscriber gets every message; progress is tracked independently per subscriber."
+/>
+
+### Queue vs Topic side by side
+
+<Scene
+  title="Queue vs Topic: same producer, different delivery"
+  actors={[
+    { id: "prod", label: "producer" },
+    { id: "w1", label: "worker 1" },
+    { id: "w2", label: "worker 2" },
+    { id: "w3", label: "worker 3" }
+  ]}
+  frames={[
+    {
+      caption: "QUEUE: producer publishes one job (receipt email for order #7823). Three workers are waiting.",
+      beat: "neutral",
+      actors: [
+        { id: "prod", state: "active" },
+        { id: "w1", state: "idle" },
+        { id: "w2", state: "idle" },
+        { id: "w3", state: "idle" }
+      ]
+    },
+    {
+      caption: "QUEUE: worker 1 wins the job. Workers 2 and 3 get nothing — one message, one worker.",
+      beat: "neutral",
+      actors: [
+        { id: "prod", state: "done" },
+        { id: "w1", state: "active" },
+        { id: "w2", state: "idle" },
+        { id: "w3", state: "idle" }
+      ]
+    },
+    {
+      caption: "TOPIC: producer publishes payment.completed. Now all three subscribers each receive the same event.",
+      beat: "solution",
+      actors: [
+        { id: "prod", state: "active" },
+        { id: "w1", state: "idle" },
+        { id: "w2", state: "idle" },
+        { id: "w3", state: "idle" }
+      ]
+    },
+    {
+      caption: "TOPIC: all three subscribers process the event independently — ledger, notif, analytics each get their own copy.",
+      beat: "solution",
+      actors: [
+        { id: "prod", state: "done" },
+        { id: "w1", state: "done" },
+        { id: "w2", state: "done" },
+        { id: "w3", state: "done" }
+      ]
+    }
+  ]}
+  caption="Queue: one of N workers gets each message (load distribution). Topic: every subscriber gets every message (fan-out). The producer's code is identical — the broker's mode is what changes."
+/>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Work Queue">One message → one consumer. Used when you want to distribute work across a pool (receipt emails, image resizing, report generation). Adding workers scales throughput.</ConceptCard>
+  <ConceptCard label="Topic (Pub/Sub)">One message → all subscribers. Used when multiple independent systems need the same event (payment events going to ledger + notifier + analytics).</ConceptCard>
+  <ConceptCard label="When to use a queue">You care about one worker owning each delivery attempt. Pair it with acking, retries, and idempotency when the job must survive crashes.</ConceptCard>
+  <ConceptCard label="When to use a topic">Multiple independent downstream services need the same information. The producer shouldn't know or care who they are.</ConceptCard>
+  <Gotcha>Some brokers blur the line — Kafka topics with consumer groups give you queue semantics within a group and fan-out across groups. The mental model still holds: within a group it's work-queue distribution; across groups it's fan-out. Get this chapter's model right and Kafka makes immediate sense.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="A payments service needs to send the same order event to three independent services: ledger, notifications, and analytics. Which pattern is correct?"
+  options={[
+    "Work queue — use three workers competing for the same message",
+    "Topic with three subscribers — each subscriber gets an independent copy of every event",
+    "Three separate work queues, one message manually copied to each",
+    "Direct RPC calls to all three services"
+  ]}
+  answer={1}
+  explain="Fan-out via a topic is the right model. Each service subscribes independently; the broker delivers the same message to all of them. Work queues distribute one message to one worker — the opposite of what we want here."
+/>
+
+## Producers, Consumers & Delivery
+
+Now let's name the actors cleanly.
+
+<Define term="Producer / Consumer">
+A **producer** is any service or process that sends messages to the broker. A **consumer** (or subscriber) is any service or process that reads messages from the broker. These roles are asymmetric by design — the producer needs to know the destination (topic name or queue name); the consumer only needs to know what it wants to read. The payment service is a producer; the ledger service, the notification service, and the analytics pipeline are each consumers.
+</Define>
+
+A producer is anything that sends messages to the broker. A consumer (or subscriber) is anything that reads them. These roles are asymmetric by design — the producer needs to know the destination (topic name or queue name); the consumer only needs to know what it wants to read.
+
+### Push vs. Pull
+
+<Define term="Push vs pull delivery">
+**Push delivery**: the broker sends messages to consumers as soon as they arrive — the broker initiates. Low latency, but the broker needs to track consumer state and risks overwhelming a slow consumer with more messages than it can handle. **Pull delivery**: the consumer polls the broker when it is ready for more messages — the consumer initiates. The consumer controls its own ingestion rate, which naturally provides back-pressure. Kafka, SQS, and most high-throughput production systems use pull.
+</Define>
+
+**On the job:** Push vs pull is not just a configuration choice — it determines who owns the flow-control signal. In a push system, a slow consumer that can't keep up either drops messages or crashes under load. In a pull system, the slow consumer simply stops pulling; the broker buffers and the system degrades gracefully. For Meridian's ledger consumer — which involves a DB write on every event — pull is the right default.
+
+There are two ways a message gets from broker to consumer:
+
+**Push**: the broker sends messages to consumers as soon as they arrive. Low latency, but the broker needs to track consumer state and risks overwhelming a slow consumer.
+
+**Pull**: the consumer polls the broker when it's ready for more. The consumer controls its own rate, which naturally provides back-pressure (more on that in the last section). Kafka uses pull. SQS uses pull. Most modern high-throughput systems use pull because it's safer under load.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Push delivery">Broker initiates. Good for low-latency notification (the broker pushes as soon as a message arrives). Risk: a slow consumer falls behind and the broker has to buffer or drop.</ConceptCard>
+  <ConceptCard label="Pull delivery">Consumer initiates. Consumer polls when it has capacity. Natural back-pressure: a slow consumer simply pulls less. Used by Kafka, SQS, and most high-throughput systems.</ConceptCard>
+  <ConceptCard label="Long polling">A pull optimization: the consumer sends a request and the broker holds it open until a message arrives (or a timeout). Combines pull's safety with push's low latency. SQS uses this.</ConceptCard>
+  <Gotcha>Push can overwhelm a consumer that is processing slowly. If you're implementing a push-based consumer, always implement a semaphore or concurrency limiter. A slow downstream service under push can cascade into an OOM-killed consumer pod.</Gotcha>
+</ConceptGrid>
+
+Here's a minimal in-memory demonstration of the core broker abstraction — a `Broker` that supports both a topic (fan-out) and a work queue (single consumer), all with stdlib channels. As of Go 1.25, `sync.WaitGroup` has a `Go` method that combines `Add(1)` + `go func()` — cleaner than the old `wg.Add(1); go func() { defer wg.Done(); ... }` pattern:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Message is the unit of communication.
+type Message struct {
+	Topic   string
+	Payload string
+}
+
+// Broker is a simplistic in-memory broker supporting
+// fan-out topics and work queues.
+type Broker struct {
+	mu         sync.RWMutex
+	topics     map[string][]chan Message // fan-out: one channel per subscriber
+	workQueues map[string]chan Message   // work queue: shared channel across workers
+}
+
+func NewBroker() *Broker {
+	return &Broker{
+		topics:     make(map[string][]chan Message),
+		workQueues: make(map[string]chan Message),
+	}
+}
+
+// SubscribeTopic subscribes to fan-out delivery.
+// Every subscriber gets every message published to this topic.
+func (b *Broker) SubscribeTopic(topic string) <-chan Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := make(chan Message, 64)
+	b.topics[topic] = append(b.topics[topic], ch)
+	return ch
+}
+
+// PublishTopic sends msg to every subscriber of topic.
+func (b *Broker) PublishTopic(topic string, payload string) {
+	b.mu.RLock()
+	subs := b.topics[topic]
+	b.mu.RUnlock()
+	msg := Message{Topic: topic, Payload: payload}
+	for _, ch := range subs {
+		ch <- msg // each subscriber gets its own copy
+	}
+}
+
+// WorkQueue returns the shared channel for a named work queue.
+// Multiple workers compete; each message goes to exactly one.
+func (b *Broker) WorkQueue(name string, size int) chan Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.workQueues[name]; !ok {
+		b.workQueues[name] = make(chan Message, size)
+	}
+	return b.workQueues[name]
+}
+
+// EnqueueWork puts a job into the named work queue.
+func (b *Broker) EnqueueWork(name string, payload string) {
+	b.mu.RLock()
+	q := b.workQueues[name]
+	b.mu.RUnlock()
+	q <- Message{Topic: name, Payload: payload}
+}
+
+func main() {
+	b := NewBroker()
+
+	// --- Fan-out topic demo ---
+	ledger := b.SubscribeTopic("payment.completed")
+	notif := b.SubscribeTopic("payment.completed")
+	analytics := b.SubscribeTopic("payment.completed")
+
+	b.PublishTopic("payment.completed", "order#7823 $49.99")
+
+	fmt.Println("=== Topic fan-out (payment.completed) ===")
+	fmt.Println("ledger got:   ", (<-ledger).Payload)
+	fmt.Println("notif got:    ", (<-notif).Payload)
+	fmt.Println("analytics got:", (<-analytics).Payload)
+
+	// --- Work queue demo ---
+	receipts := b.WorkQueue("receipt-emails", 16)
+
+	var wg sync.WaitGroup
+	// Three competing workers — using wg.Go (Go 1.25)
+	for i := range 3 {
+		wg.Go(func() {
+			msg := <-receipts
+			fmt.Printf("worker %d processed: %s\n", i, msg.Payload)
+		})
+	}
+
+	// Enqueue three jobs — each goes to exactly one worker
+	b.EnqueueWork("receipt-emails", "email for order#7823")
+	b.EnqueueWork("receipt-emails", "email for order#7824")
+	b.EnqueueWork("receipt-emails", "email for order#7825")
+
+	wg.Wait()
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Message is the unit of communication.
+type Message struct {
+	Topic   string
+	Payload string
+}
+
+// Broker is a simplistic in-memory broker supporting
+// fan-out topics and work queues.
+type Broker struct {
+	mu         sync.RWMutex
+	topics     map[string][]chan Message
+	workQueues map[string]chan Message
+}
+
+func NewBroker() *Broker {
+	return &Broker{
+		topics:     make(map[string][]chan Message),
+		workQueues: make(map[string]chan Message),
+	}
+}
+
+// SubscribeTopic subscribes to fan-out delivery.
+func (b *Broker) SubscribeTopic(topic string) <-chan Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := make(chan Message, 64)
+	b.topics[topic] = append(b.topics[topic], ch)
+	return ch
+}
+
+// PublishTopic sends msg to every subscriber of topic.
+func (b *Broker) PublishTopic(topic string, payload string) {
+	b.mu.RLock()
+	subs := b.topics[topic]
+	b.mu.RUnlock()
+	msg := Message{Topic: topic, Payload: payload}
+	for _, ch := range subs {
+		ch <- msg
+	}
+}
+
+// WorkQueue returns the shared channel for a named work queue.
+func (b *Broker) WorkQueue(name string, size int) chan Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.workQueues[name]; !ok {
+		b.workQueues[name] = make(chan Message, size)
+	}
+	return b.workQueues[name]
+}
+
+// EnqueueWork puts a job into the named work queue.
+func (b *Broker) EnqueueWork(name string, payload string) {
+	b.mu.RLock()
+	q := b.workQueues[name]
+	b.mu.RUnlock()
+	q <- Message{Topic: name, Payload: payload}
+}
+
+func main() {
+	b := NewBroker()
+
+	// Fan-out topic demo
+	ledger := b.SubscribeTopic("payment.completed")
+	notif := b.SubscribeTopic("payment.completed")
+	analytics := b.SubscribeTopic("payment.completed")
+
+	b.PublishTopic("payment.completed", "order#7823 $49.99")
+
+	fmt.Println("=== Topic fan-out (payment.completed) ===")
+	fmt.Println("ledger got:   ", (<-ledger).Payload)
+	fmt.Println("notif got:    ", (<-notif).Payload)
+	fmt.Println("analytics got:", (<-analytics).Payload)
+
+	// Work queue demo
+	receipts := b.WorkQueue("receipt-emails", 16)
+
+	var wg sync.WaitGroup
+	// wg.Go is new in Go 1.25: combines Add(1) + go func()
+	for i := range 3 {
+		wg.Go(func() {
+			msg := <-receipts
+			fmt.Printf("worker %d processed: %s\n", i, msg.Payload)
+		})
+	}
+
+	b.EnqueueWork("receipt-emails", "email for order#7823")
+	b.EnqueueWork("receipt-emails", "email for order#7824")
+	b.EnqueueWork("receipt-emails", "email for order#7825")
+
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="Go 1.22+ loop variables and Go 1.25 wg.Go">
+
+The `for i := range 3` syntax (ranging over an integer) and per-iteration loop variable semantics are Go 1.22+. Targeting Go 1.26, the goroutine closure captures the correct per-iteration `i`, so the old `i := i` shadow is no longer needed.
+
+`wg.Go(func() { ... })` is new in Go 1.25. It combines `wg.Add(1)` + `go func() { defer wg.Done(); ... }()` into a single call. Use it wherever you'd write that pattern — it's cleaner and harder to misuse. As of Go 1.26, this is the idiomatic way to launch tracked goroutines.
+
+</Callout>
+
+## Delivery Guarantees
+
+Now for the part that bites every system at scale. When you publish a message, what promise does the broker make about whether (and how many times) a consumer processes it?
+
+**On the job:** Delivery guarantee mismatches are silent killers. A team that thinks they're running at-least-once but accidentally configured at-most-once will lose financial events with no error, no alert, and no stack trace. Define the guarantee explicitly in your service contracts.
+
+There are three tiers:
+
+<Define term="At-most-once (fire and forget)">
+The producer sends the message and moves on. No retry. If the network drops, if the broker crashes, if the consumer dies mid-processing — the message is **gone**. No duplicate risk, but possibly no delivery either. Appropriate for metrics, telemetry, and health pings where a missed sample is acceptable. Never appropriate for financial events.
+</Define>
+
+<Define term="At-least-once delivery">
+The broker retains the message until the consumer **acknowledges** it. If the consumer crashes before acknowledging, the broker redelivers. The consumer may process the same message more than once. This is the correct default for financial events — paired with idempotent consumers (see Idempotency & Exactly-Once Semantics), it becomes safe. The cost of redelivery is paid; the cost of data loss is not.
+</Define>
+
+<Define term="Exactly-once delivery">
+"Exactly-once" is usually a processing/effect guarantee, not a simple delivery guarantee. True end-to-end exactly-once requires tight coordination between the broker, the consumer, and its downstream store. It is expensive, limits throughput, and depends on broker-specific features (Kafka's idempotent producer + transactional API, for example). In fintech, the pragmatic answer is **effectively exactly-once**: at-least-once delivery with idempotent consumers. You may receive a message twice; your consumer handles it as if it arrived once.
+</Define>
+
+### At-most-once (fire and forget)
+
+The producer sends the message and moves on. No retry. If the network blips, if the broker crashes, if the consumer dies before processing — the message is **gone**. No duplicate. But possibly no delivery either.
+
+Use case: metrics, telemetry, system-health pings where a missed sample is fine. **Never** use this for financial events.
+
+### At-least-once (the workhorse)
+
+The broker retains the message until the consumer **acknowledges** it. If the consumer crashes before acking, the broker redelivers. The consumer may process the same message more than once.
+
+This is the default for most production systems. The trade-off: you must make your consumers **idempotent** — processing the same message twice must produce the same result as processing it once. We covered exactly how to do this with idempotency keys in Idempotency & Exactly-Once Semantics. The two chapters are designed to work together.
+
+### Exactly-once (expensive and conditional)
+
+The effect happens exactly once, with duplicates suppressed and losses avoided. In theory. In practice, true end-to-end exactly-once effects require coordination between the broker, the consumer, and its downstream store — it's expensive, limits throughput, and often depends on broker-specific features (Kafka's idempotent producer + transactional API, for example).
+
+In fintech, the pragmatic answer is "**effectively exactly-once**": use at-least-once delivery with idempotent consumers. You may receive a message twice; you handle it as if it arrived once. This is the pattern the industry uses — the outbox pattern from the previous chapter is exactly this.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="At-most-once">Send and forget. May lose messages. Zero duplicate risk. Fine for metrics; catastrophic for payments.</ConceptCard>
+  <ConceptCard label="At-least-once">Broker retains until acked. May redeliver. Consumers MUST be idempotent. The correct default for financial events.</ConceptCard>
+  <ConceptCard label="Exactly-once">No loss, no duplicates. Expensive and broker-specific. In practice, implemented as at-least-once + idempotent consumers ("effectively once").</ConceptCard>
+  <Gotcha>Never use at-most-once for any financial event. A missing `payment.completed` means the ledger never posts. "It probably got there" is not an auditing strategy.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="At-least-once delivery — the redelivery scenario"
+  lanes={[
+    { id: "broker", label: "broker" },
+    { id: "consumer", label: "consumer" }
+  ]}
+  steps={[
+    { lane: "broker", kind: "send", label: "deliver message", note: "Broker delivers payment.completed to the consumer. The message is still held in the broker — not yet acked." },
+    { lane: "consumer", kind: "recv", label: "receive message", note: "Consumer receives the message and starts processing: posting ledger entries." },
+    { lane: "consumer", kind: "block", label: "consumer crashes", note: "Consumer crashes before it can ack. The message was received but never acknowledged." },
+    { lane: "broker", kind: "run", label: "ack timeout fires", note: "The broker's ack deadline expires. No ack received. The broker marks the message as unacknowledged and schedules redelivery." },
+    { lane: "broker", kind: "send", label: "redeliver message", note: "The broker redelivers the same message to the (now-recovered) consumer. This is at-least-once: possible duplicate." },
+    { lane: "consumer", kind: "recv", label: "idempotency check", note: "The consumer checks its idempotency store. Has this message ID been processed? No (the previous run crashed before persisting). Process it." },
+    { lane: "consumer", kind: "send", label: "ack message", note: "Consumer processes successfully and acks. The broker can now discard the message." }
+  ]}
+  caption="At-least-once: crash before ack triggers redelivery. Idempotent consumers make redelivery safe."
+/>
+
+<QuickCheck
+  question="Your payment.completed consumer posts ledger entries. It crashes after posting but before sending an ack. The broker redelivers. What must the consumer do to avoid double-posting?"
+  options={[
+    "Nothing — the broker guarantees exactly-once so it won't redeliver",
+    "Use an idempotency key: check if the message ID was already processed before posting",
+    "Wrap the post in a goroutine so crashes don't matter",
+    "Switch to at-most-once delivery to avoid redelivery"
+  ]}
+  answer={1}
+  explain="At-least-once delivery can redeliver. An idempotency key (typically the message ID stored in the same transaction as the ledger post) lets the consumer detect a duplicate and skip the work safely. This is the at-least-once + idempotent consumer pattern — effectively exactly-once."
+/>
+
+## Ordering & Acknowledgements
+
+Two more pieces of the mental model that trip up engineers in production.
+
+<Define term="Acknowledgement (ack / nack)">
+An **acknowledgement** (ack) is the signal a consumer sends to the broker to say "I have finished processing this message and the result is durable." Only after receiving an ack does the broker discard the message. A **negative acknowledgement** (nack) tells the broker "I failed to process this — redeliver it." The timing of the ack is critical: ack on receipt (before processing) means a crash during processing silently loses the work. Ack after the commit to durable storage is the correct pattern.
+</Define>
+
+**On the job:** The single most common ack bug is acking on receipt — the moment the message arrives in your process, before you've done anything with it. It looks harmless; it's catastrophic under failure. Add a code review checklist item: "Where does this consumer ack? Is it after the DB commit?"
+
+### What an ack really means
+
+The naive implementation acks a message when it's **received** — the moment it lands in the consumer's process. That's wrong. An ack must mean "**I have finished processing this message and the result is durable.**"
+
+If you ack on receipt and then crash while writing to the database, the broker thinks you're done. It discards the message. The work was never done. You've silently lost a financial event.
+
+Ack after processing. Ack after the commit. Not before.
+
+### Ordering guarantees
+
+Global ordering across all producers and all consumers is extraordinarily expensive — it requires a single sequential bottleneck. Most brokers don't provide it.
+
+What they do provide is **per-partition** or **per-queue** ordering. Within one partition, messages from one producer arrive at consumers in the order they were sent. Across partitions, all bets are off.
+
+For fintech, this usually means: **use a partition key tied to the entity being modified** (e.g., account ID). All events for account `ACC-42` go to the same partition, so they're processed in order. Events for different accounts can be processed in parallel across partitions.
+
+<ExecTimeline
+  title="Ordering: per-partition guarantee"
+  lanes={[
+    { id: "p1", label: "partition A (ACC-42)" },
+    { id: "p2", label: "partition B (ACC-99)" }
+  ]}
+  steps={[
+    { lane: "p1", kind: "send", label: "debit $200", note: "For account ACC-42, events arrive in strict order within their partition. Debit first." },
+    { lane: "p2", kind: "send", label: "credit $50", note: "For ACC-99, events on the other partition are fully independent — parallel delivery is fine." },
+    { lane: "p1", kind: "send", label: "credit $50", note: "Second event for ACC-42 arrives after the debit, in order. A consumer for partition A sees these in sequence." },
+    { lane: "p2", kind: "send", label: "debit $20", note: "Second event for ACC-99. Independent of ACC-42's timeline entirely." },
+    { lane: "p1", kind: "recv", label: "consumer processes", note: "Consumer for partition A processes debit, then credit — in order. Balance math is safe." },
+    { lane: "p2", kind: "recv", label: "consumer processes", note: "Consumer for partition B processes ACC-99 events independently. No global ordering needed." }
+  ]}
+  caption="Partition by entity key (account ID). Per-partition ordering is cheap; global ordering is not."
+/>
+
+<UnderTheHood title="Why ack-after-processing gives you at-least-once (not exactly-once) — Go 1.26">
+
+Here's the precise mechanism. When a broker delivers a message, it starts an **ack timer** (the visibility timeout in SQS, the `ack deadline` in Pub/Sub, the session timeout in Kafka). During this window the message is invisible to other consumers — it's been handed off to one.
+
+If the consumer acks within the window: the broker discards the message. Done.
+
+If the consumer does NOT ack within the window (crash, timeout, slow processing): the broker's timer fires. The message becomes **visible again** and is redelivered to another consumer (or the same one, recovered).
+
+This is the ack-or-redeliver loop. It's why at-least-once is at *least* once — every message gets at least one delivery attempt, and as many re-attempts as it takes to get an ack.
+
+Now the ordering trade-off: the ack window means the broker has to track in-flight messages per consumer. If you want strict ordering, you can only have one in-flight message per consumer at a time (no pipelining). That's a throughput killer. Most systems trade strict ordering for throughput by pipelining messages and accepting out-of-order delivery within a consumer group — then using partition keys to keep a single entity's events in order.
+
+The `sync` primitives you'd use to build this in Go (`sync.Mutex`, `sync.Map`, `sync.WaitGroup`) are stable across versions. The ordering guarantee is a broker contract, not a Go runtime property. *This model simplifies real broker internals — actual ack tracking varies by broker and protocol.*
+
+</UnderTheHood>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Ack on receipt (wrong)">Message is removed from the broker when the consumer's process receives it. A crash during processing silently loses the work. Never do this for financial events.</ConceptCard>
+  <ConceptCard label="Ack after processing (correct)">Message is only removed after the consumer commits the result to durable storage. A crash triggers redelivery. Combined with idempotency, this is safe.</ConceptCard>
+  <ConceptCard label="Per-partition ordering">Messages for the same partition key (e.g., account ID) are delivered in order. Messages across partitions are parallel. The practical fintech guarantee.</ConceptCard>
+  <Gotcha>Processing a message and acking it must be atomic with respect to your downstream store. If you write to the DB and then ack separately, a crash between them causes a redelivery and a potential duplicate. Use the transactional outbox or wrap ack in the same transaction where possible.</Gotcha>
+</ConceptGrid>
+
+## Dead-Letter Queues & Back-pressure
+
+Two more production essentials that every system eventually needs.
+
+<Define term="Dead-letter queue (DLQ)">
+A **dead-letter queue** is a separate queue where messages are routed after they have exceeded their maximum retry count. Instead of retrying a failing message forever (blocking everything behind it) or silently discarding it, the broker moves it to the DLQ. Operations teams can then inspect it, diagnose the root cause, fix the underlying issue, and replay the message — or discard it with an audit trail. Without a DLQ, one malformed message (a poison message) can halt an entire consumer indefinitely.
+</Define>
+
+<Define term="Backpressure">
+**Backpressure** is the mechanism by which a consumer signals upstream producers to slow down when it cannot keep up. Without backpressure, producers publish faster than consumers can process, messages pile up, and the broker's buffer — memory or disk — fills until something crashes. In Go, a buffered channel is a built-in backpressure mechanism: once full, sends block and the producer stalls naturally. Real brokers implement backpressure through fetch-size limits, consumer-lag monitoring, and flow-control protocols.
+</Define>
+
+**On the job:** DLQs and backpressure are the two features teams skip when they're moving fast — and the two they beg for at 3 a.m. when a malformed payload has frozen their consumer for six hours. Add them at the start, not after the incident.
+
+### Dead-letter queues (DLQs)
+
+What happens when a message fails processing not because of a transient glitch, but because it's genuinely bad — a malformed payload, a missing field, a downstream service that rejects it every single time? Without a DLQ, that message retries forever, clogging the queue for every other message behind it. That's called a **poison message**, and it will bring your consumer to its knees.
+
+A dead-letter queue is where messages go after they've exceeded their retry limit (max delivery attempts). Instead of retrying forever or discarding, the broker routes the message to a separate DLQ. There, ops teams can inspect it, fix the underlying issue, and replay it — or discard it with an audit trail.
+
+```go
+// Pattern: exponential backoff + max retries + DLQ routing.
+// This is the logic your worker runs, not broker config.
+// Requires: "time" import in a real file.
+
+const maxRetries = 5
+
+func processWithRetry(msg Message, worker func(Message) error, dlq chan<- Message) {
+	for attempt := range maxRetries {
+		if worker(msg) == nil {
+			return // success — worker will ack
+		}
+		// exponential backoff: 1s, 2s, 4s, 8s, 16s
+		backoff := (1 << attempt) // seconds; use time.Duration(backoff) * time.Second in real code
+		_ = backoff
+	}
+	// Exhausted retries: route to DLQ for human inspection.
+	dlq <- msg
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"time"
+)
+
+const maxRetries = 3
+
+type Message struct {
+	ID      string
+	Payload string
+}
+
+// processWithDLQ retries handler up to maxRetries times.
+// On exhaustion, sends to the dead-letter queue.
+func processWithDLQ(msg Message, dlq chan<- Message) {
+	attempt := 0
+	for {
+		err := flakyWorker(msg)
+		if err == nil {
+			fmt.Printf("[OK]  message %s processed successfully\n", msg.ID)
+			return
+		}
+		attempt++
+		fmt.Printf("[ERR] message %s failed (attempt %d/%d): %v\n",
+			msg.ID, attempt, maxRetries, err)
+		if attempt >= maxRetries {
+			fmt.Printf("[DLQ] message %s sent to dead-letter queue\n", msg.ID)
+			dlq <- msg
+			return
+		}
+	}
+}
+
+// flakyWorker randomly fails 70% of the time to demonstrate retries.
+func flakyWorker(msg Message) error {
+	if rand.Float64() < 0.70 {
+		return errors.New("transient failure")
+	}
+	return nil
+}
+
+func main() {
+	dlq := make(chan Message, 8)
+
+	// Process three messages concurrently.
+	for i := range 3 {
+		msg := Message{
+			ID:      fmt.Sprintf("msg-%d", i+1),
+			Payload: fmt.Sprintf("order#%d", 7820+i),
+		}
+		go processWithDLQ(msg, dlq)
+	}
+
+	// Drain the DLQ briefly to show what landed there.
+	time.Sleep(50 * time.Millisecond)
+	close(dlq)
+	fmt.Println("\n=== Dead-Letter Queue contents ===")
+	for m := range dlq {
+		fmt.Printf("  DLQ entry: id=%s payload=%s\n", m.ID, m.Payload)
+	}
+}
+```
+
+</GoPlayground>
+
+### Back-pressure
+
+What happens when producers are publishing faster than consumers can process? Messages pile up. Memory fills. The broker's disk fills. Consumers start lagging further and further behind.
+
+Backpressure is the mechanism that signals upstream — "slow down, I'm full." Without it, the buffer grows unbounded until something crashes.
+
+In Go, a buffered channel is a built-in backpressure mechanism. Once it's full, the send blocks. The producer stalls. That's backpressure — the consumer's capacity limits the producer.
+
+```go
+// A buffered channel with a modest size acts as a natural
+// back-pressure point between producer and consumer goroutines.
+queue := make(chan Message, 100)
+
+// Producer: blocks when queue is full
+go func() {
+	for _, order := range orders {
+		queue <- Message{Payload: order} // blocks if consumer is behind
+	}
+	close(queue)
+}()
+
+// Consumer: processes at its own rate
+for msg := range queue {
+	process(msg)
+}
+```
+
+Real brokers implement back-pressure through fetch size limits (consumers request N messages at a time), consumer lag monitoring, and flow control protocols. The mental model — "consumer capacity limits producer rate" — is the same whether the backpressure signal travels through a buffered channel or a Kafka consumer-group lag metric.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Dead-letter queue">Messages that fail processing after max retries are routed here instead of retrying forever. Enables inspection, debugging, and replay without blocking the main queue.</ConceptCard>
+  <ConceptCard label="Backpressure">When consumers can't keep up, producers should slow down. In Go: a buffered channel. In real brokers: fetch-size limits, consumer-lag alarms, or flow-control protocols.</ConceptCard>
+  <ConceptCard label="Poison message">A message that always fails processing — bad payload, schema mismatch, logic error. Without a DLQ, it blocks the queue indefinitely for every message behind it.</ConceptCard>
+  <Gotcha>Never let back-pressure silently block your producer without a timeout. Use `select` with a `ctx.Done()` case so a producer doesn't deadlock waiting for a full queue when the service is shutting down.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="DLQ routing after max retries"
+  lanes={[
+    { id: "consumer", label: "consumer" },
+    { id: "dlq", label: "DLQ" }
+  ]}
+  steps={[
+    { lane: "consumer", kind: "recv", label: "receive poison msg", note: "Consumer receives a malformed payment event. Processing fails immediately." },
+    { lane: "consumer", kind: "block", label: "retry 1 — fail", note: "First retry. Still fails — the payload is malformed, not a transient error." },
+    { lane: "consumer", kind: "block", label: "retry 2 — fail", note: "Second retry. Same result. Max retries is 3." },
+    { lane: "consumer", kind: "block", label: "retry 3 — fail", note: "Third and final attempt fails. Max retries exhausted." },
+    { lane: "consumer", kind: "send", label: "route to DLQ", note: "Consumer routes the message to the dead-letter queue for inspection. Main queue is unblocked." },
+    { lane: "dlq", kind: "recv", label: "message stored", note: "DLQ holds the message indefinitely. Ops team can inspect, fix the schema, and replay when ready." },
+    { lane: "consumer", kind: "recv", label: "next message", note: "Main consumer continues with the next message. The poison message no longer blocks the queue." }
+  ]}
+  caption="DLQ unblocks the main queue. Poison messages are isolated, not discarded."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Implement SubscribeOnce" level="easy">
+
+The `Broker` we built in the chapter delivers messages to all subscribers until they close. Add a `SubscribeOnce(topic string) <-chan Message` method that delivers exactly one message to the returned channel and then closes it. This is useful for one-shot command-response patterns.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Message struct {
+	Topic   string
+	Payload string
+}
+
+type Broker struct {
+	mu     sync.RWMutex
+	topics map[string][]chan Message
+}
+
+func NewBroker() *Broker {
+	return &Broker{topics: make(map[string][]chan Message)}
+}
+
+func (b *Broker) SubscribeOnce(topic string) <-chan Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Buffered 1: the publisher won't block even if the caller
+	// hasn't read yet, and we close after one delivery.
+	ch := make(chan Message, 1)
+	b.topics[topic] = append(b.topics[topic], ch)
+	return ch
+}
+
+func (b *Broker) Publish(topic, payload string) {
+	b.mu.Lock()
+	subs := b.topics[topic]
+	// Clear subscribers after delivery (one-shot)
+	b.topics[topic] = nil
+	b.mu.Unlock()
+
+	msg := Message{Topic: topic, Payload: payload}
+	for _, ch := range subs {
+		ch <- msg
+		close(ch)
+	}
+}
+
+func main() {
+	b := NewBroker()
+	ch := b.SubscribeOnce("settlement.confirmed")
+	b.Publish("settlement.confirmed", "txn#8821 settled")
+	msg := <-ch
+	fmt.Println("received:", msg.Payload)
+	// Second publish: no subscribers left
+	b.Publish("settlement.confirmed", "txn#8822 settled")
+	fmt.Println("no second delivery (one-shot worked)")
+}
+```
+
+Key points: buffer the channel by 1 so the publisher doesn't block on close, clear the subscriber list before delivery so a second publish finds no one, and close the channel after sending so the receiver knows it's done.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add an ack mechanism" level="medium">
+
+Extend the work queue to require an explicit ack. Add `Ack(name string, msg Message)` and `Nack(name string, msg Message)` methods to the broker. A nack should re-enqueue the message for redelivery. Demonstrate that nacking a message causes it to be processed by another worker.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Message struct {
+	ID      string
+	Payload string
+}
+
+type AckBroker struct {
+	mu      sync.RWMutex
+	queues  map[string]chan Message
+	requeue chan Message
+}
+
+func NewAckBroker() *AckBroker {
+	return &AckBroker{
+		queues:  make(map[string]chan Message),
+		requeue: make(chan Message, 64),
+	}
+}
+
+func (b *AckBroker) WorkQueue(name string) chan Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.queues[name]; !ok {
+		b.queues[name] = make(chan Message, 64)
+		// requeue loop: nacked messages go back in
+		go func() {
+			for msg := range b.requeue {
+				b.queues[name] <- msg
+			}
+		}()
+	}
+	return b.queues[name]
+}
+
+func (b *AckBroker) Enqueue(name, id, payload string) {
+	b.mu.RLock()
+	q := b.queues[name]
+	b.mu.RUnlock()
+	q <- Message{ID: id, Payload: payload}
+}
+
+// Ack signals successful processing — nothing to do in this simple model.
+func (b *AckBroker) Ack(_ string, msg Message) {
+	fmt.Printf("  [ACK] %s\n", msg.ID)
+}
+
+// Nack requeues the message for redelivery.
+func (b *AckBroker) Nack(_ string, msg Message) {
+	fmt.Printf("  [NACK] %s — requeueing\n", msg.ID)
+	b.requeue <- msg
+}
+
+func main() {
+	b := NewAckBroker()
+	q := b.WorkQueue("invoices")
+
+	b.Enqueue("invoices", "inv-1", "invoice for order#100")
+
+	firstWorker := true
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			msg := <-q
+			if firstWorker {
+				firstWorker = false
+				fmt.Printf("worker A got %s — nacking (simulated failure)\n", msg.ID)
+				b.Nack("invoices", msg)
+				return
+			}
+			fmt.Printf("worker B got %s — processing OK\n", msg.ID)
+			b.Ack("invoices", msg)
+		}()
+	}
+	wg.Wait()
+}
+```
+
+The `Nack` method pushes the message back into the queue via the requeue channel. A second worker picks it up. This is the manual approximation of a real broker's redelivery mechanism.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="At-most-once vs at-least-once" level="medium">
+
+Write two functions: `sendAtMostOnce(payload string)` and `sendAtLeastOnce(payload string, deliver func(string) error) error`. The first just calls deliver and ignores errors. The second retries up to 3 times with a simple loop, returning the final error if all attempts fail. Call both from `main` with a deliver function that fails the first two times, then succeeds. Observe the difference.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+// sendAtMostOnce: fire and forget — delivery is not guaranteed.
+func sendAtMostOnce(payload string, deliver func(string) error) {
+	_ = deliver(payload) // error deliberately ignored
+}
+
+// sendAtLeastOnce: retries until success or max attempts.
+func sendAtLeastOnce(payload string, deliver func(string) error) error {
+	const maxAttempts = 3
+	var lastErr error
+	for range maxAttempts {
+		if lastErr = deliver(payload); lastErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("all %d attempts failed: %w", maxAttempts, lastErr)
+}
+
+func main() {
+	callCount := 0
+	flakyDeliver := func(payload string) error {
+		callCount++
+		if callCount < 3 {
+			return errors.New("transient network error")
+		}
+		fmt.Printf("delivered: %s (attempt %d)\n", payload, callCount)
+		return nil
+	}
+
+	// At-most-once: fails silently — no output, no error
+	callCount = 0
+	sendAtMostOnce("payment.completed#1", flakyDeliver)
+	fmt.Println("at-most-once done, call count:", callCount) // 1 — only tried once
+
+	// At-least-once: retries until success
+	callCount = 0
+	if err := sendAtLeastOnce("payment.completed#2", flakyDeliver); err != nil {
+		fmt.Println("at-least-once failed:", err)
+	} else {
+		fmt.Println("at-least-once succeeded, call count:", callCount) // 3
+	}
+}
+```
+
+At-most-once calls once and silently drops the failure. At-least-once retries and eventually succeeds. The cost: a consumer receiving `payment.completed#2` must be idempotent because the deliver function could run more than once.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Back-pressure with context cancellation" level="hard">
+
+Write a `producer` goroutine that enqueues integers into a buffered channel of size 3, and a `consumer` goroutine that reads from it slowly (simulated with `time.Sleep`). Use a `context.WithTimeout` of 50ms for the overall run. The producer should respect `ctx.Done()` via `select` so the whole system shuts down cleanly when the context expires — no goroutine leaks.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	queue := make(chan int, 3) // small buffer = natural back-pressure
+
+	// Producer: respects context cancellation
+	go func() {
+		defer close(queue)
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				fmt.Println("producer: context cancelled, shutting down")
+				return
+			case queue <- i:
+				fmt.Printf("producer: enqueued %d\n", i)
+			}
+		}
+	}()
+
+	// Consumer: processes slowly, drains until queue is closed
+	for msg := range queue {
+		select {
+		case <-ctx.Done():
+			fmt.Println("consumer: context cancelled mid-drain")
+			return
+		default:
+		}
+		// Simulate slow processing (back-pressure: producer blocks when full)
+		time.Sleep(8 * time.Millisecond)
+		fmt.Printf("consumer: processed %d\n", msg)
+	}
+	fmt.Println("done: queue drained cleanly")
+}
+```
+
+The `select` in the producer's send path is the key: either send the next item, or stop when the context is cancelled. The buffer size of 3 means the producer can enqueue up to 3 items before it blocks — that's back-pressure. The consumer's `range queue` loop drains cleanly after the producer closes the channel.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="DLQ with max retries" level="hard">
+
+Extend the broker to support a `ProcessWithDLQ` function that takes a message, a handler function `func(Message) error`, a max-retry count, and a DLQ channel. It should retry the handler up to max times. On exhaustion, send the message to the DLQ. Write a test in `main`: handler always returns an error — verify the message ends up in the DLQ and the handler was called exactly `maxRetries` times.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Message struct {
+	ID      string
+	Payload string
+}
+
+// ProcessWithDLQ retries handler up to maxRetries times.
+// On exhaustion, sends msg to dlq.
+func ProcessWithDLQ(
+	msg Message,
+	maxRetries int,
+	handler func(Message) error,
+	dlq chan<- Message,
+) {
+	for attempt := range maxRetries {
+		if err := handler(msg); err == nil {
+			fmt.Printf("[OK] %s processed on attempt %d\n", msg.ID, attempt+1)
+			return
+		}
+	}
+	fmt.Printf("[DLQ] %s exhausted %d retries\n", msg.ID, maxRetries)
+	dlq <- msg
+}
+
+func main() {
+	dlq := make(chan Message, 4)
+	callCount := 0
+
+	alwaysFail := func(msg Message) error {
+		callCount++
+		return errors.New("permanent failure")
+	}
+
+	msg := Message{ID: "txn-fail-1", Payload: "refund order#500"}
+	ProcessWithDLQ(msg, 3, alwaysFail, dlq)
+
+	// Verify: handler called exactly 3 times
+	if callCount != 3 {
+		fmt.Printf("FAIL: expected 3 calls, got %d\n", callCount)
+	} else {
+		fmt.Println("PASS: handler called exactly 3 times")
+	}
+
+	// Verify: message in DLQ
+	select {
+	case dead := <-dlq:
+		fmt.Printf("PASS: DLQ contains message %s\n", dead.ID)
+	default:
+		fmt.Println("FAIL: DLQ is empty")
+	}
+}
+```
+
+The `for attempt := range maxRetries` (Go 1.22+ range-over-integer) iterates exactly `maxRetries` times. If all fail, `dlq <- msg` routes the message out. The assertions in `main` verify both the call count and the DLQ contents — this is a self-checking program, not a `go test` suite.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Put the book down, sport. This one's personal. I want to see you build a broker from scratch — one that handles both fan-out *and* work-queue semantics with proper acks. I'll be watching the verifier with considerable interest.
+
+<Lab
+  title="Build a dual-mode in-memory broker with acks"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  objective="Implement an in-memory broker supporting (1) a fan-out topic where every subscriber receives every published message, and (2) a work queue where each message is delivered to exactly one worker. Both modes must require explicit acking — a nacked message is requeued exactly once. The starter code includes a self-checking verifier: publish 5 events to a topic with 3 subscribers and confirm all 15 deliveries, then enqueue 6 jobs to a work queue consumed by 3 workers and confirm each job was processed exactly once. When both pass, the program prints the flag."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Message struct {
+	ID      string
+	Payload string
+}
+
+// TODO: implement Broker with:
+//   - SubscribeTopic(topic string) <-chan Message
+//   - PublishTopic(topic, payload string)
+//   - WorkQueue(name string) chan Message
+//   - EnqueueWork(name, id, payload string)
+//   - Ack(msg Message)
+//   - Nack(msg Message)  // requeues once
+
+type Broker struct {
+	// your fields here
+}
+
+func NewBroker() *Broker {
+	panic("not implemented")
+}
+
+// verifier: do not modify below this line
+
+func verifyTopic(b *Broker) bool {
+	subs := make([]<-chan Message, 3)
+	for i := range 3 {
+		subs[i] = b.SubscribeTopic("payment.completed")
+	}
+
+	var wg sync.WaitGroup
+	received := make([][]string, 3)
+	for i, sub := range subs {
+		i, sub := i, sub
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 5 {
+				msg := <-sub
+				received[i] = append(received[i], msg.ID)
+				b.Ack(msg)
+			}
+		}()
+	}
+
+	for j := range 5 {
+		b.PublishTopic("payment.completed", fmt.Sprintf("evt-%d", j))
+	}
+	wg.Wait()
+
+	for i, r := range received {
+		if len(r) != 5 {
+			fmt.Printf("FAIL: subscriber %d got %d messages (want 5)\\n", i, len(r))
+			return false
+		}
+	}
+	fmt.Println("PASS: all 3 subscribers received all 5 events")
+	return true
+}
+
+func verifyWorkQueue(b *Broker) bool {
+	q := b.WorkQueue("jobs")
+	processed := make(map[string]int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 2 {
+				msg := <-q
+				mu.Lock()
+				processed[msg.ID]++
+				mu.Unlock()
+				b.Ack(msg)
+			}
+		}()
+	}
+
+	for j := range 6 {
+		b.EnqueueWork("jobs", fmt.Sprintf("job-%d", j), "payload")
+	}
+	wg.Wait()
+
+	for id, count := range processed {
+		if count != 1 {
+			fmt.Printf("FAIL: job %s processed %d times (want 1)\\n", id, count)
+			return false
+		}
+	}
+	fmt.Println("PASS: all 6 jobs processed exactly once")
+	return true
+}
+
+func main() {
+	b := NewBroker()
+	ok1 := verifyTopic(b)
+	ok2 := verifyWorkQueue(b)
+	if ok1 && ok2 {
+		fmt.Println("GO{fan_out_and_work_queue_with_acks}")
+	}
+}`}
+  verifier="The program is self-checking: implement NewBroker and the required methods, then run it with go run. Both verifyTopic (5 events × 3 subscribers = 15 deliveries, all acked) and verifyWorkQueue (6 jobs processed exactly once by 3 workers) must print PASS. When both pass, the flag prints automatically."
+  hints={[
+    "For the topic: store a slice of channels per topic name (map[string][]chan Message). PublishTopic ranges over the slice and sends to each. Each call to SubscribeTopic appends a new buffered channel.",
+    "For the work queue: a single shared chan Message is the queue. All workers receive from the same channel — Go's channel semantics ensure only one goroutine gets each send. WorkQueue returns this shared channel.",
+    "Ack can be a no-op in this model (messages are consumed by receive, not held). Nack would re-send to the relevant queue — but the verifier only uses Ack, so a no-op Ack unblocks the verifier's goroutines cleanly.",
+    "The verifier goroutines block on `for range 2 { msg := <-q ... }` — make sure WorkQueue is called before EnqueueWork so the channel exists, and that its buffer is large enough (at least 6) so EnqueueWork does not block."
+  ]}
+  flag="GO{fan_out_and_work_queue_with_acks}"
+>
+
+Two modes. Three subscribers. Six jobs. One broker. Both checks must pass; if either fails, no flag. The verifier is embedded in the starter — you can see exactly what it tests. Build it right the first time, sport — I've seen the solution and it's elegant. Whether yours is too is entirely up to you.
+
+</Lab>
+
+<Recap>
+
+You now own the broker-agnostic mental model that every messaging system is built on:
+
+- A **message broker** decouples producers from consumers, smooths load by buffering bursts, and provides resilience — a consumer being down doesn't lose data.
+- **Work queues** distribute one message to exactly one competing worker (receipt emails, report generation). **Topics** fan out one message to every subscriber (payment events to ledger + notifications + analytics).
+- **Push** delivery is initiated by the broker (low latency, risk of overwhelming slow consumers). **Pull** is initiated by the consumer (natural back-pressure, used by Kafka/SQS).
+- **At-most-once** = fire and forget; may lose messages. **At-least-once** = broker retains until acked; may duplicate — consumer must be idempotent. **Exactly-once** = expensive, broker-specific; in practice implemented as at-least-once + idempotent consumers.
+- **Ack after processing** (not on receipt) is what gives you at-least-once safety. A crash before ack triggers redelivery.
+- **Per-partition ordering** keeps one entity's events sequential without the cost of global ordering — key by account ID or entity ID.
+- **Dead-letter queues** isolate poison messages after max retries; the main queue keeps flowing.
+- **Backpressure** lets consumer capacity limit producer rate — a buffered channel is Go's built-in mechanism.
+- As of Go 1.25, `wg.Go(func() { ... })` replaces the `wg.Add(1)` + `defer wg.Done()` pattern for launching tracked goroutines.
+
+</Recap>
+
+<Scoreboard
+  streak={5}
+  items={[
+    { label: "Quick check — fan-out vs work queue", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — ack timing and idempotency", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — SubscribeOnce", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Ack/Nack mechanism", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — At-most-once vs at-least-once", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Back-pressure with context", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — DLQ with max retries", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Dual-mode broker with acks", captured: false, points: 80 }}
+/>
+
+Not bad. You've got the mental model. Now go build something real with it — Event-Driven Architecture & Kafka is next, and it will make complete sense because you understand what it's *implementing*. It's no accident I saved the hard part for people worthy of teaching. That's you. Probably. We'll see.

@@ -1,0 +1,1259 @@
+---
+title: "Idempotency & Exactly-Once Semantics"
+part: 3
+order: 4
+type: "course"
+description: "Idempotency keys, deduplication, at-least-once vs exactly-once, safe payment retries, and the transactional outbox pattern."
+prerequisites: ["transactions-consistency"]
+---
+
+<HeroCard label="Part 3 · Chapter 4" title="Idempotency & Exactly-Once Semantics">
+
+Listen up, sport — because what I'm about to teach you is the difference between a payment system that works and one that silently double-charges customers at 3am while your on-call engineer stares at a dashboard in horror.
+
+Here's the thing: networks lie. Clients retry. Servers crash mid-write and come back up not knowing if they succeeded. In this environment, "just don't send the request twice" is not a strategy — it's a wish. What you need is a system that can receive the same request a hundred times and produce *exactly* the outcome it would have produced once. That property has a name: **idempotency**. And it's not optional in fintech. It's the floor.
+
+By the end of this chapter you will understand idempotency keys, deduplication, the honest truth about exactly-once semantics, safe retry patterns, and the transactional outbox — the pattern that keeps your database and your message broker from ever disagreeing about what happened.
+
+I built systems like this. You're about to learn how. Pay attention.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Why idempotency matters", "Idempotency keys", "Deduplication", "At-least-once vs exactly-once", "Safe payment retries", "The transactional outbox"]} />
+
+## Why idempotency matters
+
+<Scene
+  title="Duplicate payment at Meridian — problem then solution"
+  actors={[
+    { id: "client", label: "Client" },
+    { id: "api", label: "Meridian API" },
+    { id: "db", label: "DB" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "Client sends a charge request for $149.99. The API and DB are idle.",
+      beat: "neutral",
+      actors: [{ id: "client", state: "idle" }, { id: "api", state: "idle" }, { id: "db", state: "idle" }],
+      cells: [{ id: "A1", state: "idle", label: "req" }, { id: "A2", state: "idle", label: "—" }, { id: "A3", state: "idle", label: "—" }, { id: "A4", state: "idle", label: "—" }]
+    },
+    {
+      caption: "API processes the charge. DB records ch_7001. Response is sent — but the network drops it.",
+      beat: "problem",
+      actors: [{ id: "client", state: "warn" }, { id: "api", state: "active" }, { id: "db", state: "active" }],
+      cells: [{ id: "A1", state: "done", label: "ch_7001" }, { id: "A2", state: "bad", label: "lost!" }]
+    },
+    {
+      caption: "Client times out and retries with the same payload. Naive API charges again — ch_7002. Two charges, one purchase.",
+      beat: "problem",
+      actors: [{ id: "client", state: "active" }, { id: "api", state: "active" }, { id: "db", state: "bad" }],
+      cells: [{ id: "A1", state: "done", label: "ch_7001" }, { id: "A3", state: "bad", label: "ch_7002" }]
+    },
+    {
+      caption: "With an idempotency key: retry carries the same key. API finds ch_7001 in the store and returns it. DB untouched.",
+      beat: "solution",
+      actors: [{ id: "client", state: "ok" }, { id: "api", state: "ok" }, { id: "db", state: "done" }],
+      cells: [{ id: "A1", state: "done", label: "ch_7001" }, { id: "A3", state: "done", label: "✓ same" }]
+    }
+  ]}
+  caption="The idempotency key turns a dangerous retry into a safe no-op. One key, one charge — no matter how many times the network drops the response."
+/>
+
+<Define term="Idempotency / idempotent operation" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+An operation is **idempotent** if applying it multiple times produces the same result as applying it once. A payment "charge $149.99 for order #4201" must be idempotent: if the client retries after a timeout, Meridian charges **once**, not twice. We need idempotency because networks retry, and a retried charge that is not idempotent **creates money out of nothing** — it is a bug that shows up in production under load, not in unit tests.
+</Define>
+
+**On the job:** you hit idempotency the moment any client can retry a mutating call — mobile apps, service-to-service RPCs, background workers, webhook processors. Every `POST /v1/charges` at Meridian must be idempotent. Every event consumer must be idempotent. Getting it wrong means duplicate charges, double-booked transfers, and a support queue that grows faster than your team.
+
+Let me set the scene with the exact scenario that wakes fintech engineers up at night.
+
+A customer clicks "Pay Now" for a $149.99 subscription. Meridian's mobile client sends a `POST /v1/charges` to the payment API. The request crosses the Atlantic, the server processes the charge, deducts the balance, writes the ledger entry — and then the response packet is lost in a flaky hotel WiFi connection. The client sees a timeout. What does it do? It retries. It sends the *exact same charge request* again.
+
+The server, knowing nothing of the first attempt, processes it again. Two charges. One purchase. The customer calls support in a fury.
+
+This is the **double-spend problem**, and it exists at every layer of a distributed payment system — not just between your client and API, but between your API and the downstream card network, between your event publisher and your message broker, and between your background worker and your database.
+
+<ExecTimeline
+  title="A retry without idempotency — the double charge"
+  lanes={[{ id: "client", label: "Mobile client" }, { id: "server", label: "Meridian API" }]}
+  steps={[
+    { lane: "client", kind: "send", label: "POST /v1/charges", note: "Client sends the first charge request for $149.99." },
+    { lane: "server", kind: "run", label: "Charge processed", note: "Server deducts balance, writes ledger entry. Charge #7001 created." },
+    { lane: "server", kind: "send", label: "200 OK (lost)", note: "The response is sent but never received — a network partition drops the packet." },
+    { lane: "client", kind: "block", label: "Timeout — retry", note: "Client sees no response after 5 seconds. It retries the identical request." },
+    { lane: "client", kind: "send", label: "POST /v1/charges (retry)", note: "Same payload, same amount — the client has no way to know the first succeeded." },
+    { lane: "server", kind: "run", label: "Charge processed AGAIN", note: "Server has no memory of Charge #7001. It creates Charge #7002 — double charge." },
+    { lane: "server", kind: "done", label: "200 OK — two charges", note: "Customer billed twice. Support ticket incoming. Everyone's having a bad night." }
+  ]}
+  caption="Without idempotency, a retry turns into a double charge. The server can't tell a retry from a new request."
+/>
+
+The fix is not to disable retries. Retries are *essential* for reliability. The fix is to make every operation **idempotent** — safe to apply multiple times with the same result as applying it once.
+
+<Callout kind="warn" title="Money is never a float">
+
+Before we go further: if any dollar amount in your system lives in a `float64`, stop and fix that first. Floating-point arithmetic loses cents. Use integer minor units (cents, pence, satoshis) or a decimal library like `shopspring/decimal`. Idempotency built on top of broken money math is a more complex disaster. See **Representing Money — Never Use Floats** (Part 3, Chapter 1) for the full treatment.
+
+</Callout>
+
+The mathematical definition: a function `f` is idempotent when `f(f(x)) = f(x)`. Applying it twice gives the same result as applying it once. HTTP `GET` is idempotent by spec. `DELETE` is idempotent by spec. `POST` is not — which is exactly why POST-to-create needs idempotency keys.
+
+<QuickCheck
+  question="A client sends a POST /v1/charges request and gets a network timeout. What is the correct course of action?"
+  options={[
+    "Never retry — a timeout might mean the charge succeeded",
+    "Retry immediately with the same payload and an idempotency key",
+    "Retry with a new, different payload to avoid duplication",
+    "Wait for the customer to try again"
+  ]}
+  answer={1}
+  explain="Retrying is correct — timeouts mean the outcome is unknown, not that it failed. The idempotency key is what makes the retry safe: if the first charge succeeded, the server returns the same result without charging again."
+/>
+
+## Idempotency keys
+
+<Define term="Idempotency key" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+An **idempotency key** is a unique token that the client generates once per *logical operation* — not per HTTP request. The client sends it with every attempt, including retries. The server stores the mapping from key → result. On a repeated key, the server returns the stored result without re-executing the operation. The key is usually a UUID v4 or ULID. It must be unique per logical operation — not per session and not per user.
+</Define>
+
+**On the job:** Stripe, Adyen, and every mature payments API require an `Idempotency-Key` header on all mutating calls. If you forget to send one, retries become double charges. If you regenerate the key on retry (a common bug), idempotency is silently defeated.
+
+An **idempotency key** is a unique token the client generates for each *logical operation* — not each HTTP request. The client sends the key with every request, including retries. The server stores the mapping from key to result. On a repeated key, the server returns the stored result without re-executing the operation.
+
+The lifecycle of an idempotency key has three states:
+
+1. **In-flight** — the key has been seen but the operation has not finished yet.
+2. **Completed** — the operation finished; the result is stored and will be returned on any future request with the same key.
+3. **Expired** — keys are typically retained for 24 hours to 7 days, then purged.
+
+<ExecTimeline
+  title="Idempotency key — absorbing a duplicate request"
+  lanes={[{ id: "client", label: "Mobile client" }, { id: "server", label: "Meridian API" }, { id: "db", label: "Idempotency store" }]}
+  steps={[
+    { lane: "client", kind: "send", label: "POST + key=abc-123", note: "Client generates key abc-123 for this logical charge. Sends it with the request." },
+    { lane: "server", kind: "run", label: "INSERT key=abc-123 (in-flight)", note: "Server claims the key atomically via INSERT ... ON CONFLICT DO NOTHING. Proceeds with the charge." },
+    { lane: "db", kind: "run", label: "key stored, state=processing", note: "The key row is locked. Any concurrent request with the same key will wait." },
+    { lane: "server", kind: "run", label: "Charge #7001 created", note: "Balance deducted, ledger written. Response stored against key abc-123." },
+    { lane: "db", kind: "done", label: "key state=completed, result saved", note: "The result (charge ID, status, amount) is stored. The key is now complete." },
+    { lane: "client", kind: "send", label: "Retry: POST + key=abc-123", note: "Timeout on the first response. Client retries with the same key — identical request." },
+    { lane: "server", kind: "done", label: "Key found — return stored result", note: "Server finds key abc-123 completed. Returns the stored Charge #7001 result. No second charge." }
+  ]}
+  caption="The second request is absorbed: same key, same result, zero re-execution. The customer is billed exactly once."
+/>
+
+The key insight: the client generates the idempotency key *before* sending the request, not after. Typically it is a UUID v4 or a ULID. The key must be **unique per logical operation** — not per session, not per user. If the client wants to charge again for a different purchase, it generates a new key.
+
+### Claiming a key atomically — the race condition
+
+Here is where amateurs get it wrong. What happens when two copies of the same retry arrive *simultaneously* — say, a client is using HTTP/2 and fires two parallel attempts? You cannot let both of them race to process the charge.
+
+The solution is a **unique constraint** on the idempotency key column and an `INSERT ... ON CONFLICT` clause. This is the database's atomic test-and-set. Only one insert wins; the loser finds the row already exists and knows it must wait for the winner to finish, then return the stored result.
+
+```go
+// idempotency_store.go
+// ClaimKey attempts to insert a new idempotency key row.
+// Returns (true, nil) when this goroutine won the race and should
+// proceed with the operation.
+// Returns (false, nil) when the key already exists (completed or in-flight).
+// The caller must handle the in-flight case by polling or returning 409.
+func ClaimKey(ctx context.Context, db *sql.DB, key string) (bool, error) {
+	const q = `
+		INSERT INTO idempotency_keys (key, state, created_at)
+		VALUES ($1, 'processing', NOW())
+		ON CONFLICT (key) DO NOTHING`
+	res, err := db.ExecContext(ctx, q, key)
+	if err != nil {
+		return false, fmt.Errorf("claim idempotency key: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	return rows == 1, nil // 1 = we won; 0 = key already existed
+}
+```
+
+`ON CONFLICT (key) DO NOTHING` is atomic at the database level — it cannot race with another identical insert. The unique index on `key` guarantees only one insert succeeds. This is not application-level locking; it is a hard database guarantee.
+
+```go
+// Complete the key and store the response so retries get it back.
+func CompleteKey(ctx context.Context, db *sql.DB, key, resultJSON string) error {
+	const q = `
+		UPDATE idempotency_keys
+		SET state = 'completed', result = $2, completed_at = NOW()
+		WHERE key = $1`
+	_, err := db.ExecContext(ctx, q, key, resultJSON)
+	return err
+}
+
+// LookupKey fetches a completed key's stored result.
+// Returns ("", nil) when the key does not exist or is still in-flight.
+func LookupKey(ctx context.Context, db *sql.DB, key string) (string, error) {
+	const q = `
+		SELECT result
+		FROM idempotency_keys
+		WHERE key = $1 AND state = 'completed'`
+	var result string
+	err := db.QueryRowContext(ctx, q, key).Scan(&result)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return result, err
+}
+```
+
+Now the full handler flow — a runnable in-memory demonstration:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+// InMemoryIdempotencyStore simulates the database-backed idempotency table
+// using a map protected by a mutex. In production, replace with real SQL and
+// INSERT ... ON CONFLICT DO NOTHING on a unique-indexed key column.
+type InMemoryIdempotencyStore struct {
+	mu      sync.Mutex
+	entries map[string]string // key -> stored JSON result
+}
+
+func NewIdempotencyStore() *InMemoryIdempotencyStore {
+	return &InMemoryIdempotencyStore{entries: make(map[string]string)}
+}
+
+// Claim returns true if this caller won the race to process the key.
+// Exactly one caller wins per key — equivalent to INSERT ... ON CONFLICT DO NOTHING.
+func (s *InMemoryIdempotencyStore) Claim(key string) (won bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.entries[key]; exists {
+		return false
+	}
+	s.entries[key] = "" // placeholder — "in-flight"
+	return true
+}
+
+// Complete stores the result for a key so retries receive it.
+func (s *InMemoryIdempotencyStore) Complete(key, result string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries[key] = result
+}
+
+// Lookup returns the stored result for a completed key, or "" if none.
+func (s *InMemoryIdempotencyStore) Lookup(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.entries[key]
+}
+
+// chargeCount tracks how many real charges were executed.
+var chargeCount atomic.Int64
+
+// processCharge is the real (expensive) work — charge the card.
+// It is called at most once per idempotency key.
+func processCharge(amountCents int64) string {
+	chargeCount.Add(1)
+	return fmt.Sprintf(`{"charge_id":"ch_%d","amount_cents":%d,"status":"succeeded"}`,
+		chargeCount.Load(), amountCents)
+}
+
+// HandleCharge implements idempotent charge handling.
+// On the first call with a given key it executes the charge.
+// On any retry with the same key it returns the stored result.
+func HandleCharge(store *InMemoryIdempotencyStore, idempotencyKey string, amountCents int64) string {
+	// Step 1: check for a completed result from a prior call.
+	if stored := store.Lookup(idempotencyKey); stored != "" {
+		return "IDEMPOTENT HIT: " + stored
+	}
+
+	// Step 2: claim the key — atomic test-and-set.
+	if !store.Claim(idempotencyKey) {
+		// Another goroutine is processing or already completed.
+		// In production, poll briefly then return 409 Conflict or the result.
+		return "KEY IN-FLIGHT OR ALREADY CLAIMED"
+	}
+
+	// Step 3: we won the race — execute the real work.
+	result := processCharge(amountCents)
+
+	// Step 4: store the result so retries return it.
+	store.Complete(idempotencyKey, result)
+
+	return "NEW CHARGE: " + result
+}
+
+func main() {
+	store := NewIdempotencyStore()
+	// Meridian: Alice's June subscription — key generated once, reused on every retry.
+	key := "meridian-sub-alice-2026-06"
+
+	// First attempt — executes the real charge.
+	fmt.Println(HandleCharge(store, key, 14999))
+
+	// Retry after a timeout — returns the stored result, no second charge.
+	fmt.Println(HandleCharge(store, key, 14999))
+
+	// Another retry — still absorbed.
+	fmt.Println(HandleCharge(store, key, 14999))
+
+	fmt.Printf("\nReal charges executed: %d (should be 1)\n", chargeCount.Load())
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Why INSERT ... ON CONFLICT is race-safe and the in-memory version is not">
+
+The in-memory store above uses a mutex to serialize `Claim` — safe enough for demonstration, but it has a critical weakness: **it is not durable**. If the process crashes between `Claim` and `Complete`, the key is stuck as an empty placeholder. On restart, the key entry is gone and a new request could re-execute the charge.
+
+The database-backed version is durable *and* atomic in a deeper sense. `INSERT ... ON CONFLICT (key) DO NOTHING` compiles to a single PostgreSQL atomic operation backed by the unique index. The database **cannot** see a race between two inserts — one of them will successfully create the row; the other will see the constraint violation and do nothing, all in a single serializable operation. No gap exists between "check if key exists" and "insert it" — unlike a naive `SELECT` followed by `INSERT` in application code, which has a TOCTOU (time-of-check/time-of-use) race window.
+
+Additionally, `CompleteKey` runs inside the *same database transaction* as the business change (the ledger write, the balance debit). This means the key is marked completed *if and only if* the charge committed. A crash mid-transaction rolls both back, leaving the key unclaimed — the next retry wins the race cleanly and tries again. This atomicity is the bedrock of the whole scheme (as of Go 1.26 with `database/sql`'s `BeginTx`).
+
+</UnderTheHood>
+
+### The concurrent race test — a mandatory Meridian verification
+
+The most important test for an idempotency system is not a sequential one. It is a concurrent one: fire `N` identical requests simultaneously and verify that exactly one charge occurs.
+
+```go
+package payment_test
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+// TestIdempotencyUnderConcurrency verifies that N concurrent requests
+// with the same idempotency key result in exactly one charge.
+// Run with: go test -race ./...
+func TestIdempotencyUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	store := NewIdempotencyStore()
+	key := "meridian-concurrent-test-key-abc123"
+	const workers = 20
+
+	var wg sync.WaitGroup
+	var chargesExecuted atomic.Int64
+
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			result := HandleCharge(store, key, 14999)
+			_ = result
+			// Count how many goroutines saw "NEW CHARGE" (real execution).
+			if len(result) > 10 && result[:10] == "NEW CHARGE" {
+				chargesExecuted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if chargesExecuted.Load() != 1 {
+		t.Errorf("got %d charges; want exactly 1 — idempotency broken under concurrency",
+			chargesExecuted.Load())
+	}
+}
+```
+
+Run this with `-race` always. If there is a data race in your idempotency logic, the race detector will find it. This test must be green before any payment handler ships.
+
+<QuickCheck
+  question="A client generates one UUID per logical purchase and sends it as the Idempotency-Key header. The server times out before responding. The client retries with the same UUID. What should the server do?"
+  options={[
+    "Reject the retry with 409 Conflict — the key was already seen",
+    "Process the charge again — the first one probably failed",
+    "Look up the key: if processing completed, return the stored result; if in-flight, return 409; if absent, process and store",
+    "Ignore the idempotency key and process normally"
+  ]}
+  answer={2}
+  explain="The server checks the idempotency store first. If the key is completed, it returns the stored result — no second charge. If the key is still in-flight (another goroutine is processing it), return 409. If the key is absent (the first attempt crashed before claiming it), claim it and process fresh."
+/>
+
+## Deduplication
+
+<Define term="Deduplication" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+**Deduplication** is the practice of detecting and discarding duplicate messages or events before they can be processed twice. Where an idempotency key is client-supplied (your own mobile app, your own service), a **natural dedup key** comes from the event payload itself — the card network's authorization ID, a bank's ACH trace number, a webhook's `event_id`. Both strategies use the same underlying primitive: an atomic insert into a table with a unique constraint.
+</Define>
+
+**On the job:** dedup keys matter most at event consumer boundaries. A payment processor (Stripe, Adyen) delivers webhooks at-least-once — your consumer will receive the same `payment_intent.succeeded` event more than once during network blips and retries. Without deduplication, you credit the customer twice.
+
+Idempotency keys work when clients cooperate — they generate and send the key. But what about deduplication at the message or event level, where the producer may be a third-party system or a broker delivering events at-least-once?
+
+**Message-level deduplication** uses a different strategy: you build a **dedup table** that records which messages you have already processed, keyed by a **natural key** — an identifier that comes from the event payload itself, not from a client-supplied header.
+
+Natural keys in fintech look like:
+- A card network's authorization ID (`auth_ref: "VISA-2026-8F3C2A"`)
+- A bank's ACH trace number
+- A payment processor's event ID (`evt_1Oabc123...`)
+- A webhook's `event_id` field
+
+The dedup table schema is simple:
+
+```go
+// Schema (PostgreSQL):
+// CREATE TABLE processed_events (
+//     event_id   TEXT PRIMARY KEY,  -- the natural key from the event
+//     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+// );
+
+// IsAlreadyProcessed returns true if the event_id has been seen before.
+// It inserts the event_id atomically — safe under concurrent workers.
+func IsAlreadyProcessed(ctx context.Context, db *sql.DB, eventID string) (bool, error) {
+	const q = `
+		INSERT INTO processed_events (event_id)
+		VALUES ($1)
+		ON CONFLICT (event_id) DO NOTHING`
+	res, err := db.ExecContext(ctx, q, eventID)
+	if err != nil {
+		return false, fmt.Errorf("dedup insert: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	return rows == 0, nil // 0 rows affected = conflict = already processed
+}
+```
+
+The handler pattern with dedup:
+
+```go
+// ProcessWebhookEvent handles an inbound payment event idempotently.
+// Safe to call multiple times with the same event — the second call is a no-op.
+func ProcessWebhookEvent(ctx context.Context, db *sql.DB, evt WebhookEvent) error {
+	alreadySeen, err := IsAlreadyProcessed(ctx, db, evt.ID)
+	if err != nil {
+		return err
+	}
+	if alreadySeen {
+		// This is a duplicate delivery — silently drop it.
+		return nil
+	}
+	// First time seeing this event — process it.
+	return applyEventToDB(ctx, db, evt)
+}
+```
+
+<Callout kind="note" title="Dedup table TTL">
+
+Dedup tables grow forever unless you prune them. Add a `processed_at` column (as shown above) and run a periodic job to delete rows older than your retention window (typically the broker's maximum redelivery window — 7 days for most Kafka and SQS configurations). A partial index on `processed_at` keeps the cleanup query fast.
+
+</Callout>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Idempotency key">Client-generated, sent in a header. The server controls the schema. Used when the client is *your* code (mobile app, another service). Lifecycle is short — 24h to 7 days.</ConceptCard>
+  <ConceptCard label="Natural dedup key">Comes from the event payload itself. Used when the producer is external (card network, bank, payment processor). Tied to the message schema, not your headers.</ConceptCard>
+  <ConceptCard label="INSERT ON CONFLICT">Both strategies use the same database primitive: atomic insert with a unique constraint. Only one insert wins; the loser knows to drop the duplicate.</ConceptCard>
+  <Gotcha>Never use SELECT-then-INSERT for deduplication. There is a TOCTOU window between the check and the insert that lets two concurrent workers both see "not found" and both process the event. Use INSERT ... ON CONFLICT — it is atomic at the database level.</Gotcha>
+</ConceptGrid>
+
+## At-least-once vs exactly-once
+
+<Define term="At-most-once / at-least-once / exactly-once delivery" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+These are the three delivery guarantees a messaging system can offer:
+
+- **At-most-once**: fire and forget — the message may never arrive. No retries. Used where loss is acceptable (telemetry, UDP).
+- **At-least-once**: the message will arrive, but may arrive *more than once*. The sender retries until it gets an acknowledgement. This is the standard for reliable systems — Kafka, SQS, most webhook implementations.
+- **Exactly-once delivery**: the message arrives exactly once, never duplicated, never lost. Theoretically impossible in an asynchronous distributed system (see the Two Generals Problem and FLP impossibility). What brokers call "exactly-once" is always at-least-once + a dedup layer.
+</Define>
+
+<Define term="Exactly-once processing (= at-least-once delivery + idempotent handler)" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+**Exactly-once processing** — also called **effectively-once** — is the achievable goal: at-least-once delivery combined with an idempotent handler. The broker may deliver the message twice; the handler detects the duplicate (via a dedup table or idempotency key) and makes the second delivery a no-op. The *effect* on your system is as if the message was processed exactly once.
+</Define>
+
+**On the job:** "we need exactly-once delivery" is a common requirement in payments. The correct response is: "we implement at-least-once delivery with idempotent consumers — that gives you exactly-once *processing*, which is what you actually need."
+
+This is where I need you to listen carefully, because a lot of engineers — even experienced ones — have a fuzzy understanding here, and fuzziness in payments costs money.
+
+**The honest truth about distributed delivery guarantees:**
+
+Networks give you **at-most-once** delivery (fire and forget) or **at-least-once** delivery (with retries). **Exactly-once** *delivery* is a theoretical impossibility in a distributed system — you cannot simultaneously guarantee a message was delivered and guarantee it was delivered exactly once without a shared, synchronously-updated truth. The Two Generals Problem and FLP impossibility tell us why.
+
+What *is* achievable — and what every "exactly-once" broker feature actually implements — is this combination:
+
+**At-least-once delivery + idempotent handler = effectively-once processing.**
+
+<ExecTimeline
+  title="At-least-once delivery + idempotent handler = effectively-once"
+  lanes={[{ id: "broker", label: "Message broker" }, { id: "worker", label: "Consumer worker" }, { id: "dedup", label: "Dedup store" }]}
+  steps={[
+    { lane: "broker", kind: "send", label: "Deliver event #42", note: "Broker delivers event #42 to the worker. Broker keeps it until it receives an ACK." },
+    { lane: "worker", kind: "run", label: "INSERT event #42", note: "Worker atomically inserts event #42 into the dedup table. Wins the race — first time." },
+    { lane: "dedup", kind: "done", label: "Row created, state=new", note: "Dedup entry stored. This worker now owns processing of event #42." },
+    { lane: "worker", kind: "run", label: "Process event #42", note: "Business logic runs: ledger updated, balance changed, downstream notified." },
+    { lane: "broker", kind: "send", label: "Redeliver event #42", note: "Broker did not receive the ACK in time (worker was slow). It redelivers." },
+    { lane: "worker", kind: "block", label: "INSERT event #42 → conflict", note: "INSERT ON CONFLICT DO NOTHING — row already exists. Returns 0 rows affected." },
+    { lane: "worker", kind: "done", label: "Drop duplicate — ACK", note: "Worker recognizes the duplicate, drops it cleanly, sends ACK. Effectively once." }
+  ]}
+  caption="At-least-once delivery is the reality. Idempotent handlers are the engineering response. Together: effectively-once processing."
+/>
+
+When Kafka, SQS, or any other broker advertises "exactly-once semantics," what they mean is they provide at-least-once delivery *plus* either a dedup layer built into the broker (Kafka's idempotent producer, Kafka transactions) or an expectation that you build one yourself. The burden is ultimately on your application layer.
+
+<UnderTheHood title="Kafka's idempotent producer and transactional API">
+
+Kafka's "exactly-once semantics" (EOS, added in Kafka 0.11) works through two mechanisms:
+
+1. **Idempotent producer**: each producer is assigned a `ProducerID` and maintains a `SequenceNumber` per partition. The broker deduplicates in-order re-sends. This prevents duplicates from producer retries — but only within a single producer session.
+
+2. **Kafka transactions**: the producer wraps a sequence of `send + offset-commit` in a transaction, using a two-phase commit across the broker's internal topic (`__transaction_state`). Consumers configured with `isolation.level=read_committed` only see committed offsets. This gives you atomicity across multiple topics and partitions.
+
+What Kafka's EOS does *not* give you is exactly-once processing in your *application*. If your consumer crashes after committing the offset but before completing its DB write, you have a processing gap. You still need idempotent handlers. The Go `kafka-go` and `confluent-kafka-go` libraries expose the transactional producer API; as of Go 1.26, the pattern is the same as any other external transaction — begin, produce, commit-or-abort.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Your Kafka consumer processes a payment event, writes to the database, then crashes before committing the offset. Kafka redelivers the event. What happens?"
+  options={[
+    "The payment is processed twice — the second delivery re-executes the DB write",
+    "Kafka detects the duplicate and suppresses redelivery automatically",
+    "The second delivery is a no-op if the handler is idempotent — it checks the dedup table and drops it",
+    "The consumer panics on the second attempt because the row already exists"
+  ]}
+  answer={2}
+  explain="At-least-once delivery means the event is redelivered. The idempotent handler detects the natural key in the dedup table, finds it already processed, and drops the duplicate cleanly. The database write does not happen again. This is effectively-once processing."
+/>
+
+## Safe payment retries
+
+Retries without idempotency are dangerous. Retries *with* idempotency plus proper backoff are the standard for resilient payment systems.
+
+The retry strategy for payment API calls combines three things:
+
+1. **Idempotency key** — same key on every retry, so the server can absorb duplicates.
+2. **Exponential backoff** — wait longer after each failure to avoid hammering a struggling upstream.
+3. **Jitter** — randomize the backoff slightly so a fleet of clients does not retry in lockstep (the "thundering herd").
+
+The canonical backoff formula: `sleep = base * 2^attempt + random_jitter`.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"math/rand/v2"
+	"time"
+)
+
+// RetryConfig controls how many times and how long to wait between retries.
+type RetryConfig struct {
+	MaxAttempts int
+	BaseDelay   time.Duration
+	MaxDelay    time.Duration
+}
+
+// ChargeRequest represents a payment request with its idempotency key.
+// The key is generated once by the caller and reused on every retry.
+type ChargeRequest struct {
+	IdempotencyKey string // UUID v4, generated per logical charge — never changes on retry
+	AmountCents    int64
+	Currency       string
+	CustomerID     string
+}
+
+// ChargeResult is what a successful charge returns.
+type ChargeResult struct {
+	ChargeID string
+	Status   string
+}
+
+// retryableCharge calls Meridian's payment processor with exponential backoff + jitter.
+// The idempotency key on req ensures the server absorbs any duplicate.
+func retryableCharge(ctx context.Context, req ChargeRequest, cfg RetryConfig) (*ChargeResult, error) {
+	var lastErr error
+	for attempt := range cfg.MaxAttempts {
+		result, err := callPaymentProcessor(ctx, req)
+		if err == nil {
+			return result, nil
+		}
+
+		// Check if the context is already done before sleeping.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		lastErr = err
+		if attempt == cfg.MaxAttempts-1 {
+			break // no sleep after the last attempt
+		}
+
+		// Exponential backoff with full jitter: sleep between 0 and base*2^attempt.
+		cap := cfg.BaseDelay * (1 << attempt)
+		if cap > cfg.MaxDelay {
+			cap = cfg.MaxDelay
+		}
+		jitter := time.Duration(rand.Int64N(int64(cap)))
+		fmt.Printf("attempt %d failed (%v), retrying in %v (key=%s)\n",
+			attempt+1, err, jitter, req.IdempotencyKey)
+
+		select {
+		case <-time.After(jitter):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("charge failed after %d attempts: %w", cfg.MaxAttempts, lastErr)
+}
+
+// callPaymentProcessor simulates a flaky external API.
+// In production, this is an HTTP call to Stripe/Adyen/etc.
+var attempt int
+
+func callPaymentProcessor(_ context.Context, req ChargeRequest) (*ChargeResult, error) {
+	attempt++
+	if attempt < 3 {
+		return nil, fmt.Errorf("upstream timeout (simulated)")
+	}
+	return &ChargeResult{
+		ChargeID: "ch_" + req.IdempotencyKey[:8],
+		Status:   "succeeded",
+	}, nil
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := ChargeRequest{
+		IdempotencyKey: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+		AmountCents:    14999,
+		Currency:       "USD",
+		CustomerID:     "meridian-cus-alice",
+	}
+
+	cfg := RetryConfig{
+		MaxAttempts: 5,
+		BaseDelay:   200 * time.Millisecond,
+		MaxDelay:    5 * time.Second,
+	}
+
+	result, err := retryableCharge(ctx, req, cfg)
+	if err != nil {
+		fmt.Println("charge failed:", err)
+		return
+	}
+	fmt.Printf("charge succeeded: id=%s status=%s\n", result.ChargeID, result.Status)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="pro" title="Only retry on transient errors">
+
+Not every error is retryable. A `400 Bad Request` (invalid card number) is permanent — retrying it will not fix it. A `500 Internal Server Error` or a network timeout is transient — worth retrying. Your retry logic should inspect the error type and only back off on transient failures. Retrying a permanent error wastes time and burns your idempotency key's retry window.
+
+As of Go 1.26, `errors.AsType[T]` provides a generic helper for unwrapping typed errors — useful when your payment processor client returns a typed `*APIError` carrying a status code, letting you branch on transient vs permanent without a manual type assertion. See **Error Handling at Scale** (Part 2, Chapter 2) for the full typed-error treatment.
+
+</Callout>
+
+## The transactional outbox
+
+<Define term="The dual-write problem" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+The **dual-write problem** occurs when you need to update two separate systems atomically — typically a database and a message broker — but have no distributed transaction spanning both. If the process crashes between the two writes, one system is updated and the other is not: either the event is lost (DB committed, broker publish never happened) or a phantom event exists (broker published, DB rolled back). There is no network call that can make two independent systems commit together without a coordinator.
+</Define>
+
+<Define term="The transactional outbox" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+The **transactional outbox** pattern solves the dual-write problem without a distributed transaction. Instead of writing directly to the message broker, you write the event to an `outbox` table *inside the same database transaction* as the business change. A separate relay process polls unsent outbox rows and publishes them to the broker, then marks them sent. The DB transaction guarantees atomicity between the business write and the outbox write. The relay delivers at-least-once (it may publish twice if it crashes between publish and mark-sent), but your consumers are idempotent — so that is fine.
+</Define>
+
+**On the job:** every Meridian transfer that must notify a downstream service (fraud check, notifications, analytics) uses the outbox pattern. Without it, a crash after the DB commit but before the Kafka publish silently drops the event — downstream services never know the transfer happened, and there is no error to alert on.
+
+Here is the centerpiece of this chapter. If you remember only one pattern from Part 3, remember this one.
+
+The problem: you are processing a payment transfer at Meridian. You need to:
+1. Write the transfer record and update balances in PostgreSQL.
+2. Publish a `TransferCompleted` event to Kafka so downstream services (notifications, analytics, fraud-check) can react.
+
+The naive approach: write to Postgres, then publish to Kafka. What could go wrong?
+
+Everything. If the process crashes after the Postgres commit but before the Kafka publish, the event is lost. Downstream services never know the transfer happened. If you reverse the order (publish to Kafka first, then write to Postgres), a crash leaves a published event with no corresponding DB record — a phantom event. There is no way to make these two writes atomic across two different systems without a distributed transaction coordinator, and distributed transaction coordinators are expensive, fragile, and couple your database to your message broker.
+
+This is the **dual-write problem**. The transactional outbox pattern solves it without distributed transactions.
+
+**The solution:** write the event to an `outbox` table *in the same database transaction* as the business change. The outbox row is the event. A separate **relay process** (a poller) reads unprocessed outbox rows and publishes them to Kafka, then marks them sent. The relay delivers at-least-once (it may publish a row twice if it crashes between publish and mark-sent), but your consumers are already idempotent — so that is fine.
+
+<ExecTimeline
+  title="The transactional outbox pattern"
+  lanes={[{ id: "api", label: "API handler" }, { id: "db", label: "PostgreSQL" }, { id: "relay", label: "Outbox relay" }, { id: "kafka", label: "Kafka" }]}
+  steps={[
+    { lane: "api", kind: "run", label: "BEGIN transaction", note: "API handler opens a DB transaction for the Meridian transfer." },
+    { lane: "db", kind: "run", label: "UPDATE balances", note: "Debit sender, credit receiver. All inside the same transaction." },
+    { lane: "db", kind: "run", label: "INSERT INTO outbox", note: "Write the TransferCompleted event payload to the outbox table — same transaction, same commit." },
+    { lane: "db", kind: "done", label: "COMMIT — atomic", note: "Both the balance update AND the outbox row commit together, or both roll back. No split-brain." },
+    { lane: "relay", kind: "run", label: "Poll outbox", note: "Relay reads unsent outbox rows on a short interval (e.g. 1 second)." },
+    { lane: "kafka", kind: "send", label: "Publish event", note: "Relay publishes the outbox event to Kafka. At-least-once: may re-publish if it crashes before marking sent." },
+    { lane: "relay", kind: "done", label: "Mark row sent", note: "Relay updates outbox row to sent=true. Row may be pruned after a retention window." }
+  ]}
+  caption="Business write and outbox write commit atomically. The relay delivers at-least-once. Idempotent consumers make it effectively-once end-to-end."
+/>
+
+The outbox table schema:
+
+```go
+// Schema (PostgreSQL):
+// CREATE TABLE outbox_events (
+//     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+//     event_type  TEXT NOT NULL,
+//     payload     JSONB NOT NULL,
+//     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//     sent_at     TIMESTAMPTZ,           -- NULL until relayed
+//     sent        BOOLEAN NOT NULL DEFAULT FALSE
+// );
+// CREATE INDEX ON outbox_events (sent, created_at) WHERE NOT sent;
+```
+
+The partial index `WHERE NOT sent` makes the relay's polling query efficient — it only scans unsent rows, not the entire table. This is critical as the table grows.
+
+Now the Go implementation — the transactional write:
+
+```go
+// TransferWithOutbox executes a Meridian money transfer and writes the outbox event
+// atomically. Either both succeed or both roll back — no dual-write gap.
+func TransferWithOutbox(
+	ctx context.Context,
+	db *sql.DB,
+	fromAccount, toAccount string,
+	amountCents int64,
+	idempotencyKey string,
+) error {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() // no-op after Commit
+
+	// Step 1: debit sender.
+	_, err = tx.ExecContext(ctx,
+		`UPDATE accounts SET balance_cents = balance_cents - $1
+		 WHERE id = $2 AND balance_cents >= $1`,
+		amountCents, fromAccount)
+	if err != nil {
+		return fmt.Errorf("debit: %w", err)
+	}
+
+	// Step 2: credit receiver.
+	_, err = tx.ExecContext(ctx,
+		`UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2`,
+		amountCents, toAccount)
+	if err != nil {
+		return fmt.Errorf("credit: %w", err)
+	}
+
+	// Step 3: write the outbox event — same transaction, same commit.
+	payload := fmt.Sprintf(
+		`{"from":%q,"to":%q,"amount_cents":%d,"idempotency_key":%q}`,
+		fromAccount, toAccount, amountCents, idempotencyKey,
+	)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_type, payload)
+		 VALUES ('transfer.completed', $1)`,
+		payload)
+	if err != nil {
+		return fmt.Errorf("outbox insert: %w", err)
+	}
+
+	// Step 4: commit — balance change and outbox event are atomic.
+	return tx.Commit()
+}
+```
+
+And the relay that publishes from the outbox to Kafka:
+
+```go
+// RunOutboxRelay polls the outbox and publishes unsent events.
+// Delivers at-least-once: safe because consumers are idempotent.
+// ctx controls graceful shutdown.
+func RunOutboxRelay(ctx context.Context, db *sql.DB, publisher EventPublisher) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := relayBatch(ctx, db, publisher); err != nil {
+				// Log and continue — a single relay failure should not stop the loop.
+				fmt.Printf("relay batch error: %v\n", err)
+			}
+		}
+	}
+}
+
+// relayBatch reads up to 100 unsent outbox rows, publishes them,
+// and marks them sent. Non-atomic across publish+mark — safe because
+// publishing twice is handled by consumer idempotency.
+func relayBatch(ctx context.Context, db *sql.DB, publisher EventPublisher) error {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, event_type, payload FROM outbox_events
+		 WHERE NOT sent ORDER BY created_at LIMIT 100
+		 FOR UPDATE SKIP LOCKED`) // skip rows locked by concurrent relays
+	if err != nil {
+		return fmt.Errorf("query outbox: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, eventType, payload string
+		if err := rows.Scan(&id, &eventType, &payload); err != nil {
+			return err
+		}
+		if err := publisher.Publish(ctx, eventType, payload); err != nil {
+			return fmt.Errorf("publish event %s: %w", id, err)
+		}
+		if _, err := db.ExecContext(ctx,
+			`UPDATE outbox_events SET sent = TRUE, sent_at = NOW() WHERE id = $1`, id); err != nil {
+			return fmt.Errorf("mark sent %s: %w", id, err)
+		}
+	}
+	return rows.Err()
+}
+
+// EventPublisher is a small interface so the relay can be tested
+// without a real Kafka connection.
+type EventPublisher interface {
+	Publish(ctx context.Context, eventType, payload string) error
+}
+```
+
+<UnderTheHood title="FOR UPDATE SKIP LOCKED — safe concurrent relay workers">
+
+`FOR UPDATE SKIP LOCKED` is a PostgreSQL locking hint that makes running multiple relay workers safe. When relay worker A locks a batch of outbox rows with `FOR UPDATE`, any concurrent worker B that queries the same rows will `SKIP` them (not block) and process a different batch. Without `SKIP LOCKED`, multiple relay workers would serialize on the same rows, negating the benefit of horizontal scaling. With it, each worker grabs a non-overlapping slice of unsent rows and works in parallel. The rows are never processed twice by two different relay workers *in the same pass* — though the publish-then-mark gap still means a message can be published twice across relay *restarts*, which is why consumer idempotency remains essential. As of PostgreSQL 9.5 and `pgx` v5 (the idiomatic Go Postgres driver as of Go 1.26), this clause is supported transparently.
+
+</UnderTheHood>
+
+<BeforeAfter
+  badLabel="Dual write — split brain"
+  goodLabel="Outbox — atomic"
+  bad={`// BROKEN: two separate writes.
+// A crash between them = lost event
+// or phantom event.
+err = db.ExecContext(ctx, updateBalances)
+if err != nil { return err }
+
+// Crash here -> event never published.
+err = kafka.Publish(ctx, event)
+if err != nil { return err }`}
+  good={`// CORRECT: one transaction, two writes.
+// Both commit or both roll back.
+tx.ExecContext(ctx, updateBalances)
+tx.ExecContext(ctx, insertOutbox)
+tx.Commit() // atomic — no gap`}
+/>
+
+---
+
+## Exercises
+
+These are not optional. I watched a payment system lose $80,000 because a junior skipped the idempotency layer. You won't be that junior.
+
+<Exercise n={1} title="Identify retryable vs non-retryable errors" level="easy">
+
+A Meridian payment API returns the following error codes. For each, decide: should a client retry, and should it reuse the same idempotency key?
+
+- `400 Bad Request: invalid card number`
+- `402 Payment Required: insufficient funds`
+- `500 Internal Server Error: database timeout`
+- `503 Service Unavailable`
+- `200 OK` (with a `status: "failed"` in the response body because the card was declined)
+
+<Solution>
+
+- `400 Bad Request`: **Do not retry** with the same payload — the request is malformed. Fix the data before retrying (new key, corrected payload).
+- `402 Insufficient Funds`: **Do not retry** — the card does not have enough funds. This is a permanent business failure, not a transient error.
+- `500 Internal Server Error / database timeout`: **Retry** with the same idempotency key. The server may have failed before or during processing — retry finds out.
+- `503 Service Unavailable`: **Retry** with the same key. The upstream was overloaded or restarting. Backoff and retry.
+- `200 OK with status "failed"` (card declined): **Do not retry** — this is a successful API call with a negative business outcome. The payment was attempted and declined. Retrying will not fix the customer's credit situation.
+
+The key rule: retry on *transport-layer* failures (network errors, 5xx). Do not retry on *business-logic* failures (4xx, or a 200 with a failure status). Always reuse the same idempotency key when you do retry.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add expiry to the idempotency store" level="medium">
+
+The `InMemoryIdempotencyStore` shown in this chapter has no expiry. Keys live forever. Add a `CreatedAt` field to each entry and a `PurgeOlderThan(d time.Duration)` method that removes entries older than `d`. Write a test that verifies old entries are purged and new ones are retained.
+
+<Solution>
+
+```go
+package payment
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+type entry struct {
+	result    string
+	createdAt time.Time
+}
+
+type ExpiringIdempotencyStore struct {
+	mu      sync.Mutex
+	entries map[string]entry
+}
+
+func NewExpiringStore() *ExpiringIdempotencyStore {
+	return &ExpiringIdempotencyStore{entries: make(map[string]entry)}
+}
+
+func (s *ExpiringIdempotencyStore) Claim(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.entries[key]; ok {
+		return false
+	}
+	s.entries[key] = entry{createdAt: time.Now()}
+	return true
+}
+
+func (s *ExpiringIdempotencyStore) Complete(key, result string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[key]; ok {
+		e.result = result
+		s.entries[key] = e
+	}
+}
+
+func (s *ExpiringIdempotencyStore) Lookup(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.entries[key].result
+}
+
+// PurgeOlderThan removes entries created more than d ago.
+func (s *ExpiringIdempotencyStore) PurgeOlderThan(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-d)
+	for k, e := range s.entries {
+		if e.createdAt.Before(cutoff) {
+			delete(s.entries, k)
+		}
+	}
+}
+
+func TestPurgeOlderThan(t *testing.T) {
+	t.Parallel()
+	store := NewExpiringStore()
+
+	store.Claim("old-key")
+	store.Complete("old-key", `{"status":"ok"}`)
+
+	// Backdate the old-key entry by mutating time directly in tests.
+	// In production code, inject a clock; here we use a short sleep.
+	time.Sleep(50 * time.Millisecond)
+
+	store.Claim("new-key")
+	store.Complete("new-key", `{"status":"ok"}`)
+
+	// Purge anything older than 25ms.
+	store.PurgeOlderThan(25 * time.Millisecond)
+
+	if store.Lookup("old-key") != "" {
+		t.Error("old-key should have been purged")
+	}
+	if store.Lookup("new-key") == "" {
+		t.Error("new-key should still be present")
+	}
+}
+```
+
+In production, the database handles expiry with a scheduled `DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '7 days'` run by a cron or background goroutine.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Implement a webhook deduplication handler" level="medium">
+
+Meridian receives payment webhooks from external processors at-least-once. Write `WebhookHandler(store DeduplicationStore, process func(event)) http.Handler` where `DeduplicationStore` has a single method `MarkSeen(eventID string) (alreadySeen bool)`. The handler reads the event ID from the `X-Event-ID` header, checks the store, and calls `process` only on the first delivery. Return `200` on success or duplicate, `400` if the header is missing.
+
+<Solution>
+
+```go
+package payment
+
+import (
+	"net/http"
+	"sync"
+)
+
+// DeduplicationStore is a consumer-defined interface — small and testable.
+type DeduplicationStore interface {
+	MarkSeen(eventID string) (alreadySeen bool)
+}
+
+// InMemDedup is a simple in-memory implementation for tests.
+type InMemDedup struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func NewInMemDedup() *InMemDedup {
+	return &InMemDedup{seen: make(map[string]bool)}
+}
+
+func (d *InMemDedup) MarkSeen(eventID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.seen[eventID] {
+		return true
+	}
+	d.seen[eventID] = true
+	return false
+}
+
+// WebhookHandler returns an http.Handler that deduplicates inbound events.
+func WebhookHandler(store DeduplicationStore, process func(eventID string)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		eventID := r.Header.Get("X-Event-ID")
+		if eventID == "" {
+			http.Error(w, "missing X-Event-ID", http.StatusBadRequest)
+			return
+		}
+		if store.MarkSeen(eventID) {
+			// Duplicate — return 200 so the sender stops retrying.
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		process(eventID)
+		w.WriteHeader(http.StatusOK)
+	})
+}
+```
+
+Note the `200` on a duplicate: returning `4xx` would cause well-implemented webhook senders to retry indefinitely. Returning `200` signals "I received it" — which is true, even if we chose not to process it again.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Outbox relay with a mock publisher" level="hard">
+
+Write a unit test for `relayBatch` using an in-memory publisher. The test should seed two unsent outbox rows (use a real SQLite or `database/sql` with a mock `*sql.DB` via `DATA-DOG/go-sqlmock`), call `relayBatch`, and assert both rows were published and marked sent.
+
+<Solution>
+
+```go
+package payment_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+)
+
+// MockPublisher captures published events without touching Kafka.
+type MockPublisher struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (m *MockPublisher) Publish(_ context.Context, eventType, payload string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, eventType+":"+payload)
+	return nil
+}
+
+func (m *MockPublisher) Events() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.events))
+	copy(out, m.events)
+	return out
+}
+
+// TestRelayBatch verifies that unsent outbox rows are published and marked sent.
+// Uses go-sqlmock for a real *sql.DB without a real database.
+// (Requires: github.com/DATA-DOG/go-sqlmock)
+//
+// This test is intentionally left as pseudocode-adjacent to avoid importing
+// a test-only dependency in a course snippet. Wire it to go-sqlmock by:
+//
+//	db, mock, _ := sqlmock.New()
+//
+// Then set up the expected Query and Exec calls with mock.ExpectQuery / mock.ExpectExec.
+func TestRelayBatch_Concept(t *testing.T) {
+	t.Parallel()
+	pub := &MockPublisher{}
+
+	// In a real test:
+	// 1. Open db, mock := sqlmock.New()
+	// 2. mock.ExpectQuery("SELECT id, event_type, payload FROM outbox_events...").
+	//    WillReturnRows(rows with two events)
+	// 3. mock.ExpectExec("UPDATE outbox_events SET sent").WillReturnResult(x2)
+	// 4. Call relayBatch(ctx, db, pub)
+	// 5. Assert pub.Events() has both events.
+	// 6. Assert mock.ExpectationsMet() == nil.
+
+	// Minimal assertion on the mock publisher.
+	_ = pub
+	t.Log("wire this to go-sqlmock for a full integration-style unit test")
+}
+```
+
+For a production-grade integration test, use `testcontainers-go` to spin up a real PostgreSQL instance, seed the outbox table, run `relayBatch`, and query the table to confirm `sent = TRUE`. That test is slower but gives you confidence in the real SQL.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Design the idempotency key schema for a multi-tenant payment API" level="hard">
+
+Meridian's payment API serves multiple merchant tenants. Merchant A's idempotency key `"inv-1001"` must not collide with Merchant B's key `"inv-1001"`. Extend the `idempotency_keys` table schema to support multi-tenancy. Write the SQL schema and the updated `ClaimKey` function signature and query in Go.
+
+<Solution>
+
+```go
+// SQL Schema:
+// CREATE TABLE idempotency_keys (
+//     merchant_id  TEXT NOT NULL,
+//     key          TEXT NOT NULL,
+//     state        TEXT NOT NULL DEFAULT 'processing',
+//     result       TEXT,
+//     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//     completed_at TIMESTAMPTZ,
+//     PRIMARY KEY (merchant_id, key)  -- composite unique constraint
+// );
+// CREATE INDEX ON idempotency_keys (merchant_id, created_at)
+//     WHERE state != 'completed';  -- for expiry scans
+
+// ClaimKey now takes a merchantID to scope the key to the tenant.
+func ClaimKey(ctx context.Context, db *sql.DB, merchantID, key string) (bool, error) {
+	const q = `
+		INSERT INTO idempotency_keys (merchant_id, key, state, created_at)
+		VALUES ($1, $2, 'processing', NOW())
+		ON CONFLICT (merchant_id, key) DO NOTHING`
+	res, err := db.ExecContext(ctx, q, merchantID, key)
+	if err != nil {
+		return false, fmt.Errorf("claim idempotency key: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	return rows == 1, nil
+}
+```
+
+The composite primary key `(merchant_id, key)` is the unique constraint. Merchant A's `"inv-1001"` and Merchant B's `"inv-1001"` are two different rows — no collision. The `INSERT ... ON CONFLICT` now conflicts on the composite key, so it remains atomic. Expiry cleanup filters by `merchant_id` to purge each tenant's keys independently.
+
+</Solution>
+
+</Exercise>
+
+---
+
+<Recap>
+
+- **The double-spend problem** is real: network timeouts cause clients to retry, and without idempotency, retries become double charges. The solution is not to disable retries — it's to make every operation safe to retry.
+- **Idempotency keys** are client-generated unique tokens per logical operation. The server stores key → result. Retries with the same key return the stored result without re-executing. `INSERT ... ON CONFLICT DO NOTHING` on a unique-indexed key column makes claiming atomic and race-safe.
+- **Deduplication** at the message level uses a `processed_events` table with a natural key from the event payload. Same atomic insert primitive — `INSERT ... ON CONFLICT DO NOTHING`.
+- **At-least-once delivery + idempotent handler = effectively-once processing**. True exactly-once delivery is impossible in distributed systems. Any broker that advertises "exactly-once" is building at-least-once + a dedup layer — you still need idempotent consumers.
+- **Safe payment retries** combine idempotency keys + exponential backoff + jitter. Retry on transient (5xx, network) errors; do not retry on permanent (4xx) failures. Use `errors.AsType[T]` (Go 1.26) to unwrap typed errors when branching on transient vs permanent.
+- **The transactional outbox** solves the dual-write problem. Write the event to an outbox table in the same DB transaction as the business change. A relay process reads unsent outbox rows and publishes them at-least-once. The atomicity of the DB transaction guarantees no split-brain between your database and your message broker.
+
+</Recap>
+
+<Lab
+  title="Build an idempotent payment handler"
+  archetype="build-it"
+  difficulty="unscaffolded"
+  points={100}
+  hintCost={15}
+  verify="self-check"
+  objective="Implement HandleCharge so that any number of concurrent requests with the same idempotency key result in exactly one charge being processed. The starter's main() fires 50 concurrent goroutines with the same key and prints the final chargesExecuted count — it should print 1. Then fires 50 more with a different key — should print 2. The race detector must be silent: run with go run -race."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+// chargesExecuted counts real charge executions.
+// Check this after concurrent calls — it must equal 1 after the first batch.
+var chargesExecuted atomic.Int64
+
+// TODO: implement an idempotency store.
+// It must be safe for concurrent use.
+
+// HandleCharge processes a charge idempotently.
+// Multiple concurrent calls with the same key must result
+// in exactly one real charge (chargesExecuted incremented once).
+func HandleCharge(key string, amountCents int64) string {
+	// TODO: implement idempotency check here.
+	// For now this is NOT idempotent — it always charges.
+	chargesExecuted.Add(1)
+	return fmt.Sprintf("charge executed for key=%s amount=%d", key, amountCents)
+}
+
+func main() {
+	var wg sync.WaitGroup
+	key := "meridian-idem-test-001"
+	const workers = 50
+
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			HandleCharge(key, 9999)
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("charges executed (batch 1, want 1): %d\n", chargesExecuted.Load())
+
+	var wg2 sync.WaitGroup
+	key2 := "meridian-idem-test-002"
+	wg2.Add(workers)
+	for range workers {
+		go func() {
+			defer wg2.Done()
+			HandleCharge(key2, 9999)
+		}()
+	}
+	wg2.Wait()
+	fmt.Printf("charges executed (batch 2, want 2): %d\n", chargesExecuted.Load())
+}`}
+  verifier="Run with: go run -race main.go. The output must show 'charges executed (batch 1, want 1): 1' and 'charges executed (batch 2, want 2): 2' with no race detector output. Both lines correct = PASS."
+  hints={[
+    "You need a map from key to result, protected by a sync.Mutex. The Claim method must use the mutex to atomically check-and-set — check if the key exists, and if not, insert a placeholder before releasing the lock.",
+    "The Claim method should return (won bool). If won==false, look up the completed result and return it. If won==true, execute the real charge, then call Complete(key, result) to store it.",
+    "Make sure Complete stores the result under the same lock that Claim uses. The concurrent test with 50 goroutines will expose any window between Claim and Complete where a second goroutine can slip through."
+  ]}
+  flag="GO{idempotent_handler_exactly_one_charge}"
+>
+
+I built payment systems that handle millions of retries a day without a single double charge. Now you're going to show me you understand why. Fifty goroutines. One key. One charge. The race detector watching every move. Run it with `-race` and show me clean output, sport.
+
+</Lab>
+
+<Scoreboard
+  streak={4}
+  items={[
+    { label: "Quick check — retry with idempotency key", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — idempotency key on retry", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — at-least-once + idempotent = effectively-once", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Retryable vs non-retryable errors", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Expiring idempotency store", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Webhook deduplication handler", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Outbox relay with mock publisher", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Multi-tenant idempotency schema", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Idempotent payment handler (50 concurrent goroutines, 1 charge)", captured: false, points: 100 }}
+/>
+
+Not bad. I've seen engineers three years into a payments role who still couldn't explain the outbox pattern without hand-waving. You're ahead of them — and you're barely getting started. Next, we go deeper into the async machinery: messaging foundations, pub/sub, and why the outbox you just built is the on-ramp to event-driven architecture. Onward.

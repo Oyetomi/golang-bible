@@ -1,0 +1,1588 @@
+---
+title: "gRPC & Service-to-Service Communication"
+part: 2
+order: 18
+type: "course"
+description: "Protocol Buffers and schema-first workflow, the four RPC types, interceptors, status codes, deadlines over the wire, gRPC vs REST trade-offs, and gRPC gateways for HTTP/JSON."
+prerequisites: ["production-project-architecture"]
+---
+
+<HeroCard label="Part 2 · Chapter 18" title="gRPC & Service-to-Service Communication">
+
+Listen up, because I'm only going to say this once: REST is fine. REST is comfortable. REST is what the ordinary engineer reaches for because ordinary engineers don't know any better.
+
+You're not ordinary. Not on my watch.
+
+gRPC is what elite backend teams reach for when two services need to talk fast, safely, and with a typed contract that the compiler enforces on both sides of the wire. Protocol Buffers. Generated Go code. HTTP/2 multiplexing. Bidirectional streaming. Interceptors that chain like middleware but at the transport layer. Deadlines that propagate from your client all the way through a three-service call chain and cancel *everything* if they expire.
+
+By the end of this chapter you will know how to build a gRPC API from scratch — the schema, the server, the client, the interceptors, the error discipline, the deadline discipline — and you will know *why* every piece is shaped the way it is. The ledger service will expose a gRPC API. The payments service will call it. We will make them talk to each other correctly or not at all.
+
+Let's go. You're lucky to have me.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Protocol Buffers & Schema-First", "The Four RPC Types", "Interceptors", "Status Codes & Errors", "Deadlines & Cancellation", "Connection Management", "gRPC vs REST", "gRPC Gateways", "Protobuf Schema Evolution"]} />
+
+<Scene
+  title="Deadline propagation — no deadline vs. enforced deadline"
+  actors={[
+    { id: "pay", label: "payments" },
+    { id: "led", label: "ledger" },
+    { id: "fx", label: "exchange-rate" }
+  ]}
+  frames={[
+    {
+      caption: "No deadline set. Payments calls ledger; ledger calls exchange-rate. Exchange-rate is under load.",
+      beat: "problem",
+      actors: [
+        { id: "pay", state: "active" },
+        { id: "led", state: "active" },
+        { id: "fx", state: "warn" }
+      ]
+    },
+    {
+      caption: "Exchange-rate hangs for 30 s. Ledger goroutine is blocked, holding a DB connection and a gRPC stream.",
+      beat: "problem",
+      actors: [
+        { id: "pay", state: "warn" },
+        { id: "led", state: "warn" },
+        { id: "fx", state: "bad" }
+      ]
+    },
+    {
+      caption: "With no deadline, the pile-up continues. Every new payment request queues behind the blocked one.",
+      beat: "problem",
+      actors: [
+        { id: "pay", state: "bad" },
+        { id: "led", state: "bad" },
+        { id: "fx", state: "bad" }
+      ]
+    },
+    {
+      caption: "With a deadline: payments sends a 3 s budget in the grpc-timeout header. The clock starts.",
+      beat: "neutral",
+      actors: [
+        { id: "pay", state: "active" },
+        { id: "led", state: "idle" },
+        { id: "fx", state: "idle" }
+      ]
+    },
+    {
+      caption: "Ledger receives the call with ~2.8 s remaining and passes the residual context — not a fresh 3 s — to exchange-rate.",
+      beat: "neutral",
+      actors: [
+        { id: "pay", state: "active" },
+        { id: "led", state: "active" },
+        { id: "fx", state: "active" }
+      ]
+    },
+    {
+      caption: "Exchange-rate goes slow. At 3 s the deadline fires. ctx.Done() unblocks every waiting goroutine in the chain simultaneously.",
+      beat: "solution",
+      actors: [
+        { id: "pay", state: "ok" },
+        { id: "led", state: "ok" },
+        { id: "fx", state: "done" }
+      ]
+    },
+    {
+      caption: "Payments receives DEADLINE_EXCEEDED. The idempotency key lets it retry safely. Resources are freed. No pile-up.",
+      beat: "solution",
+      actors: [
+        { id: "pay", state: "done" },
+        { id: "led", state: "idle" },
+        { id: "fx", state: "idle" }
+      ]
+    }
+  ]}
+  caption="A deadline is not a per-hop timeout — it is a single budget shared across the entire call chain. Every service inherits the residual time, and a single ctx.Done() cancels everything at once."
+/>
+
+<Define term="gRPC" since="gRPC & Service-to-Service Communication (Part 2, Chapter 18)">
+**gRPC** (Google Remote Procedure Call) is an open-source RPC framework built on HTTP/2 and Protocol Buffers. Instead of hand-crafting HTTP requests and JSON bodies, you define a **schema** in a `.proto` file and generate strongly-typed client and server code in any supported language. Every call is binary, compact, and compiler-checked. We need it because JSON-over-HTTP between services lacks a machine-enforced contract — one team renames a field and the other breaks silently at runtime.
+</Define>
+
+<Define term="Protocol Buffers / protobuf" since="gRPC & Service-to-Service Communication (Part 2, Chapter 18)">
+**Protocol Buffers** (protobuf) is Google's binary serialization format and schema language. You define message shapes in a `.proto` file using typed fields with stable field numbers. `proto.Marshal` serializes a Go struct into a compact binary stream (often 5–10x smaller than equivalent JSON). The field **number** — not the name — is what travels on the wire, which is why you can rename fields freely but must never reuse or change a field number.
+</Define>
+
+<Define term="RPC" since="gRPC & Service-to-Service Communication (Part 2, Chapter 18)">
+**RPC** (Remote Procedure Call) is the pattern of calling a function on a remote machine as if it were a local function. The framework handles serialization, transport, and deserialization — your Go code just calls `stub.PostTransfer(ctx, req)` and receives a typed response or error, with no manual HTTP wiring. The cost: RPCs can fail in ways local calls cannot (network partitions, deadline exceeded, partial commitment on the server before the client gives up).
+</Define>
+
+<Define term="Interceptor" since="gRPC & Service-to-Service Communication (Part 2, Chapter 18)">
+A **gRPC interceptor** is a function that wraps every RPC on either the client or server side — the gRPC equivalent of HTTP middleware. Interceptors are where you put authentication, logging, tracing, and panic recovery once, correctly, for every method in the service. Multiple interceptors chain in declaration order via `grpc.ChainUnaryInterceptor`.
+</Define>
+
+<Define term="Streaming RPC" since="gRPC & Service-to-Service Communication (Part 2, Chapter 18)">
+A **streaming RPC** keeps an HTTP/2 stream open so that either the client, the server, or both sides can send a sequence of messages rather than a single request/response pair. gRPC has three streaming shapes: server-streaming (one request, many responses), client-streaming (many requests, one response), and bidirectional (both sides stream concurrently). Use streaming when data is too large to buffer in one message or when you need real-time push semantics.
+</Define>
+
+<Define term="Deadline propagation" since="Context in Production (Part 2)">
+**Deadline propagation** is the discipline of passing a single time budget from the originating caller through every downstream hop in a call chain. In gRPC, the deadline travels over the wire as a `grpc-timeout` header. Each downstream service receives the **remaining** budget — not a fresh timeout — so the entire chain shares one clock. When the deadline fires, every goroutine waiting on `ctx.Done()` unblocks simultaneously. Without propagation, a slow dependency will block callers indefinitely, exhausting connection pools and cascading across services.
+</Define>
+
+## Protocol Buffers & Schema-First
+
+The ordinary approach to service-to-service communication is to agree on a JSON shape in a Slack thread, write a `curl` example in a README, and call it a contract. Then one team adds a field, the other team breaks, nobody knows whose fault it is, and someone pages you at 3 a.m.
+
+gRPC refuses to let that happen. It forces you to define the contract first — in a **`.proto` file** — and then *generates* the Go code that both sides use. The schema is the source of truth. Not the README. Not the Slack thread. The file.
+
+### What a `.proto` file looks like
+
+Here is the schema for the ledger service's `AccountService`. This is real Proto 3 syntax — not pseudocode:
+
+```protobuf
+// ledger/proto/ledger.proto
+syntax = "proto3";
+
+package ledger.v1;
+
+option go_package = "github.com/meridian/ledger/gen/ledger/v1;ledgerv1";
+
+// A monetary amount in the smallest currency unit (e.g. cents for USD).
+message Money {
+  int64 amount_minor_units = 1;  // field number 1
+  string currency_code     = 2;  // ISO 4217 e.g. "USD"
+}
+
+// A snapshot of one ledger account.
+message Account {
+  string account_id = 1;
+  string owner_id   = 2;
+  Money  balance    = 3;
+  AccountStatus status = 4;
+}
+
+enum AccountStatus {
+  ACCOUNT_STATUS_UNSPECIFIED = 0; // always define the zero value
+  ACCOUNT_STATUS_ACTIVE      = 1;
+  ACCOUNT_STATUS_FROZEN      = 2;
+}
+
+message GetAccountRequest {
+  string account_id = 1;
+}
+
+message GetAccountResponse {
+  Account account = 1;
+}
+
+message PostTransferRequest {
+  string from_account_id = 1;
+  string to_account_id   = 2;
+  Money  amount          = 3;
+  string idempotency_key = 4;
+}
+
+message PostTransferResponse {
+  string transfer_id = 1;
+  Money  new_balance = 2;
+}
+
+message WatchBalancesRequest {
+  repeated string account_ids = 1; // watch multiple accounts
+}
+
+message BalanceEvent {
+  string account_id    = 1;
+  Money  new_balance   = 2;
+  string transfer_id   = 3;
+}
+
+// The ledger service itself.
+service AccountService {
+  // Unary: fetch one account.
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+
+  // Unary: post a double-entry transfer.
+  rpc PostTransfer(PostTransferRequest) returns (PostTransferResponse);
+
+  // Server-streaming: watch a set of accounts for balance changes.
+  rpc WatchBalances(WatchBalancesRequest) returns (stream BalanceEvent);
+}
+```
+
+Let me break every piece down — one idea at a time.
+
+**`syntax = "proto3"`** — Proto 3 is the current version. All fields are optional by default, and missing fields get zero values (sound familiar?). Proto 2 had required/optional keywords; Proto 3 dropped them and is cleaner for it.
+
+**`package ledger.v1`** — this is the Protobuf namespace. Versioning it (`v1`) is the schema-first equivalent of semantic import versioning: when you make a breaking change, you mint a `v2` package alongside `v1` and migrate consumers at their own pace.
+
+**`option go_package`** — tells `protoc` (the Protocol Buffer compiler) what Go import path and package name to emit.
+
+**`message`** — a typed record, like a Go struct. Each field has a **name**, a **type**, and a **field number**.
+
+**Field numbers** — the integers after `=`. These are critical: they are what actually goes on the wire, not the field name. `amount_minor_units = 1` means the varint-encoded value of that field is tagged with `1` in the binary encoding. You can rename a field freely; you must never reuse or change its number once deployed. That's how backward/forward compatibility works.
+
+**`enum`** — a set of named integer constants. Always define `UNSPECIFIED = 0` as the first value; it's what a field gets when absent (the zero value).
+
+**`repeated`** — a list/slice. `repeated string account_ids = 1` compiles to `[]string` in Go.
+
+**`service` + `rpc`** — the RPC methods. The `stream` keyword on a return type turns a unary call into a server-streaming one. We'll cover all four shapes in the next section.
+
+**On the job:** The moment you hand-write the contract in a Slack thread instead of a `.proto` file, a field gets renamed during a deploy and two services disagree in production — always make the schema the source of truth.
+
+### Code generation: `protoc` and `buf`
+
+You don't hand-write the Go code. You generate it:
+
+```bash
+# Old school: protoc with plugins
+protoc \
+  --go_out=. \
+  --go_opt=paths=source_relative \
+  --go-grpc_out=. \
+  --go-grpc_opt=paths=source_relative \
+  ledger/proto/ledger.proto
+
+# Modern: buf (recommended — handles deps, linting, breaking-change detection)
+buf generate
+```
+
+**`buf`** is the modern toolchain. It reads a `buf.gen.yaml` that declares which plugins to run and where output goes. It also runs `buf lint` (enforces proto style rules) and `buf breaking` (flags field-number changes, renames to reserved fields, and other wire-incompatible changes in CI). Use `buf`.
+
+### What the generated Go looks like
+
+After generation you get two files per `.proto`:
+
+- **`ledger.pb.go`** — Go structs for every `message` and `enum`, plus `proto.Marshal`/`proto.Unmarshal`, MarshalJSON, and the `Stringer` interface.
+- **`ledger_grpc.pb.go`** — the `AccountServiceClient` interface (what callers use), the `AccountServiceServer` interface (what you implement), and the registration glue.
+
+The generated server interface looks like this (simplified):
+
+```go
+// AccountServiceServer is the interface you implement.
+// Generated — do NOT hand-edit.
+type AccountServiceServer interface {
+    GetAccount(context.Context, *GetAccountRequest) (*GetAccountResponse, error)
+    PostTransfer(context.Context, *PostTransferRequest) (*PostTransferResponse, error)
+    WatchBalances(*WatchBalancesRequest, AccountService_WatchBalancesServer) error
+    mustEmbedUnimplementedAccountServiceServer()
+}
+```
+
+Notice `context.Context` is the first argument — exactly the Go convention for anything that does I/O. The generated code is idiomatic Go.
+
+You implement this interface with a real struct:
+
+```go
+// LedgerServer implements the generated AccountServiceServer.
+type LedgerServer struct {
+    ledgerv1.UnimplementedAccountServiceServer // embed for forward compatibility
+    db *pgxpool.Pool
+    // ... other deps
+}
+
+func (s *LedgerServer) GetAccount(
+    ctx context.Context,
+    req *ledgerv1.GetAccountRequest,
+) (*ledgerv1.GetAccountResponse, error) {
+    // real DB call using req.AccountId
+    // ...
+    return &ledgerv1.GetAccountResponse{Account: acct}, nil
+}
+```
+
+Embedding `UnimplementedAccountServiceServer` is required by the generated interface (via `mustEmbedUnimplementedAccountServiceServer`). It also future-proofs you: when the `.proto` adds a new RPC, the embedded struct returns `codes.Unimplemented` automatically — your server keeps compiling and returns a sensible error instead of silently panic-ing.
+
+<UnderTheHood title="The Protobuf wire format — tag+type varints, field numbers, and why they matter for compatibility">
+
+When `proto.Marshal` serializes a `Money{AmountMinorUnits: 4999, CurrencyCode: "USD"}`, it does not write field names. It writes a compact binary stream of **tag-value pairs**.
+
+Each pair opens with a single varint that encodes two things packed together:
+- The **field number** (e.g. `1` for `amount_minor_units`) in the upper bits
+- The **wire type** (e.g. `0` = varint, `2` = length-delimited) in the lower 3 bits
+
+For `amount_minor_units = 1` with a varint wire type, the tag varint is `(1 << 3) | 0 = 0x08`. The value `4999` follows as a varint (base-128 encoding, 2 bytes). For `currency_code = 2`, the tag is `0x12` and the value is a length-prefixed UTF-8 byte string.
+
+The full encoding for `Money{4999, "USD"}` is: `08 c7 27 12 03 55 53 44` — eight bytes. The equivalent JSON `{"amount_minor_units":4999,"currency_code":"USD"}` is 45 bytes and must be parsed as text. That's why gRPC wins on wire efficiency.
+
+**Why field numbers are sacred:** if the decoder on the other end sees tag `0x08`, it knows it's reading field 1. It doesn't know whether that field is named `amount_minor_units` or `price_in_cents` — the name doesn't exist on the wire. This means you can rename fields freely (binary-compatible). But if you change field 1 from `int64` to `string`, the decoder reads the bytes as the wrong type and produces garbage or panics. And if you reuse a deleted field number for a new field, old clients will misinterpret the new data. Field numbers are a permanent commitment.
+
+**Unknown fields** are preserved by default (as of proto3 since the 3.5.x runtime). A message serialized by a newer schema and deserialized by an older one keeps the unknown fields around — if it re-serializes, those bytes travel forward untouched. This is forward compatibility: old code passes new data through without destroying it.
+
+As of Go 1.26, the `google.golang.org/protobuf` module (v2 API) is the standard. The older `github.com/golang/protobuf` module (v1) is a wrapper shim — use the v2 API directly.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="You rename a protobuf field from amount_minor_units to price_cents but keep its field number as 1. Is this a wire-breaking change?"
+  options={["Yes — the name is encoded on the wire", "No — only field numbers are on the wire; names are metadata", "Depends on whether you regenerate the Go code", "Only breaking for JSON encoding, not binary"]}
+  answer={1}
+  explain="Protobuf encodes field numbers on the wire, not names. Renaming a field with the same number is binary-compatible. The JSON encoding (via protojson) uses the field name, so renaming does break JSON consumers — another reason to version your APIs."
+/>
+
+## The Four RPC Types
+
+gRPC has four shapes. Every service call you make falls into one of them. Get this grid in your head:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Unary">One request, one response. The everyday RPC. Fetch an account, post a transfer. Same shape as HTTP request/response but over HTTP/2 with a typed schema.</ConceptCard>
+  <ConceptCard label="Server Streaming">One request, a stream of responses. The server sends multiple messages in sequence before closing. Use for: live balance feeds, audit log tails, bulk exports too large to buffer in one message.</ConceptCard>
+  <ConceptCard label="Client Streaming">A stream of requests from the client, then one response. Use for: bulk ingest (uploading a batch of transactions), aggregating inputs before committing.</ConceptCard>
+  <ConceptCard label="Bidirectional Streaming">Both sides send a stream of messages, concurrently. Use for: real-time trading feeds, co-operative flows like a market-data subscription where the client can add or remove symbols mid-stream.</ConceptCard>
+  <Gotcha>Streaming RPCs hold open an HTTP/2 stream for their duration. Every open stream consumes resources on both sides. A bidirectional stream that the client never closes (because it forgot to call `CloseSend`) leaks the server goroutine and the stream. Always close the send side when done, and always respect context cancellation.</Gotcha>
+</ConceptGrid>
+
+### Implementing a server-streaming RPC
+
+The ledger service has `WatchBalances` — a client sends a list of account IDs and the server streams `BalanceEvent` messages as balances change (triggered by transfers). Here is what that looks like on the server side:
+
+```go
+// WatchBalances streams BalanceEvent messages until the client disconnects
+// or the context is cancelled.
+// Non-runnable: requires generated code + a running gRPC server.
+func (s *LedgerServer) WatchBalances(
+    req *ledgerv1.WatchBalancesRequest,
+    stream ledgerv1.AccountService_WatchBalancesServer,
+) error {
+    ctx := stream.Context()
+
+    // Subscribe to an internal event bus for the requested accounts.
+    sub := s.events.Subscribe(req.AccountIds)
+    defer sub.Close()
+
+    for {
+        select {
+        case <-ctx.Done():
+            // Client disconnected or deadline exceeded — stop cleanly.
+            return ctx.Err()
+        case evt, ok := <-sub.Ch():
+            if !ok {
+                return nil // event bus closed
+            }
+            if err := stream.Send(&ledgerv1.BalanceEvent{
+                AccountId:  evt.AccountID,
+                NewBalance: moneyProto(evt.NewBalance),
+                TransferId: evt.TransferID,
+            }); err != nil {
+                // The stream is broken — client is gone.
+                return err
+            }
+        }
+    }
+}
+```
+
+The `stream.Send` call writes one `BalanceEvent` to the HTTP/2 stream and blocks until it's flushed. The `stream.Context()` carries the client's deadline and cancellation — always `select` on it.
+
+### Implementing a bidirectional streaming RPC
+
+For a bidirectional stream (imagine a market-data service where the client can subscribe and unsubscribe to symbols while it receives quotes), both sides read and write concurrently:
+
+```go
+// BidirectionalStream pattern: two goroutines, one per direction.
+// Non-runnable: requires generated proto + gRPC runtime.
+func (s *QuoteServer) StreamQuotes(
+    stream quotev1.QuoteService_StreamQuotesServer,
+) error {
+    ctx := stream.Context()
+    symCh := make(chan string, 8)
+
+    // Goroutine 1: receive subscription requests from client.
+    go func() {
+        for {
+            req, err := stream.Recv()
+            if err != nil {
+                close(symCh)
+                return
+            }
+            symCh <- req.Symbol
+        }
+    }()
+
+    // Goroutine 2 (main): send quotes as subscriptions arrive.
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case sym, ok := <-symCh:
+            if !ok {
+                return nil
+            }
+            quote := s.feed.Latest(sym)
+            if err := stream.Send(quoteProto(quote)); err != nil {
+                return err
+            }
+        }
+    }
+}
+```
+
+The pattern: **one goroutine reads, the main goroutine (or another goroutine) writes**. Never call `Recv` and `Send` from two goroutines on the same stream without synchronization — `Send` and `Recv` are each individually goroutine-safe, but calling two `Send`s concurrently is not.
+
+<ExecTimeline
+  title="Bidirectional stream — payments service talking to ledger service"
+  lanes={[
+    { id: "client", label: "payments (client)" },
+    { id: "server", label: "ledger (server)" }
+  ]}
+  steps={[
+    { lane: "client", kind: "send", label: "Dial + open stream", note: "payments dials the ledger gRPC server. HTTP/2 negotiates a new stream (stream ID 1). The stream is open; no request has been sent yet." },
+    { lane: "client", kind: "send", label: "Send WatchBalancesRequest", note: "Client sends the list of account IDs it wants to watch as the opening message on the stream." },
+    { lane: "server", kind: "recv", label: "Recv() → account IDs", note: "Server receives the request, subscribes to the internal event bus, and enters its select loop." },
+    { lane: "server", kind: "send", label: "Send BalanceEvent (acct-A)", note: "A transfer posts. Server calls stream.Send — one BalanceEvent flows back to the client over the same HTTP/2 stream." },
+    { lane: "client", kind: "recv", label: "Recv() → BalanceEvent", note: "Client receives the event and updates its local state. The stream stays open — more events are coming." },
+    { lane: "server", kind: "send", label: "Send BalanceEvent (acct-B)", note: "A second transfer posts on a different account. Server streams another event." },
+    { lane: "client", kind: "done", label: "CloseSend + EOF", note: "Client is done. It calls CloseSend. The server's Recv() returns io.EOF, the server returns nil, and the stream closes cleanly." }
+  ]}
+  caption="HTTP/2 lets both sides send messages on the same stream concurrently. The stream stays open until one side closes it or the context expires."
+/>
+
+<QuickCheck
+  question="Your ledger service needs to export 500,000 audit-log entries to a compliance tool. Which gRPC shape fits best?"
+  options={["Unary — one request, one giant response", "Server streaming — one request, stream the rows", "Client streaming — client sends row-by-row", "Bidirectional — both sides stream"]}
+  answer={1}
+  explain="Server streaming is the right shape: the compliance tool sends one request (e.g., a date range) and the ledger service streams the rows back one page at a time, never buffering 500k rows in memory. Unary would require buffering the entire response — a recipe for OOM on the server and a timeout on the client."
+/>
+
+## Interceptors
+
+gRPC interceptors are the exact equivalent of HTTP middleware: functions that wrap every RPC call. They run for every request, on both the server and the client. They're where you put auth, logging, tracing, and panic recovery — once, correctly, instead of copying the same boilerplate into every handler.
+
+**On the job:** Skipping a panic-recovery interceptor means one nil-pointer dereference in a handler takes down the entire gRPC server process — every inflight RPC fails and your SLO tanks until the pod restarts.
+
+There are two kinds:
+
+- **Unary interceptors** — wrap a single request/response call.
+- **Stream interceptors** — wrap a streaming call (both the setup phase and each `Send`/`Recv`).
+
+### A logging + auth unary server interceptor
+
+```go
+// authUnaryInterceptor validates the bearer token from metadata.
+// Non-runnable: requires google.golang.org/grpc + your auth package.
+func authUnaryInterceptor(
+    ctx context.Context,
+    req any,
+    info *grpc.UnaryServerInfo,
+    handler grpc.UnaryHandler,
+) (any, error) {
+    md, ok := metadata.FromIncomingContext(ctx)
+    if !ok {
+        return nil, status.Error(codes.Unauthenticated, "missing metadata")
+    }
+    tokens := md.Get("authorization")
+    if len(tokens) == 0 {
+        return nil, status.Error(codes.Unauthenticated, "missing authorization header")
+    }
+    claims, err := verifyToken(tokens[0])
+    if err != nil {
+        return nil, status.Error(codes.Unauthenticated, "invalid token")
+    }
+    // Inject the verified claims into the context for handlers to read.
+    ctx = context.WithValue(ctx, claimsKey{}, claims)
+    return handler(ctx, req)
+}
+
+// loggingUnaryInterceptor logs every RPC with method, duration, and status.
+func loggingUnaryInterceptor(
+    ctx context.Context,
+    req any,
+    info *grpc.UnaryServerInfo,
+    handler grpc.UnaryHandler,
+) (any, error) {
+    start := time.Now()
+    resp, err := handler(ctx, req)
+    code := status.Code(err)
+    slog.InfoContext(ctx, "rpc",
+        "method", info.FullMethod,
+        "code", code,
+        "duration_ms", time.Since(start).Milliseconds(),
+    )
+    return resp, err
+}
+```
+
+### Chaining interceptors on the server
+
+Multiple interceptors are chained with `grpc.ChainUnaryInterceptor`. They run in declaration order — the first interceptor wraps the outermost layer, just like HTTP middleware:
+
+```go
+// Non-runnable: requires google.golang.org/grpc.
+srv := grpc.NewServer(
+    grpc.ChainUnaryInterceptor(
+        recoveryUnaryInterceptor,  // outermost: catch panics before they crash the server
+        loggingUnaryInterceptor,   // log every RPC (even ones that fail auth)
+        authUnaryInterceptor,      // enforce auth before reaching the handler
+    ),
+    grpc.ChainStreamInterceptor(
+        recoveryStreamInterceptor,
+        loggingStreamInterceptor,
+        authStreamInterceptor,
+    ),
+)
+ledgerv1.RegisterAccountServiceServer(srv, &LedgerServer{db: db})
+```
+
+Order matters: `recovery` goes first so it can catch panics from every layer below it. `logging` goes second so it logs auth failures. `auth` goes last in the chain so it only runs after logging wraps the call.
+
+### A panic-recovery interceptor
+
+Never let a handler panic crash your server. The recovery interceptor turns a panic into a `codes.Internal` error — logged, not fatal:
+
+```go
+// recoveryUnaryInterceptor catches panics in handlers and converts them
+// to a gRPC Internal error rather than crashing the server.
+// Non-runnable: requires google.golang.org/grpc.
+func recoveryUnaryInterceptor(
+    ctx context.Context,
+    req any,
+    info *grpc.UnaryServerInfo,
+    handler grpc.UnaryHandler,
+) (resp any, err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            slog.ErrorContext(ctx, "panic in handler",
+                "method", info.FullMethod,
+                "panic", r,
+            )
+            err = status.Errorf(codes.Internal, "internal server error")
+        }
+    }()
+    return handler(ctx, req)
+}
+```
+
+<UnderTheHood title="How interceptors chain — the handler onion">
+
+A gRPC unary interceptor has the signature:
+
+```
+func(ctx, req, info, handler) (resp, error)
+```
+
+The `handler` argument is the next function in the chain — either the next interceptor or, at the bottom, the actual RPC handler. When you call `handler(ctx, req)` you're passing control inward. When you return from the interceptor, you're passing control back out. This is the classic onion model: your code runs before and after the inner call, just like `net/http` middleware.
+
+`grpc.ChainUnaryInterceptor` stitches N interceptors together by building a `handler` closure for each that calls the next one in line. The final handler in the chain is the actual method implementation. The widely used `grpc-go` module (`google.golang.org/grpc`) provides this chaining model via `grpc.ChainUnaryInterceptor` and `grpc.ChainStreamInterceptor` — no extra middleware library needed.
+
+Client-side interceptors follow the same pattern but with `grpc.WithChainUnaryInterceptor` as a `DialOption`. The interceptors run on the client side, so you can inject auth headers, add tracing spans, or log outbound calls without touching handler code.
+
+</UnderTheHood>
+
+## Status Codes & Errors
+
+HTTP has 500 status codes. Nobody uses most of them. gRPC ships with a **clean, finite set of status codes** that map to real RPC failure modes — and forces you to pick one.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="OK (0)">The call succeeded. Not returned explicitly — a nil error maps to OK.</ConceptCard>
+  <ConceptCard label="NOT_FOUND (5)">The requested resource doesn't exist. Account not found, transfer not found.</ConceptCard>
+  <ConceptCard label="ALREADY_EXISTS (6)">A resource the client tried to create already exists. Idempotency key already seen.</ConceptCard>
+  <ConceptCard label="INVALID_ARGUMENT (3)">The client sent a malformed request. Negative transfer amount, missing account ID. The client should not retry without changing the request.</ConceptCard>
+  <ConceptCard label="PERMISSION_DENIED (7)">Authenticated, but not authorized to do this. Don't expose whether the resource exists.</ConceptCard>
+  <ConceptCard label="UNAUTHENTICATED (16)">Missing or invalid credentials. No token, expired token, bad signature.</ConceptCard>
+  <ConceptCard label="RESOURCE_EXHAUSTED (8)">Rate limited or out of quota. Client should back off.</ConceptCard>
+  <ConceptCard label="UNAVAILABLE (14)">The server is temporarily unavailable — overloaded, restarting. Retryable with backoff.</ConceptCard>
+  <ConceptCard label="DEADLINE_EXCEEDED (4)">The deadline expired before the operation completed. May or may not have side effects — idempotency keys matter here.</ConceptCard>
+  <ConceptCard label="INTERNAL (13)">Something went wrong on the server that shouldn't have. Never expose internal error details in the message — log them, return a generic message.</ConceptCard>
+  <ConceptCard label="UNIMPLEMENTED (12)">The method exists in the schema but the server hasn't implemented it yet. Returned automatically by the embedded Unimplemented struct.</ConceptCard>
+  <ConceptCard label="FAILED_PRECONDITION (9)">The system is not in the right state for this operation. Insufficient funds, frozen account. Not retryable without fixing the precondition.</ConceptCard>
+  <Gotcha>Do NOT return INTERNAL for domain errors you know about. If an account has insufficient funds, that is FAILED_PRECONDITION (the caller can reason about it and act). INTERNAL means "something broke that I don't understand." Leaking internal details in INTERNAL error messages is a security issue — always log the real error server-side and return a generic message over the wire.</Gotcha>
+</ConceptGrid>
+
+### Mapping domain errors to status codes
+
+The ledger service has a layer of domain errors (from the error-handling chapter). Here is how to map them to gRPC status codes at the transport boundary — not inside the business logic, but in the gRPC handler:
+
+```go
+// domainErrToStatus maps typed domain errors to gRPC status codes.
+// This is the ONLY place domain errors cross the wire boundary.
+func domainErrToStatus(err error) error {
+    if err == nil {
+        return nil
+    }
+
+    var notFound *ErrNotFound
+    if errors.As(err, &notFound) {
+        return status.Errorf(codes.NotFound, "account %s not found", notFound.ID)
+    }
+
+    var insufficientFunds *ErrInsufficientFunds
+    if errors.As(err, &insufficientFunds) {
+        return status.Errorf(codes.FailedPrecondition,
+            "insufficient funds: need %d, have %d",
+            insufficientFunds.Need, insufficientFunds.Have)
+    }
+
+    var conflict *ErrIdempotencyConflict
+    if errors.As(err, &conflict) {
+        return status.Errorf(codes.AlreadyExists,
+            "idempotency key %s already processed", conflict.Key)
+    }
+
+    // Unknown domain error — internal. Log it, don't expose it.
+    slog.Error("unhandled domain error", "err", err)
+    return status.Error(codes.Internal, "internal server error")
+}
+```
+
+Here is a runnable simulation of the domain-error → status-code mapping using stdlib only, so you can see the classification logic in isolation before wiring it to the real gRPC runtime:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+// gRPC status codes — a finite, typed vocabulary.
+// In production these come from google.golang.org/grpc/codes.
+type Code int
+
+const (
+	OK                 Code = 0
+	NotFound           Code = 5
+	AlreadyExists      Code = 6
+	InvalidArgument    Code = 3
+	FailedPrecondition Code = 9
+	Unavailable        Code = 14
+	ResourceExhausted  Code = 8
+	DeadlineExceeded   Code = 4
+	Internal           Code = 13
+)
+
+func (c Code) String() string {
+	switch c {
+	case OK:
+		return "OK"
+	case NotFound:
+		return "NOT_FOUND"
+	case AlreadyExists:
+		return "ALREADY_EXISTS"
+	case InvalidArgument:
+		return "INVALID_ARGUMENT"
+	case FailedPrecondition:
+		return "FAILED_PRECONDITION"
+	case Unavailable:
+		return "UNAVAILABLE"
+	case ResourceExhausted:
+		return "RESOURCE_EXHAUSTED"
+	case DeadlineExceeded:
+		return "DEADLINE_EXCEEDED"
+	case Internal:
+		return "INTERNAL"
+	default:
+		return fmt.Sprintf("Code(%d)", int(c))
+	}
+}
+
+// Domain errors from the ledger business-logic layer.
+type ErrNotFound struct{ ID string }
+
+func (e *ErrNotFound) Error() string { return "not found: " + e.ID }
+
+type ErrInsufficientFunds struct{ Have, Need int64 }
+
+func (e *ErrInsufficientFunds) Error() string { return "insufficient funds" }
+
+type ErrIdempotencyConflict struct{ Key string }
+
+func (e *ErrIdempotencyConflict) Error() string { return "idempotency conflict: " + e.Key }
+
+// domainErrToCode maps typed domain errors to gRPC status codes.
+// This is the ONLY place domain errors cross the wire boundary.
+func domainErrToCode(err error) Code {
+	if err == nil {
+		return OK
+	}
+	var nf *ErrNotFound
+	if errors.As(err, &nf) {
+		return NotFound
+	}
+	var insuf *ErrInsufficientFunds
+	if errors.As(err, &insuf) {
+		return FailedPrecondition
+	}
+	var conflict *ErrIdempotencyConflict
+	if errors.As(err, &conflict) {
+		return AlreadyExists
+	}
+	return Internal
+}
+
+// isRetryable returns true for codes a client may safely retry.
+func isRetryable(c Code) bool {
+	switch c {
+	case Unavailable, ResourceExhausted, DeadlineExceeded:
+		return true
+	}
+	return false
+}
+
+func main() {
+	cases := []error{
+		nil,
+		&ErrNotFound{ID: "acct-001"},
+		&ErrInsufficientFunds{Have: 100, Need: 500},
+		&ErrIdempotencyConflict{Key: "idem-key-42"},
+		fmt.Errorf("unexpected DB panic"),
+	}
+	for _, err := range cases {
+		code := domainErrToCode(err)
+		errStr := "nil"
+		if err != nil {
+			errStr = err.Error()
+		}
+		fmt.Printf("err=%-35s code=%-20s retryable=%v\n", errStr, code, isRetryable(code))
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="Error details — richer than a code + message">
+
+gRPC supports **error details**: structured protobuf messages attached to a status. The `google.golang.org/grpc/status` package lets you build a `Status` with details:
+
+```go
+// Attach a BadRequest detail so the client knows which field is wrong.
+// Non-runnable: requires google.golang.org/genproto.
+st, _ := status.New(codes.InvalidArgument, "invalid transfer").
+    WithDetails(&errdetails.BadRequest{
+        FieldViolations: []*errdetails.BadRequest_FieldViolation{
+            {Field: "amount.amount_minor_units", Description: "must be positive"},
+        },
+    })
+return nil, st.Err()
+```
+
+Details travel over the wire as `google.protobuf.Any` messages in the trailing metadata. Use them for machine-readable validation errors that clients can surface to end users.
+
+</Callout>
+
+## Deadlines & Cancellation
+
+Here is the discipline rule that separates amateur gRPC code from production gRPC code: **every outbound RPC must carry a deadline**.
+
+Without a deadline, a slow downstream service stalls your goroutine forever, your connection pool exhausts, your handlers queue up, and your service dies. With a deadline, the call fails cleanly in a bounded time, you return `DEADLINE_EXCEEDED` or surface an error, and your service lives.
+
+**On the job:** A gRPC call without a deadline is the single most common cause of cascading failure in microservice deployments — one slow dependency hangs every goroutine waiting on it until the process OOMs or exhausts its connection pool.
+
+### Setting a deadline on the client
+
+```go
+// payClient makes a PostTransfer call with a tight deadline.
+// Non-runnable: requires generated proto + grpc conn.
+func (c *LedgerClient) PostTransfer(
+    ctx context.Context,
+    req *ledgerv1.PostTransferRequest,
+) (*ledgerv1.PostTransferResponse, error) {
+    // Derive a deadline from the incoming context OR impose our own budget.
+    // Always pick the tighter of the two.
+    callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
+
+    resp, err := c.stub.PostTransfer(callCtx, req)
+    if err != nil {
+        code := status.Code(err)
+        if code == codes.DeadlineExceeded {
+            // The call timed out. The transfer MAY have committed on the server
+            // before the deadline fired — treat as ambiguous; use idempotency key.
+            return nil, fmt.Errorf("ledger transfer timed out (may have committed): %w", err)
+        }
+        return nil, err
+    }
+    return resp, nil
+}
+```
+
+The critical subtlety: `DEADLINE_EXCEEDED` on a write RPC is **ambiguous**. The server may have committed the transfer *before* the deadline fired, and the acknowledgement was simply lost. This is exactly why the `PostTransfer` request carries an `idempotency_key` — if you retry, the server detects the duplicate and returns the original result instead of creating a second transfer.
+
+### How deadlines propagate over the wire
+
+This is the part that surprises engineers from an HTTP background: **gRPC carries the deadline over the wire as a timeout metadata header**. When the payments service calls the ledger service with a 3-second deadline, the ledger service receives that deadline and its own context reflects it. If the ledger service then calls the exchange-rate service to validate a currency, that call inherits the *remaining* budget — not a fresh 3 seconds, the *remainder*.
+
+<ExecTimeline
+  title="Deadline propagating from payments → ledger → exchange-rate"
+  lanes={[
+    { id: "pay", label: "payments" },
+    { id: "led", label: "ledger" },
+    { id: "fx", label: "exchange-rate" }
+  ]}
+  steps={[
+    { lane: "pay", kind: "send", label: "PostTransfer (deadline: 3s)", note: "payments sends a PostTransfer RPC with a 3-second absolute deadline encoded in the grpc-timeout header." },
+    { lane: "led", kind: "recv", label: "Recv: 2.8s remaining", note: "ledger receives the call. Its context.Deadline() reflects ~2.8s remaining (minus the network hop). It does NOT get a fresh 3 seconds." },
+    { lane: "led", kind: "run", label: "DB write (0.4s)", note: "ledger posts to Postgres. 2.4s of budget remain." },
+    { lane: "led", kind: "send", label: "GetRate (deadline: 2.3s)", note: "ledger calls exchange-rate to verify the currency. It passes the remaining context — NOT a new timeout — so the entire chain shares the original budget." },
+    { lane: "fx", kind: "block", label: "slow! 2.5s elapsed", note: "exchange-rate is under load and takes too long. The deadline fires at the 3-second mark." },
+    { lane: "led", kind: "block", label: "ctx.Done() fires", note: "ledger's context is cancelled. Its call to exchange-rate returns DEADLINE_EXCEEDED. ledger stops work." },
+    { lane: "pay", kind: "done", label: "recv DEADLINE_EXCEEDED", note: "payments receives DEADLINE_EXCEEDED. Because the DB write committed before the deadline, the idempotency key lets a retry succeed safely." }
+  ]}
+  caption="Deadlines flow downstream. Each hop inherits the remaining budget. A slow dependency at the bottom cancels everything above it."
+/>
+
+### Respecting context cancellation in a handler
+
+The flip side: your handler must honour the context it receives. A client that disconnects cancels the context immediately — your handler must check:
+
+```go
+// Non-runnable: gRPC server handler pattern.
+func (s *LedgerServer) GetAccount(
+    ctx context.Context,
+    req *ledgerv1.GetAccountRequest,
+) (*ledgerv1.GetAccountResponse, error) {
+    // Bail fast if the client is already gone.
+    if ctx.Err() != nil {
+        return nil, status.FromContextError(ctx.Err()).Err()
+    }
+
+    row, err := s.db.QueryRow(ctx, queryGetAccount, req.AccountId)
+    // ... The DB call itself carries ctx, so it also cancels if the deadline fires.
+    if err != nil {
+        return nil, domainErrToStatus(err)
+    }
+    return &ledgerv1.GetAccountResponse{Account: protoAccount(row)}, nil
+}
+```
+
+`status.FromContextError` converts `context.DeadlineExceeded` → `DEADLINE_EXCEEDED` and `context.Canceled` → `CANCELED` — the right gRPC codes for the situation.
+
+<Callout kind="warn" title="Do not create a fresh context in a handler">
+
+Doing `ctx = context.Background()` or `ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)` inside a gRPC handler throws away the client's deadline and the propagated cancellation. Your DB call will keep running even after the client gives up. Pass `ctx` through — always.
+
+</Callout>
+
+## Connection Management
+
+gRPC over HTTP/2 means one `grpc.ClientConn` is enough — don't create one per request.
+
+### Create it once, reuse it everywhere
+
+```go
+// In main or a wire-injection function: create the conn once.
+// Non-runnable: requires google.golang.org/grpc.
+conn, err := grpc.NewClient(
+    "ledger-service:50051",
+    grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+    grpc.WithKeepaliveParams(keepalive.ClientParameters{
+        Time:                20 * time.Second, // send a ping if idle for 20s
+        Timeout:             5 * time.Second,  // wait 5s for ping ack
+        PermitWithoutStream: true,             // keepalive even with no active RPCs
+    }),
+)
+if err != nil {
+    return fmt.Errorf("dial ledger: %w", err)
+}
+// conn is long-lived — close it only at process shutdown.
+defer conn.Close()
+
+stub := ledgerv1.NewAccountServiceClient(conn)
+```
+
+HTTP/2 **multiplexes** multiple concurrent RPCs over a single TCP connection. Where HTTP/1.1 needs N connections for N concurrent requests (or you serialize), HTTP/2 uses stream IDs inside one connection. The gRPC client manages the stream lifecycle — you just make RPC calls on the stub.
+
+<UnderTheHood title="How gRPC rides HTTP/2 — streams, framing, and multiplexing">
+
+gRPC is a thin layer on top of HTTP/2. Each RPC — whether unary or streaming — is mapped to one HTTP/2 **stream** (a virtual, bidirectional channel within the same TCP connection, identified by a stream ID).
+
+The HTTP/2 **framing layer** breaks data into `DATA` frames and `HEADERS` frames. A gRPC unary request sends:
+1. A `HEADERS` frame with `:method: POST`, `:path: /ledger.v1.AccountService/GetAccount`, `content-type: application/grpc`, and `grpc-timeout: 3000000u` (the deadline as microseconds).
+2. One or more `DATA` frames containing the length-prefixed protobuf body (a 5-byte prefix: 1 byte compression flag + 4-byte message length, then the proto bytes).
+3. A `HEADERS` frame with `END_STREAM` set, signaling the client has finished sending.
+
+The server replies with `HEADERS` (status 200 + grpc-status trailer), `DATA` (the response proto), and `HEADERS` with `grpc-status: 0` (OK) trailing.
+
+HTTP/2 **flow control** (per-stream and per-connection window sizes) prevents a fast sender from overwhelming a slow receiver. If you're streaming a large export, the receiver's window filling up will cause `Send` to block — that's backpressure working correctly, not a bug.
+
+**Head-of-line blocking** in HTTP/1.1 (one request must finish before the next starts on the same connection) is gone. HTTP/2's multiplexing means a slow streaming RPC on stream 3 doesn't delay a fast unary call on stream 5. This is the core reason gRPC outperforms a naive HTTP/1.1 REST client for high-concurrency backend-to-backend traffic.
+
+As of Go 1.26, `grpc-go` uses Go's HTTP/2 transport stack (including `x/net/http2` internals) for RPC transport. `grpc.NewClient` is the current entry point; `grpc.Dial` and `grpc.DialContext` are deprecated but still documented as supported throughout grpc-go 1.x.
+
+</UnderTheHood>
+
+### Load balancing
+
+A `grpc.ClientConn` with a single target address is fine for a single-instance service. For multiple replicas you need a resolver and a load-balancing policy:
+
+```go
+// Non-runnable: gRPC load-balancing setup.
+conn, err := grpc.NewClient(
+    "dns:///ledger-service.payments.svc.cluster.local:50051",
+    grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
+    grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+)
+```
+
+The `dns:///` prefix tells gRPC to resolve the hostname and balance across the returned A records. In Kubernetes this works out of the box with headless services (which return one A record per pod). For more sophisticated balancing (consistent hashing, locality-aware), you'd use a service mesh (Envoy, Istio) or gRPC's xDS protocol — that's outside our scope here, but now you know where the seam is.
+
+## gRPC vs REST
+
+I'm going to give you the honest trade-off table, not the marketing one. Pick the right tool.
+
+<BeforeAfter
+  badLabel="Naive REST service-to-service"
+  goodLabel="gRPC service-to-service"
+  bad={`// Manual JSON encode/decode
+// every call — no compile-time
+// contract between teams.
+resp, _ := http.Post(url,
+  "application/json", body)
+json.NewDecoder(resp.Body).
+  Decode(&result)
+// If the server renames a field:
+// silent wrong data at runtime.`}
+  good={`// Generated stub — compile-time
+// contract. Rename a field in
+// .proto? Both sides regenerate
+// and mismatches are caught
+// before they ship.
+resp, err := stub.PostTransfer(
+  ctx, req)
+// Wrong field name: won't compile.`}
+/>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="gRPC wins: performance">Binary protobuf + HTTP/2 multiplexing cuts payload size 5–10x vs JSON and eliminates per-request connection overhead. At high RPC rates (thousands/sec between services) this is measurable.</ConceptCard>
+  <ConceptCard label="gRPC wins: streaming">First-class streaming in all four shapes. Bidirectional streaming over HTTP/2 is genuinely different from bolting long-polling onto REST.</ConceptCard>
+  <ConceptCard label="gRPC wins: typed contract">The `.proto` schema is a machine-enforceable contract. Breaking changes are caught at `buf breaking` time in CI, not at runtime in production.</ConceptCard>
+  <ConceptCard label="gRPC wins: generated clients">Every consumer gets a generated, type-safe client in their language (Go, Java, Python, Rust, TypeScript…). No hand-written HTTP client code.</ConceptCard>
+  <ConceptCard label="REST wins: browser native">Browsers can't speak gRPC natively (no access to raw HTTP/2 trailers). A REST API is immediately consumable from `fetch`. gRPC requires a gateway or gRPC-Web.</ConceptCard>
+  <ConceptCard label="REST wins: tooling & debugging">curl, Postman, browser devtools, every proxy in existence speaks HTTP/JSON. gRPC needs grpcurl or Evans. For public APIs where third-party consumers matter, REST is still king.</ConceptCard>
+  <ConceptCard label="REST wins: simplicity">For a simple CRUD API with a handful of endpoints and no streaming, the extra setup (protoc/buf, code gen, gRPC server) is genuine overhead. REST and OpenAPI are faster to get right for a small surface area.</ConceptCard>
+  <Gotcha>gRPC is not a silver bullet for internal services. The typed contract and performance are real advantages — but the tooling setup (buf, code gen, mTLS, reflection for debugging) is a real cost. Evaluate per-service. The ledger-to-payments communication is a great fit: high frequency, typed money amounts, needs streaming for balance events. A simple admin webhook is not.</Gotcha>
+</ConceptGrid>
+
+**The rule of thumb:** use gRPC for synchronous service-to-service communication where performance, streaming, or typed contracts matter. Use REST for public-facing APIs, browser-facing endpoints, or simple internal APIs where the gRPC tooling overhead isn't justified.
+
+## gRPC Gateways
+
+The browser problem is real: your mobile app and web frontend can't speak raw gRPC. The solution is a **gRPC gateway** — a reverse proxy that speaks HTTP/JSON on one side and gRPC on the other.
+
+### grpc-gateway
+
+`grpc-gateway` (from the `grpc-ecosystem` org) generates a reverse-proxy server from your `.proto` file using HTTP annotations:
+
+```protobuf
+// Add HTTP annotations to ledger.proto.
+// Non-runnable: requires google/api/annotations.proto import.
+import "google/api/annotations.proto";
+
+service AccountService {
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}"
+    };
+  }
+
+  rpc PostTransfer(PostTransferRequest) returns (PostTransferResponse) {
+    option (google.api.http) = {
+      post: "/v1/transfers"
+      body: "*"
+    };
+  }
+}
+```
+
+The `buf generate` step (with the grpc-gateway plugin added) then generates a `RegisterAccountServiceHandlerFromEndpoint` function. You register it on a standard `net/http` mux and the proxy is live:
+
+```go
+// Non-runnable: requires grpc-gateway generated code + grpc server running.
+// grpc-gateway v2 uses grpc.NewClient internally — no grpc.Dial needed.
+mux := runtime.NewServeMux()
+opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+if err := ledgerv1.RegisterAccountServiceHandlerFromEndpoint(
+    ctx, mux, "localhost:50051", opts,
+); err != nil {
+    return err
+}
+// Serve HTTP/JSON on :8080, gRPC on :50051 simultaneously.
+go http.ListenAndServe(":8080", mux)
+grpcServer.Serve(lis)
+```
+
+Now `GET /v1/accounts/acct-001` returns a JSON-encoded `GetAccountResponse`. The path variable `` {account_id} `` in the URL template maps to `GetAccountRequest.AccountId`. POST body goes to the request message fields. No extra server code — it's generated.
+
+### gRPC-Web
+
+An alternative for browser clients: **gRPC-Web** is a variant of the gRPC protocol that works over standard HTTP/1.1 and HTTP/2 without needing access to HTTP/2 trailers directly. Envoy (a proxy) supports gRPC-Web transcoding. The browser uses the generated `@grpc/grpc-js` or `grpc-web` TypeScript client. For internal services behind a service mesh, this is common. For public APIs where you control the schema, grpc-gateway's HTTP/JSON mapping is usually simpler.
+
+<Callout kind="pro" title="One schema, three surfaces">
+
+A single `.proto` file with `buf generate` can emit:
+1. The Go gRPC server + client
+2. An OpenAPI / Swagger spec (via the protoc-gen-openapiv2 plugin)
+3. A grpc-gateway reverse proxy
+
+Your compliance team gets the REST API. Your mobile team gets the OpenAPI doc. Your internal services get the typed gRPC client. One source of truth.
+
+</Callout>
+
+## Protobuf Schema Evolution
+
+The wire format is a permanent commitment. Every field number you ship in a `.proto` file is frozen forever — it is the address that decoders on both ends of the wire use to find a value. Mess this up and you get **silent data corruption across two service versions during a rolling deploy**: old pods read field 4 as a `string`; new pods wrote field 4 as an `int64`; neither side errors — they just misinterpret bytes.
+
+<Define term="Schema evolution" since="SQL & Databases in Go (Part 1)">
+**Schema evolution** is the discipline of changing a data format in a way that is compatible with existing producers and consumers running simultaneously. In protobuf, a field number is the wire address — changing or reusing it breaks the contract. In SQL, the equivalent discipline is the **expand-contract migration** pattern covered in SQL & Databases in Go (Part 1): add before removing, never alter a column's type in-place.
+</Define>
+
+**On the job:** Reusing a deleted field's number ships a silent data-corruption bug across two service versions during a rolling deploy — old pods fill field 3 with a `string`; new pods read field 3 as an `int64`; no error is returned on either side.
+
+### The rules
+
+1. **Never reuse a field number.** Once a field number is assigned and deployed, it is reserved for that type forever — even after the field is deleted.
+2. **Never change a field's type.** Changing `string` to `int64` on field 2 means old decoders misinterpret the bytes. It is not wire-compatible.
+3. **Adding a new field is safe.** Old decoders ignore unknown fields (proto3 since runtime 3.5.x preserves them); new decoders see the value, old decoders see the zero value. Additive changes are wire-compatible.
+4. **Use `reserved` to tombstone deleted field numbers and names.** This prevents you — or a future teammate — from accidentally reusing them.
+
+### `reserved` in practice
+
+When you delete a field, mark its number and name as `reserved` so the compiler errors if anyone tries to reuse them:
+
+```protobuf
+// ledger/proto/ledger.proto — after removing the legacy `note` field.
+// Non-runnable: protobuf syntax.
+message PostTransferRequest {
+  string from_account_id = 1;
+  string to_account_id   = 2;
+  Money  amount          = 3;
+  string idempotency_key = 4;
+  // Field 5 was `string note` — removed in v1.3.
+  // NEVER reuse field number 5 or the name "note".
+  reserved 5;
+  reserved "note";
+  // Safe to add new fields starting at 6:
+  string reference_label = 6;  // additive — wire-compatible
+}
+```
+
+The `reserved` keyword is a compile-time lock. `buf lint` and `protoc` will reject any future `.proto` that assigns field number 5 or the name `"note"` to a new field. It costs two lines and saves a production incident.
+
+<BeforeAfter
+  badLabel="Breaking: retype and renumber a field"
+  goodLabel="Safe: add with reserved tombstone"
+  bad={`// BREAKING CHANGE — do NOT do this.
+// Old field 5: string note
+// Dev decides to "clean up" by reusing 5
+// for a new int64 and renaming it.
+message PostTransferRequest {
+  string from_account_id = 1;
+  string to_account_id   = 2;
+  Money  amount          = 3;
+  string idempotency_key = 4;
+  // REUSED field 5 as a different type:
+  // old pods read garbage; new pods produce garbage.
+  int64  priority_level  = 5; // ← wire-incompatible!
+}`}
+  good={`// SAFE — additive evolution with reserved tombstone.
+message PostTransferRequest {
+  string from_account_id = 1;
+  string to_account_id   = 2;
+  Money  amount          = 3;
+  string idempotency_key = 4;
+  // Tombstone the deleted field — never reuse 5 or "note".
+  reserved 5;
+  reserved "note";
+  // New field gets the NEXT available number:
+  int64 priority_level = 6; // ← wire-compatible addition
+}`}
+/>
+
+### How this dovetails with expand-contract migrations
+
+The expand-contract pattern from SQL & Databases in Go applies here too: **expand first, then contract**. Before you remove a field from the `.proto`, you must confirm that no producer still writes it and no consumer still reads it — only then is it safe to delete (and immediately `reserved`). Rolling deploys mean both the old schema and the new schema are live simultaneously; the wire format must be readable by both versions at once.
+
+`buf breaking` in CI enforces this automatically: it compares your current `.proto` against a known-good baseline (usually the previous git tag) and fails if any field number is reassigned, any field type changes, or any `reserved` tombstone is removed. Add it to your merge-gate the day you ship your first `.proto`.
+
+<Callout kind="pro" title="Version the package, not the file">
+
+When you need a genuinely breaking change — a message restructure, a field type change, a service rename — mint a new package version (`ledger.v2`) alongside `ledger.v1` and migrate consumers at their own pace. This is the protobuf equivalent of Go's semantic import versioning. Never silently break `v1`; it may still be running in a pod on the other side of the cluster.
+
+</Callout>
+
+---
+
+## Exercises
+
+Stop nodding. The gRPC interceptor doesn't care that you understand it in theory — only that you've written one. Let's go.
+
+<Exercise n={1} title="Decode a protobuf-style varint" level="easy">
+
+Protobuf encodes integers as base-128 **varints**: the low 7 bits of each byte are data; the high bit is a "more bytes follow" flag. Write `decodeVarint(b []byte) (value uint64, bytesRead int)` that decodes the first varint from `b`. Test it: `decodeVarint([]byte{0xC7, 0x27})` should return `(5063, 2)`. (This is the actual encoding of 5063 in gRPC message framing.)
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func decodeVarint(b []byte) (value uint64, bytesRead int) {
+	var shift uint
+	for i, byt := range b {
+		// Low 7 bits are data bits.
+		value |= uint64(byt&0x7F) << shift
+		shift += 7
+		if byt&0x80 == 0 {
+			// High bit clear: this is the last byte.
+			return value, i + 1
+		}
+	}
+	// Truncated varint — return zero.
+	return 0, 0
+}
+
+func main() {
+	// 5063 in varint: 0xC7 0x27
+	// 0xC7 = 1100_0111 → low 7 = 100_0111 = 71, more=1
+	// 0x27 = 0010_0111 → low 7 = 010_0111 = 39, more=0
+	// value = 71 | (39 << 7) = 71 + 4992 = 5063
+	v, n := decodeVarint([]byte{0xC7, 0x27})
+	fmt.Printf("value=%d  bytesRead=%d\n", v, n)
+
+	// Single-byte: 42
+	v2, n2 := decodeVarint([]byte{0x2A})
+	fmt.Printf("value=%d  bytesRead=%d\n", v2, n2)
+}
+```
+
+The varint encoding is why small field numbers (1, 2, 3) cost one byte for the tag — the field number fits in 4 bits of the tag byte with room for the wire type in the low 3 bits. Field number 1 tags as `0x08` (1 shl 3 | wire type 0) — a single byte. Field number 16+ needs two bytes. Assign the most frequently used fields the smallest numbers.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Status code classifier" level="easy">
+
+Write `classify(code codes.Code) string` that returns `"retryable"`, `"fix-request"`, or `"server-error"` for a gRPC status code. `UNAVAILABLE` and `DEADLINE_EXCEEDED` and `RESOURCE_EXHAUSTED` are retryable. `INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `UNAUTHENTICATED`, and `FAILED_PRECONDITION` are fix-request. Everything else is server-error. Run it against all the codes in the problem set.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"google.golang.org/grpc/codes"
+)
+
+func classify(code codes.Code) string {
+	switch code {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
+		return "retryable"
+	case codes.InvalidArgument, codes.NotFound, codes.AlreadyExists,
+		codes.PermissionDenied, codes.Unauthenticated, codes.FailedPrecondition:
+		return "fix-request"
+	default:
+		return "server-error"
+	}
+}
+
+func main() {
+	toCheck := []codes.Code{
+		codes.OK,
+		codes.Unavailable,
+		codes.DeadlineExceeded,
+		codes.ResourceExhausted,
+		codes.NotFound,
+		codes.InvalidArgument,
+		codes.AlreadyExists,
+		codes.PermissionDenied,
+		codes.Unauthenticated,
+		codes.FailedPrecondition,
+		codes.Internal,
+		codes.Unknown,
+	}
+	for _, c := range toCheck {
+		fmt.Printf("%-22s → %s\n", c, classify(c))
+	}
+}
+```
+
+On the client side, this classification drives your retry policy: only attempt a retry on `"retryable"` codes, and even then use exponential backoff with jitter so you don't hammer a struggling server.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Write a unary timing interceptor" level="medium">
+
+Implement `timingInterceptor`, a `grpc.UnaryClientInterceptor` that records how long each outbound RPC takes and prints `method=<name> duration=<ms>ms code=<code>`. Wire it into a `grpc.NewClient` call using `grpc.WithChainUnaryInterceptor`. You may use a stub invoker that always returns a synthetic latency for testing.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// timingInterceptor is a gRPC unary client interceptor that logs call duration.
+func timingInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply any,
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	start := time.Now()
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	code := status.Code(err)
+	fmt.Printf("method=%-40s duration=%4dms code=%s\n",
+		method, time.Since(start).Milliseconds(), code)
+	return err
+}
+
+// fakeInvoker simulates a server call with a fixed latency and result.
+func fakeInvoker(latency time.Duration, errCode codes.Code) grpc.UnaryInvoker {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+		time.Sleep(latency)
+		if errCode != codes.OK {
+			return status.Error(errCode, "simulated error")
+		}
+		return nil
+	}
+}
+
+func main() {
+	calls := []struct {
+		method  string
+		latency time.Duration
+		code    codes.Code
+	}{
+		{"/ledger.v1.AccountService/GetAccount", 12 * time.Millisecond, codes.OK},
+		{"/ledger.v1.AccountService/PostTransfer", 45 * time.Millisecond, codes.OK},
+		{"/ledger.v1.AccountService/GetAccount", 3100 * time.Millisecond, codes.DeadlineExceeded},
+	}
+
+	for _, c := range calls {
+		invoker := fakeInvoker(c.latency, c.code)
+		// Call the interceptor directly with the fake invoker.
+		_ = timingInterceptor(
+			context.Background(),
+			c.method,
+			nil, nil, nil,
+			invoker,
+		)
+	}
+}
+```
+
+In a real service you'd emit these timings to your metrics system (Prometheus histogram, OpenTelemetry span) rather than printing them. The interceptor shape is identical; only the recording mechanism changes.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Deadline budget propagation" level="medium">
+
+Write `remainingBudget(ctx context.Context) time.Duration` that returns the time remaining until the context deadline, or `0` if there is no deadline. Then write `callWithBudget(ctx context.Context, downstream string) error` that checks the budget before making a (simulated) outbound call: if less than `200ms` remains, return `status.Error(codes.DeadlineExceeded, "insufficient budget for downstream call")` immediately — no point starting a call that will certainly time out. Demonstrate both paths.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func remainingBudget(ctx context.Context) time.Duration {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(dl)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// callWithBudget refuses to start an outbound call if the budget is too thin.
+func callWithBudget(ctx context.Context, downstream string) error {
+	const minBudget = 200 * time.Millisecond
+	budget := remainingBudget(ctx)
+	if budget > 0 && budget < minBudget {
+		return status.Errorf(codes.DeadlineExceeded,
+			"only %v left — not enough budget to call %s (need %v)",
+			budget, downstream, minBudget)
+	}
+	// Simulate the downstream call taking 50ms.
+	time.Sleep(50 * time.Millisecond)
+	fmt.Printf("called %s with %v budget — OK\n", downstream, budget)
+	return nil
+}
+
+func main() {
+	// Ample budget: 2 seconds.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+	if err := callWithBudget(ctx1, "exchange-rate-service"); err != nil {
+		fmt.Println("error:", err)
+	}
+
+	// Thin budget: 80ms — less than the 200ms minimum.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel2()
+	if err := callWithBudget(ctx2, "exchange-rate-service"); err != nil {
+		fmt.Println("error:", err)
+	}
+
+	// No deadline at all (remainingBudget returns 0, treated as "no limit").
+	if err := callWithBudget(context.Background(), "exchange-rate-service"); err != nil {
+		fmt.Println("error:", err)
+	}
+}
+```
+
+This pattern — the **minimum-budget guard** — prevents wasted work. It's especially important before a chain of calls: check that each leg has enough time before initiating it, and return `DEADLINE_EXCEEDED` proactively rather than letting the downstream call fail partway through.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="A full auth + logging server interceptor chain" level="hard">
+
+Implement two server-side unary interceptors that chain cleanly:
+
+1. `authInterceptor` — reads a `"x-api-key"` value from incoming gRPC metadata. If it equals `"secret-key-1234"`, let the call through. Otherwise return `codes.Unauthenticated`. Inject the key into the context.
+2. `auditInterceptor` — after calling the handler, log the method, the status code, and (if auth succeeded) the API key that made the call. Always log, even on auth failures.
+
+Show how to chain them with `grpc.ChainUnaryInterceptor` and test both paths with a fake handler.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+type apiKeyCtxKey struct{}
+
+func authInterceptor(
+	ctx context.Context,
+	req any,
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (any, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "missing metadata")
+	}
+	keys := md.Get("x-api-key")
+	if len(keys) == 0 || keys[0] != "secret-key-1234" {
+		return nil, status.Error(codes.Unauthenticated, "invalid api key")
+	}
+	ctx = context.WithValue(ctx, apiKeyCtxKey{}, keys[0])
+	return handler(ctx, req)
+}
+
+func auditInterceptor(
+	ctx context.Context,
+	req any,
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (any, error) {
+	start := time.Now()
+	resp, err := handler(ctx, req)
+	code := status.Code(err)
+	apiKey, _ := ctx.Value(apiKeyCtxKey{}).(string)
+	if apiKey == "" {
+		apiKey = "(unauthenticated)"
+	}
+	slog.Info("rpc audit",
+		"method", info.FullMethod,
+		"code", code,
+		"api_key", apiKey,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
+	return resp, err
+}
+
+// chainedHandler simulates the grpc.ChainUnaryInterceptor behaviour.
+func chainedHandler(
+	ctx context.Context,
+	req any,
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+	interceptors ...grpc.UnaryServerInterceptor,
+) (any, error) {
+	if len(interceptors) == 0 {
+		return handler(ctx, req)
+	}
+	next := func(c context.Context, r any) (any, error) {
+		return chainedHandler(c, r, info, handler, interceptors[1:]...)
+	}
+	return interceptors[0](ctx, req, info, next)
+}
+
+func echoHandler(ctx context.Context, req any) (any, error) {
+	return fmt.Sprintf("echo: %v", req), nil
+}
+
+func main() {
+	info := &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.AccountService/GetAccount"}
+
+	// Path 1: valid API key.
+	mdGood := metadata.New(map[string]string{"x-api-key": "secret-key-1234"})
+	ctxGood := metadata.NewIncomingContext(context.Background(), mdGood)
+	resp, err := chainedHandler(ctxGood, "req-1", info, echoHandler,
+		auditInterceptor, authInterceptor)
+	fmt.Printf("good path → resp=%v err=%v\n", resp, err)
+
+	// Path 2: missing API key.
+	ctxBad := metadata.NewIncomingContext(context.Background(), metadata.MD{})
+	resp, err = chainedHandler(ctxBad, "req-2", info, echoHandler,
+		auditInterceptor, authInterceptor)
+	fmt.Printf("bad path  → resp=%v err=%v\n", resp, err)
+}
+```
+
+Notice `auditInterceptor` is listed first in the chain — it wraps `authInterceptor`. So it logs even when auth fails: the `handler` call includes `authInterceptor`, which returns `Unauthenticated` before the real handler runs. The audit log captures that outcome. This ordering is intentional.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Alright. Exercises were the warmup. Now it's time to see if you can actually *build* something that holds together under real conditions.
+
+The ledger service has a `PostTransfer` gRPC handler, and the payments service calls it. Right now the handler does three things wrong: it ignores the context deadline (keeps working after the client gives up), it doesn't enforce authentication (anyone can post transfers), and it returns a raw Go error instead of a proper gRPC status code for domain failures.
+
+I set this test personally. I am *very* interested in whether you pass.
+
+<Lab
+  title="Wire the auth + deadline-aware PostTransfer interceptor chain"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="reference"
+  objective="Complete the three missing pieces: (1) implement authInterceptor to check the x-api-key metadata header and return codes.Unauthenticated on failure; (2) implement deadlineGuardInterceptor to return codes.DeadlineExceeded immediately if the context has less than 100ms remaining; (3) fix the PostTransfer handler to map ErrInsufficientFunds to codes.FailedPrecondition and ErrNotFound to codes.NotFound using errors.As — no raw errors over the wire. Test your solution against three scenarios: (a) missing auth key → must produce codes.Unauthenticated; (b) tight deadline (50ms remaining) → must produce codes.DeadlineExceeded; (c) insufficient funds with valid auth and ample deadline → must produce codes.FailedPrecondition."
+  starter={`package main
+
+import (
+    "context"
+    "errors"
+    "time"
+
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/metadata"
+    "google.golang.org/grpc/status"
+)
+
+// Domain errors from the ledger business logic layer.
+type ErrInsufficientFunds struct{ Have, Need int64 }
+func (e *ErrInsufficientFunds) Error() string { return "insufficient funds" }
+
+type ErrNotFound struct{ ID string }
+func (e *ErrNotFound) Error() string { return "not found: " + e.ID }
+
+// TODO: implement authInterceptor.
+// Check metadata "x-api-key". If missing or not "secret-key-1234",
+// return codes.Unauthenticated.
+func authInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+    // your code here
+    return handler(ctx, req)
+}
+
+// TODO: implement deadlineGuardInterceptor.
+// If ctx has a deadline and less than 100ms remains, return codes.DeadlineExceeded.
+func deadlineGuardInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+    // your code here
+    return handler(ctx, req)
+}
+
+// simulatedDomainCall returns a domain error based on the scenario key.
+func simulatedDomainCall(scenario string) error {
+    switch scenario {
+    case "insufficient_funds":
+        return &ErrInsufficientFunds{Have: 100, Need: 500}
+    case "not_found":
+        return &ErrNotFound{ID: "acct-999"}
+    }
+    return nil
+}
+
+// TODO: fix postTransferHandler to map domain errors to gRPC status codes.
+// ErrInsufficientFunds → codes.FailedPrecondition
+// ErrNotFound          → codes.NotFound
+// anything else        → codes.Internal (log it, don't expose it)
+func postTransferHandler(ctx context.Context, req any) (any, error) {
+    scenario, _ := req.(string)
+    if err := simulatedDomainCall(scenario); err != nil {
+        // BUG: returning raw Go error — fix this.
+        return nil, err
+    }
+    return "transfer posted", nil
+}
+`}
+  verifier="Reference rubric: call the interceptor chain directly with three scenarios using chainedHandler. (1) No x-api-key in metadata → status.Code(err) must equal codes.Unauthenticated. (2) Context with 50 ms remaining → status.Code(err) must equal codes.DeadlineExceeded. (3) 'insufficient_funds' scenario with valid auth and a 2 s deadline → status.Code(err) must equal codes.FailedPrecondition. Compare your output to the reference solution to confirm all three paths."
+  hints={[
+    "For authInterceptor: metadata.FromIncomingContext(ctx) gives you the MD map. md.Get(\"x-api-key\") returns a []string — check len and compare values[0] to \"secret-key-1234\".",
+    "For deadlineGuardInterceptor: dl, ok := ctx.Deadline(); if ok && time.Until(dl) < 100*time.Millisecond { return nil, status.Error(codes.DeadlineExceeded, \"...\") }",
+    "For postTransferHandler: use errors.As(err, &target) to detect each typed error, then return status.Errorf(codes.FailedPrecondition, ...) or status.Errorf(codes.NotFound, ...). Fall through to status.Error(codes.Internal, \"internal server error\") for unknowns."
+  ]}
+  flag="GO{auth_deadline_status_codes_all_correct}"
+>
+
+The ledger service handles real money. A handler that ignores deadlines, skips auth, and leaks raw errors is not a handler — it's a liability. Fix all three, make the verifier green, and capture the flag. I'll be watching.
+
+</Lab>
+
+---
+
+<Recap>
+
+You now know how to build gRPC APIs the way professionals do:
+
+- **Protocol Buffers** are the schema-first contract. Field numbers are on the wire — not names. Rename freely; never reuse or change a field number. `buf` over `protoc`.
+- **Four RPC shapes:** unary (request/response), server-streaming (one request, many responses), client-streaming (many requests, one response), bidirectional (both sides stream). Choose based on the data-flow shape, not habit.
+- **Interceptors** are the gRPC middleware stack. Chain `auth → logging → recovery` (outermost first). Client interceptors inject auth and tracing; server interceptors enforce auth and log outcomes.
+- **Status codes** are a finite, typed vocabulary. Map domain errors to codes at the transport boundary using `errors.As`. Never expose internal errors over the wire. `FAILED_PRECONDITION` for known domain failures, `INTERNAL` for genuine surprises.
+- **Deadlines propagate over the wire** via the `grpc-timeout` header. The remaining budget — not a fresh timeout — flows to each downstream hop. Always check `ctx.Err()` in handlers; always set a deadline on outbound calls; always carry an idempotency key for write RPCs because `DEADLINE_EXCEEDED` is ambiguous.
+- **One `ClientConn` per service target**, reused across goroutines. HTTP/2 multiplexes concurrent RPCs for free.
+- **gRPC vs REST:** gRPC wins on performance, streaming, and typed contracts for backend-to-backend traffic. REST wins on browser compatibility and tooling reach for public APIs. They're not exclusive — grpc-gateway gives you both from one `.proto`.
+- **Schema evolution:** field numbers are permanent. Never reuse a deleted field number or change a field's type. Use `reserved` to tombstone removed fields. Adding fields is wire-compatible; everything else is not. `buf breaking` in CI catches violations before they ship.
+
+</Recap>
+
+<Scoreboard
+  streak={16}
+  items={[
+    { label: "Quick check — proto field rename", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — best shape for 500k audit rows", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Decode a varint", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Status code classifier", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Timing interceptor", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Deadline budget guard", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Auth + audit interceptor chain", kind: "exercise", points: 20, done: false },
+    { label: "Schema Evolution — reserved field tombstones", kind: "exercise", points: 10, done: false }
+  ]}
+  flag={{ label: "Lab — Wire the auth + deadline-aware interceptor chain", captured: false, points: 80 }}
+/>
+
+Not bad. Honestly, not bad at all. You've got the schema-first discipline, the interceptor chain, the deadline propagation, the status code mapping — all the pieces that separate a gRPC service from an HTTP service with delusions of grandeur. It's no *me*, obviously — nothing is — but you're getting there. Part 2 is done. Rest up, sport. Part 3 is fintech, the money is real (well, represented correctly as integer minor units), and the correctness requirements are not going to give you any slack whatsoever.

@@ -1,0 +1,1328 @@
+---
+title: "Integrating with External Payment Systems"
+part: 3
+order: 8
+type: "course"
+description: "Outbound: robust processor/bank clients with timeouts, retries, idempotency keys and circuit breakers. Inbound webhooks: HMAC signature verification, replay protection, async idempotent processing. And modeling pending → settled → failed states for slow rails."
+prerequisites: ["watermill"]
+---
+
+<HeroCard label="Part 3 · Chapter 8" title="Integrating with External Payment Systems">
+
+Here's the thing, sport. Every payments engineer who crashes in production does it in one of three ways: they retried a charge without an idempotency key and double-charged a customer, they accepted a webhook without verifying the signature and let a fraudster drain accounts, or they assumed a charge was final the instant the API returned 200. Three mistakes, three disasters, and I have personally never made any of them.
+
+By the end of this chapter you will not make them either. We're talking robust outbound clients that survive flaky processors, inbound webhooks that reject every forgery and replay, and a state machine that correctly models the days-long reality of ACH and SEPA. This is where the fintech rubber meets the road.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Outbound: Robust API Clients", "Inbound Webhooks", "The Async Reality"]} />
+
+## Outbound: Robust API Clients
+
+Let me set the scenario, because the stakes matter.
+
+Meridian needs to charge a customer's card. The payments service calls the processor's API. The network hiccups. Do you retry? The naive answer — "yes, just retry" — is the wrong answer, because you have no idea whether the processor received the first request. It might have received it, charged the card, and simply failed to send the response back. A blind retry means a double charge. The customer gets billed twice. They file a chargeback. You lose your merchant account. That's a company-ending bug, and it is completely preventable.
+
+The correct answer is: **retry, but with an idempotency key.**
+
+<Define term="Payment processor / acquirer" since="Idempotency & Exactly-Once Semantics (Part 3)">
+A **payment processor** (sometimes called an **acquirer**) is the third-party service that actually moves money — Stripe, Adyen, Braintree, or a direct bank API. Meridian calls the processor's API to initiate a charge or transfer; the processor talks to the card networks and banks on Meridian's behalf. The processor is the **external source of truth** for whether a transaction actually happened. If Meridian's database disagrees with the processor's records, the processor wins.
+</Define>
+
+### Idempotency Keys in Outbound Calls
+
+<Define term="Idempotency key" since="Idempotency & Exactly-Once Semantics (Part 3)">
+An **idempotency key** is a unique token you generate once per logical operation and include in every retry of that same operation. The processor stores the key alongside the result. When it sees the same key again, it returns the original result instead of executing the operation a second time. The key is what makes "retry safely" possible: without it, every retry is a new charge.
+</Define>
+
+**On the job:** You hit this every time a network timeout leaves you uncertain whether the first attempt landed. Without an idempotency key, a retry after a timeout silently double-charges the customer — the worst bug in payments, and the hardest to detect until the chargebacks arrive.
+
+An idempotency key in outbound calls:
+
+1. Generate a stable key for this charge attempt (e.g., a UUID stored with the order record).
+2. Send the key as a request header (e.g., `Idempotency-Key: <uuid>`).
+3. The processor stores the key and result. On any duplicate request with the same key, it returns the *original* result — no second charge.
+4. Retry as many times as the network demands. The outcome is idempotent.
+
+```go
+// chargeCard sends one attempt to the processor, embedding an idempotency key.
+// The key must be stable across retries for the same logical charge.
+func chargeCard(
+	ctx context.Context,
+	httpClient *http.Client,
+	endpoint string,
+	req ChargeRequest,
+) (*ChargeResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal charge request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	// Idempotency-Key is the processor's dedup mechanism.
+	// Use the same key on every retry for this charge.
+	httpReq.Header.Set("Idempotency-Key", req.IdempotencyKey)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("charge request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("processor error %d (retryable)", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("charge declined %d (non-retryable)", resp.StatusCode)
+	}
+
+	var result ChargeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &result, nil
+}
+```
+
+Notice what we distinguish: a **5xx** is a transient server error — retry it (the key protects you). A **4xx** is a client error — the card was declined, the request was malformed — do **not** retry, fix the input. Never retry a 4xx blindly; you'll exhaust your rate limit and accomplish nothing.
+
+### Retries with Exponential Backoff
+
+Raw retries without delay hammer a struggling processor and guarantee you'll be rate-limited. The right pattern is exponential backoff with jitter — covered in depth in "Reliability Patterns" (Part 2). Here's what it looks like wired to `chargeCard`:
+
+```go
+// withRetry wraps an operation in exponential-backoff retries.
+// It only retries on retryable errors (signaled by the operation returning errRetryable).
+func withRetry(ctx context.Context, op func() error, maxAttempts int, base time.Duration) error {
+	var err error
+	for attempt := range maxAttempts {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		// Only retry server-side (5xx) errors; 4xx errors are final.
+		if !errors.Is(err, errRetryable) {
+			return err
+		}
+		if attempt == maxAttempts-1 {
+			break
+		}
+		// Exponential backoff: base * 2^attempt, plus jitter.
+		delay := base * (1 << attempt)
+		jitter := time.Duration(rand.Int64N(int64(delay / 4)))
+		select {
+		case <-time.After(delay + jitter):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf("all %d attempts failed: %w", maxAttempts, err)
+}
+```
+
+The `range maxAttempts` form uses Go 1.22's integer range — clean and idiomatic. `rand.Int64N` is a top-level function in `math/rand/v2` (import it as `rand` if you want this call shape). As of Go 1.26, the cryptographically secure random source (`crypto/rand`) is the recommended baseline for any security-sensitive nonce or key generation — use it instead of `math/rand/v2` if you are generating an idempotency key from scratch rather than deriving it from an existing order ID.
+
+<Callout kind="warn" title="Idempotency key scope">
+
+Generate the idempotency key **once per logical operation**, before the first attempt, and persist it with your order record. If you generate a new UUID on every retry loop iteration, you have invented a new operation — the processor sees a brand-new charge each time. Generate once, store, reuse across all retries.
+
+</Callout>
+
+### Animate: Safe Retry with an Idempotency Key
+
+This is the most important thing to see as a sequence. Watch what the processor does on the second attempt.
+
+<ExecTimeline
+  title="Outbound charge: idempotency key prevents double-charge on retry"
+  lanes={[
+    { id: "svc", label: "Meridian Payments Svc" },
+    { id: "net", label: "Network" },
+    { id: "proc", label: "Processor" }
+  ]}
+  steps={[
+    { lane: "svc",  kind: "run",   label: "gen key + attempt 1", note: "Service generates idempotency key idem_abc123 once, stores it with the order, and sends the charge request." },
+    { lane: "net",  kind: "send",  label: "POST /charge (idem_abc123)", note: "Request reaches the processor with the idempotency key in the header." },
+    { lane: "proc", kind: "run",   label: "charge card → stored result", note: "Processor charges the card, stores (idem_abc123 → {ok, txn_9}) in its dedup store." },
+    { lane: "net",  kind: "block", label: "network drop!", note: "The response is lost in transit. The service sees a timeout/EOF error." },
+    { lane: "svc",  kind: "run",   label: "error → retry attempt 2", note: "Service detects a retryable 5xx/network error. Backs off 200 ms, then retries with the same key." },
+    { lane: "net",  kind: "send",  label: "POST /charge (idem_abc123)", note: "Retry reaches the processor with the identical idempotency key." },
+    { lane: "proc", kind: "recv",  label: "key seen → return stored result", note: "Processor finds idem_abc123 in its dedup store. Returns the original result without charging again." }
+  ]}
+  caption="The idempotency key is the dedup handle. One charge, one deduction — no matter how many retries the network forces."
+/>
+
+### Circuit Breakers Around Flaky Providers
+
+<Define term="Circuit breaker" since="Reliability Patterns (Part 2)">
+A **circuit breaker** wraps calls to an external dependency (a payment processor, a bank API) and tracks how often those calls fail. Once the failure rate exceeds a threshold, the circuit "opens" and subsequent calls fail immediately without hitting the dependency — giving it time to recover. After a cooldown period the circuit enters "half-open" and allows a test request through; if it succeeds, the circuit closes again. The pattern prevents a struggling dependency from consuming all of your threads, connections, or goroutines while it is down.
+</Define>
+
+**On the job:** A processor that goes down at 2am shouldn't take Meridian down with it. Without a circuit breaker, 30 concurrent charge attempts each block for 30 seconds — 900 goroutine-seconds of pressure that can exhaust your HTTP connection pool and cascade into a full service outage.
+
+```go
+// ProcessorCircuitBreaker wraps a payment processor call.
+// It tracks failures and opens the circuit (stops calling) when
+// the error rate exceeds a threshold, allowing the processor to recover.
+type ProcessorCircuitBreaker struct {
+	mu        sync.Mutex
+	failures  int
+	threshold int
+	openUntil time.Time
+}
+
+func (cb *ProcessorCircuitBreaker) Call(op func() error) error {
+	cb.mu.Lock()
+	if time.Now().Before(cb.openUntil) {
+		cb.mu.Unlock()
+		return fmt.Errorf("circuit open: processor unavailable, try again later")
+	}
+	cb.mu.Unlock()
+
+	err := op()
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if err != nil {
+		cb.failures++
+		if cb.failures >= cb.threshold {
+			// Open the circuit for 30 seconds before allowing a retry.
+			cb.openUntil = time.Now().Add(30 * time.Second)
+			cb.failures = 0
+		}
+		return err
+	}
+	// Success resets the counter.
+	cb.failures = 0
+	return nil
+}
+```
+
+In production, reach for a library like `sony/gobreaker` or `mercari/go-circuitbreaker` rather than this hand-rolled version — but understanding the internals makes you dangerous. The key insight: **fail fast on a known-broken provider** rather than queuing up thousands of goroutines waiting on a 30-second timeout.
+
+### Reconciliation: the External Source of Truth
+
+Your database says a charge succeeded. The processor's dashboard says it was declined. Who is right?
+
+The processor is *always* right — their system is the authoritative record of what actually moved money. Reconciliation jobs (a periodic background task, not the request path) fetch the processor's transaction list and compare it against your records, flagging discrepancies. This is the safety net that catches bugs where your service crashed between the charge succeeding and writing it to the database.
+
+**On the job:** You hit this when a network partition lets the charge succeed on the processor's side but crashes Meridian before the INSERT commits. Without reconciliation, that payment is permanently lost — the customer was charged but the ledger never posted it.
+
+```go
+// ReconcileCharges fetches the processor's list for the past hour
+// and marks any charges Meridian's DB says "pending" but the processor
+// says "succeeded" or "failed".
+func ReconcileCharges(ctx context.Context, db *sql.DB, proc ProcessorClient) error {
+	processorTxns, err := proc.ListTransactions(ctx, time.Now().Add(-1*time.Hour), time.Now())
+	if err != nil {
+		return fmt.Errorf("fetch processor transactions: %w", err)
+	}
+
+	for _, txn := range processorTxns {
+		if err := syncTransaction(ctx, db, txn); err != nil {
+			slog.ErrorContext(ctx, "reconcile txn",
+				"txn_id", txn.ID,
+				"err", err)
+			// Continue reconciling the rest; log and observe.
+		}
+	}
+	return nil
+}
+```
+
+<QuickCheck
+  question="You retry a card charge after a network timeout. What prevents the customer being charged twice?"
+  options={[
+    "Retrying after a delay is always safe; processors handle duplicates automatically",
+    "The idempotency key: the processor stores the result keyed to it and returns the original result on duplicates",
+    "Using a short timeout so the first attempt always fails cleanly",
+    "Only retrying on 4xx errors, which are always safe to retry"
+  ]}
+  answer={1}
+  explain="The idempotency key is the processor's deduplication handle. The same key on a retry returns the cached result without re-charging. Delays alone provide no protection. And 4xx errors (declined cards, bad input) should never be retried — retrying 5xx server errors with the same idempotency key is safe."
+/>
+
+## Inbound Webhooks
+
+Providers don't wait for you to poll them. They call *you* — sending an HTTP POST to your registered endpoint the moment something changes: a charge settles, a transfer fails, a dispute is opened. These are **webhooks**, and handling them safely is a different problem from calling the provider.
+
+<Define term="Webhook">
+A **webhook** is an inbound HTTP POST that a provider sends to Meridian's registered URL when an event occurs — a payment settles, a transfer returns, a chargeback is filed. It is the provider's way of pushing notifications rather than waiting for Meridian to poll. Because the webhook endpoint is a public URL, anyone on the internet can POST to it — which is exactly why signature verification and replay protection are mandatory, not optional.
+</Define>
+
+### Why Webhooks Are Dangerous Without Verification
+
+Your webhook endpoint is a public URL. Anyone on the internet can POST to it. If you process the request blindly:
+
+- A fraudster can forge a "payment succeeded" event, unlocking a product they never paid for.
+- A competitor can forge a "chargeback filed" event, triggering your dispute workflow unnecessarily.
+- A buggy integration can replay an event from six months ago, re-processing a settled payment.
+
+The fix is to **verify the signature** before touching the payload.
+
+### The Real-World Problem: Forgery and Replay
+
+Before we look at the code, see what is actually happening at Meridian's webhook endpoint when a bad actor is involved.
+
+<Scene
+  title="Meridian webhook endpoint: forgery and replay"
+  actors={[
+    { id: "provider", label: "Provider" },
+    { id: "attacker", label: "Attacker" },
+    { id: "meridian", label: "Meridian /webhooks" }
+  ]}
+  frames={[
+    {
+      caption: "Provider sends a legitimately signed settlement webhook to Meridian.",
+      beat: "neutral",
+      actors: [
+        { id: "provider", state: "active" },
+        { id: "meridian", state: "idle" }
+      ]
+    },
+    {
+      caption: "Attacker crafts a FORGED webhook — same body, wrong signature. A naive handler trusts it, releasing goods never paid for.",
+      beat: "problem",
+      actors: [
+        { id: "attacker", state: "bad" },
+        { id: "meridian", state: "warn" }
+      ]
+    },
+    {
+      caption: "Attacker replays the legitimate webhook a second time. A naive handler processes it again — double-releasing, double-posting to the ledger.",
+      beat: "problem",
+      actors: [
+        { id: "attacker", state: "bad" },
+        { id: "meridian", state: "warn" }
+      ]
+    },
+    {
+      caption: "With HMAC verification: the forged signature is rejected immediately. The attacker gets a 401.",
+      beat: "solution",
+      actors: [
+        { id: "attacker", state: "idle" },
+        { id: "meridian", state: "ok" }
+      ]
+    },
+    {
+      caption: "With replay protection: the replayed event ID is found in the nonce store. Meridian returns 200 to stop provider retries — but does NOT process it again.",
+      beat: "solution",
+      actors: [
+        { id: "provider", state: "idle" },
+        { id: "attacker", state: "idle" },
+        { id: "meridian", state: "done" }
+      ]
+    }
+  ]}
+  caption="Two attack surfaces, two defenses. HMAC verification kills forgeries. Replay protection kills duplicate processing. Both are required."
+/>
+
+### HMAC Signature Verification
+
+<Define term="HMAC signature verification" since="Application Security Baseline (Part 2)">
+**HMAC** (Hash-based Message Authentication Code) is a construction that uses a shared secret key plus a hash function to produce a fixed-length authentication tag over a message. When a provider sends a webhook, they compute `HMAC-SHA256(secret, rawBody)` and include the result in the request headers. Meridian recomputes the same HMAC with its copy of the secret and compares the two values. If they match, the request genuinely came from the provider — no one else knows the secret. If they differ, the body was tampered with or the request is forged.
+</Define>
+
+**On the job:** Every production payments service has a `verifyWebhookSignature` function. Miss it once and a fraudster can POST a fake `payment.settled` event to your endpoint, releasing goods they never paid for. This is not theoretical — it happens.
+
+When your provider sends a webhook, they include a signature computed over the raw request body using a shared secret known only to you and the provider. Your job is to recompute that signature and compare it to the one they sent.
+
+The algorithm: `HMAC-SHA256(secret, rawBody)` — using Go's `crypto/hmac` and `crypto/sha256`:
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
+
+// verifyWebhookSignature returns true if the signature on the request
+// matches what we'd compute from the raw body and our shared secret.
+//
+// CRITICAL: use hmac.Equal, not == or bytes.Equal.
+// hmac.Equal is constant-time; == leaks timing information that an
+// attacker can use to forge signatures one byte at a time.
+func verifyWebhookSignature(secret []byte, rawBody []byte, sigHeader string) bool {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(rawBody)
+	expected := mac.Sum(nil)
+
+	// The provider typically sends "sha256=<hex>"; strip the prefix.
+	sig := sigHeader
+	if len(sig) > 7 && sig[:7] == "sha256=" {
+		sig = sig[7:]
+	}
+
+	received, err := hex.DecodeString(sig)
+	if err != nil {
+		return false
+	}
+
+	// Constant-time comparison prevents timing attacks.
+	return hmac.Equal(expected, received)
+}
+
+func main() {
+	secret := []byte("whsec_supersecret")
+	body := []byte(`{"event":"payment.settled","amount":4999}`)
+
+	// Compute the expected signature (simulating what the provider does).
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("Valid sig passes:", verifyWebhookSignature(secret, body, validSig))
+	fmt.Println("Forged sig fails:", verifyWebhookSignature(secret, body, "sha256=deadbeef00000000"))
+	fmt.Println("Tampered body fails:", verifyWebhookSignature(secret, []byte(`{"event":"payment.settled","amount":99999}`), validSig))
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
+
+// verifyWebhookSignature returns true if the signature on the request
+// matches what we'd compute from the raw body and our shared secret.
+//
+// CRITICAL: use hmac.Equal, not == or bytes.Equal.
+// hmac.Equal is constant-time; == leaks timing information that an
+// attacker can use to forge signatures one byte at a time.
+func verifyWebhookSignature(secret []byte, rawBody []byte, sigHeader string) bool {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(rawBody)
+	expected := mac.Sum(nil)
+
+	sig := sigHeader
+	if len(sig) > 7 && sig[:7] == "sha256=" {
+		sig = sig[7:]
+	}
+
+	received, err := hex.DecodeString(sig)
+	if err != nil {
+		return false
+	}
+
+	return hmac.Equal(expected, received)
+}
+
+func main() {
+	secret := []byte("whsec_supersecret")
+	body := []byte(`{"event":"payment.settled","amount":4999}`)
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("Valid sig passes:", verifyWebhookSignature(secret, body, validSig))
+	fmt.Println("Forged sig fails:", verifyWebhookSignature(secret, body, "sha256=deadbeef00000000"))
+	fmt.Println("Tampered body fails:", verifyWebhookSignature(secret, []byte(`{"event":"payment.settled","amount":99999}`), validSig))
+}
+```
+
+</GoPlayground>
+
+Run it. Watch a forged signature and a tampered body both get correctly rejected.
+
+<UnderTheHood title="Why hmac.Equal and not == — the timing attack">
+
+A naive signature comparison with `==` (or even `bytes.Equal`) is vulnerable to a **timing attack**.
+
+Here's the mechanism. String comparison in most languages short-circuits: it returns `false` the moment it finds the first differing byte. An attacker sending many forged signatures can measure how long each comparison takes. A signature that is wrong on the first byte fails in ~1 ns. One that is wrong on the 31st byte fails in ~30 ns. By sending thousands of attempts and measuring the response time distribution, the attacker can brute-force the correct signature one byte at a time — reducing the search space from `256^32` to `256 * 32`.
+
+`hmac.Equal` (stable since Go 1.1) uses `subtle.ConstantTimeCompare`, which always compares all bytes and takes the same time regardless of where the first difference is. It literally ORs the XOR of every byte pair into an accumulator and checks whether the accumulator is zero. Every comparison takes the same amount of time.
+
+The rule is simple: **any security-sensitive comparison uses `hmac.Equal` or `subtle.ConstantTimeCompare`.** Never `==` for secrets, tokens, or signatures — ever.
+
+Go version note (Go 1.26 baseline): `hmac.Equal` and `crypto/subtle.ConstantTimeCompare` have been stable since Go 1.1 and are unchanged in Go 1.26. The Go 1.26 release also makes the global `crypto/rand` reader the unambiguous default for all security-sensitive random values — use it for nonce generation and shared-secret bootstrapping.
+
+</UnderTheHood>
+
+### Replay Protection
+
+<Define term="Replay attack / replay protection">
+A **replay attack** is when an adversary captures a legitimate, correctly signed message and re-sends it later. The signature still verifies — the message is authentic — but processing it a second time causes harm: a "payment settled" event processed twice could release an order twice, credit a balance twice, or trigger two ledger postings. **Replay protection** is the set of defenses that make replaying a message harmless: a timestamp check (reject messages older than N minutes) and a nonce store (reject any event ID you have already processed).
+</Define>
+
+**On the job:** Replay attacks are not hypothetical. Providers retry webhooks on non-2xx responses for hours or days. If your dedup logic is broken, every provider retry is a replay that corrupts your ledger.
+
+Two defenses:
+
+1. **Timestamp check** — providers include a timestamp in the signed payload or a separate header. Reject any event older than 5 minutes.
+2. **Nonce / event ID deduplication** — store each processed event ID in a short-lived cache (Redis with a TTL, or a database table). Reject any ID you have seen before.
+
+```go
+// ReplayProtector checks events against both a timestamp window and
+// a nonce store. Both must pass for the event to be accepted.
+type ReplayProtector struct {
+	seen      map[string]struct{} // in production: Redis with TTL
+	mu        sync.Mutex
+	maxAgeSec int64
+}
+
+func (rp *ReplayProtector) Check(eventID string, issuedAt time.Time) error {
+	if time.Since(issuedAt) > time.Duration(rp.maxAgeSec)*time.Second {
+		return fmt.Errorf("webhook too old: issued %s ago", time.Since(issuedAt).Round(time.Second))
+	}
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	if _, exists := rp.seen[eventID]; exists {
+		return fmt.Errorf("duplicate event %s rejected", eventID)
+	}
+	rp.seen[eventID] = struct{}{}
+	return nil
+}
+```
+
+In production, `rp.seen` is a Redis `SET` with a TTL matching your timestamp window. The in-memory map here is fine for the example but will not survive a service restart or work across replicas.
+
+### Acknowledge Fast, Process Async
+
+This is a rule that providers enforce with ruthless simplicity: **if your webhook endpoint does not return a 2xx within a few seconds, they will retry.** Stripe's default timeout is 30 seconds; many others are less. And they will retry the event for hours or days until you acknowledge it.
+
+The correct architecture:
+
+1. **Receive** the webhook.
+2. **Verify** the signature (fast, in-memory — a few microseconds).
+3. **Check replay** (Redis GET — a few milliseconds).
+4. **Store** the raw event to your database or outbox (a single INSERT).
+5. **Return 200** immediately.
+6. **Process asynchronously** — a background worker reads from the outbox and handles the business logic.
+
+This is the transactional outbox pattern from "Idempotency & Exactly-Once Semantics" (Part 3) and "Watermill — Event-Driven Go in Practice" (Part 3) applied to webhooks. The inbound path does the minimum to safely acknowledge; the outbox plus idempotent consumers gives you effectively-once processing even when delivery is retried.
+
+```go
+// WebhookHandler is the HTTP handler for inbound provider webhooks.
+// It verifies, deduplicates, stores, and acknowledges fast.
+// Processing happens in a separate goroutine/worker via the outbox.
+func WebhookHandler(
+	secret []byte,
+	protector *ReplayProtector,
+	outbox OutboxWriter,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 1. Read the raw body BEFORE any parsing — HMAC is over raw bytes.
+		rawBody, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MB max
+		if err != nil {
+			http.Error(w, "read error", http.StatusBadRequest)
+			return
+		}
+
+		// 2. Verify signature.
+		sig := r.Header.Get("Webhook-Signature")
+		if !verifyWebhookSignature(secret, rawBody, sig) {
+			// Log the attempt, but don't leak details.
+			slog.Warn("webhook signature verification failed",
+				"remote_addr", r.RemoteAddr)
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+
+		// 3. Parse just enough for replay check.
+		var meta struct {
+			EventID  string `json:"event_id"`
+			IssuedAt int64  `json:"issued_at"`
+		}
+		if err := json.Unmarshal(rawBody, &meta); err != nil {
+			http.Error(w, "bad payload", http.StatusBadRequest)
+			return
+		}
+
+		// 4. Replay check.
+		if err := protector.Check(meta.EventID, time.Unix(meta.IssuedAt, 0)); err != nil {
+			slog.Info("webhook replay rejected", "event_id", meta.EventID, "reason", err)
+			// Return 200 to stop the provider from retrying a known duplicate.
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// 5. Store raw event to outbox (one INSERT in same DB transaction if possible).
+		if err := outbox.Write(r.Context(), meta.EventID, rawBody); err != nil {
+			slog.ErrorContext(r.Context(), "outbox write failed", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		// 6. Acknowledge immediately. A background worker processes from the outbox.
+		w.WriteHeader(http.StatusOK)
+	}
+}
+```
+
+<Callout kind="warn" title="Read the raw body first, then parse">
+
+HMAC is computed over the **raw bytes** of the body. If you parse the JSON first (`json.Decode` into a struct) and then re-marshal to get bytes, you may get a different byte sequence — different whitespace, different key ordering. Always buffer `io.ReadAll` into `rawBody`, compute the HMAC over that, and *then* parse. The `http.Request.Body` is a one-shot stream; read it once.
+
+</Callout>
+
+### Animate: Inbound Webhook Verification and Dedup
+
+<ExecTimeline
+  title="Inbound webhook: signature verify → replay check → outbox → async process"
+  lanes={[
+    { id: "handler", label: "HTTP Handler" },
+    { id: "worker",  label: "Background Worker" }
+  ]}
+  steps={[
+    { lane: "handler", kind: "recv",  label: "POST /webhooks arrives", note: "Provider POSTs a signed webhook. Handler reads the raw body before any parsing." },
+    { lane: "handler", kind: "run",   label: "HMAC verify", note: "Recompute HMAC-SHA256(secret, rawBody) and compare with header via hmac.Equal. Forged requests are rejected 401 here." },
+    { lane: "handler", kind: "run",   label: "replay check", note: "Check event_id against Redis/dedup store. Seen-before → return 200 (stop provider retrying), skip processing." },
+    { lane: "handler", kind: "run",   label: "outbox INSERT", note: "Write raw event bytes to the outbox table in the same DB transaction that marks the nonce as seen." },
+    { lane: "handler", kind: "send",  label: "HTTP 200 OK", note: "Acknowledge immediately. Provider stops its retry timer. Total handler time: a few ms." },
+    { lane: "worker",  kind: "recv",  label: "poll outbox", note: "Background worker reads unprocessed events from the outbox." },
+    { lane: "worker",  kind: "done",  label: "process + mark done", note: "Run business logic (update ledger, release order), mark outbox row processed. Idempotent: safe to run again if worker crashes." }
+  ]}
+  caption="Fast path: verify + dedup + store + 200. Slow path: worker processes from the outbox. Provider only ever sees fast acknowledgements."
+/>
+
+<QuickCheck
+  question={'Why does the webhook handler return HTTP 200 for a duplicate event instead of 409 Conflict?'}
+  options={[
+    "409 would be more semantically correct; 200 is a white lie",
+    "Returning any non-2xx causes the provider to retry the event, which would create more duplicates to filter",
+    "200 signals to the provider that the event was newly processed",
+    "It doesn't matter — providers ignore the status code"
+  ]}
+  answer={1}
+  explain="Providers interpret any non-2xx as 'delivery failed, retry later.' Returning 409 for a duplicate would cause the provider to keep retrying indefinitely, creating an ever-growing flood of duplicates. Return 200 to tell the provider 'I received this, stop retrying' — whether it was new or a known duplicate. Your dedup layer already handled it correctly."
+/>
+
+## The Async Reality
+
+Now let me shatter an assumption that kills junior engineers in fintech.
+
+You called the processor. They returned `{"status": "succeeded"}`. You wrote that to your database. **The money has not moved.**
+
+For card payments on major networks, you are right 99% of the time — cards authorize and capture quickly. But for **ACH** (US bank transfers), **SEPA** (European bank transfers), **BACS** (UK), and international wires, the story is completely different.
+
+<Define term="ACH / SEPA / wire (slow rails)">
+**ACH** (Automated Clearing House) is the US batch payment network. **SEPA** (Single Euro Payments Area) is the European equivalent. **Wires** (SWIFT, Fedwire) are point-to-point bank transfers used for large or cross-border amounts. All three are called **slow rails** because settlement is not instant: ACH takes 1–3 business days, SEPA Credit Transfers take 1 business day (SEPA Instant can be seconds, but is not universally available), and wires can take multiple days across jurisdictions. The processor's "accepted" response for slow-rail payments means "we queued the instruction" — not "the money moved." Settlement confirmation arrives later, as a webhook.
+</Define>
+
+**On the job:** Ship goods on a pending ACH payment and you will ship goods you were never paid for. The return window for ACH is up to 2 business days — and for certain return codes (unauthorized transactions), up to 60 days. Model the states; do not trust "accepted."
+
+The correct engineering response is to model these states explicitly.
+
+### A Payment State Machine
+
+<Define term="Settlement">
+**Settlement** is the confirmation that funds have definitively moved — the processor or bank has reported that the money is in the destination account. For slow rails, settlement is a separate event from acceptance, arriving hours or days later as a webhook. Until settlement is confirmed, a payment is in the **pending** state: the instruction was accepted, but the money has not moved. Posting to Meridian's ledger should happen at settlement, not at acceptance.
+</Define>
+
+<Define term="Payment states (pending / settled / failed / returned)">
+A payment progresses through an explicit lifecycle. **Pending**: the processor accepted the instruction; no money has moved yet. **Settled**: the processor confirmed funds transferred; safe to post to the ledger and release goods. **Failed**: the payment attempt failed permanently — card declined, insufficient funds, invalid account; terminal state, do not retry. **Returned**: money was sent but the receiving bank sent it back — common in ACH (NSF, closed account, unauthorized); requires a compensating action to reverse the ledger entry. Each state is terminal or has defined legal transitions; no other changes are valid.
+</Define>
+
+**On the job:** Using a boolean `is_paid` flag or a nullable `paid_at` timestamp instead of an explicit state enum is the most common junior mistake in fintech. You cannot model "returned after settling" with a boolean. You cannot reject out-of-order webhooks without an explicit transition validator. Use the enum; use the state machine.
+
+A payment has a lifecycle. Model it as an explicit state machine — not a boolean `is_paid` flag, not a nullable `paid_at` timestamp, but an enumerated state with defined transitions:
+
+```go
+// PaymentStatus represents the lifecycle state of a payment.
+type PaymentStatus string
+
+const (
+	// StatusPending: instruction accepted, awaiting settlement.
+	// Money has NOT moved. Do not release goods/services yet
+	// unless your risk policy allows it.
+	StatusPending PaymentStatus = "pending"
+
+	// StatusSettled: funds confirmed moved. The external source of
+	// truth (the processor/bank) has confirmed settlement.
+	StatusSettled PaymentStatus = "settled"
+
+	// StatusFailed: the payment attempt failed permanently.
+	// The processor rejected it or the bank declined it.
+	StatusFailed PaymentStatus = "failed"
+
+	// StatusReturned: money was sent but later returned by the
+	// receiving bank (NSF, closed account, etc.). Common in ACH.
+	StatusReturned PaymentStatus = "returned"
+)
+
+// Payment is the domain object.
+type Payment struct {
+	ID             string
+	IdempotencyKey string
+	AmountCents    int64 // never a float
+	Currency       string
+	Status         PaymentStatus
+	ProcessorRef   string    // the processor's transaction ID
+	CreatedAt      time.Time
+	SettledAt      *time.Time // nil until settled
+	FailedAt       *time.Time // nil unless failed/returned
+}
+```
+
+Note: `AmountCents int64`. If you wrote `float64` I will find you.
+
+### State Transition Function
+
+Transitions must be validated. Not every status change is legal. A settled payment cannot go back to pending. A failed payment cannot settle.
+
+```go
+// Transition applies a new status to a payment, validating the transition.
+// It returns an error for illegal transitions so the caller can log and discard
+// out-of-order or invalid processor callbacks.
+func (p *Payment) Transition(newStatus PaymentStatus, at time.Time) error {
+	valid := map[PaymentStatus][]PaymentStatus{
+		StatusPending:  {StatusSettled, StatusFailed},
+		StatusSettled:  {StatusReturned}, // returned after settling is possible in ACH
+		StatusFailed:   {},               // terminal
+		StatusReturned: {},               // terminal
+	}
+
+	allowed, ok := valid[p.Status]
+	if !ok {
+		return fmt.Errorf("unknown current status %q", p.Status)
+	}
+
+	for _, s := range allowed {
+		if s == newStatus {
+			p.Status = newStatus
+			switch newStatus {
+			case StatusSettled:
+				p.SettledAt = &at
+			case StatusFailed, StatusReturned:
+				p.FailedAt = &at
+			}
+			return nil
+		}
+	}
+
+	return fmt.Errorf("illegal transition %s → %s", p.Status, newStatus)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type PaymentStatus string
+
+const (
+	StatusPending  PaymentStatus = "pending"
+	StatusSettled  PaymentStatus = "settled"
+	StatusFailed   PaymentStatus = "failed"
+	StatusReturned PaymentStatus = "returned"
+)
+
+type Payment struct {
+	ID          string
+	AmountCents int64
+	Status      PaymentStatus
+	SettledAt   *time.Time
+	FailedAt    *time.Time
+}
+
+func (p *Payment) Transition(newStatus PaymentStatus, at time.Time) error {
+	valid := map[PaymentStatus][]PaymentStatus{
+		StatusPending:  {StatusSettled, StatusFailed},
+		StatusSettled:  {StatusReturned},
+		StatusFailed:   {},
+		StatusReturned: {},
+	}
+
+	allowed := valid[p.Status]
+	for _, s := range allowed {
+		if s == newStatus {
+			p.Status = newStatus
+			switch newStatus {
+			case StatusSettled:
+				p.SettledAt = &at
+			case StatusFailed, StatusReturned:
+				p.FailedAt = &at
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("illegal transition %s → %s", p.Status, newStatus)
+}
+
+func main() {
+	now := time.Now()
+	p := &Payment{ID: "pay_001", AmountCents: 4999, Status: StatusPending}
+
+	fmt.Printf("Initial: %s\n", p.Status)
+
+	if err := p.Transition(StatusSettled, now); err != nil {
+		fmt.Println("error:", err)
+	} else {
+		fmt.Printf("After settlement: %s (settled at %s)\n", p.Status, p.SettledAt.Format(time.RFC3339))
+	}
+
+	// Try an illegal transition: settled → pending
+	if err := p.Transition(StatusPending, now); err != nil {
+		fmt.Println("Correctly rejected:", err)
+	}
+
+	// Returned after settled is valid (ACH return)
+	p2 := &Payment{ID: "pay_002", AmountCents: 9900, Status: StatusSettled}
+	if err := p2.Transition(StatusReturned, now.Add(48*time.Hour)); err != nil {
+		fmt.Println("error:", err)
+	} else {
+		fmt.Printf("ACH return: %s\n", p2.Status)
+	}
+}
+```
+
+</GoPlayground>
+
+### Handling Out-of-Order Status Callbacks
+
+Providers do not guarantee delivery order. A settlement webhook and a return webhook might arrive in the wrong order. Your `Transition` function's explicit allowed-transitions map is the defense: an out-of-order callback that tries `returned → settled` is rejected with an error, logged, and dropped. You do not panic; you do not corrupt your state; you log it and alert on it.
+
+```go
+// HandleSettlementWebhook processes an inbound settlement or failure callback
+// from the provider. It is idempotent: calling it twice with the same event is safe.
+func HandleSettlementWebhook(
+	ctx context.Context,
+	db *sql.DB,
+	event ProviderEvent,
+) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// SELECT FOR UPDATE to prevent concurrent webhook handlers
+	// racing on the same payment row.
+	var p Payment
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, amount_cents, status FROM payments WHERE processor_ref = $1 FOR UPDATE`,
+		event.ProcessorRef)
+	if err := row.Scan(&p.ID, &p.AmountCents, &p.Status); err != nil {
+		return fmt.Errorf("load payment: %w", err)
+	}
+
+	newStatus := eventToStatus(event.Type)
+	if err := p.Transition(newStatus, event.OccurredAt); err != nil {
+		// Log and drop — out-of-order or duplicate callback.
+		slog.WarnContext(ctx, "ignoring out-of-order webhook",
+			"payment_id", p.ID,
+			"current_status", p.Status,
+			"incoming_status", newStatus,
+			"err", err)
+		return tx.Commit() // commit the no-op; we already deduped above
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`UPDATE payments SET status = $1, settled_at = $2, failed_at = $3 WHERE id = $4`,
+		p.Status, p.SettledAt, p.FailedAt, p.ID)
+	if err != nil {
+		return fmt.Errorf("update payment: %w", err)
+	}
+
+	return tx.Commit()
+}
+```
+
+The `SELECT ... FOR UPDATE` prevents two concurrent webhook deliveries for the same payment (yes, providers can send the same event twice in parallel) from both trying to update the row simultaneously. Combined with the transition validator, your payment state is always consistent.
+
+### Animate: Payment State Machine Transitions
+
+<ExecTimeline
+  title="Payment lifecycle: pending → settled (and pending → failed)"
+  lanes={[
+    { id: "pay",  label: "Payment" },
+    { id: "hook", label: "Webhook Handler" }
+  ]}
+  steps={[
+    { lane: "pay",  kind: "run",   label: "created: pending", note: "A new payment is created in status=pending after the processor accepts the charge instruction. Money has not moved." },
+    { lane: "hook", kind: "recv",  label: "settlement webhook", note: "Hours or days later, the processor POSTs a settlement event. Handler verifies signature, checks replay, begins processing." },
+    { lane: "hook", kind: "run",   label: "Transition(settled)", note: "Handler calls Transition(StatusSettled). The state machine validates pending → settled is a legal move." },
+    { lane: "pay",  kind: "done",  label: "status: settled", note: "Payment row updated. settled_at recorded. Downstream systems (ledger post, order release) can now trigger." },
+    { lane: "hook", kind: "recv",  label: "return webhook (48h later)", note: "ACH return: recipient bank rejected the transfer. Provider sends a 'payment.returned' event." },
+    { lane: "hook", kind: "run",   label: "Transition(returned)", note: "settled → returned is valid. State machine allows it." },
+    { lane: "pay",  kind: "block", label: "status: returned", note: "Payment is now returned. A compensating saga step should reverse the ledger posting and notify the customer." }
+  ]}
+  caption="State is always explicit. No transition happens outside the state machine. Out-of-order webhooks are rejected at the Transition call and logged, never silently applied."
+/>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="pending">Processor accepted the instruction. No money has moved. For slow rails (ACH, SEPA), this can last 1–3 business days.</ConceptCard>
+  <ConceptCard label="settled">Funds confirmed moved. The processor has definitively reported settlement. Now it is safe to post to the ledger and release goods.</ConceptCard>
+  <ConceptCard label="failed">Permanent failure. Card declined, insufficient funds, invalid account. Terminal state — do not retry; notify the customer.</ConceptCard>
+  <ConceptCard label="returned">Money was sent but came back. Common in ACH (NSF, closed account). Requires a compensating action to reverse ledger entries.</ConceptCard>
+  <ConceptCard label="out-of-order">Providers may deliver webhooks out of sequence. The transition validator rejects illegal moves. Log and discard — never crash.</ConceptCard>
+  <Gotcha>Never treat the processor's initial "accepted" response as final settlement. For ACH and SEPA, "accepted" means "we queued it." The payment is pending until you receive an explicit settlement webhook. Ship goods on pending ACH and you will ship goods you were never paid for.</Gotcha>
+</ConceptGrid>
+
+---
+
+## Exercises
+
+Stop reading. Start typing. You don't learn payment engineering by nodding along.
+
+<Exercise n={1} title="Compute an HMAC-SHA256 signature" level="easy">
+
+Write `SignPayload(secret []byte, body []byte) string` that returns the hex-encoded HMAC-SHA256 signature of `body`, prefixed with `"sha256="`. Use `crypto/hmac` and `crypto/sha256`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
+
+func SignPayload(secret []byte, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func main() {
+	sig := SignPayload([]byte("secret"), []byte(`{"event":"test"}`))
+	fmt.Println(sig)
+}
+```
+
+`hmac.New` returns a `hash.Hash`. Write the body into it, then call `Sum(nil)` to get the raw bytes. `hex.EncodeToString` gives you the lowercase hex string most providers expect.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Reject an old webhook" level="easy">
+
+Write `CheckTimestamp(issuedAt time.Time, maxAge time.Duration) error` that returns an error if the timestamp is older than `maxAge`. This is the first half of replay protection.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func CheckTimestamp(issuedAt time.Time, maxAge time.Duration) error {
+	age := time.Since(issuedAt)
+	if age > maxAge {
+		return fmt.Errorf("webhook timestamp too old: %s ago (max %s)", age.Round(time.Second), maxAge)
+	}
+	return nil
+}
+
+func main() {
+	recent := time.Now().Add(-2 * time.Minute)
+	old := time.Now().Add(-10 * time.Minute)
+
+	fmt.Println(CheckTimestamp(recent, 5*time.Minute)) // nil
+	fmt.Println(CheckTimestamp(old, 5*time.Minute))    // error
+}
+```
+
+`time.Since` is shorthand for `time.Now().Sub(t)`. Compare directly against the maximum age. Simple, correct, and easy to test.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Implement a payment state machine" level="medium">
+
+Implement `Payment.Transition(newStatus PaymentStatus, at time.Time) error` with the following legal transitions:
+- `pending` → `settled` or `failed`
+- `settled` → `returned`
+- `failed` and `returned` are terminal (no transitions out)
+
+Return a descriptive error for illegal transitions. Write a `main` that demonstrates both a legal and an illegal transition.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type PaymentStatus string
+
+const (
+	StatusPending  PaymentStatus = "pending"
+	StatusSettled  PaymentStatus = "settled"
+	StatusFailed   PaymentStatus = "failed"
+	StatusReturned PaymentStatus = "returned"
+)
+
+type Payment struct {
+	ID        string
+	Status    PaymentStatus
+	SettledAt *time.Time
+	FailedAt  *time.Time
+}
+
+func (p *Payment) Transition(newStatus PaymentStatus, at time.Time) error {
+	allowed := map[PaymentStatus][]PaymentStatus{
+		StatusPending:  {StatusSettled, StatusFailed},
+		StatusSettled:  {StatusReturned},
+		StatusFailed:   {},
+		StatusReturned: {},
+	}
+	for _, s := range allowed[p.Status] {
+		if s == newStatus {
+			p.Status = newStatus
+			switch newStatus {
+			case StatusSettled:
+				p.SettledAt = &at
+			case StatusFailed, StatusReturned:
+				p.FailedAt = &at
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("illegal transition: %s → %s", p.Status, newStatus)
+}
+
+func main() {
+	now := time.Now()
+	p := &Payment{ID: "pay_1", Status: StatusPending}
+
+	if err := p.Transition(StatusSettled, now); err != nil {
+		fmt.Println("error:", err)
+	} else {
+		fmt.Println("settled OK, status:", p.Status)
+	}
+
+	if err := p.Transition(StatusPending, now); err != nil {
+		fmt.Println("correctly rejected:", err)
+	}
+}
+```
+
+The map of allowed transitions is the core of the state machine. Iterating over the slice (rather than using a nested map) keeps the structure readable and easy to extend.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Distinguish retryable from terminal errors" level="medium">
+
+Write `ChargeError` as a typed error that carries an HTTP status code and a `Retryable bool`. Implement `func isRetryable(err error) bool` using `errors.As`. Demonstrate that a `500` error is retryable and a `402` (Payment Required / declined) is not.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type ChargeError struct {
+	StatusCode int
+	Message    string
+	Retryable  bool
+}
+
+func (e *ChargeError) Error() string {
+	return fmt.Sprintf("charge error %d: %s (retryable=%v)", e.StatusCode, e.Message, e.Retryable)
+}
+
+func isRetryable(err error) bool {
+	var ce *ChargeError
+	if errors.As(err, &ce) {
+		return ce.Retryable
+	}
+	return false
+}
+
+func main() {
+	serverErr := &ChargeError{StatusCode: 500, Message: "internal server error", Retryable: true}
+	declineErr := &ChargeError{StatusCode: 402, Message: "card declined", Retryable: false}
+
+	fmt.Println("500 retryable:", isRetryable(serverErr))  // true
+	fmt.Println("402 retryable:", isRetryable(declineErr)) // false
+
+	wrapped := fmt.Errorf("processor call: %w", serverErr)
+	fmt.Println("wrapped 500 retryable:", isRetryable(wrapped)) // true — errors.As unwraps
+}
+```
+
+`errors.As` unwraps the chain, so wrapping a `*ChargeError` with `fmt.Errorf("%w", ...)` still works transparently. This is exactly how you distinguish transient from permanent failures in a retry loop.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Idempotent webhook handler" level="hard">
+
+Write a function `ProcessWebhookEvent(ctx context.Context, store EventStore, event WebhookEvent) error` that:
+1. Checks if `event.ID` has already been processed in `store`.
+2. If yes, returns `nil` without re-processing.
+3. If no, calls `store.Process(ctx, event)` and marks it done.
+
+Define `EventStore` as a minimal consumer interface with `Exists(ctx context.Context, id string) (bool, error)` and `Process(ctx context.Context, event WebhookEvent) error`. Write a stub implementation and demonstrate that calling it three times only processes once.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+type WebhookEvent struct {
+	ID      string
+	Payload []byte
+}
+
+type EventStore interface {
+	Exists(ctx context.Context, id string) (bool, error)
+	Process(ctx context.Context, event WebhookEvent) error
+}
+
+func ProcessWebhookEvent(ctx context.Context, store EventStore, event WebhookEvent) error {
+	exists, err := store.Exists(ctx, event.ID)
+	if err != nil {
+		return fmt.Errorf("check exists: %w", err)
+	}
+	if exists {
+		return nil // idempotent: already processed
+	}
+	return store.Process(ctx, event)
+}
+
+// memStore is a simple in-memory stub for testing.
+type memStore struct {
+	seen      map[string]bool
+	callCount int
+}
+
+func (m *memStore) Exists(_ context.Context, id string) (bool, error) {
+	return m.seen[id], nil
+}
+
+func (m *memStore) Process(_ context.Context, event WebhookEvent) error {
+	m.callCount++
+	m.seen[event.ID] = true
+	fmt.Printf("processed event %s (call #%d)\n", event.ID, m.callCount)
+	return nil
+}
+
+func main() {
+	ctx := context.Background()
+	store := &memStore{seen: make(map[string]bool)}
+	evt := WebhookEvent{ID: "evt_abc", Payload: []byte(`{"type":"payment.settled"}`)}
+
+	ProcessWebhookEvent(ctx, store, evt) // processed
+	ProcessWebhookEvent(ctx, store, evt) // skipped
+	ProcessWebhookEvent(ctx, store, evt) // skipped
+
+	fmt.Printf("total process calls: %d (expected 1)\n", store.callCount)
+}
+```
+
+The interface is defined by the consumer (`ProcessWebhookEvent`) with exactly the methods it needs — the Go way. The stub satisfies it with no framework required. Three calls, one actual processing.
+
+</Solution>
+
+</Exercise>
+
+## The Lab
+
+Exercises were practice. This is the field. I set this test personally, and I have personally never, not once, accepted a forged webhook. Let's see if you can say the same.
+
+<Lab
+  title="Harden the Webhook Handler"
+  archetype="break-fix"
+  difficulty="guided"
+  points={80}
+  hintCost={10}
+  verify="self-check"
+  objective="The starter webhook handler has two critical vulnerabilities: it does NOT verify the HMAC signature (accepts any forged event), and it does NOT check for replayed events (processes the same event multiple times). Add HMAC signature verification using hmac.Equal and replay protection using the provided nonce store. The starter's main function sends a forged webhook (wrong signature), a valid webhook, and a replayed webhook — the forged and replayed events must be rejected, and the valid event must be processed exactly once. When all four checks pass, the program prints the flag."
+  starter={`package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"time"
+)
+
+// --- Nonce store (already implemented for you) ---
+
+type NonceStore struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (n *NonceStore) CheckAndMark(id string, issuedAt time.Time) error {
+	if time.Since(issuedAt) > 5*time.Minute {
+		return fmt.Errorf("event too old")
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.seen[id] {
+		return fmt.Errorf("duplicate event %s", id)
+	}
+	n.seen[id] = true
+	return nil
+}
+
+// --- Webhook handler (BROKEN — fix me) ---
+
+var webhookSecret = []byte("test_secret_key")
+
+// TODO: Fix this handler. It currently:
+// 1. Does NOT verify the HMAC signature — accepts any POST.
+// 2. Does NOT check the nonce store — processes duplicates.
+func webhookHandler(store *NonceStore, processed *[]string, mu *sync.Mutex) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ := io.ReadAll(r.Body)
+
+		// BUG 1: signature is read but never verified
+		_ = r.Header.Get("Webhook-Signature")
+
+		var evt struct {
+			EventID  string \`json:"event_id"\`
+			IssuedAt int64  \`json:"issued_at"\`
+			Type     string \`json:"type"\`
+		}
+		json.Unmarshal(rawBody, &evt)
+
+		// BUG 2: nonce store is never checked
+		_ = store
+
+		mu.Lock()
+		*processed = append(*processed, evt.EventID)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// --- Verifier (do not edit below this line) ---
+
+func sign(secret, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func main() {
+	store := &NonceStore{seen: make(map[string]bool)}
+	var processed []string
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(webhookHandler(store, &processed, &mu))
+	defer srv.Close()
+
+	send := func(body string, sig string) int {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(body))
+		req.Header.Set("Webhook-Signature", sig)
+		resp, _ := http.DefaultClient.Do(req)
+		return resp.StatusCode
+	}
+
+	now := time.Now().Unix()
+	validBody := fmt.Sprintf(\`{"event_id":"evt_001","issued_at":%d,"type":"payment.settled"}\`, now)
+	validSig := sign(webhookSecret, []byte(validBody))
+	forgedSig := "sha256=000000000000000000000000000000000000000000000000000000000000dead"
+
+	// Test 1: forged signature must be rejected (non-2xx)
+	s1 := send(validBody, forgedSig)
+	// Test 2: valid event must be processed (200)
+	s2 := send(validBody, validSig)
+	// Test 3: replay must be rejected (200 to stop retries, but NOT added to processed)
+	s3 := send(validBody, validSig)
+
+	mu.Lock()
+	count := len(processed)
+	mu.Unlock()
+
+	fmt.Printf("Forged sig status: %d (want non-2xx, got %d — PASS=%v)\\n", s1, s1, s1 >= 400)
+	fmt.Printf("Valid sig status:  %d (want 200, got %d — PASS=%v)\\n", s2, s2, s2 == 200)
+	fmt.Printf("Replay status:     %d (want 200, got %d — PASS=%v)\\n", s3, s3, s3 == 200)
+	fmt.Printf("Processed count:   %d (want 1, got %d — PASS=%v)\\n", count, count, count == 1)
+
+	if s1 >= 400 && s2 == 200 && s3 == 200 && count == 1 {
+		fmt.Println("FLAG: GO{hmac_equal_plus_nonce_makes_webhooks_safe}")
+	} else {
+		fmt.Println("Not yet. Fix both bugs and run again.")
+	}
+}`}
+  verifier="The starter's main function is the verifier: it sends three requests and checks four conditions. When all four pass it prints the flag. verify=self-check because the program prints PASS/FAIL for each condition and the flag inline — no hidden server-side test is needed."
+  hints={[
+    "Bug 1: after reading rawBody, call verifyWebhookSignature(webhookSecret, rawBody, r.Header.Get(\"Webhook-Signature\")). If false, return http.Error(w, \"invalid signature\", http.StatusUnauthorized).",
+    "Bug 2: after parsing the event JSON, call store.CheckAndMark(evt.EventID, time.Unix(evt.IssuedAt, 0)). If it returns an error (duplicate or too old), return w.WriteHeader(http.StatusOK) without appending to processed.",
+    "Implement verifyWebhookSignature: hmac.New(sha256.New, secret), mac.Write(rawBody), then hex-decode the header value (strip 'sha256=' prefix), and return hmac.Equal(expected, received)."
+  ]}
+  flag="GO{hmac_equal_plus_nonce_makes_webhooks_safe}"
+>
+
+The handler is open to the internet and currently trusting. Any POST will be processed. A forged `payment.settled` event could release goods that were never paid for. The same event can be POSTed a hundred times and it will be processed a hundred times.
+
+Fix both vulnerabilities. I set this test personally. I expect you to pass it.
+
+</Lab>
+
+<Recap>
+
+- **Outbound charges need idempotency keys.** Generate once, store, reuse across retries. The processor deduplicates on the key — no double charges. Retry 5xx errors; never retry 4xx.
+- **Circuit breakers protect your service from flaky providers.** Fail fast when a downstream is broken rather than letting goroutines pile up on a 30-second timeout.
+- **Reconciliation jobs are the safety net.** The processor is the external source of truth. Periodic reconciliation catches discrepancies your service missed.
+- **Verify every webhook with HMAC-SHA256.** Use `hmac.Equal` — always, without exception. It is constant-time; `==` is not. A timing attack on a naive comparison can brute-force a signature.
+- **Reject replays.** Timestamp check (reject events older than 5 minutes) plus nonce store (reject seen event IDs). Return 200 for duplicates to stop provider retries.
+- **Acknowledge fast, process async.** Read body → verify sig → check replay → outbox INSERT → return 200. Business logic runs from the outbox in a background worker.
+- **Model payment states explicitly.** `pending → settled → returned` (and `pending → failed`) are the states. The processor's initial "accepted" is not settlement for ACH, SEPA, or wires. Never release on pending for slow rails.
+- **Validate state transitions.** A settled payment cannot go back to pending. An out-of-order webhook that tries an illegal transition is logged and discarded — it does not corrupt state.
+- **Money is never a float.** I will keep saying this until you say it in your sleep.
+
+</Recap>
+
+<Scoreboard
+  streak={8}
+  items={[
+    { label: "Quick check — idempotency keys prevent double charge", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — 200 for duplicate webhooks", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Compute an HMAC-SHA256 signature", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Reject an old webhook", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Implement a payment state machine", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Distinguish retryable from terminal errors", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Idempotent webhook handler", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Harden the Webhook Handler", captured: false, points: 80 }}
+/>
+
+Not bad. You now know how to call the outside world without wrecking it, how to receive the outside world without being wrecked by it, and how to model the days-long reality of slow payment rails without ever assuming money moved before it did. That's most of what separates a backend engineer from a payments engineer. The rest is just scar tissue — and now you've earned some.
+
+— Your instructor. The greatest payments engineer alive, obviously.

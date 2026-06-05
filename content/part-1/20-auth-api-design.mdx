@@ -1,0 +1,2445 @@
+---
+title: "Auth & API Design"
+part: 1
+order: 20
+type: "course"
+description: "Password hashing, sessions vs tokens, JWTs and their footguns, OAuth2/OIDC; plus REST conventions, versioning, pagination, idempotency and OpenAPI."
+prerequisites: ["http-servers"]
+---
+
+<HeroCard label="Part 1 · Chapter 20" title="Auth & API Design">
+
+Listen up, because I'm only going to say this once: the most catastrophic breaches in history weren't caused by clever zero-days or nation-state APTs. They were caused by engineers who stored passwords in plain text, signed JWTs with the secret `"secret"`, and built APIs so inconsistent that their own clients gave up trying to parse the errors.
+
+You are not going to be one of those people. Not on my watch.
+
+This chapter is two disciplines in one. The **Auth half** covers password hashing done right, sessions versus stateless tokens, the full JWT machinery and every footgun bolted onto it, and OAuth2/OIDC so you stop treating "Login with Google" as magic. The **API Design half** covers REST conventions, status codes that actually mean something, versioning, pagination, idempotency, error shapes, and generating an OpenAPI contract from Go. We'll secure and design Meridian's ledger API — specifically the `POST /transfers` endpoint and the checkout auth flow — all the way through this chapter.
+
+This chapter is long because it has to be. Auth done halfway is worse than auth not done at all.
+
+</HeroCard>
+
+<Scene
+  title="JWT auth in action — the forgery problem"
+  actors={[
+    { id: "client", label: "Client" },
+    { id: "api", label: "Meridian API" },
+  ]}
+  frames={[
+    {
+      caption: "Client logs in with valid credentials. Meridian verifies the bcrypt hash and mints a signed JWT.",
+      beat: "neutral",
+      actors: [
+        { id: "client", state: "active" },
+        { id: "api", state: "active" },
+      ],
+    },
+    {
+      caption: "Client receives the JWT and sends it on POST /transfers. The API verifies the HS256 signature — request proceeds.",
+      beat: "neutral",
+      actors: [
+        { id: "client", state: "ok" },
+        { id: "api", state: "ok" },
+      ],
+    },
+    {
+      caption: "Attacker crafts a token with alg:none in the header and role:admin in the payload — no signature required. A naive verifier trusts the alg field from the token itself and skips all cryptographic work.",
+      beat: "problem",
+      actors: [
+        { id: "client", state: "bad" },
+        { id: "api", state: "warn" },
+      ],
+    },
+    {
+      caption: "The naive API accepts the forged token. Attacker now has admin access to POST /transfers — fraudulent transfers go through.",
+      beat: "problem",
+      actors: [
+        { id: "client", state: "bad" },
+        { id: "api", state: "bad" },
+      ],
+    },
+    {
+      caption: "With algorithm pinning: the key function asserts the method is HS256 before returning the signing key. The alg:none token is rejected before any claims are read.",
+      beat: "solution",
+      actors: [
+        { id: "client", state: "warn" },
+        { id: "api", state: "ok" },
+      ],
+    },
+    {
+      caption: "Signature verification rejects the forgery. The attacker gets 401 — no claims parsed, no key returned, no access.",
+      beat: "solution",
+      actors: [
+        { id: "client", state: "idle" },
+        { id: "api", state: "done" },
+      ],
+    },
+  ]}
+  caption="The alg:none attack exploits libraries that trust the algorithm field from the token header. Defense: always assert the expected algorithm in your key function before returning the signing key."
+/>
+
+<ChapterTabs tabs={["Password Hashing", "Email Verification", "Sessions vs Tokens", "JWTs", "Authorization and RBAC", "OAuth2 and OIDC", "REST Design", "Versioning and Pagination", "Idempotency and Errors", "OpenAPI and GraphQL"]} />
+
+---
+
+## Password Hashing
+
+Here's the scene: you're building authentication for Meridian's ledger API. A user registers with an email and a password. How do you store it?
+
+**On the job:** Meridian's checkout endpoint processes real transfers. If a credential database leaks and passwords aren't properly hashed, every account is compromised — and the regulatory fallout is worse than the breach itself.
+
+The catastrophically wrong answer — the one that has destroyed companies — is to store the password as-is, or to hash it with MD5 or SHA-256. Both approaches look like they're "doing something secure." Neither is.
+
+Let me break down why, one step at a time.
+
+<Define term="Password hashing (bcrypt / argon2id)" since="Security for Financial Systems (Part 3)">
+A **password hash** is a one-way transformation of a plaintext password into a fixed-size digest. The point is that verification requires only re-running the same transformation — you never store the plaintext. What makes **bcrypt** and **argon2id** different from general-purpose hashes (MD5, SHA-256) is that they are **deliberately slow and memory-hard**: tunable work factors make brute-force economically infeasible even after a database leak. Get this wrong and a single breach exposes every user's password.
+</Define>
+
+### Why fast hashes are a crime
+
+MD5, SHA-256, SHA-512 — these are **general-purpose** hashes. They're designed to be **fast**. A modern GPU can compute **10 billion** SHA-256 hashes per second. If your database leaks (and someday it will), an attacker can brute-force every 8-character password in minutes using pre-computed rainbow tables or GPU cracking rigs.
+
+What you need is a hash that's **deliberately slow** and **memory-hard** — one where computing it costs real CPU and RAM, so brute-forcing 100 million candidates becomes economically infeasible.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="bcrypt">The battle-tested standard. Built-in cost factor (work factor) — you dial the CPU cost. Each hash is unique because bcrypt embeds a random 22-character salt. Rounds-based: at cost 12, one hash takes ~250ms on a modern CPU. Attacker on a GPU? Slowed to thousands per second, not billions.</ConceptCard>
+  <ConceptCard label="argon2">The 2015 Password Hashing Competition winner. Two variants: `argon2i` (side-channel resistant) and `argon2id` (recommended — best of both). Three tuning knobs: time, memory, and parallelism. Memory-hard: requires RAM, not just CPU, which cripples GPU/ASIC cracking rigs. The modern recommendation for new systems.</ConceptCard>
+  <ConceptCard label="scrypt">Memory-hard, pre-dates argon2. Used by some older systems. Decent but argon2id is preferred for new code. Go has it in `golang.org/x/crypto/scrypt`.</ConceptCard>
+  <Gotcha>Never use MD5, SHA-1, SHA-256, SHA-512, or any general-purpose hash for passwords. Never store a password without a per-password salt. Never invent your own scheme. Never use plain `encoding/base64` and call it hashing. These are career-ending mistakes, not academic ones.</Gotcha>
+</ConceptGrid>
+
+### bcrypt in Go
+
+Go's `golang.org/x/crypto/bcrypt` package makes this straightforward. Here's a complete, correct implementation:
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+// HashPassword hashes a plaintext password using bcrypt at cost 12.
+// Store the returned []byte in your database — it contains the salt.
+func HashPassword(plain string) ([]byte, error) {
+	// Cost 12 is a good default in 2026: ~250ms on a modern server.
+	// Increase cost as hardware gets faster; bcrypt upgrades are seamless
+	// because the cost is encoded in the hash itself.
+	return bcrypt.GenerateFromPassword([]byte(plain), 12)
+}
+
+// CheckPassword compares a plaintext password against a stored bcrypt hash.
+// Returns nil on match, bcrypt.ErrMismatchedHashAndPassword on failure.
+func CheckPassword(plain string, hashed []byte) error {
+	return bcrypt.CompareHashAndPassword(hashed, []byte(plain))
+}
+
+func main() {
+	password := "hunter2-but-actually-strong-42!"
+
+	// Registration: hash and store.
+	hash, err := HashPassword(password)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("stored hash: %s\n", hash)
+
+	// Login: compare. Correct password.
+	if err := CheckPassword(password, hash); err != nil {
+		if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			fmt.Println("wrong password")
+		} else {
+			log.Fatal(err) // unexpected error — treat as server fault
+		}
+	} else {
+		fmt.Println("password matches — login OK")
+	}
+
+	// Login: wrong password.
+	if err := CheckPassword("wrong", hash); err != nil {
+		fmt.Println("wrong password — as expected")
+	}
+}
+```
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+func HashPassword(plain string) ([]byte, error) {
+	return bcrypt.GenerateFromPassword([]byte(plain), 12)
+}
+
+func CheckPassword(plain string, hashed []byte) error {
+	return bcrypt.CompareHashAndPassword(hashed, []byte(plain))
+}
+
+func main() {
+	password := "hunter2-but-actually-strong-42!"
+	hash, err := HashPassword(password)
+	if err != nil {
+		fmt.Println("hash error:", err)
+		return
+	}
+	fmt.Printf("hash: %s\n", hash)
+
+	if err := CheckPassword(password, hash); err != nil {
+		fmt.Println("mismatch")
+	} else {
+		fmt.Println("match — login OK")
+	}
+
+	if errors.Is(CheckPassword("wrong", hash), bcrypt.ErrMismatchedHashAndPassword) {
+		fmt.Println("wrong password caught correctly")
+	}
+}
+```
+
+<Callout kind="pro" title="Timing-safe comparison is non-negotiable">
+
+`bcrypt.CompareHashAndPassword` runs in constant time — it doesn't short-circuit the moment it finds a mismatch. This prevents **timing attacks**, where an attacker measures tiny differences in response time to deduce how much of the hash matched. Never do a plain `bytes.Equal` or `==` comparison for secrets. For non-bcrypt secrets (API keys, HMAC tags) use `crypto/subtle.ConstantTimeCompare`.
+
+</Callout>
+
+<UnderTheHood title="How bcrypt works internally (Go 1.26 baseline)">
+
+When `bcrypt.GenerateFromPassword(password, cost)` runs, it:
+
+1. **Generates 16 random bytes** from `crypto/rand` — this is the salt. The salt is unique per password, so two users with the same password get completely different hashes. `bcrypt.GenerateFromPassword` does not accept a caller-provided randomness source; the salt comes from Go's cryptographically secure random source.
+2. **Runs the Eksblowfish key schedule** `2^cost` times — at cost 12 that's 4,096 rounds of an expensive key setup. This is the "deliberately slow" part. The key schedule runs in time proportional to `2^cost`, and you can tune that as hardware improves.
+3. **Encrypts the 24-byte magic string** `"OrpheanBeholderScryDoubt"` 64 times using the resulting key.
+4. **Encodes the result** as a 60-character string in modified-base64: `$2a$12$<22-char-salt><31-char-hash>`. The cost and salt are embedded, so `CompareHashAndPassword` can re-derive the hash without you storing them separately.
+
+This is a conceptual model — the actual Blowfish state and round mechanics are more involved; see the Provos/Mazières paper for exact details. The memory requirement is small (Blowfish state is ~4 KB), which is why argon2id is preferred for new systems — argon2's memory-hardness makes GPU cracking far more expensive. But bcrypt is battle-tested and widely supported, so it remains a solid choice for most Go services.
+
+</UnderTheHood>
+
+### argon2id in Go
+
+For new systems, reach for argon2id. The API is slightly more manual because you manage the salt yourself:
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"fmt"
+
+	"golang.org/x/crypto/argon2"
+)
+
+// Argon2idParams holds the tuning knobs.
+// Adjust to hit ~100-300ms on your target hardware.
+type Argon2idParams struct {
+	Memory      uint32 // in KiB — 64MB is a reasonable start
+	Iterations  uint32 // time parameter
+	Parallelism uint8  // threads
+	SaltLen     uint32
+	KeyLen      uint32
+}
+
+var DefaultArgon2Params = Argon2idParams{
+	Memory: 64 * 1024, Iterations: 3,
+	Parallelism: 2, SaltLen: 16, KeyLen: 32,
+}
+
+// HashArgon2id hashes a password, returning a base64-encoded key and salt.
+func HashArgon2id(plain string, p Argon2idParams) (key, salt string, err error) {
+	saltBytes := make([]byte, p.SaltLen)
+	if _, err = rand.Read(saltBytes); err != nil {
+		return
+	}
+	keyBytes := argon2.IDKey(
+		[]byte(plain), saltBytes,
+		p.Iterations, p.Memory, p.Parallelism, p.KeyLen,
+	)
+	key = base64.RawStdEncoding.EncodeToString(keyBytes)
+	salt = base64.RawStdEncoding.EncodeToString(saltBytes)
+	return
+}
+
+// CheckArgon2id compares a plaintext password to stored key+salt.
+func CheckArgon2id(plain, key, salt string, p Argon2idParams) (bool, error) {
+	saltBytes, err := base64.RawStdEncoding.DecodeString(salt)
+	if err != nil {
+		return false, err
+	}
+	keyBytes := argon2.IDKey(
+		[]byte(plain), saltBytes,
+		p.Iterations, p.Memory, p.Parallelism, p.KeyLen,
+	)
+	storedKey, err := base64.RawStdEncoding.DecodeString(key)
+	if err != nil {
+		return false, err
+	}
+	// constant-time comparison — never use == for secrets
+	return subtle.ConstantTimeCompare(keyBytes, storedKey) == 1, nil
+}
+
+func main() {
+	p := DefaultArgon2Params
+	key, salt, err := HashArgon2id("my-strong-password", p)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("key:", key[:12]+"...")
+	ok, _ := CheckArgon2id("my-strong-password", key, salt, p)
+	fmt.Println("match:", ok)
+	wrong, _ := CheckArgon2id("wrong", key, salt, p)
+	fmt.Println("wrong match:", wrong)
+}
+```
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"fmt"
+
+	"golang.org/x/crypto/argon2"
+)
+
+type Argon2idParams struct {
+	Memory, Iterations uint32
+	Parallelism        uint8
+	SaltLen, KeyLen    uint32
+}
+
+var P = Argon2idParams{Memory: 64 * 1024, Iterations: 3, Parallelism: 2, SaltLen: 16, KeyLen: 32}
+
+func HashArgon2id(plain string) (key, salt string, err error) {
+	saltB := make([]byte, P.SaltLen)
+	if _, err = rand.Read(saltB); err != nil {
+		return
+	}
+	keyB := argon2.IDKey([]byte(plain), saltB, P.Iterations, P.Memory, P.Parallelism, P.KeyLen)
+	return base64.RawStdEncoding.EncodeToString(keyB), base64.RawStdEncoding.EncodeToString(saltB), nil
+}
+
+func CheckArgon2id(plain, key, salt string) (bool, error) {
+	saltB, err := base64.RawStdEncoding.DecodeString(salt)
+	if err != nil {
+		return false, err
+	}
+	keyB := argon2.IDKey([]byte(plain), saltB, P.Iterations, P.Memory, P.Parallelism, P.KeyLen)
+	stored, err := base64.RawStdEncoding.DecodeString(key)
+	if err != nil {
+		return false, err
+	}
+	return subtle.ConstantTimeCompare(keyB, stored) == 1, nil
+}
+
+func main() {
+	key, salt, err := HashArgon2id("my-strong-password")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("key (truncated):", key[:16]+"...")
+	ok, _ := CheckArgon2id("my-strong-password", key, salt)
+	fmt.Println("correct match:", ok)
+	bad, _ := CheckArgon2id("wrong", key, salt)
+	fmt.Println("wrong match:", bad)
+}
+```
+
+<QuickCheck
+  question="Why can't you use SHA-256 to hash passwords for storage?"
+  options={["SHA-256 produces too short a hash", "SHA-256 is too slow for login endpoints", "SHA-256 is too fast — a GPU can compute billions per second, making brute-force trivial", "SHA-256 doesn't support salts"]}
+  answer={2}
+  explain="Speed is the enemy here. A general-purpose hash like SHA-256 is optimized to be fast. bcrypt and argon2id are intentionally slow (and memory-hard for argon2id), making brute-force economically infeasible even after a database leak."
+/>
+
+---
+
+## Email Verification
+
+You hashed the password. Beautiful. But you have no idea whether `ada@example.com` actually belongs to the human who just signed up — or whether they fat-fingered it, or typed someone else's address to harvest Meridian receipts. Account creation is only half done until the email is **proven**. This is the section that course you were eyeing spends an hour on, and it's the first time we actually send mail in Go.
+
+<Define term="Transactional email" since="Auth & API Design (Part 1)">
+A **transactional email** is a one-to-one message triggered by a user action — verify-your-address, password reset, a payment receipt — as opposed to bulk marketing mail. It must be reliable and fast: a verification email that arrives ten minutes late loses the signup. Why it matters: at Meridian, the verification, receipt, and settlement-notice emails are part of the product's correctness, not decoration.
+</Define>
+
+<Define term="SMTP" since="Auth & API Design (Part 1)">
+**SMTP** (Simple Mail Transfer Protocol) is the protocol mail servers speak to hand messages to each other. Your app connects to an SMTP server (your provider's, or your own relay), authenticates, and submits the message; the server takes over delivery. Go ships `net/smtp` in the standard library — minimal but enough to send. Why it matters: you rarely run your own mail server; you submit to a provider (SES, SendGrid, Postmark) over SMTP or their HTTP API, but the shape is the same.
+</Define>
+
+The flow has two halves separated by *the user's inbox* — which means it spans real wall-clock time and you must not block a web request waiting for the second half.
+
+<ExecTimeline
+  title="① Signup → email: mint the token, return 201 without waiting"
+  lanes={[
+    { id: "client", label: "Client" },
+    { id: "api", label: "API" },
+    { id: "db", label: "DB" },
+    { id: "smtp", label: "SMTP / inbox" }
+  ]}
+  steps={[
+    { lane: "client", kind: "run", label: "POST /v1/users", note: "User submits email + password to sign up." },
+    { lane: "api", kind: "run", label: "hash password, insert user", note: "argon2id the password, insert the row with verified = false. An unverified user can log in but can't move money." },
+    { lane: "api", kind: "run", label: "mint token (32 random bytes)", note: "crypto/rand → a URL-safe token. This is a bearer secret, treated like a password." },
+    { lane: "db", kind: "run", label: "store SHA-256(token) + expiry", note: "Persist only the HASH of the token plus expires_at (24h) and used = false. Never store the raw token — same reason you never store the raw password." },
+    { lane: "smtp", kind: "run", label: "send verify link", note: "Email the RAW token inside a link: /v1/verify?token=…  The email is the only place the raw token ever exists." },
+    { lane: "api", kind: "done", label: "201 Created (don't wait)", note: "Return immediately. The HTTP response does NOT wait for SMTP — sending mail is slow and can fail; block here and your signup p99 is hostage to your mail provider." }
+  ]}
+  caption="First half ends at 201. The request never blocks on SMTP — the raw token now lives only in the user's inbox, stored hashed and expiring on your side."
+/>
+
+The second half begins minutes later, when the user opens that email and clicks the link — a fresh request that recomputes the hash and consumes the token:
+
+<ExecTimeline
+  title="② Click → verified: recompute the hash, consume the token once"
+  lanes={[
+    { id: "client", label: "Client" },
+    { id: "api", label: "API" },
+    { id: "db", label: "DB" },
+    { id: "smtp", label: "SMTP / inbox" }
+  ]}
+  steps={[
+    { lane: "client", kind: "run", label: "user clicks link (minutes later)", note: "Separated by real time. GET /v1/verify?token=raw." },
+    { lane: "api", kind: "run", label: "SHA-256(token), look up digest", note: "Recompute the hash from the token in the URL, find the matching digest." },
+    { lane: "db", kind: "run", label: "check expiry + unused, consume", note: "Reject if expired or already used. On success, set verified = true and used = true in ONE transaction — single-use." },
+    { lane: "api", kind: "done", label: "verified ✓", note: "Account fully active. The token is now spent and worthless if leaked from logs." }
+  ]}
+  caption="Second half split from the first by the inbox. Token stored hashed, expiring, single-use — consumed in one transaction."
+/>
+
+### Minting the token — it's a bearer secret
+
+The token in the verification link is a **bearer credential**: whoever holds it can verify the account. So it gets the same respect as a password — generated from a CSPRNG, stored hashed, expiring, single-use.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// newVerificationToken returns the raw token to EMAIL and the digest to STORE.
+// Email the token; persist only the digest — never the token itself.
+func newVerificationToken() (token, digest string) {
+	b := make([]byte, 32)
+	rand.Read(b) // crypto/rand — NEVER math/rand for a secret
+	token = base64.RawURLEncoding.EncodeToString(b)
+	sum := sha256.Sum256([]byte(token))
+	return token, hex.EncodeToString(sum[:])
+}
+
+// buildEmail assembles a multipart/alternative message: plain text + HTML.
+// Getting the CRLF line endings and boundary right is where people lose hours.
+func buildEmail(from, to, verifyURL string) string {
+	const boundary = "meridian-boundary-7f3a"
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", from)
+	fmt.Fprintf(&b, "To: %s\r\n", to)
+	fmt.Fprintf(&b, "Subject: Verify your Meridian account\r\n")
+	fmt.Fprintf(&b, "MIME-Version: 1.0\r\n")
+	fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", boundary)
+
+	fmt.Fprintf(&b, "--%s\r\n", boundary)
+	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n\r\n")
+	fmt.Fprintf(&b, "Confirm your email: %s\r\n\r\n", verifyURL)
+
+	fmt.Fprintf(&b, "--%s\r\n", boundary)
+	b.WriteString("Content-Type: text/html; charset=UTF-8\r\n\r\n")
+	fmt.Fprintf(&b, "<p>Confirm your email: <a href=%q>Verify</a></p>\r\n\r\n", verifyURL)
+
+	fmt.Fprintf(&b, "--%s--\r\n", boundary)
+	return b.String()
+}
+
+func main() {
+	token, digest := newVerificationToken()
+	verifyURL := "https://api.meridian.com/v1/verify?token=" + token
+	expires := time.Now().Add(24 * time.Hour)
+
+	fmt.Println("STORE in DB (note: the digest, not the token):")
+	fmt.Println("  token_digest:", digest)
+	fmt.Println("  expires_at:  ", expires.Format(time.RFC3339))
+	fmt.Println("\nEMAIL body:")
+	fmt.Print(buildEmail("no-reply@meridian.com", "ada@example.com", verifyURL))
+
+	// Verify side: recompute the digest from the token in the link, compare
+	// in constant time so a timing attack can't probe valid digests.
+	sum := sha256.Sum256([]byte(token))
+	got := hex.EncodeToString(sum[:])
+	ok := subtle.ConstantTimeCompare([]byte(got), []byte(digest)) == 1
+	fmt.Println("verify: digest matches stored:", ok)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="The five rules a verification token must obey">
+
+1. **CSPRNG only.** `crypto/rand`, never `math/rand`. A predictable token is a free account takeover.
+2. **Store the hash, not the token.** A leaked database (or log line) of raw tokens is a leaked set of working verify-links. Store `SHA-256(token)`; email the token.
+3. **Expire it.** 24 hours is typical. An eternal token is an eternal liability.
+4. **Single-use.** Consume it inside the same transaction that flips `verified = true`. Replaying a used link does nothing.
+5. **Constant-time compare** the digest (`crypto/subtle`) so response timing can't be used to confirm a guess.
+
+</Callout>
+
+### Actually sending it — `net/smtp`
+
+Here is the real mailer. It does not run in the playground above because it dials a network — the sandbox has none — but this is the production shape:
+
+```go
+package mailer
+
+import (
+	"fmt"
+	"net/smtp"
+)
+
+// SMTPMailer submits messages to a provider's SMTP endpoint (SES, Postmark, …).
+type SMTPMailer struct {
+	addr string // "smtp.provider.com:587"
+	auth smtp.Auth
+	from string
+}
+
+func NewSMTPMailer(host, port, user, pass, from string) *SMTPMailer {
+	return &SMTPMailer{
+		addr: host + ":" + port,
+		auth: smtp.PlainAuth("", user, pass, host),
+		from: from,
+	}
+}
+
+// Send delivers one message. smtp.SendMail negotiates STARTTLS automatically
+// when the server advertises it on the submission port (587), so credentials
+// and body travel encrypted.
+func (m *SMTPMailer) Send(to, rawMessage string) error {
+	if err := smtp.SendMail(m.addr, m.auth, m.from, []string{to}, []byte(rawMessage)); err != nil {
+		return fmt.Errorf("send mail to %s: %w", to, err)
+	}
+	return nil
+}
+```
+
+<Callout kind="note" title="net/smtp is the floor, not the ceiling">
+
+`net/smtp` is frozen and deliberately minimal — `SendMail` does plain auth + STARTTLS on port 587, and that's about it. For **implicit TLS** (port 465) you dial the TLS connection yourself with `tls.Dial` and wrap it in `smtp.NewClient`. In real services most teams skip SMTP entirely and call the provider's **HTTP API** (SES/SendGrid/Postmark SDKs) for delivery receipts, bounce webhooks, and templating. The protocol knowledge here is what those SDKs wrap.
+
+</Callout>
+
+<Callout kind="pro" title="Never block the request on the mail send">
+
+The `201 Created` in the timeline returns *before* SMTP. Sending mail is a slow, flaky, third-party network call; if you `await` it inside the signup handler, your signup latency and error rate become your mail provider's latency and error rate. **Enqueue the send as a background job** and return immediately. Retries, backoff, and dead-lettering for that job are exactly what we build in **Background Jobs, Scheduling & Async Work (Part 2)** — the verification email is the textbook async job.
+
+</Callout>
+
+**On the job:** the single most common verification bug isn't crypto — it's the enumeration leak. If `POST /users` answers "email already registered" but a fresh email answers "check your inbox," an attacker learns which emails have Meridian accounts. Return the **same** neutral response either way ("If that address is valid, you'll receive a link"), and send a "you already have an account" email to the existing address instead of telling the caller.
+
+<QuickCheck
+  question="Why store SHA-256(token) in the database instead of the token itself?"
+  options={["To save space — the hash is smaller", "So a database or log leak doesn't hand the attacker working verification links", "SHA-256 makes the token expire automatically", "Because net/smtp requires hashed tokens"]}
+  answer={1}
+  explain="The raw token is a bearer credential — holding it verifies the account. If you store it raw, anyone who reads the table (or a log line that captured it) has a working link. Storing only the hash means a leak of the stored value is useless: you can't reverse SHA-256 to recover the token. Same principle as password hashing."
+/>
+
+---
+
+## Sessions vs Tokens
+
+After a Meridian user proves their identity at login, you need to remember it across requests. Two schools of thought: **sessions** (stateful, server-remembers) and **tokens** (stateless, client-carries).
+
+**On the job:** Meridian runs multiple API replicas behind a load balancer. Choosing session vs token is not just a design preference — it decides whether you need a shared session store, and what "logout" means under a race condition.
+
+<Define term="Session vs token">
+A **session** is a server-side record keyed by a random ID sent to the client in a cookie. The server is the source of truth — revoke the record, revoke access instantly. A **token** (typically a JWT) is a self-contained signed credential the client carries; the server verifies the signature without a database lookup. Sessions win on revocability; tokens win on statelessness across replicas. The choice shapes your logout story and your infrastructure.
+</Define>
+
+### Sessions: the server remembers you
+
+In a session-based system:
+
+1. User logs in → server creates a session record in a database or Redis, keyed by a random session ID.
+2. Server sends the session ID to the client — typically in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie.
+3. On every subsequent request, the browser sends the cookie; the server looks up the session ID in the store.
+4. Logout: delete the session record. The cookie is instantly worthless.
+
+<ExecTimeline
+  title="Session-based login flow"
+  lanes={[{id: "client", label: "Browser"}, {id: "server", label: "Ledger API"}, {id: "store", label: "Session Store"}]}
+  steps={[
+    {lane: "client", kind: "send", label: "POST /login", note: "Client sends credentials: email + password."},
+    {lane: "server", kind: "run", label: "verify password hash", note: "Server fetches the stored hash and runs bcrypt.CompareHashAndPassword. This takes ~250ms intentionally."},
+    {lane: "store", kind: "run", label: "INSERT session row", note: "Server generates a cryptographically random session ID (32+ bytes) and stores it with user ID and expiry."},
+    {lane: "client", kind: "recv", label: "200 + Set-Cookie", note: "Response sets an HttpOnly Secure cookie with the opaque session ID. The client can't read it with JS."},
+    {lane: "client", kind: "send", label: "GET /accounts", note: "Browser automatically sends the session cookie on every subsequent request."},
+    {lane: "store", kind: "run", label: "SELECT session", note: "Server looks up the session ID. If found and not expired, request is authenticated."},
+    {lane: "client", kind: "recv", label: "200 + account data", note: "Request proceeds. Server attached the user to the request context."}
+  ]}
+  caption="Sessions are stateful: the server is the source of truth. Revocation is instant — just delete the row."
+/>
+
+**Advantages of sessions:** instant revocation (logout is a DB delete), simple to reason about, no cryptographic complexity at the application layer.
+
+**Disadvantages:** requires shared state. If you run 10 API replicas, they all need access to the same session store (Redis, Postgres). Adds latency per request for the lookup. Horizontal scaling adds complexity.
+
+### Tokens: the client carries the proof
+
+In a token-based system, the server mints a **signed token** and sends it to the client. The token itself encodes the user's identity and permissions, signed with the server's key. To authenticate, the server just verifies the signature — no database lookup required.
+
+JWTs (JSON Web Tokens) are the most common format. They're the topic of the next section, and they come with enough footguns that they deserve their own treatment.
+
+<BeforeAfter
+  badLabel="Naive session (no flags)"
+  goodLabel="Hardened session cookie"
+  bad={`http.SetCookie(w, &http.Cookie{
+    Name:  "session",
+    Value: sessionID,
+})`}
+  good={`http.SetCookie(w, &http.Cookie{
+    Name:     "session_id",
+    Value:    sessionID,
+    HttpOnly: true,   // JS cannot read it
+    Secure:   true,   // HTTPS only
+    SameSite: http.SameSiteStrictMode,
+    MaxAge:   86400,  // 24h
+    Path:     "/",
+})`}
+/>
+
+<Callout kind="warn" title="Never store tokens in localStorage">
+
+`localStorage` is readable by any JavaScript on your page — including injected XSS payloads. If you must use JWTs, store them in `HttpOnly` cookies (same as sessions). The "localStorage for JWTs" pattern is one of the most widely spread security antipatterns in web development. It's wrong. Every time.
+
+</Callout>
+
+---
+
+## JWTs
+
+JWT stands for **JSON Web Token**. It's a compact, URL-safe, self-contained token format that encodes claims — who you are, what you can do, when this expires — and proves they haven't been tampered with via a cryptographic signature.
+
+**On the job:** Meridian's `POST /transfers` endpoint is protected by a JWT middleware. If the signing key is weak or the algorithm isn't pinned, an attacker can forge admin tokens, authorize fraudulent transfers, and drain accounts before anyone notices. This section is security-sensitive — read it twice.
+
+<Define term="JWT — JSON Web Token (header.payload.signature)" since="Security for Financial Systems (Part 3)">
+A **JWT** is three base64url-encoded JSON objects joined by dots: a **header** (algorithm + token type), a **payload** (claims: who you are, when this expires, what roles you have), and a **signature** that proves the first two haven't been tampered with. The payload is encoded, not encrypted — never put secrets there. The signature only proves integrity; it does not hide the claims. An attacker who captures a JWT can read all the claims; they cannot forge a valid one without the signing key.
+</Define>
+
+### Structure: header.payload.signature
+
+A JWT is three base64url-encoded JSON objects joined by dots:
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+.
+eyJzdWIiOiJ1c2VyXzEyMyIsImV4cCI6MTcxOTk5OTk5OX0
+.
+SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+**Header** (base64url-decoded):
+```json
+{"alg": "HS256", "typ": "JWT"}
+```
+
+**Payload** (base64url-decoded):
+```json
+{"sub": "user_123", "exp": 1719999999, "iat": 1719913599, "role": "admin"}
+```
+
+**Signature**: `HMAC-SHA256(base64url(header) + "." + base64url(payload), secret_key)`
+
+The payload is **not encrypted** — it's just encoded. Anyone who intercepts the token can decode the header and payload. The signature only proves the payload hasn't been *tampered with*. Never put a password, credit card number, or PII in a JWT payload unless you're also encrypting it (JWE, a separate spec).
+
+<ExecTimeline
+  title="JWT mint → send → verify"
+  lanes={[{id: "server", label: "API Server"}, {id: "client", label: "Client"}]}
+  steps={[
+    {lane: "client", kind: "send", label: "POST /auth/login", note: "Client sends email + password to authenticate."},
+    {lane: "server", kind: "run", label: "verify password", note: "Server checks bcrypt hash. On success, proceeds to mint a token."},
+    {lane: "server", kind: "run", label: "build JWT claims", note: "Server creates claims: sub=user_123, exp=now+1h, role=user. These go in the payload."},
+    {lane: "server", kind: "run", label: "sign with HS256", note: "HMAC-SHA256(base64url(header)+'.'+base64url(payload), signingKey). The signature is appended as the third segment."},
+    {lane: "client", kind: "recv", label: "200 + JWT", note: "Server returns the token. Client stores it in an HttpOnly cookie, never localStorage."},
+    {lane: "client", kind: "send", label: "GET /accounts (+ JWT)", note: "Client sends the JWT in the Authorization header: Bearer <token>, or via cookie."},
+    {lane: "server", kind: "run", label: "verify + parse JWT", note: "Server re-computes the HMAC and compares. If it matches and exp is in the future, the request is authenticated. No DB lookup needed."}
+  ]}
+  caption="The server is stateless: it re-derives trust from the signature alone, not from a session store."
+/>
+
+### Implementing JWT in Go
+
+The standard library doesn't have JWT support — you'll use `github.com/golang-jwt/jwt/v5`. Here's a complete, correct implementation:
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// signingKey should come from config/secrets — never hardcoded.
+// Must be at least 32 bytes. Generate with crypto/rand, never math/rand.
+// Use crypto/rand for key material; never use math/rand for secrets.
+var signingKey = []byte("change-me-to-a-32-byte-random-secret-!!")
+
+// Claims holds our custom payload on top of jwt.RegisteredClaims.
+type Claims struct {
+	UserID string `json:"sub"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+// MintToken creates a signed JWT for the given user, valid for ttl.
+func MintToken(userID, role string, ttl time.Duration) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		UserID: userID,
+		Role:   role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			Issuer:    "ledger-api",
+		},
+	}
+	// jwt.NewWithClaims picks the signing method and embeds alg in the header.
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(signingKey)
+}
+
+// VerifyToken parses and validates a JWT string.
+// It returns the embedded claims on success.
+func VerifyToken(tokenStr string) (*Claims, error) {
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(
+		tokenStr,
+		claims,
+		// CRITICAL: always validate the alg. Never accept tokens signed
+		// with an algorithm you didn't intend. This closes the alg:none attack.
+		func(t *jwt.Token) (any, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			return signingKey, nil
+		},
+	)
+	if err != nil {
+		// jwt/v5 wraps typed errors — use errors.Is/As to distinguish.
+		// Go 1.26 adds errors.AsType[T](err) as a generic alternative to
+		// errors.As; for a single known type it's more concise but either works.
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, fmt.Errorf("token expired")
+		}
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("token invalid")
+	}
+	return claims, nil
+}
+
+func main() {
+	// Mint a 1-hour token for user_123.
+	tok, err := MintToken("user_123", "user", time.Hour)
+	if err != nil {
+		fmt.Println("mint error:", err)
+		return
+	}
+	fmt.Println("token (truncated):", tok[:40]+"...")
+
+	// Verify it.
+	claims, err := VerifyToken(tok)
+	if err != nil {
+		fmt.Println("verify error:", err)
+		return
+	}
+	fmt.Printf("verified: user=%s role=%s exp=%s\n",
+		claims.UserID, claims.Role,
+		claims.ExpiresAt.Time.Format(time.RFC3339))
+}
+```
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+var signingKey = []byte("change-me-to-a-32-byte-random-secret-!!")
+
+type Claims struct {
+	UserID string `json:"sub"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+func MintToken(userID, role string, ttl time.Duration) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		UserID: userID,
+		Role:   role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			Issuer:    "ledger-api",
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(signingKey)
+}
+
+func VerifyToken(tokenStr string) (*Claims, error) {
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected alg: %v", t.Header["alg"])
+		}
+		return signingKey, nil
+	})
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, fmt.Errorf("token expired")
+		}
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("token invalid")
+	}
+	return claims, nil
+}
+
+func main() {
+	tok, err := MintToken("user_123", "user", time.Hour)
+	if err != nil {
+		fmt.Println("mint error:", err)
+		return
+	}
+	fmt.Println("minted (truncated):", tok[:40]+"...")
+
+	claims, err := VerifyToken(tok)
+	if err != nil {
+		fmt.Println("verify error:", err)
+		return
+	}
+	fmt.Printf("verified: user=%s role=%s\n", claims.UserID, claims.Role)
+}
+```
+
+### The JWT footguns
+
+There are three footguns that have caused real production security incidents. Know them cold.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label={`"alg": "none"`}>The most notorious JWT vulnerability. The spec (RFC 7519) allows an algorithm of `"none"` — meaning the signature is empty and skipped entirely. A naive verifier that trusts the `alg` field from the token header itself will accept any unsigned token as valid. An attacker crafts `{"alg":"none"}` in the header, forges any claims they want, and sends an empty signature. Always validate the algorithm yourself in the key function — never accept what the token claims.</ConceptCard>
+  <ConceptCard label="Weak secrets (HS256)">HS256 is symmetric: you sign and verify with the same secret. If the secret is short, predictable, or taken from a wordlist, an attacker who captures one valid token can brute-force the secret offline (they just need to find a key where `HMAC(header.payload, key) == signature`). Use at minimum 32 bytes of `crypto/rand` entropy. Or switch to RS256/ES256 (asymmetric) — then even a compromised public key can't sign tokens.</ConceptCard>
+  <Gotcha>Never skip `ExpiresAt` (`exp` claim). A JWT without an expiry is valid forever — a leaked token is permanent compromise. Short-lived access tokens (15min–1h) + refresh tokens (longer-lived, stored server-side and revocable) is the right pattern. The access token's short life limits blast radius; the refresh token lets you log out by deleting it.</Gotcha>
+</ConceptGrid>
+
+<UnderTheHood title="How HMAC and RS256 signature verification actually works (Go 1.26 baseline)">
+
+**HMAC-SHA256 (HS256):**
+
+The server computes `HMAC-SHA256(base64url(header) + "." + base64url(payload), secret)`. HMAC is a symmetric construction: the same key that signs can also verify. Verification re-computes the HMAC and compares it to the signature segment using `crypto/subtle.ConstantTimeCompare`. If they match, the payload is authentic — it was signed by someone who holds the same secret.
+
+**Signing key generation (Go 1.26):** Generate HS256 keys with `crypto/rand.Read`. As of Go 1.26, several `crypto/*` generators ignore a caller-supplied `io.Reader` and always draw from the OS entropy pool — you cannot accidentally weaken them. Never use `math/rand` for keys, tokens, or nonces. Static analysis tools such as `golangci-lint` (with the `gosec` ruleset) flag this pattern.
+
+**Why `alg:none` is catastrophic:** The JWT spec (RFC 7519) defines `"none"` as a valid algorithm value meaning "unsecured" — no signature is required. A library that reads `header["alg"]` to select the verification algorithm before invoking the key function will receive `"none"`, skip all cryptographic work, and declare the token valid regardless of the signature field (which the attacker leaves empty). The attacker needs no key — they only need a library with this flaw. `golang-jwt/jwt/v5` closes this by requiring you to validate the method inside the key function callback before returning the key. If the method doesn't match what you expect, return an error and no key.
+
+**RSA-SHA256 (RS256):**
+
+The server holds a private RSA key and signs with PKCS#1 v1.5: `RSA-PKCS1v15(SHA256(header.payload), privateKey)`. Clients and other services verify with the public key only — they cannot forge tokens without the private key. The public key is typically published at a JWKS endpoint (e.g., `/.well-known/jwks.json`) so any service can fetch and cache it. RS256 is the right choice when multiple services verify tokens but only one mints them — a clean trust boundary.
+
+In Go, `jwt.SigningMethodRS256.Sign` internally calls `rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, hash)` and `jwt.SigningMethodRS256.Verify` calls `rsa.VerifyPKCS1v15`. This is a simplification of the library internals; the authoritative source is the `golang-jwt/jwt` source.
+
+</UnderTheHood>
+
+### Access tokens vs refresh tokens
+
+Short-lived access tokens + long-lived refresh tokens is the production pattern. Here's the flow:
+
+- **Access token:** signed JWT, 15 minutes to 1 hour, sent on every API request. Stateless — server verifies the signature, no DB needed. When it expires, the client needs a new one.
+- **Refresh token:** opaque random string (or a JWT), stored server-side in a table, long-lived (7–30 days). Client uses it to silently get a new access token without re-entering credentials. Because it's stored server-side, you can revoke it instantly by deleting the row — this is your "logout" and "revoke all sessions" lever.
+
+<QuickCheck
+  question={'Which JWT vulnerability allows an attacker to forge any token with an empty signature by setting the algorithm to "none"?'}
+  options={["Weak secret attack", `The "alg": "none" attack — trusting the algorithm field from the token header itself`, "Token replay attack", "Clock skew attack"]}
+  answer={1}
+  explain={`The "alg": "none" attack exploits JWT libraries that check t.Header["alg"] to pick the verification algorithm before validating it. Set alg to "none", send an empty signature, and a naive verifier skips all cryptographic work. Defense: always assert the expected algorithm in your key function before returning the key.`}
+/>
+
+---
+
+## Authorization and RBAC
+
+Everything up to here answered **who are you** — the password check, the session, the verified JWT signature. That's **authentication**. It is *not* the same question as **what are you allowed to do** — and conflating the two is how a read-only auditor ends up able to move money.
+
+**On the job:** Meridian has two kinds of internal users on the same API. An **admin** can create transfers; a compliance **auditor** can only read them. They authenticate identically — same login, same JWT machinery. The difference is purely authorization. If `POST /transfers` only checks "is this a valid token?" and not "does this user hold `transactions:write`?", the auditor's perfectly-valid token authorizes a transfer it should never be allowed to make. That's a 403 that should have happened and didn't.
+
+<Define term="Authentication vs authorization" since="Auth & API Design (Part 1)">
+**Authentication** establishes *who* the caller is (valid credentials → a known user). **Authorization** decides *what* that authenticated caller may do (this user holds the permission this endpoint requires). They are sequential and distinct: authentication produces a 401 when it fails ("not logged in"); authorization produces a 403 when it fails ("logged in, but not allowed"). Get them backwards and you either leak access or leak the existence of resources.
+</Define>
+
+### Roles vs permissions
+
+The naive approach stuffs a single `role` string into the JWT (`"role": "admin"`) and scatters `if role == "admin"` checks through the handlers. It works until you have a third role, or a permission that two roles share, or an "admin who can't delete" — then the `if` ladder rots.
+
+The model that scales is **permission-based**: define fine-grained permission *codes* that name a capability, not a person.
+
+<Define term="Permission-based access control (RBAC)" since="Auth & API Design (Part 1)">
+A **permission** is a fine-grained capability code like `transactions:read` or `transactions:write`. Users are granted a **set** of permissions (usually via roles — an admin role bundles `transactions:read` + `transactions:write`; an auditor role bundles only `transactions:read`). Each endpoint declares the *one* permission it requires, and a middleware checks the caller's set for it. Why it matters: capabilities compose and evolve without rewriting handlers — adding a new role is a data change, not a code change, and every endpoint's requirement is stated in exactly one place.
+</Define>
+
+For Meridian we'll use two codes — `transactions:read` and `transactions:write` — and align endpoints to them:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="GET /v1/transfers">requires `transactions:read` — admin and auditor both have it.</ConceptCard>
+  <ConceptCard label="POST /v1/transfers">requires `transactions:write` — admin only.</ConceptCard>
+  <ConceptCard label="DELETE /v1/transfers/{id}">requires `transactions:write` — admin only.</ConceptCard>
+  <Gotcha>Don't bake the permission *set* into a long-lived JWT and trust it for authorization. Permissions can be revoked mid-session; a token minted while you were an admin would keep admin powers until it expired. Look the permissions up server-side (keyed by the authenticated user) on each request, or keep access tokens short and re-check on refresh.</Gotcha>
+</ConceptGrid>
+
+### The `requirePermission` middleware
+
+Model the permission set as a slice with a membership check, then write **one** middleware that guards a handler with a required code. Authorization runs *after* authentication has already put a user on the request — it checks the set and returns `403 Forbidden` if the code is missing.
+
+<ExecTimeline
+  title="requirePermission — authenticated auditor hits POST /transfers"
+  lanes={[{id: "client", label: "Auditor"}, {id: "authn", label: "authn mw"}, {id: "authz", label: "requirePermission"}, {id: "h", label: "handler"}]}
+  steps={[
+    {lane: "client", kind: "send", label: "POST /v1/transfers + token", note: "Auditor sends a perfectly valid token — they ARE who they say they are."},
+    {lane: "authn", kind: "run", label: "verify token → user", note: "Authentication middleware verifies the signature and attaches the user to the request context. 200-path so far."},
+    {lane: "authz", kind: "run", label: "load user's permissions", note: "requirePermission looks up the caller's permission set server-side: the auditor holds {transactions:read}."},
+    {lane: "authz", kind: "block", label: "Includes('transactions:write')? no", note: "The endpoint requires transactions:write. The auditor's set does not include it."},
+    {lane: "authz", kind: "done", label: "403 Forbidden", note: "Authorization fails. The handler is NEVER called — no transfer is created. 403, not 401: they're logged in, just not allowed."},
+    {lane: "h", kind: "block", label: "(never runs)", note: "Business logic is short-circuited. Authentication passing does not imply authorization passing."},
+  ]}
+  caption="Authentication said 'yes, this is the auditor.' Authorization said 'and the auditor may not write.' Two questions, two answers."
+/>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+)
+
+// Permissions is the set of permission codes a user holds, e.g.
+// "transactions:read" or "transactions:write". This is the model of
+// authorization: what a user may DO, distinct from who they are.
+type Permissions []string
+
+// Includes reports whether the set contains a specific permission code.
+func (p Permissions) Includes(code string) bool {
+	return slices.Contains(p, code)
+}
+
+// userPerms stands in for a users_permissions join table. In production
+// this comes from a DB query keyed by the authenticated user's ID.
+var userPerms = map[string]Permissions{
+	"admin-ada":    {"transactions:read", "transactions:write"},
+	"auditor-finn": {"transactions:read"}, // read-only compliance auditor
+}
+
+// requirePermission wraps a handler, letting it run only if the caller holds
+// the required permission. Missing it returns 403 Forbidden — the handler
+// never runs. Authorization (what you may do) is checked AFTER authentication
+// (who you are); here we assume authn already identified the caller.
+func requirePermission(code string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// In real code the user comes from auth middleware via the request
+		// context. We read a header to keep the example self-contained.
+		caller := r.Header.Get("X-User")
+		if !userPerms[caller].Includes(code) {
+			http.Error(w, "your account lacks the required permission", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+func createTransfer(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprint(w, `{"transfer_id":"txn_1","status":"created"}`)
+}
+
+func try(h http.HandlerFunc, user string) {
+	req := httptest.NewRequest("POST", "/v1/transfers", nil)
+	req.Header.Set("X-User", user)
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	fmt.Printf("%-12s POST /v1/transfers -> %d %s\n", user, rec.Code, rec.Body.String())
+}
+
+func main() {
+	// POST /v1/transfers requires the transactions:write permission.
+	guarded := requirePermission("transactions:write", createTransfer)
+
+	try(guarded, "admin-ada")    // 200 — admin holds transactions:write
+	try(guarded, "auditor-finn") // 403 — auditor is read-only
+}
+```
+
+</GoPlayground>
+
+The middleware is the *only* place the rule lives. Wire it onto each route with the permission that route demands:
+
+```go
+mux.HandleFunc("GET /v1/transfers", requirePermission("transactions:read", listTransfers))
+mux.HandleFunc("POST /v1/transfers", requirePermission("transactions:write", createTransfer))
+mux.HandleFunc("DELETE /v1/transfers/{id}", requirePermission("transactions:write", deleteTransfer))
+```
+
+In a real service `requirePermission` wraps your authentication middleware (which puts the user on the context) — so the full chain is *authenticate → look up permissions → check the required code → handler*. Each layer answers exactly one question.
+
+<Callout kind="pro" title="Least privilege is the default, not an upgrade">
+
+Grant a user the **minimum** permission set their job requires, and nothing more — the same principle as minimal OAuth2 scopes in the next section. Meridian's auditor gets `transactions:read` because reading is their entire job; they never get `transactions:write` "just in case." When an account is compromised, the blast radius is exactly the permissions that account held. A read-only token that leaks cannot move money. Design the permission codes narrow and assign them stingily.
+
+</Callout>
+
+<QuickCheck
+  question="An authenticated auditor with a valid JWT calls POST /transfers, which requires transactions:write. The auditor only holds transactions:read. What should the API return, and why?"
+  options={[
+    "401 Unauthorized — the token must be invalid",
+    "403 Forbidden — authentication succeeded but authorization failed; the caller is known but not permitted",
+    "200 OK — a valid token is enough to authorize any endpoint",
+    "404 Not Found — hide the endpoint from unauthorized users"
+  ]}
+  answer={1}
+  explain="The token is valid, so authentication passed — 401 would be wrong (that means 'not logged in'). The failure is authorization: the caller's permission set lacks transactions:write. That is precisely what 403 Forbidden means — 'logged in, but not allowed.' The handler must not run; no transfer is created."
+/>
+
+---
+
+## OAuth2 and OIDC
+
+OAuth2 is an **authorization** framework. OIDC (OpenID Connect) is an **authentication** layer built on top of it. When you add "Login with Google" to Meridian's checkout, you're implementing the OAuth2 authorization-code flow with OIDC claims.
+
+**On the job:** If you skip the `state` CSRF parameter, an attacker can trick a Meridian user into linking their bank account to the attacker's Meridian session — a classic account-takeover vector. This isn't theoretical; it's been exploited in production fintech apps.
+
+The most important concept to internalize: in OAuth2, there are three actors:
+
+1. **Resource Owner** — the user.
+2. **Client** — your application, asking for access on behalf of the user.
+3. **Authorization Server / Provider** — Google, GitHub, your own OAuth server. This is who the user actually logs into, and who issues tokens.
+
+Your Go service can be a **client** (you're consuming someone else's OAuth, e.g. "Login with GitHub"), or a **provider** (you're building the OAuth server that other services authenticate against). Most backends are clients.
+
+<Define term="OAuth2 — authorization-code flow">
+**OAuth2** is an authorization framework: it lets a user grant your app limited access to their account on another service without giving you their password. In the **authorization-code flow** — the secure default for server-side apps — the user authenticates directly with the provider (Google, GitHub), which hands back a short-lived code. Your server exchanges that code (plus your `client_secret`) for access and refresh tokens, server-to-server, away from the browser. Your app never sees the user's password, and the browser never sees your `client_secret`.
+</Define>
+
+### The Authorization-Code Flow
+
+<ExecTimeline
+  title="OAuth2 Authorization-Code Flow end to end"
+  lanes={[{id: "user", label: "User/Browser"}, {id: "client", label: "Your App"}, {id: "provider", label: "Auth Provider"}]}
+  steps={[
+    {lane: "user", kind: "run", label: "click 'Login with GitHub'", note: "User clicks the login button. Your app needs to send them to GitHub's authorization endpoint."},
+    {lane: "client", kind: "run", label: "redirect to provider", note: "Your app generates a random `state` parameter (CSRF protection), stores it in the session, and redirects: GET /authorize?client_id=...&redirect_uri=...&scope=read:user&state=abc123"},
+    {lane: "provider", kind: "run", label: "user authenticates", note: "GitHub shows its login page. The user enters their credentials directly to GitHub — your app never sees the password. User consents to the requested scopes."},
+    {lane: "user", kind: "send", label: "redirect back (+ code)", note: "GitHub redirects back to your redirect_uri with a short-lived authorization code: GET /callback?code=xyz&state=abc123"},
+    {lane: "client", kind: "run", label: "validate state, exchange code", note: "Your app validates that state matches what it stored (CSRF check), then POSTs to GitHub's token endpoint: code + client_id + client_secret to get tokens."},
+    {lane: "provider", kind: "send", label: "access + refresh tokens", note: "GitHub returns an access token (short-lived) and optionally a refresh token. With OIDC, it also returns an id_token (JWT) containing the user's identity."},
+    {lane: "client", kind: "run", label: "fetch user profile + create session", note: "Your app uses the access token to call the provider's userinfo endpoint, gets the user's ID/email, creates a local user record if needed, and issues your own session/JWT."}
+  ]}
+  caption="Your app never sees the user's password. The authorization code is single-use and short-lived — even if intercepted in transit, it's useless without your client_secret."
+/>
+
+The **state** parameter is load-bearing — it prevents CSRF attacks where an attacker tricks a user into authenticating with the attacker's account. Generate it with `crypto/rand`, store it in the session before the redirect, and verify it on callback.
+
+### Scopes: asking for the minimum
+
+Scopes define what access you're requesting. `read:user` is not `user:email` is not `repo`. Request the minimum scope your app actually needs — this is the **principle of least privilege** applied to OAuth2. Users see the scope list on the consent screen; asking for `repo:write` when you only need to read a username will (correctly) alarm them.
+
+### Access tokens vs refresh tokens (OAuth2 side)
+
+In OAuth2, access tokens are short-lived (minutes to hours) and used to call the protected API. Refresh tokens are longer-lived, stored on your server, and used to get new access tokens when the old ones expire — without requiring the user to log in again. The provider can revoke a refresh token (e.g. the user revokes your app's access), which immediately cuts off future token refreshes.
+
+<Callout kind="note" title="OIDC: authentication on top of OAuth2">
+
+OAuth2 is authorization-only — it proves a user granted you access, but tells you nothing about *who they are*. OIDC adds an `id_token` — a JWT signed by the provider — that contains claims like `sub` (stable user ID), `email`, `name`, and `email_verified`. The `sub` claim is the stable identifier you store locally to represent that user. Don't use `email` as the primary key — it can change.
+
+</Callout>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/github"
+)
+
+// oauthConfig is package-level but read-only after init —
+// in real code, inject this as a dependency, don't use a global.
+var oauthConfig = &oauth2.Config{
+	ClientID:     "YOUR_CLIENT_ID",     // from env/secrets
+	ClientSecret: "YOUR_CLIENT_SECRET", // never in source
+	RedirectURL:  "http://localhost:8080/auth/github/callback",
+	Scopes:       []string{"read:user", "user:email"},
+	Endpoint:     github.Endpoint,
+}
+
+// handleLogin redirects the user to GitHub's authorization page.
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	// state must be a crypto/rand-generated token stored in the session.
+	// As of Go 1.26, crypto/rand always draws from OS entropy — never math/rand.
+	state := "random-state-from-crypto-rand" // in production: use crypto/rand
+	url := oauthConfig.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	http.Redirect(w, r, url, http.StatusFound)
+}
+
+// handleCallback exchanges the code for tokens.
+func handleCallback(w http.ResponseWriter, r *http.Request) {
+	// 1. Validate state (anti-CSRF) — compare to what you stored in the session.
+	// state := r.URL.Query().Get("state") ...
+
+	code := r.URL.Query().Get("code")
+	// Exchange code for tokens using client_id + client_secret (server-to-server).
+	token, err := oauthConfig.Exchange(context.Background(), code)
+	if err != nil {
+		http.Error(w, "exchange failed", http.StatusInternalServerError)
+		return
+	}
+	// token.AccessToken — use this to call GitHub's API.
+	// token.RefreshToken — store this to refresh without re-auth.
+	fmt.Fprintf(w, "access token obtained (expiry: %s)\n", token.Expiry)
+}
+
+func main() {
+	http.HandleFunc("/auth/github/login", handleLogin)
+	http.HandleFunc("/auth/github/callback", handleCallback)
+	fmt.Println("listening :8080")
+	_ = http.ListenAndServe(":8080", nil)
+}
+```
+
+```go
+package main
+
+// This snippet demonstrates the OAuth2 config structure.
+// A full callback flow requires a real provider — this shows the setup.
+import (
+	"fmt"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/github"
+)
+
+func main() {
+	cfg := &oauth2.Config{
+		ClientID:     "demo-client-id",
+		ClientSecret: "demo-client-secret",
+		RedirectURL:  "http://localhost:8080/auth/callback",
+		Scopes:       []string{"read:user", "user:email"},
+		Endpoint:     github.Endpoint,
+	}
+	// AuthCodeURL builds the redirect URL to send the user to.
+	state := "csrf-state-token"
+	url := cfg.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	fmt.Println("redirect user to:")
+	fmt.Println(url)
+}
+```
+
+---
+
+## REST Design
+
+Now we pivot. Auth secures the API; the next four sections are about designing it. We'll use Meridian's ledger API as the running example throughout.
+
+**On the job:** Inconsistent REST design isn't just aesthetically bad — it breaks client SDKs, breaks auto-generated OpenAPI docs, and makes every outage harder to diagnose because nobody agrees on what a 200 with an error body means.
+
+### Resources and URLs
+
+REST is about resources, not actions. The URL names a **thing**; the HTTP method describes what to do with it.
+
+<BeforeAfter
+  badLabel="Action-oriented (RPC-style)"
+  goodLabel="Resource-oriented (REST)"
+  bad={`POST /getAccount?id=123
+POST /createTransfer
+POST /deleteAccount?id=123
+POST /listAccountTransactions`}
+  good={`GET    /accounts/123
+POST   /accounts/123/transfers
+DELETE /accounts/123
+GET    /accounts/123/transfers`}
+/>
+
+Rules:
+- Nouns, plural: `/accounts`, `/transactions`, `/users` — not `/getAccount` or `/accountList`.
+- Nesting for ownership: `/accounts/123/transfers` — transfers that belong to account 123.
+- Don't go deeper than two levels of nesting. `/accounts/123/transfers/456/line-items` — that's too deep; consider `/transfers/456/line-items` instead.
+- IDs in the path, not the body: `DELETE /accounts/123`, not `POST /accounts/delete` with `{"id":123}`.
+
+### Status codes that actually mean something
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="200 OK">The general success. GET, PUT success. Body contains the resource.</ConceptCard>
+  <ConceptCard label="201 Created">POST that created something. Include a `Location` header pointing to the new resource.</ConceptCard>
+  <ConceptCard label="204 No Content">Success with no body. DELETE, or a PATCH that returns nothing.</ConceptCard>
+  <ConceptCard label="400 Bad Request">The client sent malformed input — invalid JSON, missing required field, wrong type. Include a body explaining what was wrong.</ConceptCard>
+  <ConceptCard label="401 Unauthorized">The client is not authenticated (no token, or token is invalid/expired). "401" means "not logged in."</ConceptCard>
+  <ConceptCard label="403 Forbidden">The client is authenticated but not authorized. "403" means "logged in but not allowed."</ConceptCard>
+  <ConceptCard label="404 Not Found">Resource doesn't exist — or you're hiding it (returning 404 instead of 403 to not leak existence).</ConceptCard>
+  <ConceptCard label="409 Conflict">The request can't be completed due to a state conflict — duplicate key, optimistic lock failure, idempotency key collision.</ConceptCard>
+  <ConceptCard label="422 Unprocessable Entity">Syntactically valid but semantically wrong — amount is negative, account is closed, insufficient funds.</ConceptCard>
+  <Gotcha>Never return 200 with an error in the body. `{"status":"error","message":"account not found"}` with HTTP 200 is an abomination. It breaks every HTTP-aware middleware, breaks monitoring, breaks retry logic, and makes me profoundly sad. Use the right status code. The response body elaborates; it does not override.</Gotcha>
+</ConceptGrid>
+
+### Consistent error shapes
+
+Every error response should have a consistent JSON shape across your entire API. Pick one and stick to it — forever. Here's a good one:
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+// APIError is the canonical error envelope for all 4xx/5xx responses.
+// Consistent shape means clients can always expect the same structure.
+type APIError struct {
+	Code    string `json:"code"`    // machine-readable: "insufficient_funds"
+	Message string `json:"message"` // human-readable: "account has insufficient funds"
+	// Optional: validation errors, request ID, docs URL.
+	Fields  []FieldError `json:"fields,omitempty"` // for 400s with multiple field errors
+	TraceID string       `json:"trace_id,omitempty"`
+}
+
+type FieldError struct {
+	Field   string `json:"field"`
+	Message string `json:"message"`
+}
+
+// WriteError encodes an APIError with the correct status code.
+func WriteError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(APIError{Code: code, Message: message})
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /accounts/{id}/transfers", func(w http.ResponseWriter, r *http.Request) {
+		// Imagine validation failed:
+		WriteError(w, http.StatusUnprocessableEntity,
+			"insufficient_funds", "account 123 has insufficient funds for this transfer")
+	})
+	_ = http.ListenAndServe(":8080", mux)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type APIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func WriteError(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(APIError{Code: code, Message: msg})
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	WriteError(w, http.StatusUnprocessableEntity,
+		"insufficient_funds", "account has insufficient funds")
+}
+
+func main() {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/accounts/123/transfers", nil)
+	handler(rec, req)
+	fmt.Printf("status: %d\nbody: %s", rec.Code, rec.Body.String())
+}
+```
+
+</GoPlayground>
+
+---
+
+## Versioning and Pagination
+
+### API versioning strategies
+
+You will change your API. The question is how to manage that change without breaking existing clients. Three strategies:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="URL path versioning">`/v1/accounts`, `/v2/accounts`. Most common, most explicit. Clients know exactly what they're talking to. The downside: it duplicates routes, and people sometimes forget to update the version prefix. New to most Go teams — start here.</ConceptCard>
+  <ConceptCard label="Header versioning">`Accept: application/vnd.ledger.v2+json` or `API-Version: 2026-01-01`. Keeps URLs clean. Harder to test in a browser. Stripe uses date-based header versioning — it's elegant but complex to route in middleware.</ConceptCard>
+  <ConceptCard label="Query param versioning">`/accounts?v=2`. Easy to add, easy to miss. Caching is harder because the version is part of the query string. Generally the weakest option, but you'll see it in legacy systems.</ConceptCard>
+</ConceptGrid>
+
+For most Go services, **URL path versioning is the right default**. It's obvious, it's easy to route in `net/http`, and it's impossible to miss:
+
+```go
+mux.Handle("/v1/", v1Handler)
+mux.Handle("/v2/", v2Handler)
+```
+
+Keep `/v1` alive while clients migrate. Deprecate it loudly (a `Deprecation` response header, documentation, email). Delete it on a published schedule, not quietly.
+
+<Define term="Pagination — offset vs cursor">
+**Pagination** breaks a large list into pages so you don't return 100,000 transfers in one response. **Offset pagination** skips N rows (`OFFSET N`) — simple, but the position drifts when rows are inserted mid-session and it gets slower at depth. **Cursor pagination** anchors to the last-seen row ID (`WHERE id {">"} cursor`) — equally fast at any depth and stable under concurrent inserts. For Meridian's live transfer feed, cursor is the right default.
+</Define>
+
+### Pagination: offset vs cursor
+
+Any endpoint that returns a list needs pagination. Two approaches with meaningfully different trade-offs:
+
+<ExecTimeline
+  title="Offset vs cursor pagination comparison"
+  lanes={[{id: "offset", label: "Offset pagination"}, {id: "cursor", label: "Cursor pagination"}]}
+  steps={[
+    {lane: "offset", kind: "run", label: "GET /txns?limit=10&offset=0", note: "Client requests the first page. SQL: SELECT ... LIMIT 10 OFFSET 0. Returns items 1-10."},
+    {lane: "cursor", kind: "run", label: "GET /txns?limit=10", note: "Client requests the first page. SQL: SELECT ... WHERE id > 0 ORDER BY id LIMIT 10. Returns items 1-10 plus a cursor (last ID seen)."},
+    {lane: "offset", kind: "run", label: "GET /txns?limit=10&offset=10", note: "Page 2. SQL scans and discards 10 rows, then returns the next 10. At large offsets this gets expensive."},
+    {lane: "cursor", kind: "run", label: "GET /txns?limit=10&after=id_of_row10", note: "Page 2. SQL: WHERE id > {cursor} LIMIT 10. Seeks directly to the cursor position — equally fast at any page depth."},
+    {lane: "offset", kind: "block", label: "row inserted → page drifts", note: "A new transfer is inserted mid-pagination. Offset shifts: the client skips or duplicates rows. No defense against this."},
+    {lane: "cursor", kind: "run", label: "row inserted → cursor stable", note: "New inserts don't move the cursor. The WHERE id > {cursor} anchor is unaffected by concurrent writes."},
+    {lane: "offset", kind: "done", label: "returns total_count", note: "Offset supports total_count (COUNT(*)) for numbered page UIs. Cursor does not — use offset only when you genuinely need it."},
+  ]}
+  caption="Cursor pagination is strictly better for performance and correctness on live data. Use offset only when you need total_count or a numbered-page UI."
+/>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+)
+
+// PageResult is the envelope for paginated list responses.
+type PageResult[T any] struct {
+	Data       []T    `json:"data"`
+	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
+}
+
+// listTransfers demonstrates cursor-based pagination.
+// In production: replace with a real DB query.
+func listTransfers(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 100 {
+		limit = 20 // default, max-cap
+	}
+	after := q.Get("after") // cursor: the last seen transfer ID
+
+	// In real code: WHERE id > after ORDER BY id ASC LIMIT limit+1
+	// We fetch limit+1 items; if we got limit+1 back, there are more pages.
+	// The (limit+1)th item becomes the next_cursor — we don't return it.
+	_ = after // placeholder
+
+	type Transfer struct {
+		ID     string `json:"id"`
+		Amount int    `json:"amount_cents"`
+	}
+	// Dummy data — replace with your DB call.
+	items := []Transfer{
+		{ID: "txn_1", Amount: 5000},
+		{ID: "txn_2", Amount: 1200},
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	var nextCursor string
+	if hasMore && len(items) > 0 {
+		nextCursor = items[len(items)-1].ID
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(PageResult[Transfer]{
+		Data:       items,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	})
+	fmt.Fprintf(w, "") // flush
+}
+
+func main() {
+	http.HandleFunc("GET /v1/accounts/{id}/transfers", listTransfers)
+	fmt.Println("listening :8080")
+	_ = http.ListenAndServe(":8080", nil)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type PageResult[T any] struct {
+	Data       []T    `json:"data"`
+	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
+}
+
+type Transfer struct {
+	ID     string `json:"id"`
+	Amount int    `json:"amount_cents"`
+}
+
+func listTransfers(w http.ResponseWriter, r *http.Request) {
+	items := []Transfer{
+		{ID: "txn_1", Amount: 5000},
+		{ID: "txn_2", Amount: 1200},
+		{ID: "txn_3", Amount: 750},
+	}
+	// Simulate: page size 2, so there are more pages.
+	limit := 2
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	var next string
+	if hasMore {
+		next = items[len(items)-1].ID
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(PageResult[Transfer]{
+		Data: items, NextCursor: next, HasMore: hasMore,
+	})
+}
+
+func main() {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/accounts/123/transfers", nil)
+	listTransfers(rec, req)
+	fmt.Print(rec.Body.String())
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question="Why does cursor-based pagination not drift when rows are inserted during pagination?"
+  options={["It uses a transaction that locks the table", "The cursor is anchored to a stable ID in the ordered set — new inserts before the cursor don't shift the page boundary", "It caches the full result set on the first request", "It always queries from the beginning and skips already-seen IDs"]}
+  answer={1}
+  explain="Cursor pagination uses WHERE id > {last_seen_id} ORDER BY id. The cursor position is stable regardless of what gets inserted. Offset pagination uses OFFSET N which is positional — any insert before position N shifts all subsequent pages."
+/>
+
+### Sorting: the SQL-injection footgun in `ORDER BY`
+
+List endpoints invite a `?sort=` parameter (`?sort=amount`, `?sort=-created_at` for descending). It looks harmless, and it is the single most common way an otherwise-parameterized API gets a SQL injection.
+
+The reason is a hard SQL limitation: **you cannot use a placeholder parameter for a column name or for `ASC`/`DESC`**. Placeholders (`$1`, `?`) only bind *values*. So the tempting move is to interpolate the client's string straight into the query — and now `?sort=amount; DROP TABLE transfers --` is your problem.
+
+<Define term="Safe sorting — column safelist" since="Auth & API Design (Part 1)">
+A **sort safelist** is the fixed set of column names (and directions) your endpoint permits a client to sort by. Because `ORDER BY` can't be parameterized, you must validate the client's `sort` value against this allowlist and reject anything not on it — never interpolate the raw string into the SQL. Why it matters: the safelist is the boundary between "the client picks a sort order" and "the client writes arbitrary SQL." It's also good UX — an unknown sort key gets a clean `422`, not a 500.
+</Define>
+
+The pattern: keep an explicit safelist, confirm the requested value is a member, then map it to a trusted column + direction you control. Anything not on the list is a `422 Unprocessable Entity`, never a query.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
+
+// sortSafelist is the ONLY set of sort values this endpoint accepts.
+// A leading "-" means descending. The client's raw string is matched
+// against this list before it ever influences the SQL.
+var sortSafelist = []string{
+	"created_at", "-created_at",
+	"amount_cents", "-amount_cents",
+	"id", "-id",
+}
+
+// orderByClause validates the client's sort value and returns a SAFE
+// "column DIR" fragment, plus ok=false if the value isn't on the safelist.
+// The returned column never contains client bytes — only our own strings.
+func orderByClause(sort string) (clause string, ok bool) {
+	if !slices.Contains(sortSafelist, sort) {
+		return "", false // not on the safelist — reject, do NOT interpolate
+	}
+	col := strings.TrimPrefix(sort, "-")
+	dir := "ASC"
+	if strings.HasPrefix(sort, "-") {
+		dir = "DESC"
+	}
+	// Always append a unique tiebreaker (id) so the order is deterministic
+	// — without it, equal sort keys can come back in any order, breaking
+	// pagination across pages.
+	return fmt.Sprintf("ORDER BY %s %s, id ASC", col, dir), true
+}
+
+func main() {
+	for _, sort := range []string{
+		"-amount_cents",                 // legit: descending by amount
+		"created_at",                    // legit: ascending by date
+		"amount_cents; DROP TABLE x --", // attack: not on the safelist
+		"password",                      // not a sortable column here
+	} {
+		if clause, ok := orderByClause(sort); ok {
+			fmt.Printf("sort=%-32q -> %s\n", sort, clause)
+		} else {
+			fmt.Printf("sort=%-32q -> 422 invalid sort value\n", sort)
+		}
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="The safelist is the whole defense — there is no 'sanitize' shortcut">
+
+Do not try to "escape" or "clean" the sort string and then interpolate it — escaping is for *values*, and `ORDER BY` takes an *identifier*. The only correct approach is membership in a fixed allowlist of strings you wrote. The same rule covers `?filter=`, page-size caps (clamp `page_size` to a max like 100 so a client can't request a million rows), and any dynamic column or table name. Filtering on *values* (`WHERE amount_cents > $1`) uses placeholders as normal — it's the *identifier* positions (`ORDER BY`, `SELECT` column lists) that can't be parameterized and therefore must be safelisted.
+
+</Callout>
+
+---
+
+## Idempotency and Errors
+
+<Define term="Idempotency key" since="Idempotency &amp; Exactly-Once Semantics (Part 3)">
+An **idempotency key** is a client-generated UUID the client includes in every state-mutating request (`Idempotency-Key: <uuid>`). The server stores the result of the first execution keyed by that UUID; if the same key arrives again (a retry after a timeout), the server replays the cached result without re-executing. This turns a non-idempotent operation — `POST /transfers` — into one that can be safely retried. Without it, a network timeout followed by a retry creates two transfers: money moves twice. In a ledger system, that's not a bug — it's fraud.
+</Define>
+
+### Idempotency keys for writes
+
+A network timeout is not a failure — it's an unknown. The request may or may not have reached the server. If your client retries a `POST /transfers` after a timeout and it had already succeeded, you've just double-charged someone. In a ledger system, this is catastrophic.
+
+The solution: **idempotency keys**. The client generates a unique key (typically a UUID v4) for each logical operation and sends it in a header (`Idempotency-Key: <uuid>`). The server:
+
+1. Checks if it's seen this key before (in Redis or Postgres).
+2. If yes: return the cached response from the first execution.
+3. If no: execute the operation, store the result keyed by the idempotency key, return the result.
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync"
+)
+
+// idempotencyStore is an in-memory stand-in.
+// In production: Redis with a TTL (24h is common), or a DB table.
+type idempotencyStore struct {
+	mu   sync.Mutex
+	seen map[string][]byte // key → cached response body
+}
+
+var store = &idempotencyStore{seen: make(map[string][]byte)}
+
+type TransferRequest struct {
+	FromAccount string `json:"from_account"`
+	ToAccount   string `json:"to_account"`
+	AmountCents int64  `json:"amount_cents"`
+}
+
+type TransferResponse struct {
+	TransferID string `json:"transfer_id"`
+	Status     string `json:"status"`
+	Cached     bool   `json:"cached,omitempty"`
+}
+
+func handleTransfer(w http.ResponseWriter, r *http.Request) {
+	idempKey := r.Header.Get("Idempotency-Key")
+	if idempKey == "" {
+		http.Error(w, `{"code":"missing_idempotency_key"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Check if we've processed this key before.
+	store.mu.Lock()
+	if cached, ok := store.seen[idempKey]; ok {
+		store.mu.Unlock()
+		// Replay the exact same response.
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Idempotent-Replayed", "true")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached)
+		return
+	}
+	store.mu.Unlock()
+
+	var req TransferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"code":"invalid_body"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Execute the transfer (placeholder).
+	resp := TransferResponse{TransferID: "txn_abc123", Status: "completed"}
+	body, _ := json.Marshal(resp)
+
+	// Store the result before responding.
+	store.mu.Lock()
+	store.seen[idempKey] = body
+	store.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(body)
+}
+
+func main() {
+	http.HandleFunc("POST /v1/transfers", handleTransfer)
+	fmt.Println("listening :8080")
+	_ = http.ListenAndServe(":8080", nil)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+)
+
+type idempotencyStore struct {
+	mu   sync.Mutex
+	seen map[string][]byte
+}
+
+var store = &idempotencyStore{seen: make(map[string][]byte)}
+
+type TransferResponse struct {
+	TransferID string `json:"transfer_id"`
+	Status     string `json:"status"`
+}
+
+func handleTransfer(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(w, `{"code":"missing_key"}`, http.StatusBadRequest)
+		return
+	}
+	store.mu.Lock()
+	if cached, ok := store.seen[key]; ok {
+		store.mu.Unlock()
+		w.Header().Set("Idempotent-Replayed", "true")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(cached)
+		return
+	}
+	store.mu.Unlock()
+
+	resp := TransferResponse{TransferID: "txn_abc123", Status: "completed"}
+	body, _ := json.Marshal(resp)
+	store.mu.Lock()
+	store.seen[key] = body
+	store.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(body)
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/transfers", handleTransfer)
+
+	body := bytes.NewBufferString(`{"from":"acct_1","to":"acct_2","amount_cents":5000}`)
+	r1 := httptest.NewRequest(http.MethodPost, "/v1/transfers", body)
+	r1.Header.Set("Idempotency-Key", "unique-key-abc")
+	rec1 := httptest.NewRecorder()
+	mux.ServeHTTP(rec1, r1)
+	fmt.Printf("First call status: %d, body: %s\n", rec1.Code, rec1.Body.String())
+
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/transfers", bytes.NewBufferString(`{}`))
+	r2.Header.Set("Idempotency-Key", "unique-key-abc")
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, r2)
+	fmt.Printf("Retry status: %d, replayed: %s, body: %s\n",
+		rec2.Code, rec2.Result().Header.Get("Idempotent-Replayed"), rec2.Body.String())
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="Idempotency and the Meridian ledger">
+
+In Meridian's double-entry ledger (covered fully in Part 3, "Double-Entry Ledgers"), idempotency keys are critical infrastructure, not a nice-to-have. A payment retry without idempotency creates a second debit/credit pair — the books no longer balance and someone's money is wrong. Wire idempotency keys into every state-mutating operation from day one. Retrofitting it later is miserable.
+
+</Callout>
+
+### CSRF protection for API routes (Go 1.25+)
+
+JSON APIs that accept `Authorization` headers are generally safe from classic form-based CSRF, but browser-based clients that rely on session cookies are not. Go 1.25 introduced `net/http.CrossOriginProtection`, which validates the `Sec-Fetch-Site`, `Origin`, and `Referer` Fetch metadata headers to reject cross-origin requests automatically.
+
+**On the job:** Meridian's checkout endpoint accepts cookie-authenticated sessions in addition to Bearer tokens. Without CSRF protection, a malicious page can trigger `POST /transfers` from a logged-in user's browser with zero JavaScript — the browser sends the cookie automatically.
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/transfers", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+
+	// net/http.CrossOriginProtection (Go 1.25) validates Fetch metadata headers
+	// (Sec-Fetch-Site, Sec-Fetch-Mode, Origin) and rejects cross-origin requests
+	// that don't match your allowlist. No third-party library required.
+	cop := http.NewCrossOriginProtection()
+	// Allow same-origin and the explicit Meridian web origin.
+	cop.AddTrustedOrigin("https://app.meridianpay.example")
+
+	// Wrap the mux: cross-origin requests to mutation endpoints are rejected
+	// with 403 before the handler runs.
+	_ = http.ListenAndServe(":8080", cop.Handler(mux))
+}
+```
+
+<Callout kind="note" title="CrossOriginProtection is not a CORS handler">
+
+`net/http.CrossOriginProtection` is a **defense** layer — it rejects requests that look cross-origin based on Fetch metadata headers. It is not the same as setting `Access-Control-Allow-Origin` (that's CORS, which is about what browsers are allowed to read). Use both: CORS to control what clients can read, `CrossOriginProtection` to reject mutations that shouldn't be coming from other origins at all.
+
+</Callout>
+
+### Why CSRF happens, and the two classic defenses
+
+The Fetch-metadata approach above is the modern, low-effort layer. But you should understand *why* CSRF is possible at all, because it explains both the older defenses and exactly which clients need them.
+
+<Define term="CSRF — cross-site request forgery" since="Auth & API Design (Part 1)">
+**CSRF** is an attack that abuses **ambient credentials**: a browser attaches a site's session cookie to *every* request to that site, including requests triggered by a *different*, malicious site. So a logged-in Meridian user who visits `evil.example` can have their browser silently fire `POST /transfers` to Meridian — cookie attached, request authenticated — with no JavaScript and no token theft. Why it matters: anything authenticated by an automatically-sent cookie is exposed; anything authenticated by an explicit `Authorization: Bearer` header is **not**, because the browser does not attach that header cross-site.
+</Define>
+
+That last point is the key triage: **a pure token-in-header API is largely immune to classic CSRF** (the attacker's page can't set your `Authorization` header). CSRF is a problem specifically for **cookie/session-based** auth, where the credential travels automatically. Two defenses, usually layered:
+
+**Defense 1 — the `SameSite` cookie attribute.** This is the cheapest and most effective single control. It tells the browser *not to send the cookie* on cross-site requests:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="SameSite=Strict">The cookie is never sent on any cross-site request, even a top-level navigation (clicking a link to Meridian from another site). Maximum safety; mildly annoying UX (a link from an email lands the user logged-out). Right default for a sensitive session cookie.</ConceptCard>
+  <ConceptCard label="SameSite=Lax">The cookie IS sent on top-level GET navigations but NOT on cross-site `POST`/`fetch`. This blocks the classic forged-`POST` CSRF while keeping inbound links working. The browser default for cookies without an explicit attribute.</ConceptCard>
+  <ConceptCard label="SameSite=None">The cookie is sent on all cross-site requests (requires `Secure`). Only for cookies that genuinely must work in a third-party context. For a session cookie this re-opens the CSRF door — avoid it.</ConceptCard>
+  <Gotcha>`SameSite=Lax` blocks cross-site `POST` but not a cross-site top-level `GET` — so never put a state-mutating action behind a `GET`. `GET /transfer?to=attacker` is forgeable even with `Lax`. State changes go through `POST`/`PUT`/`PATCH`/`DELETE`, always.</Gotcha>
+</ConceptGrid>
+
+The hardened session cookie from earlier already sets this — `SameSite: http.SameSiteStrictMode` is itself a CSRF control, not just a tidy default.
+
+**Defense 2 — the synchronizer-token (anti-CSRF token) pattern.** For older browsers, or as defense-in-depth, pair the session cookie with an unpredictable token the attacker cannot know:
+
+1. On a safe request, the server generates a random token (`crypto/rand`), stores it tied to the session, and hands it to the page (in a hidden form field or a response header).
+2. Every state-mutating request must echo that token back (in a header like `X-CSRF-Token` or a form field).
+3. The server compares the submitted token to the session's stored token using a **constant-time** compare. No match → reject.
+
+It works because the attacker's cross-site request carries the ambient cookie but **cannot read or guess the per-session token** — same-origin policy keeps the token out of their reach. The **double-submit** variant avoids server-side storage: send the token both as a cookie and as a header, and verify the two match (the attacker can't read your cookie to forge the matching header).
+
+```go
+// Synchronizer-token verification on a state-mutating route.
+// The session already proved WHO; this proves the request originated
+// from OUR page, not a forged cross-site one.
+func verifyCSRF(w http.ResponseWriter, r *http.Request) bool {
+	sent := r.Header.Get("X-CSRF-Token")     // echoed by our page
+	expected := csrfTokenForSession(r)       // crypto/rand token tied to the session
+	// Constant-time compare — never == for a secret (timing leak).
+	if subtle.ConstantTimeCompare([]byte(sent), []byte(expected)) != 1 {
+		http.Error(w, `{"code":"csrf_failed"}`, http.StatusForbidden)
+		return false
+	}
+	return true
+}
+```
+
+<Callout kind="warn" title="Pick the defense that matches your auth model">
+
+Don't bolt anti-CSRF tokens onto a stateless `Authorization: Bearer` API — there's no ambient credential to forge, so the tokens add ceremony for no gain. **Token-in-header → no CSRF problem.** **Cookie/session → `SameSite=Strict/Lax` first, plus `net/http.CrossOriginProtection`, plus a synchronizer token for legacy-browser defense-in-depth.** Meridian's checkout, which accepts *both* Bearer tokens and session cookies, needs the cookie defenses precisely because of the cookie path — the Bearer path is already safe.
+
+</Callout>
+
+---
+
+## OpenAPI and GraphQL
+
+### OpenAPI/Swagger: your API contract
+
+OpenAPI is a machine-readable specification for your REST API — the types, endpoints, parameters, request/response schemas, and authentication requirements. It's the contract between your service and every client that consumes it.
+
+**On the job:** Meridian's partner banks integrate against the ledger API. Without a published OpenAPI spec, every integration is reverse-engineered from curl examples in a Slack thread. With a spec, partners generate typed SDKs in their language of choice. The spec also feeds contract tests — the moment a Go struct change breaks the spec, CI catches it before production.
+
+In Go, you have two approaches:
+
+1. **Spec-first:** write the `openapi.yaml` manually, then generate server stubs and client SDKs from it. Tools: `oapi-codegen`, `openapi-generator`.
+2. **Code-first (generate from Go):** annotate your handlers and types, then generate the spec. Tools: `swaggo/swag`, `go-swagger`.
+
+For most teams, **spec-first with `oapi-codegen`** produces cleaner results — the spec is the single source of truth and you always have it. Here's a minimal example with `oapi-codegen`:
+
+```go
+// Generated from openapi.yaml by oapi-codegen — don't hand-edit.
+// go:generate oapi-codegen -package api -generate types,chi-server openapi.yaml
+
+package api
+
+// Transfer represents a money movement between two accounts.
+type Transfer struct {
+	ID          string `json:"id"`
+	FromAccount string `json:"from_account"`
+	ToAccount   string `json:"to_account"`
+	AmountCents int64  `json:"amount_cents"`
+	Status      string `json:"status"`
+}
+
+// CreateTransferParams are the body params for POST /v1/transfers.
+type CreateTransferParams struct {
+	FromAccount string `json:"from_account"`
+	ToAccount   string `json:"to_account"`
+	AmountCents int64  `json:"amount_cents"`
+}
+```
+
+The `//go:generate` directive means `go generate ./...` regenerates the types whenever you change the spec. The spec becomes the contract; Go types are a derived artifact.
+
+<Callout kind="pro" title="Ship a /openapi.json endpoint">
+
+Embed your OpenAPI spec into the binary with `//go:embed openapi.yaml` — covered in the next chapter, "File Servers, go:embed & CDNs" — and serve it at `/openapi.json`. Every toolchain that needs to consume Meridian's API can find its contract at a predictable URL, and you never have out-of-date docs rotting in a wiki.
+
+</Callout>
+
+### GraphQL: what it solves and what it costs
+
+GraphQL is not a replacement for REST; it's a solution to a specific set of problems REST has.
+
+**What GraphQL solves:**
+
+- **Overfetching:** REST endpoints return fixed shapes. If the mobile client only needs `id` and `name` from a `GET /accounts/{id}` that returns 30 fields, it wastes bandwidth. GraphQL lets clients ask for exactly the fields they need.
+- **Underfetching (N+1 in the client):** displaying a list of accounts with each account's last transfer requires N+1 REST calls. A GraphQL query fetches both in one round trip.
+- **Schema introspection:** the schema is self-documenting and tooling (GraphiQL, code generators) can interrogate it.
+
+**What GraphQL costs:**
+
+- **Complexity.** Resolvers, dataloaders to kill N+1 on the server side, a query parser, depth limiting to prevent DoS from deeply nested queries, cost analysis. That's real infrastructure.
+- **Caching.** HTTP caching (CDN, `ETag`, `Cache-Control`) works beautifully with REST's GET semantics. GraphQL's POST-based queries mostly bypass it.
+- **Rate limiting.** A REST endpoint has a predictable cost. A GraphQL query's cost is variable — a single query can trigger dozens of resolver chains.
+
+**When REST wins:** internal services talking machine-to-machine, APIs with stable and well-known shapes, anything where CDN caching is valuable, teams without the bandwidth to maintain a GraphQL layer.
+
+**When GraphQL wins:** a public API consumed by many different clients (mobile, web, third-party) that need different shapes of the same data; a product with a front-end team who wants to own data fetching without a back-end round trip for every new UI requirement.
+
+For the ledger API we've been building? REST with cursor pagination and a clean OpenAPI spec wins. You're building a financial system with auditable, predictable operations — not a flexible data exploration layer for a consumer app.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Use REST when">Stable shapes, internal services, caching matters, machine-to-machine communication, simple team structure, latency is not dominated by over-fetching.</ConceptCard>
+  <ConceptCard label="Use GraphQL when">Multiple clients needing different projections of the same data, large front-end teams, the product evolves the UI faster than the API, over-fetching is a real measured problem.</ConceptCard>
+  <Gotcha>GraphQL's N+1 problem lives on the server side, not the client side. Each resolver runs per-item in a list. Without the dataloader pattern (batching), a list of 100 accounts will fire 100 individual DB queries for a nested field. This is worse than the REST N+1 problem because it's invisible in the query — it's a server-side implementation detail.</Gotcha>
+</ConceptGrid>
+
+---
+
+## Exercises
+
+You've absorbed a lot. Now prove it compiles, runs, and does the right thing.
+
+<Exercise n={1} title="Bcrypt round-trip" level="easy">
+
+Write a `main` program that hashes the password `"correcthorsebatterystaple"` with bcrypt at cost 10, then verifies it against both the correct password and the string `"wrong"`. Print `"match"` or `"mismatch"` for each.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"golang.org/x/crypto/bcrypt"
+)
+
+func main() {
+	password := "correcthorsebatterystaple"
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 10)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if bcrypt.CompareHashAndPassword(hash, []byte(password)) == nil {
+		fmt.Println("correct: match")
+	}
+	if bcrypt.CompareHashAndPassword(hash, []byte("wrong")) != nil {
+		fmt.Println("wrong: mismatch")
+	}
+}
+```
+
+`bcrypt.CompareHashAndPassword` returns `nil` on match and `bcrypt.ErrMismatchedHashAndPassword` (or another error) on failure. The hash embeds the salt, so two calls to `GenerateFromPassword` with the same password produce different hashes — both will verify correctly.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="JWT with expiry" level="medium">
+
+Using `github.com/golang-jwt/jwt/v5`, write `MintToken(userID string, ttl time.Duration) (string, error)` and `VerifyToken(tok string) (userID string, err error)`. Then in `main`:
+
+1. Mint a token that expires in 1 hour and verify it.
+2. Mint a token that expires in `-1*time.Millisecond` (already expired) and show that verification fails with `"token expired"`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+var key = []byte("test-key-32-bytes-minimum-length!")
+
+type claims struct {
+	jwt.RegisteredClaims
+}
+
+func MintToken(userID string, ttl time.Duration) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, &claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
+		},
+	}).SignedString(key)
+}
+
+func VerifyToken(tok string) (string, error) {
+	c := &claims{}
+	t, err := jwt.ParseWithClaims(tok, c, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected alg: %v", t.Header["alg"])
+		}
+		return key, nil
+	})
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return "", fmt.Errorf("token expired")
+		}
+		return "", fmt.Errorf("invalid: %w", err)
+	}
+	if !t.Valid {
+		return "", fmt.Errorf("invalid")
+	}
+	return c.Subject, nil
+}
+
+func main() {
+	tok, _ := MintToken("user_1", time.Hour)
+	sub, err := VerifyToken(tok)
+	fmt.Println("valid token:", sub, err)
+
+	expired, _ := MintToken("user_1", -time.Millisecond)
+	_, err = VerifyToken(expired)
+	fmt.Println("expired token error:", err)
+}
+```
+
+The `jwt/v5` library returns a wrapped `jwt.ErrTokenExpired` inside the parse error — `errors.Is` correctly unwraps it regardless of wrapping depth.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Idempotency middleware" level="medium">
+
+Write an `IdempotencyMiddleware(next http.Handler) http.Handler` that:
+
+1. Reads the `Idempotency-Key` header.
+2. If the key was seen before: replay the cached status code and body, add `Idempotent-Replayed: true`, and return.
+3. If the key is new: record the response (capture the status code and body with `httptest.ResponseRecorder` or a response-capturing wrapper), store it, then write it to the real `http.ResponseWriter`.
+
+Test it with two sequential calls using the same key.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+)
+
+type cachedResp struct {
+	status int
+	body   []byte
+}
+
+type idempStore struct {
+	mu    sync.Mutex
+	cache map[string]cachedResp
+}
+
+func (s *idempStore) get(key string) (cachedResp, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.cache[key]
+	return r, ok
+}
+
+func (s *idempStore) set(key string, r cachedResp) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cache[key] = r
+}
+
+func IdempotencyMiddleware(store *idempStore, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("Idempotency-Key")
+		if key == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if cached, ok := store.get(key); ok {
+			w.Header().Set("Idempotent-Replayed", "true")
+			w.WriteHeader(cached.status)
+			_, _ = w.Write(cached.body)
+			return
+		}
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, r)
+		store.set(key, cachedResp{status: rec.Code, body: rec.Body.Bytes()})
+		for k, vs := range rec.Header() {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	})
+}
+
+func main() {
+	s := &idempStore{cache: make(map[string]cachedResp)}
+	handler := IdempotencyMiddleware(s, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"transfer_id":"txn_1"}`)
+	}))
+
+	make2Calls := func(key string) {
+		for i := 1; i <= 2; i++ {
+			r := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewBufferString("{}"))
+			r.Header.Set("Idempotency-Key", key)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, r)
+			fmt.Printf("call %d: status=%d replayed=%q body=%s\n",
+				i, rec.Code, rec.Header().Get("Idempotent-Replayed"), rec.Body.String())
+		}
+	}
+	make2Calls("key-abc-123")
+}
+```
+
+The key insight: capture the handler's output with `httptest.NewRecorder`, store it, then replay verbatim. The middleware is transparent to the handler and to the caller.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Cursor pagination" level="medium">
+
+Write `paginateTransfers(transfers []Transfer, afterID string, limit int) PageResult[Transfer]` where `Transfer` has fields `ID string` and `AmountCents int64`. The function should return up to `limit` items after `afterID` (exclusive), set `HasMore`, and set `NextCursor` to the last returned ID when there are more items.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+type Transfer struct {
+	ID          string
+	AmountCents int64
+}
+
+type PageResult[T any] struct {
+	Data       []T
+	NextCursor string
+	HasMore    bool
+}
+
+func paginateTransfers(ts []Transfer, afterID string, limit int) PageResult[Transfer] {
+	start := 0
+	if afterID != "" {
+		for i, t := range ts {
+			if t.ID == afterID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	window := ts[start:]
+	hasMore := len(window) > limit
+	if hasMore {
+		window = window[:limit]
+	}
+	var next string
+	if hasMore && len(window) > 0 {
+		next = window[len(window)-1].ID
+	}
+	return PageResult[Transfer]{Data: window, NextCursor: next, HasMore: hasMore}
+}
+
+func main() {
+	ts := []Transfer{
+		{ID: "t1", AmountCents: 1000},
+		{ID: "t2", AmountCents: 2000},
+		{ID: "t3", AmountCents: 3000},
+		{ID: "t4", AmountCents: 4000},
+		{ID: "t5", AmountCents: 5000},
+	}
+	page1 := paginateTransfers(ts, "", 2)
+	fmt.Printf("page1: %+v\n", page1)
+	page2 := paginateTransfers(ts, page1.NextCursor, 2)
+	fmt.Printf("page2: %+v\n", page2)
+	page3 := paginateTransfers(ts, page2.NextCursor, 2)
+	fmt.Printf("page3: %+v\n", page3)
+}
+```
+
+Page 1 returns t1+t2 with `NextCursor=t2` and `HasMore=true`. Page 2 returns t3+t4. Page 3 returns t5 with `HasMore=false`. This exactly mirrors a real DB cursor query.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Reject the alg:none attack" level="hard">
+
+Write `VerifyTokenSafe(tok string, key []byte) error` using `golang-jwt/jwt/v5` that correctly rejects:
+
+1. A token with an empty/`"none"` algorithm.
+2. A token with a tampered payload (valid structure, wrong signature).
+3. An expired token.
+
+Write three tests (using `testing` package style, expressed as table-driven subtests) that verify each case. The token for case 1 should be hand-crafted: `base64url({"alg":"none","typ":"JWT"}) + "." + base64url({"sub":"attacker","exp":<far future>}) + "."` (empty signature).
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+var testKey = []byte("test-key-32bytes-padding-padding!")
+
+func VerifyTokenSafe(tok string, key []byte) error {
+	c := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(tok, c, func(t *jwt.Token) (any, error) {
+		// Reject anything that isn't HS256.
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return key, nil
+	})
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return fmt.Errorf("token expired")
+		}
+		return fmt.Errorf("invalid token: %w", err)
+	}
+	return nil
+}
+
+func b64url(s string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(s))
+}
+
+func TestVerifyTokenSafe(t *testing.T) {
+	// Valid token for contrast.
+	valid, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, &jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		Subject:   "user_1",
+	}).SignedString(testKey)
+
+	// alg:none token — empty signature, far-future exp.
+	noneHeader := b64url(`{"alg":"none","typ":"JWT"}`)
+	nonePayload := b64url(fmt.Sprintf(`{"sub":"attacker","exp":%d}`, time.Now().Add(24*time.Hour).Unix()))
+	algNoneToken := strings.Join([]string{noneHeader, nonePayload, ""}, ".")
+
+	// Tampered token — flip a byte in the signature of the valid token.
+	parts := strings.Split(valid, ".")
+	sig := []byte(parts[2])
+	sig[0] ^= 0xFF
+	tamperedToken := parts[0] + "." + parts[1] + "." + string(sig)
+
+	// Expired token.
+	expired, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, &jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Second)),
+		Subject:   "user_1",
+	}).SignedString(testKey)
+
+	tests := []struct {
+		name    string
+		tok     string
+		wantErr string
+	}{
+		{"valid", valid, ""},
+		{"alg none", algNoneToken, "invalid token"},
+		{"tampered", tamperedToken, "invalid token"},
+		{"expired", expired, "token expired"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyTokenSafe(tc.tok, testKey)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected %q in error, got %q", tc.wantErr, err.Error())
+				}
+			}
+		})
+	}
+}
+
+func main() {
+	fmt.Println("Run with: go test -v")
+}
+```
+
+The key function returns an error for any non-HMAC signing method — this closes the `alg:none` door. `jwt/v5`'s parser then surfaces that as an error. The `errors.Is(err, jwt.ErrTokenExpired)` check distinguishes expiry from other validation failures so callers can act accordingly (e.g. redirect to refresh instead of showing "access denied").
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+All right, sport. I've watched you learn — now I need to watch you *think* under pressure.
+
+<Lab
+  title="The Vulnerable JWT Verifier"
+  archetype="break-fix"
+  difficulty="guided"
+  points={120}
+  hintCost={15}
+  objective="The starter code contains a JWT verifier with two critical vulnerabilities: it trusts the algorithm from the token header (enabling the alg:none attack) and it doesn't check the exp claim (tokens never expire). Your mission — in two phases. Phase 1: craft an exploit that bypasses authentication with an unsigned alg:none token, capture the flag from the /admin endpoint. Phase 2: patch both vulnerabilities so the verifier rejects alg:none tokens AND refuses expired tokens. The verifier tests must all pass green. This lab runs fully sandboxed — the vulnerable handler is in-process only, not connected to any real system."
+  starter={`package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+// VULNERABLE verifier — do NOT ship this.
+// Bug 1: it decodes the header to pick the algorithm,
+//         trusting whatever the token claims.
+// Bug 2: it never checks the exp claim.
+func vulnerableVerify(tokenStr string) (map[string]any, error) {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("malformed token")
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, err
+	}
+	var header map[string]any
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return nil, err
+	}
+	alg, _ := header["alg"].(string)
+	// BUG 1: if alg is "none", we skip signature verification entirely!
+	if alg != "none" {
+		// (real signature check omitted for brevity — assume it works for HS256)
+		_ = parts[2]
+	}
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payloadJSON, &claims); err != nil {
+		return nil, err
+	}
+	// BUG 2: we never check claims["exp"]!
+	return claims, nil
+}
+
+func adminHandler(w http.ResponseWriter, r *http.Request) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	claims, err := vulnerableVerify(strings.TrimPrefix(auth, "Bearer "))
+	if err != nil || claims["role"] != "admin" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	fmt.Fprint(w, "GO{never_trust_the_alg_header_verify_or_die}")
+}
+
+// TODO Phase 1: craft a forged alg:none token with role=admin and
+//              call adminHandler to capture the flag.
+//
+// TODO Phase 2: replace vulnerableVerify with a safe version using
+//              golang-jwt/jwt/v5 that:
+//              - asserts the algorithm is HS256 in the key function
+//              - checks exp and returns an error if the token is expired
+//              Run the provided tests to confirm both bugs are fixed.
+
+var signingKey = []byte("change-me-32-bytes-for-real-use!!")
+
+func main() {
+	// Sanity: the real handler is here, waiting.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin", adminHandler)
+	fmt.Println("Sandbox server ready. Write your exploit, then patch it.")
+	_ = mux
+}`}
+  verify="self-check"
+  verifier="Phase 1: call adminHandler with your forged token and print the response body — the flag string appears if the exploit works. Phase 2: add a main-function self-check that calls your safe verifier with (a) an alg-none token, (b) an expired HS256 token, and (c) a valid HS256 admin token, printing PASS or FAIL for each case. Codapi runs go run only — the verification is visible in stdout, not via go test."
+  hints={[
+    "Phase 1 — forge the token: base64url-encode the header JSON and payload JSON separately, join with dots, add an empty string as the signature: header.payload.",
+    "Phase 2 — fix Bug 1: use jwt.ParseWithClaims with a key function that checks t.Method is *jwt.SigningMethodHMAC before returning the key. If the method is anything else, return an error.",
+    "Phase 2 — fix Bug 2: jwt/v5 checks exp automatically if the RegisteredClaims struct embeds ExpiresAt. Wrap the parse error and check errors.Is(err, jwt.ErrTokenExpired) to return a distinct 'token expired' error.",
+    "The forged alg:none token payload needs: sub, role=admin, and an exp in the far future (though the vulnerable verifier ignores exp anyway). Encode with base64.RawURLEncoding, not standard base64."
+  ]}
+  flag="GO{never_trust_the_alg_header_verify_or_die}"
+>
+
+The starter code contains a JWT verifier with two deliberate vulnerabilities. Your job: **exploit them**, then **close both doors**. This is what separates engineers who know about security from engineers who build secure systems.
+
+The flag lives inside `adminHandler`. The only way to reach it is through the vulnerability — or through a correct, patched verifier after you've proven both bugs are sealed. The sandbox is entirely in-process; nothing here touches any real system.
+
+I'll be watching.
+
+</Lab>
+
+<Recap>
+
+You now have both halves of auth and API design locked down for Meridian's `POST /transfers` and every other endpoint you'll build.
+
+**Auth (Go 1.26 baseline):**
+- Use **bcrypt** (cost ≥12) or **argon2id** for password hashing. Fast/plain hashes are a crime. Per-password salts are built in to bcrypt; you manage them manually for argon2id.
+- All signing keys, session IDs, and OAuth2 state tokens come from `crypto/rand`. As of Go 1.26, `crypto/rand` always uses OS entropy — you cannot accidentally weaken it. Never use `math/rand` for anything security-related.
+- **Sessions** (server-side state + `HttpOnly Secure SameSite` cookie) give you instant revocation. **Stateless JWTs** eliminate the DB lookup but require careful key management and short expiries.
+- JWT structure: `base64url(header).base64url(payload).signature`. Payload is encoded, not encrypted — never put secrets there. Signature proves integrity, not confidentiality.
+- JWT footguns: the `alg:none` attack (always validate the algorithm in the key function), weak secrets (32+ bytes of entropy for HS256), missing `exp` (always set expiry; short-lived access + long-lived revocable refresh tokens). Use `errors.Is(err, jwt.ErrTokenExpired)` — or `errors.AsType[T]` (new in Go 1.26) — to distinguish expiry from other parse failures.
+- **Authentication ≠ authorization.** Authn = *who you are* (fail → 401); authz = *what you may do* (fail → 403). **Permission-based RBAC**: define capability codes (`transactions:read`, `transactions:write`), grant users a set (via roles), and gate each endpoint with one `requirePermission(code, handler)` middleware that returns 403 when the code is absent. Look permissions up server-side; don't trust a stale set baked into a long-lived token. Least privilege by default.
+- **OAuth2 authorization-code flow**: the user authenticates with the provider directly; you exchange a short-lived code for tokens. Never skip the `state` CSRF parameter. With OIDC, use the `sub` claim as the stable user identifier — not email.
+- **CSRF** abuses ambient cookies, so it hits **cookie/session** auth — a `Authorization: Bearer` header API is largely immune. Defenses: `SameSite=Strict`/`Lax` cookies first, `net/http.CrossOriginProtection` (Go 1.25+) for Fetch-metadata checks, and a synchronizer/double-submit token for legacy-browser defense-in-depth. Never put a state change behind a `GET`.
+
+**API Design:**
+- REST: noun-based URLs, plural resources, HTTP verbs for operations. Status codes that mean what they say (401 ≠ 403, 200 ≠ an error body).
+- Consistent error envelope: machine-readable `code`, human-readable `message`, optional `fields` for validation errors.
+- **URL-path versioning** (`/v1/`, `/v2/`) is the pragmatic default. Keep old versions alive while clients migrate.
+- **Cursor pagination** over offset for live data: equally fast at any page depth, no drift on concurrent inserts. Offset only when you genuinely need `total_count`.
+- **Idempotency keys** for every state-mutating endpoint, including Meridian's `POST /transfers`. Client generates a UUID; server stores the first result and replays it for retries. Non-negotiable in a ledger system.
+- **OpenAPI/Swagger** as a generated contract. Spec-first with `oapi-codegen` is the cleanest pattern.
+- **GraphQL** when clients need projections of the same data and you have the budget to maintain resolvers and dataloaders. REST wins for stable, internal, or cacheable APIs.
+
+</Recap>
+
+<Scoreboard
+  streak={17}
+  items={[
+    { label: "Quick check — why not SHA-256 for passwords", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — alg:none JWT attack", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — cursor vs offset pagination", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — bcrypt round-trip", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — JWT with expiry", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3 — Idempotency middleware", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — Cursor pagination", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Reject the alg:none attack", kind: "exercise", points: 30, done: false }
+  ]}
+  flag={{ label: "Lab — The Vulnerable JWT Verifier", captured: false, points: 120 }}
+/>
+
+Not bad. You survived the auth gauntlet and came out with a working understanding of JWT internals, OAuth2 plumbing, and API design that won't make me cringe. That's genuinely impressive — not *me*-level, obviously, but… impressive. The next chapter covers file servers and CDNs: how to serve static assets, embed entire filesystems into your binary, and make a CDN work for you instead of against you. The fundamentals are laid. Don't squander them.

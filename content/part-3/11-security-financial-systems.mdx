@@ -1,0 +1,1839 @@
+---
+title: "Security for Financial Systems"
+part: 3
+order: 11
+type: "course"
+description: "Building on the Part 2 security baseline: secrets management, encryption at rest and in transit, request signing, authorization models, replay/tamper protection and handling PII."
+prerequisites: ["auditability-compliance"]
+---
+
+<HeroCard label="Part 3 · Chapter 11" title="Security for Financial Systems">
+
+Here's the thing, sport. Every engineer who's ever said "security is someone else's job" has eventually had their name in a breach disclosure. Not mine — mine has never appeared there. Yours won't either, because I'm not going to let you ship a payments service that stores bank details in plaintext, signs nothing, and trusts every request that walks through the door.
+
+Part 2 gave you the baseline — input validation, injection, TLS, supply-chain scanning. We're not repeating that. We're going *further*. Finance-grade security: envelope encryption with AES-GCM, HMAC-signed API requests, per-account authorization, nonce-guarded replay protection, and PII handling that minimizes blast radius. This chapter also teaches you **how Go crypto actually works** — the primitives, the failure modes, and the one rule that trips up every engineer at least once. By the end you will build things that are genuinely hard to break. And I'll personally verify that you did it right.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Secrets Management for Finance", "crypto/rand vs math/rand", "Encryption at Rest and in Transit", "Envelope Encryption with a KMS", "Field-Level PII Encryption", "Constant-Time Comparison", "Request Signing", "Authorization Models", "Replay and Tamper Protection", "Handling PII"]} />
+
+## Secrets Management for Finance
+
+Let's set the scene: Meridian's payments service needs a private key to sign outbound requests to the card network, an AES master key to decrypt stored bank account numbers, and database credentials. These are not configuration. They are **secrets**, and they carry wildly different risk profiles.
+
+The **Configuration & Secrets Management** chapter (Part 2) covered the baseline: never commit secrets, load them from a secrets manager, keep them out of logs. That baseline is table stakes here. What finance adds on top is a key hierarchy and operational controls that make a compromised secret survivable.
+
+**On the job:** You discover that a rotation script accidentally wrote a data key to a CloudWatch log stream. With envelope encryption, rotating the KEK re-wraps every DEK without touching the ciphertexts — and the exposed DEK protected exactly one record, not the whole database.
+
+### The finance-specific threat model
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Key material vs. config">A database URL is a secret. A 256-bit AES master key is **cryptographic key material** — it must never touch disk unencrypted, must live in a hardware-backed store, and must have a rotation schedule measured in days, not years.</ConceptCard>
+  <ConceptCard label="HSM / KMS">A **Hardware Security Module** (HSM) or cloud **Key Management Service** (KMS — AWS KMS, GCP Cloud KMS, Azure Key Vault) stores master keys in tamper-resistant hardware. Your service never sees the raw key bytes for master keys; it calls the KMS API to encrypt or decrypt.</ConceptCard>
+  <ConceptCard label="Separation of duties">The service that encrypts data should not be the same identity that can rotate the master key. The engineer who deploys the service should not be the one who approves key access. Separate IAM roles, separate approvals, audited in the append-only log you built in the **Auditability & Compliance** chapter.</ConceptCard>
+  <Gotcha>Never put a KMS master key in an environment variable or a config file. You call the KMS — the KMS holds the key. If your service can print its master key bytes to stdout, something is already wrong.</Gotcha>
+</ConceptGrid>
+
+### Key rotation without downtime
+
+A key you can't rotate is a liability. The pattern:
+
+1. **Generate** a new data key (or new master key version) in the KMS.
+2. **Re-encrypt** the data keys for existing records using the new master key version (the KMS API does this — your service never touches plaintext master key bytes).
+3. **Update** the key version reference in every encrypted record.
+4. **Revoke** the old key version after a quiet period.
+
+Go's `crypto/aes` and `crypto/cipher` are the implementation layer. The KMS is the root of trust. The next sections cover both in depth.
+
+<Callout kind="pro" title="Link to Part 2">
+The **Configuration & Secrets Management** chapter covers HashiCorp Vault, AWS Secrets Manager, and the discipline of keeping secrets out of logs and crash dumps. Everything there applies here — this chapter layers the cryptographic controls on top, not instead of. The **Application Security Baseline** chapter (Part 2) is the prerequisite for TLS, injection, and secrets hygiene.
+</Callout>
+
+---
+
+## `crypto/rand` vs `math/rand`
+
+<Define term="CSPRNG / crypto/rand" since="Application Security Baseline (Part 2)">
+A **Cryptographically Secure Pseudo-Random Number Generator** (CSPRNG) produces output that is computationally indistinguishable from true randomness — an attacker who sees past output cannot predict future output. Go's `crypto/rand` package wraps the OS CSPRNG (`/dev/urandom` on Linux, `BCryptGenRandom` on Windows). It is the **only** correct source for keys, nonces, tokens, and any value whose secrecy matters. `math/rand` (and `math/rand/v2`) is a deterministic PRNG seeded by a fixed algorithm — fast, convenient for simulations and tests, and **completely wrong** for security-sensitive values.
+</Define>
+
+This is the single most important rule in Go cryptography. If you use `math/rand` to generate a nonce, a session token, or an API key, an attacker who knows (or guesses) the seed can reproduce your entire output stream. The seed for a `math/rand.New(math/rand.NewSource(time.Now().UnixNano()))` call is a 64-bit integer. A motivated attacker can exhaust the entire space in minutes on commodity hardware.
+
+**On the job:** A security audit at a fintech finds that their token-generation library used `math/rand` seeded with `time.Now().UnixNano()`. The library had been in production for two years, passed every code review, and was the source of all idempotency keys, nonces, and HMAC secrets. Predictable keys meant every HMAC signature for the past two years was forgeable given the server's approximate start time.
+
+<Scene
+  title="Predictable stream vs. unpredictable stream"
+  actors={[
+    { id: "mrand", label: "math/rand (seed=42)" },
+    { id: "crand", label: "crypto/rand (OS CSPRNG)" },
+    { id: "atk", label: "Attacker" }
+  ]}
+  rows={2}
+  cols={6}
+  frames={[
+    {
+      caption: "Both generators produce 6 values. math/rand output is fully determined by its seed.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "idle", label: "?" },
+        { id: "A2", state: "idle", label: "?" },
+        { id: "A3", state: "idle", label: "?" },
+        { id: "A4", state: "idle", label: "?" },
+        { id: "A5", state: "idle", label: "?" },
+        { id: "A6", state: "idle", label: "?" },
+        { id: "B1", state: "idle", label: "?" },
+        { id: "B2", state: "idle", label: "?" },
+        { id: "B3", state: "idle", label: "?" },
+        { id: "B4", state: "idle", label: "?" },
+        { id: "B5", state: "idle", label: "?" },
+        { id: "B6", state: "idle", label: "?" }
+      ]
+    },
+    {
+      caption: "math/rand seed=42 produces a fixed, reproducible sequence — same seed, same output, every time.",
+      beat: "problem",
+      actors: [{ id: "mrand", state: "active" }],
+      cells: [
+        { id: "A1", state: "warn", label: "5a" },
+        { id: "A2", state: "warn", label: "1f" },
+        { id: "A3", state: "warn", label: "8c" },
+        { id: "A4", state: "warn", label: "2b" },
+        { id: "A5", state: "warn", label: "7e" },
+        { id: "A6", state: "warn", label: "d3" }
+      ]
+    },
+    {
+      caption: "crypto/rand draws from the OS entropy pool — no seed, no pattern, output is unpredictable even to the OS.",
+      beat: "solution",
+      actors: [{ id: "crand", state: "ok" }],
+      cells: [
+        { id: "B1", state: "done", label: "f7" },
+        { id: "B2", state: "done", label: "3a" },
+        { id: "B3", state: "done", label: "c1" },
+        { id: "B4", state: "done", label: "91" },
+        { id: "B5", state: "done", label: "0e" },
+        { id: "B6", state: "done", label: "58" }
+      ]
+    },
+    {
+      caption: "Attacker guesses seed=42, runs math/rand.New(seed), reproduces the entire Meridian nonce/token stream. crypto/rand output is computationally infeasible to predict.",
+      beat: "problem",
+      actors: [{ id: "atk", state: "bad" }, { id: "mrand", state: "bad" }, { id: "crand", state: "ok" }],
+      cells: [
+        { id: "A1", state: "bad", label: "✕" },
+        { id: "A2", state: "bad", label: "✕" },
+        { id: "A3", state: "bad", label: "✕" },
+        { id: "A4", state: "bad", label: "✕" },
+        { id: "A5", state: "bad", label: "✕" },
+        { id: "A6", state: "bad", label: "✕" },
+        { id: "B1", state: "done", label: "✓" },
+        { id: "B2", state: "done", label: "✓" },
+        { id: "B3", state: "done", label: "✓" },
+        { id: "B4", state: "done", label: "✓" },
+        { id: "B5", state: "done", label: "✓" },
+        { id: "B6", state: "done", label: "✓" }
+      ]
+    }
+  ]}
+  caption="Row A = math/rand (predictable). Row B = crypto/rand (unpredictable). For nonces, keys, and tokens, only row B is safe."
+/>
+
+The rule is absolute: `crypto/rand` for anything security-sensitive; `math/rand` only for non-secret randomness (shuffling a playlist, test fixtures, load simulation).
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+)
+
+// generateToken returns a 32-byte cryptographically random token,
+// hex-encoded to 64 characters. Safe for session IDs, API keys, nonces.
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", fmt.Errorf("crypto/rand: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func main() {
+	tok, err := generateToken()
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("token:", tok) // 64 hex chars, unpredictable
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+)
+
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", fmt.Errorf("crypto/rand: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func main() {
+	tok, err := generateToken()
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("token:", tok)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Always-secure randomness in Go 1.26 — and what changed">
+
+Go 1.25 and 1.26 tightened the relationship between `crypto/*` generators and their randomness source.
+
+**Go 1.20:** `math/rand` global functions are auto-seeded with a random value by default (no longer the fixed seed=1 from older Go). This closed the most egregious `math/rand` footgun for new programs, but `math/rand` is still deterministic given a known seed — it is **not** a CSPRNG and must not be used for security values.
+
+**Go 1.26 (always-secure crypto):** Several functions in `crypto/ecdsa`, `crypto/rsa`, and `crypto/dsa` that previously accepted a `rand io.Reader` parameter now **ignore the supplied reader** and always use `crypto/rand` internally. The signatures are unchanged for backward compatibility, but passing a custom reader no longer has any effect — the implementation silently uses the OS CSPRNG. This means tests that previously passed a seeded `math/rand` reader to `ecdsa.Sign` for determinism will still compile but no longer produce deterministic output. If you need deterministic ECDSA for tests, use RFC 6979 deterministic signing explicitly instead.
+
+**`crypto/hpke` (new in Go 1.26):** The standard library now includes `crypto/hpke`, which implements Hybrid Public Key Encryption (RFC 9180). HPKE combines an asymmetric KEM (key encapsulation mechanism) with a symmetric AEAD for forward-secrecy-friendly encryption without a pre-shared secret. It is more sophisticated than the AES-GCM + RSA pattern and is the recommended primitive for new protocols that need public-key encryption.
+
+**`runtime/secret` (experimental in Go 1.26):** An experimental package `runtime/secret` provides a `Value[T]` type that holds sensitive material (keys, tokens) and, on supported platforms, attempts to zero memory when the value is garbage-collected or explicitly released. It is not a substitute for good key lifecycle discipline, but it reduces the window during which key material sits in a heap dump. Treat it as defense-in-depth, not a primary control.
+
+`crypto/aes` + `crypto/cipher` for AES-GCM remains canonical and unchanged. These notes are additive, not replacements.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="A colleague generates a nonce with math/rand.New(math/rand.NewSource(time.Now().UnixNano())). What is the problem?"
+  options={[
+    "math/rand is too slow for production use",
+    "The nonce is deterministically reproducible by anyone who knows (or approximates) the process start time — the entire output stream can be reconstructed",
+    "math/rand does not generate bytes, only integers",
+    "There is no problem; Go 1.20+ auto-seeds math/rand securely"
+  ]}
+  answer={1}
+  explain="math/rand is a PRNG — its output is a deterministic function of its seed. A 64-bit UnixNano seed has ~2^64 possibilities, but in practice the attacker can narrow the window to within a few hundred milliseconds using the server's observed response timestamps, reducing the brute-force space dramatically. crypto/rand draws from the OS entropy pool and is computationally indistinguishable from true randomness."
+/>
+
+---
+
+## Encryption at Rest and in Transit
+
+### In transit: TLS everywhere
+
+TLS is the non-negotiable floor. The **Application Security Baseline** chapter (Part 2) covers TLS enforcement and HSTS. For fintech, two additional rules:
+
+- **Mutual TLS (mTLS)** between internal services — not just server auth, but client auth. Every service presents a certificate; the server rejects any caller that can't prove who it is.
+- **Certificate pinning or SPIFFE/SVID** for service-to-service calls in high-assurance environments. A stolen credential on one service should not grant it access to the payments vault.
+
+For the rest of this section we focus on **at rest**: data that lives in your database.
+
+### Symmetric encryption with AES-GCM
+
+<Define term="AES-GCM / AEAD">
+**AES-GCM** (Advanced Encryption Standard in Galois/Counter Mode) is an **AEAD** cipher — Authenticated Encryption with Associated Data. It provides two guarantees in one operation: **confidentiality** (the ciphertext reveals nothing about the plaintext) and **integrity** (any modification to the ciphertext is detected before you get plaintext back). In Go, AES-GCM is exposed via the `crypto/aes` and `crypto/cipher` packages through the `cipher.AEAD` interface.
+</Define>
+
+<Define term="Nonce">
+A **nonce** (number-used-once) is a value that must be unique for every encryption operation under the same key. For AES-GCM, the standard nonce is 12 bytes. If you reuse a nonce with the same key, an attacker who sees both ciphertexts can XOR them to cancel the keystream and recover the XOR of the two plaintexts — confidentiality is completely broken. Generate nonces with `crypto/rand`; never use a counter shared across replicas.
+</Define>
+
+**On the job:** A nonce collision in AES-GCM is not hypothetical. In 2016, researchers demonstrated a practical nonce-reuse attack against TLS 1.3 candidates. In practice, a shared counter nonce under a key used across multiple replicas can collide under load. `crypto/rand` nonces make collision probability negligible (birthday bound at 96 bits is effectively zero for any realistic record count).
+
+AES-GCM gives you two guarantees in one operation: confidentiality and integrity. A tampered ciphertext returns an error — not garbled data, a hard failure.
+
+Here is a complete, runnable implementation of encrypt/decrypt with `crypto/aes` and `crypto/cipher`:
+
+```go
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// encryptAESGCM encrypts plaintext with the given 32-byte AES-256 key.
+// Returns: nonce (12 bytes) + ciphertext + GCM tag, all concatenated.
+// The nonce is prepended so the decryptor can split it out.
+func encryptAESGCM(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("new cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("new gcm: %w", err)
+	}
+	// A nonce MUST be unique for every encryption under the same key.
+	// crypto/rand gives us a cryptographically random 12-byte nonce.
+	nonce := make([]byte, gcm.NonceSize()) // 12 bytes for standard GCM
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("rand nonce: %w", err)
+	}
+	// Seal appends the encrypted ciphertext + tag to nonce.
+	sealed := gcm.Seal(nonce, nonce, plaintext, nil)
+	return sealed, nil
+}
+
+// decryptAESGCM decrypts a value produced by encryptAESGCM.
+// Returns an error (not garbled plaintext) if the ciphertext was tampered with.
+func decryptAESGCM(key, sealed []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("new cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("new gcm: %w", err)
+	}
+	ns := gcm.NonceSize()
+	if len(sealed) < ns {
+		return nil, errors.New("ciphertext too short")
+	}
+	nonce, ciphertext := sealed[:ns], sealed[ns:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		// err here means the authentication tag did NOT match —
+		// either the key is wrong, or the data was tampered with.
+		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
+	return plaintext, nil
+}
+
+func main() {
+	// In production this key comes from the KMS (as the plaintext data key).
+	// Never hardcode a key — this is demo-only.
+	key, _ := hex.DecodeString(
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+	)
+
+	accountNumber := "GB29NWBK60161331926819" // a UK IBAN
+
+	sealed, err := encryptAESGCM(key, []byte(accountNumber))
+	if err != nil {
+		fmt.Println("encrypt error:", err)
+		return
+	}
+	fmt.Printf("encrypted (%d bytes): %x\n", len(sealed), sealed)
+
+	plaintext, err := decryptAESGCM(key, sealed)
+	if err != nil {
+		fmt.Println("decrypt error:", err)
+		return
+	}
+	fmt.Println("decrypted:", string(plaintext))
+
+	// Tamper with the ciphertext and see that decryption fails cleanly.
+	tampered := make([]byte, len(sealed))
+	copy(tampered, sealed)
+	tampered[len(tampered)-1] ^= 0xFF // flip a bit in the auth tag
+
+	_, err = decryptAESGCM(key, tampered)
+	fmt.Println("tampered decrypt:", err) // authentication failed: cipher: message authentication failed
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+)
+
+func encryptAESGCM(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("new cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("new gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("rand nonce: %w", err)
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func decryptAESGCM(key, sealed []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("new cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("new gcm: %w", err)
+	}
+	ns := gcm.NonceSize()
+	if len(sealed) < ns {
+		return nil, errors.New("ciphertext too short")
+	}
+	nonce, ciphertext := sealed[:ns], sealed[ns:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
+	return plaintext, nil
+}
+
+func main() {
+	key, _ := hex.DecodeString(
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+	)
+	accountNumber := "GB29NWBK60161331926819"
+
+	sealed, err := encryptAESGCM(key, []byte(accountNumber))
+	if err != nil {
+		fmt.Println("encrypt error:", err)
+		return
+	}
+	fmt.Printf("encrypted (%d bytes): %x\n", len(sealed), sealed)
+
+	plaintext, err := decryptAESGCM(key, sealed)
+	if err != nil {
+		fmt.Println("decrypt error:", err)
+		return
+	}
+	fmt.Println("decrypted:", string(plaintext))
+
+	tampered := make([]byte, len(sealed))
+	copy(tampered, sealed)
+	tampered[len(tampered)-1] ^= 0xFF
+
+	_, err = decryptAESGCM(key, tampered)
+	fmt.Println("tampered decrypt:", err)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Why AES-GCM gives both confidentiality and integrity — and why nonce reuse is catastrophic (Go 1.26)">
+
+**AES-GCM** is an **AEAD** scheme. Here is what happens under the hood (as of Go 1.26, using the standard `crypto/aes` and `crypto/cipher` packages — this is a conceptual model; the assembly path elides intermediate steps):
+
+1. **Counter mode (CTR)** provides the confidentiality stream. AES-GCM internally runs AES in CTR mode — it never encrypts data directly with the block cipher. Instead, it generates a keystream by encrypting successive counter values (`nonce || counter`), then XORs that stream with your plaintext. Because XOR is symmetric, decryption is the same operation.
+
+2. **GHASH** provides the authentication tag. In parallel with CTR, GCM computes a polynomial hash (GHASH) over the ciphertext (and any additional data you pass). This hash is itself encrypted with AES under a derived subkey and appended as the 16-byte **authentication tag**. `gcm.Open` recomputes the tag over the received ciphertext; if it doesn't match the appended tag, it returns an error *before yielding any plaintext* — a constant-time comparison so timing attacks learn nothing.
+
+3. **The nonce must never repeat.** If you encrypt two different plaintexts with the **same nonce and the same key**, an attacker who sees both ciphertexts can XOR them together and cancel out the keystream — recovering the XOR of the two plaintexts. For a 12-byte random nonce (96 bits), the birthday-bound collision probability is negligible for any realistic record count. But a counter-based nonce under a shared key across replicas *can* collide. Use `crypto/rand` for nonces. Never reuse a key+nonce pair.
+
+4. **Go's implementation uses hardware AES-NI on amd64 and arm64** (Go 1.21+). The `crypto/aes` package probes CPU features at init time; if AES-NI is available, it dispatches to the assembly implementation, making AES-GCM competitive with memory bandwidth rather than CPU-bound. The stdlib pure-Go path is the fallback only.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="If an attacker flips one bit in an AES-GCM ciphertext stored in your database, what happens when your service decrypts it?"
+  options={["It decrypts to garbled plaintext — the bit flip corrupts one block", "Decryption returns an error before yielding any plaintext — the authentication tag check fails", "Nothing — AES has error-correction built in", "It panics the Go process"]}
+  answer={1}
+  explain="AES-GCM's authentication tag covers the entire ciphertext. Any modification — even a single bit — causes gcm.Open to return an error (cipher: message authentication failed) without returning any plaintext. This is the integrity guarantee of authenticated encryption."
+/>
+
+---
+
+## Envelope Encryption with a KMS
+
+### The problem with a single encryption key
+
+Suppose Meridian encrypts a bank account number with a single key and stores the ciphertext. The database is breached — the attacker has the ciphertexts. If they also exfiltrate the application key (from an environment variable, a misconfigured secrets manager, or a side-channel), **every record is decrypted in one operation**. One key, total loss.
+
+The answer is **envelope encryption**.
+
+<Define term="Envelope encryption / DEK / KEK">
+**Envelope encryption** is a two-layer key hierarchy. A **Data Encryption Key (DEK)** is a fresh random AES key generated per record (or per small batch) that encrypts the actual sensitive value. A **Key-Encryption Key (KEK)** — the master key, held by the KMS — encrypts the DEK. The encrypted DEK (EncDEK) is stored alongside the ciphertext in the database. To decrypt, you ask the KMS to unwrap the EncDEK, use the resulting plaintext DEK to decrypt the ciphertext, and discard the DEK immediately. An attacker who steals only the database gets ciphertexts and encrypted DEKs — useless without KMS access.
+</Define>
+
+<Define term="KMS">
+A **Key Management Service** (KMS) is a managed system — hardware-backed in production (AWS KMS, GCP Cloud KMS, Azure Key Vault, HashiCorp Vault) — that stores master keys (KEKs) in tamper-resistant hardware and exposes only an API: `GenerateDataKey`, `Encrypt`, `Decrypt`. Your application never receives the raw KEK bytes; it calls the API. Every call is audited.
+</Define>
+
+**On the job:** With envelope encryption, a database breach exposes only encrypted DEKs. A KEK compromise requires KMS access (separate IAM, audited, hardware-backed). The blast radius of losing one is contained — and either can be rotated without the other.
+
+<Scene
+  title="Envelope encryption: problem → solution"
+  actors={[
+    { id: "svc", label: "Payments service" },
+    { id: "kms", label: "KMS" },
+    { id: "db", label: "Database" },
+    { id: "atk", label: "Attacker" }
+  ]}
+  rows={2}
+  cols={5}
+  frames={[
+    {
+      caption: "Problem: Meridian encrypts all IBANs with one hardcoded key stored in config. Database + config breach = total loss.",
+      beat: "problem",
+      actors: [{ id: "svc", state: "warn" }, { id: "db", state: "warn" }],
+      cells: [
+        { id: "A1", state: "bad", label: "key" },
+        { id: "A2", state: "bad", label: "ct1" },
+        { id: "A3", state: "bad", label: "ct2" },
+        { id: "A4", state: "bad", label: "ct3" },
+        { id: "A5", state: "bad", label: "ct4" }
+      ]
+    },
+    {
+      caption: "Attacker steals DB + config. One key decrypts every record instantly.",
+      beat: "problem",
+      actors: [{ id: "atk", state: "bad" }, { id: "db", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad", label: "KEY!" },
+        { id: "A2", state: "bad", label: "IBAN" },
+        { id: "A3", state: "bad", label: "IBAN" },
+        { id: "A4", state: "bad", label: "IBAN" },
+        { id: "A5", state: "bad", label: "IBAN" }
+      ]
+    },
+    {
+      caption: "Solution: envelope encryption. Each record has its own DEK. DEKs are wrapped by the KEK in the KMS.",
+      beat: "solution",
+      actors: [{ id: "svc", state: "active" }, { id: "kms", state: "ok" }],
+      cells: [
+        { id: "B1", state: "done", label: "EncDEK1" },
+        { id: "B2", state: "done", label: "ct1" },
+        { id: "B3", state: "done", label: "EncDEK2" },
+        { id: "B4", state: "done", label: "ct2" },
+        { id: "B5", state: "done", label: "KMS" }
+      ]
+    },
+    {
+      caption: "Attacker steals the DB — gets EncDEKs and ciphertexts. Without KMS access, both are useless.",
+      beat: "solution",
+      actors: [{ id: "atk", state: "warn" }, { id: "kms", state: "ok" }],
+      cells: [
+        { id: "B1", state: "warn", label: "EncDEK?" },
+        { id: "B2", state: "idle", label: "ct?" },
+        { id: "B3", state: "warn", label: "EncDEK?" },
+        { id: "B4", state: "idle", label: "ct?" },
+        { id: "B5", state: "done", label: "KMS ✓" }
+      ]
+    }
+  ]}
+  caption="Envelope encryption: one compromised database reveals nothing without KMS access. Rotate the KEK in the KMS to re-secure all records."
+/>
+
+### How envelope encryption works end-to-end
+
+<ExecTimeline
+  title="Envelope encryption: store a bank account number"
+  lanes={[{ id: "svc", label: "Payments service" }, { id: "kms", label: "KMS" }]}
+  steps={[
+    { lane: "svc", kind: "run", label: "GenerateDataKey()", note: "Service calls the KMS to generate a fresh 256-bit AES data key. The KMS returns both the plaintext DEK (for this operation only) and an encrypted copy (EncDEK) that only the KMS can decrypt." },
+    { lane: "kms", kind: "send", label: "plaintext DEK + EncDEK", note: "KMS returns the plaintext data key for immediate use. The plaintext copy is NEVER persisted — it lives only in memory for the duration of this request." },
+    { lane: "svc", kind: "run", label: "AES-GCM Encrypt(DEK, accountNumber)", note: "Service encrypts the bank account number with the plaintext DEK using AES-GCM. Output: ciphertext + GCM authentication tag + nonce." },
+    { lane: "svc", kind: "done", label: "Store: {EncDEK, nonce, ciphertext}", note: "Store the encrypted data key, nonce, and ciphertext in the database. The plaintext DEK is discarded from memory. An attacker with only the database gains nothing without KMS access." }
+  ]}
+  caption="Envelope encryption: data key encrypts the record; KMS key encrypts the data key. Compromise the DB alone → useless ciphertexts."
+/>
+
+<ExecTimeline
+  title="Envelope encryption: read a bank account number"
+  lanes={[{ id: "svc", label: "Payments service" }, { id: "kms", label: "KMS" }]}
+  steps={[
+    { lane: "svc", kind: "run", label: "Load {EncDEK, nonce, ciphertext}", note: "Service reads the stored encrypted data key, nonce, and ciphertext from the database row." },
+    { lane: "svc", kind: "send", label: "Decrypt(EncDEK)", note: "Service calls the KMS Decrypt API, passing the encrypted data key. The service's IAM role must have permission — this call is audited." },
+    { lane: "kms", kind: "recv", label: "verify IAM + audit", note: "KMS checks the caller's IAM policy, writes an audit log entry, and decrypts the data key using the master KEK stored in hardware." },
+    { lane: "kms", kind: "send", label: "plaintext DEK", note: "KMS returns the plaintext data key. It exists in the service's memory only for the duration of the decryption." },
+    { lane: "svc", kind: "run", label: "AES-GCM Decrypt(DEK, ciphertext)", note: "Service decrypts the ciphertext using the plaintext DEK. AES-GCM also verifies the authentication tag — if the ciphertext was tampered with, this returns an error, not garbled data." },
+    { lane: "svc", kind: "done", label: "plaintext account number", note: "Plaintext in memory for the request lifetime. Never written back to disk. Never logged." }
+  ]}
+  caption="Decrypt path: KMS call is audited, data key lives only in RAM, GCM tag catches any tampering."
+/>
+
+---
+
+## Field-Level PII Encryption
+
+Envelope encryption scales to individual database columns — a pattern called **field-level encryption**. Sensitive columns (account numbers, national IDs, card numbers) each carry their own EncDEK beside the ciphertext. Everything else in the system uses the opaque row ID; only the service that must display or act on the raw value ever calls the KMS.
+
+**On the job:** In Meridian's architecture, only the payments processor service and the KYC service can call the KMS `Decrypt` API. The ledger service, the notifications service, and the fraud service work with opaque `account_ref` tokens. A compromised notifications service cannot decrypt account numbers — not because of application-layer access control alone, but because it lacks the IAM role to call KMS `Decrypt`.
+
+Here is a `FieldEncryptor` that wraps a `KMSClient` interface:
+
+```go
+package main
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// KMSClient abstracts AWS KMS / GCP Cloud KMS / Vault — same interface,
+// different implementations injected at wire time.
+type KMSClient interface {
+	GenerateDataKey(ctx context.Context) (plaintext, encrypted []byte, err error)
+	Decrypt(ctx context.Context, encryptedKey []byte) ([]byte, error)
+}
+
+// EncryptedField is what gets stored in the database column.
+// All three fields are required to decrypt.
+type EncryptedField struct {
+	EncryptedDataKey []byte // DEK wrapped by KMS KEK
+	Nonce            []byte // AES-GCM nonce (12 bytes)
+	Ciphertext       []byte // AES-GCM ciphertext + tag
+}
+
+type FieldEncryptor struct{ kms KMSClient }
+
+func NewFieldEncryptor(kms KMSClient) *FieldEncryptor { return &FieldEncryptor{kms: kms} }
+
+func (fe *FieldEncryptor) Encrypt(ctx context.Context, plaintext []byte) (EncryptedField, error) {
+	dk, encDK, err := fe.kms.GenerateDataKey(ctx)
+	if err != nil {
+		return EncryptedField{}, fmt.Errorf("generate data key: %w", err)
+	}
+	block, err := aes.NewCipher(dk)
+	if err != nil {
+		return EncryptedField{}, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return EncryptedField{}, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return EncryptedField{}, err
+	}
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+	return EncryptedField{EncryptedDataKey: encDK, Nonce: nonce, Ciphertext: ciphertext}, nil
+}
+
+func (fe *FieldEncryptor) Decrypt(ctx context.Context, f EncryptedField) ([]byte, error) {
+	dk, err := fe.kms.Decrypt(ctx, f.EncryptedDataKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt data key: %w", err)
+	}
+	block, err := aes.NewCipher(dk)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(f.Nonce) != gcm.NonceSize() {
+		return nil, errors.New("bad nonce size")
+	}
+	return gcm.Open(nil, f.Nonce, f.Ciphertext, nil)
+}
+
+// mockKMS uses XOR wrapping for tests — never in production.
+type mockKMS struct{ masterKey []byte }
+
+func (m *mockKMS) GenerateDataKey(_ context.Context) (plaintext, encrypted []byte, err error) {
+	dk := make([]byte, 32)
+	if _, err = rand.Read(dk); err != nil {
+		return nil, nil, err
+	}
+	enc := make([]byte, 32)
+	for i := range dk {
+		enc[i] = dk[i] ^ m.masterKey[i]
+	}
+	return dk, enc, nil
+}
+
+func (m *mockKMS) Decrypt(_ context.Context, encryptedKey []byte) ([]byte, error) {
+	dk := make([]byte, 32)
+	for i := range encryptedKey {
+		dk[i] = encryptedKey[i] ^ m.masterKey[i]
+	}
+	return dk, nil
+}
+
+func main() {
+	masterKey, _ := hex.DecodeString(
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+	)
+	enc := NewFieldEncryptor(&mockKMS{masterKey: masterKey})
+	ctx := context.Background()
+
+	iban := []byte("GB29NWBK60161331926819")
+	field, err := enc.Encrypt(ctx, iban)
+	if err != nil {
+		fmt.Println("encrypt:", err)
+		return
+	}
+
+	recovered, err := enc.Decrypt(ctx, field)
+	if err != nil {
+		fmt.Println("decrypt:", err)
+		return
+	}
+	fmt.Println("recovered:", string(recovered)) // GB29NWBK60161331926819
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+)
+
+type KMSClient interface {
+	GenerateDataKey(ctx context.Context) (plaintext, encrypted []byte, err error)
+	Decrypt(ctx context.Context, encryptedKey []byte) ([]byte, error)
+}
+
+type EncryptedField struct {
+	EncryptedDataKey []byte
+	Nonce            []byte
+	Ciphertext       []byte
+}
+
+type FieldEncryptor struct{ kms KMSClient }
+
+func NewFieldEncryptor(kms KMSClient) *FieldEncryptor { return &FieldEncryptor{kms: kms} }
+
+func (fe *FieldEncryptor) Encrypt(ctx context.Context, plaintext []byte) (EncryptedField, error) {
+	dk, encDK, err := fe.kms.GenerateDataKey(ctx)
+	if err != nil {
+		return EncryptedField{}, fmt.Errorf("generate data key: %w", err)
+	}
+	block, err := aes.NewCipher(dk)
+	if err != nil {
+		return EncryptedField{}, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return EncryptedField{}, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return EncryptedField{}, err
+	}
+	return EncryptedField{EncryptedDataKey: encDK, Nonce: nonce, Ciphertext: gcm.Seal(nil, nonce, plaintext, nil)}, nil
+}
+
+func (fe *FieldEncryptor) Decrypt(ctx context.Context, f EncryptedField) ([]byte, error) {
+	dk, err := fe.kms.Decrypt(ctx, f.EncryptedDataKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt data key: %w", err)
+	}
+	block, err := aes.NewCipher(dk)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(f.Nonce) != gcm.NonceSize() {
+		return nil, errors.New("bad nonce size")
+	}
+	return gcm.Open(nil, f.Nonce, f.Ciphertext, nil)
+}
+
+type mockKMS struct{ masterKey []byte }
+
+func (m *mockKMS) GenerateDataKey(_ context.Context) (plaintext, encrypted []byte, err error) {
+	dk := make([]byte, 32)
+	if _, err = rand.Read(dk); err != nil {
+		return nil, nil, err
+	}
+	enc := make([]byte, 32)
+	for i := range dk {
+		enc[i] = dk[i] ^ m.masterKey[i]
+	}
+	return dk, enc, nil
+}
+
+func (m *mockKMS) Decrypt(_ context.Context, encryptedKey []byte) ([]byte, error) {
+	dk := make([]byte, 32)
+	for i := range encryptedKey {
+		dk[i] = encryptedKey[i] ^ m.masterKey[i]
+	}
+	return dk, nil
+}
+
+func main() {
+	masterKey, _ := hex.DecodeString(
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+	)
+	enc := NewFieldEncryptor(&mockKMS{masterKey: masterKey})
+	ctx := context.Background()
+	iban := []byte("GB29NWBK60161331926819")
+
+	field, err := enc.Encrypt(ctx, iban)
+	if err != nil {
+		fmt.Println("encrypt:", err)
+		return
+	}
+	recovered, err := enc.Decrypt(ctx, field)
+	if err != nil {
+		fmt.Println("decrypt:", err)
+		return
+	}
+	fmt.Println("recovered:", string(recovered))
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="The KMSClient interface matters">
+The `KMSClient` interface means you inject a mock in unit tests and a real AWS/GCP/Vault client in production — `FieldEncryptor` never changes. The mock's XOR wrapping is intentionally trivial; a production test mock should use a fixed data key or a local Vault instance via testcontainers.
+</Callout>
+
+---
+
+## Constant-Time Comparison
+
+<Define term="Constant-time comparison / timing attack">
+A **timing attack** exploits the fact that a naive string-equality comparison (`==`, `bytes.Equal`) returns early as soon as it finds a mismatching byte — so comparing an HMAC signature against a series of guesses leaks how many leading bytes are correct via response-time differences. Over many requests, an attacker can recover the expected signature one byte at a time. A **constant-time comparison** (`subtle.ConstantTimeCompare`, `hmac.Equal`) always examines every byte regardless of where the first mismatch occurs, eliminating the timing signal.
+</Define>
+
+**On the job:** This is not theoretical. In 2009, a timing attack was used against HMAC-MD5 in the Keyczar library. Requests with a correct first byte took measurably longer to reject than random guesses, allowing reconstruction of the full signature across ~2^16 requests — well within the rate-limit budget for any payment API.
+
+The fix is one word. In any HMAC or secret comparison, replace `bytes.Equal` with `hmac.Equal` (or `subtle.ConstantTimeCompare` for raw byte slices). Both are in the standard library.
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"fmt"
+)
+
+func safeCompareHMAC(secret, message []byte, receivedSig string) bool {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	expected := mac.Sum(nil)
+
+	received, err := hex.DecodeString(receivedSig)
+	if err != nil {
+		return false
+	}
+	// hmac.Equal is a convenience wrapper around subtle.ConstantTimeCompare.
+	// Both examine every byte regardless of where the first mismatch occurs.
+	return hmac.Equal(expected, received)
+}
+
+func safeCompareToken(expected, received string) bool {
+	// subtle.ConstantTimeCompare works on raw byte slices.
+	// It returns 1 (equal) or 0 (not equal) — never short-circuits.
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(received)) == 1
+}
+
+func main() {
+	secret := []byte("meridian-webhook-secret-32bytes!!")
+	message := []byte(`{"amount_cents":5000,"to":"GB29NWBK60161331926819"}`)
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("valid sig:", safeCompareHMAC(secret, message, sig))     // true
+	fmt.Println("bad sig:", safeCompareHMAC(secret, message, "deadbeef")) // false
+
+	tok := "correct-token"
+	fmt.Println("token match:", safeCompareToken(tok, tok))          // true
+	fmt.Println("token mismatch:", safeCompareToken(tok, "wrong"))   // false
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"fmt"
+)
+
+func safeCompareHMAC(secret, message []byte, receivedSig string) bool {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	expected := mac.Sum(nil)
+	received, err := hex.DecodeString(receivedSig)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(expected, received)
+}
+
+func safeCompareToken(expected, received string) bool {
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(received)) == 1
+}
+
+func main() {
+	secret := []byte("meridian-webhook-secret-32bytes!!")
+	message := []byte(`{"amount_cents":5000,"to":"GB29NWBK60161331926819"}`)
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("valid sig:", safeCompareHMAC(secret, message, sig))
+	fmt.Println("bad sig:", safeCompareHMAC(secret, message, "deadbeef"))
+
+	tok := "correct-token"
+	fmt.Println("token match:", safeCompareToken(tok, tok))
+	fmt.Println("token mismatch:", safeCompareToken(tok, "wrong"))
+}
+```
+
+</GoPlayground>
+
+The connection to webhook signature verification: the **Integrating with External Payment Systems** chapter shows how to verify Stripe/payment processor webhook signatures. Every one of those verifications must use `hmac.Equal` or `subtle.ConstantTimeCompare` — never `==` or `bytes.Equal` — because the attacker controls the request rate and can measure your response times.
+
+<Callout kind="warn" title="bytes.Equal is never safe for secrets">
+`bytes.Equal` short-circuits on the first mismatching byte, exactly as `==` does. For any comparison involving a secret (HMAC tag, session token, API key), this leaks a byte-by-byte timing oracle. Use `hmac.Equal` for HMAC tags and `subtle.ConstantTimeCompare` for arbitrary secrets. There is no performance argument for `bytes.Equal` on a 32-byte HMAC — the constant-time version is the same asymptotic complexity.
+</Callout>
+
+---
+
+## Request Signing
+
+Meridian's payments service talks to card networks, bank APIs, and internal microservices. How does the receiving end *prove* that the request came from *you* and wasn't modified in transit? TLS protects the channel, but once a request hits the server, TLS is terminated. If there's a reverse proxy, a load balancer, or a compromised internal network hop in between, TLS alone proves nothing about the application-layer origin.
+
+The answer is **request signing**: the caller produces a cryptographic signature over the request, and the server verifies it before doing anything.
+
+### HMAC signing
+
+HMAC (Hash-based Message Authentication Code) uses a shared secret key to produce a fixed-length tag over an arbitrary message. The server holds the same key, recomputes the HMAC, and compares. If they match, the request is authentic and unmodified.
+
+The critical discipline is the **canonical request** — a deterministic serialization of the request elements you want to sign. AWS Signature Version 4 is the canonical reference implementation: method + URL + sorted headers + body hash, concatenated in a defined order. You don't have to implement SigV4, but you do have to define a canonical form and stick to it on both sides.
+
+**On the job:** A Meridian transfer request is signed when it leaves the service. If the load balancer modifies headers (adds `X-Forwarded-For`, normalizes `Content-Type`), the signature still covers the body hash and path — the canonical request is defined to include only the elements you control.
+
+Here is a complete, runnable HMAC request signing implementation:
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// canonicalRequest builds the deterministic string that both sides sign.
+// method + "\n" + path + "\n" + timestamp + "\n" + hex(sha256(body))
+// In production you would also include selected HTTP headers (e.g. Content-Type).
+func canonicalRequest(method, path, timestamp string, body []byte) string {
+	bodyHash := sha256.Sum256(body)
+	return strings.Join([]string{
+		method,
+		path,
+		timestamp,
+		hex.EncodeToString(bodyHash[:]),
+	}, "\n")
+}
+
+// signRequest returns the HMAC-SHA256 signature over the canonical form.
+func signRequest(secret []byte, method, path, timestamp string, body []byte) string {
+	canon := canonicalRequest(method, path, timestamp, body)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(canon))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// verifyRequest checks the incoming signature against the recomputed one.
+// It also enforces a ±5-minute clock-skew window.
+func verifyRequest(secret []byte, method, path, timestamp, sig string, body []byte, now time.Time) error {
+	ts, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return fmt.Errorf("bad timestamp: %w", err)
+	}
+	skew := now.Sub(ts)
+	if skew < -5*time.Minute || skew > 5*time.Minute {
+		return fmt.Errorf("timestamp out of window: skew=%v", skew)
+	}
+	want := signRequest(secret, method, path, timestamp, body)
+	// hmac.Equal is constant-time — safe against timing attacks.
+	wantBytes, _ := hex.DecodeString(want)
+	gotBytes, _ := hex.DecodeString(sig)
+	if !hmac.Equal(wantBytes, gotBytes) {
+		return fmt.Errorf("signature mismatch")
+	}
+	return nil
+}
+
+func main() {
+	secret := []byte("super-secret-shared-key-32bytes!!")
+	method := "POST"
+	path := "/v1/transfers"
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	body := []byte(`{"amount_cents":5000,"currency":"GBP","to_account":"GB29NWBK60161331926819"}`)
+
+	sig := signRequest(secret, method, path, timestamp, body)
+	fmt.Println("signature:", sig)
+
+	// Server side: verify the valid request.
+	err := verifyRequest(secret, method, path, timestamp, sig, body, time.Now())
+	fmt.Println("valid request:", err) // <nil>
+
+	// Server side: verify a tampered body.
+	tamperedBody := []byte(`{"amount_cents":999999,"currency":"GBP","to_account":"GB29NWBK60161331926819"}`)
+	err = verifyRequest(secret, method, path, timestamp, sig, tamperedBody, time.Now())
+	fmt.Println("tampered body:", err) // signature mismatch
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+)
+
+func canonicalRequest(method, path, timestamp string, body []byte) string {
+	bodyHash := sha256.Sum256(body)
+	return strings.Join([]string{
+		method,
+		path,
+		timestamp,
+		hex.EncodeToString(bodyHash[:]),
+	}, "\n")
+}
+
+func signRequest(secret []byte, method, path, timestamp string, body []byte) string {
+	canon := canonicalRequest(method, path, timestamp, body)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(canon))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyRequest(secret []byte, method, path, timestamp, sig string, body []byte, now time.Time) error {
+	ts, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return fmt.Errorf("bad timestamp: %w", err)
+	}
+	skew := now.Sub(ts)
+	if skew < -5*time.Minute || skew > 5*time.Minute {
+		return fmt.Errorf("timestamp out of window: skew=%v", skew)
+	}
+	want := signRequest(secret, method, path, timestamp, body)
+	wantBytes, _ := hex.DecodeString(want)
+	gotBytes, _ := hex.DecodeString(sig)
+	if !hmac.Equal(wantBytes, gotBytes) {
+		return fmt.Errorf("signature mismatch")
+	}
+	return nil
+}
+
+func main() {
+	secret := []byte("super-secret-shared-key-32bytes!!")
+	method := "POST"
+	path := "/v1/transfers"
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	body := []byte(`{"amount_cents":5000,"currency":"GBP","to_account":"GB29NWBK60161331926819"}`)
+
+	sig := signRequest(secret, method, path, timestamp, body)
+	fmt.Println("signature:", sig)
+
+	err := verifyRequest(secret, method, path, timestamp, sig, body, time.Now())
+	fmt.Println("valid request:", err)
+
+	tamperedBody := []byte(`{"amount_cents":999999,"currency":"GBP","to_account":"GB29NWBK60161331926819"}`)
+	err = verifyRequest(secret, method, path, timestamp, sig, tamperedBody, time.Now())
+	fmt.Println("tampered body:", err)
+}
+```
+
+</GoPlayground>
+
+### Clock-skew window
+
+The timestamp in the canonical request is what prevents **replay attacks** — an attacker recording a valid signed request and resending it later. If the server rejects requests where the timestamp is more than ±5 minutes from now, a replayed request eventually expires.
+
+Five minutes is the conventional window. It is large enough to survive reasonable clock drift in distributed systems and small enough that a captured request is useless before the attacker can act on it.
+
+<Callout kind="warn" title="Asymmetric signing for high-value operations">
+HMAC requires both parties to know the shared secret. For signing requests *to external parties* (card networks, external bank APIs) where you cannot share a secret, use **asymmetric signing**: sign with your private key (ECDSA P-256 or Ed25519), publish your public key so the receiver can verify. The `crypto/ecdsa` and `crypto/ed25519` packages in stdlib handle both. The canonical-request discipline is identical; only the signing primitive changes. As of Go 1.26, `ecdsa.Sign` ignores any supplied `rand io.Reader` and always uses `crypto/rand` internally.
+</Callout>
+
+<QuickCheck
+  question="Why does the canonical request include a hash of the request body rather than the raw body?"
+  options={["To keep the signature short — HMAC has a length limit", "So the body hash is always a fixed-length input regardless of body size, and any change to the body changes the hash, invalidating the signature", "The hash replaces TLS — you don't need both", "To avoid encoding issues with binary request bodies"]}
+  answer={1}
+  explain="SHA-256(body) is always 32 bytes regardless of body size, and it's a deterministic function of the body content — any change to even one byte produces a completely different hash. The signature then covers that hash, so a tampered body produces a different canonical request and a different expected signature, which won't match what the caller sent."
+/>
+
+---
+
+## Authorization Models
+
+Authentication proves *who you are*. Authorization decides *what you're allowed to do*. In a financial system, getting authorization wrong is often more damaging than getting authentication wrong — an authenticated attacker with over-broad permissions is the worst case.
+
+**On the job:** The most common authorization bug in fintech audits is not a missing role check — it's a missing ownership check in the data layer. An attacker who knows account ID formats can enumerate every account in the database if the `WHERE` clause doesn't include `owner_id`. Role checks protect endpoints; row-level checks protect data.
+
+### RBAC vs. ABAC
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="RBAC — Role-Based Access Control">A user has **roles** (`viewer`, `transfer-initiator`, `admin`). Each role grants a fixed set of permissions. Simple to reason about, audit, and explain to compliance. The dominant model for most fintech services.</ConceptCard>
+  <ConceptCard label="ABAC — Attribute-Based Access Control">Access decisions use **attributes** of the subject, the resource, and the environment. Example: a user can transfer if `user.kycLevel >= 2` AND `transfer.amount <= user.dailyLimit` AND `user.country == account.country`. More expressive but significantly harder to audit and debug.</ConceptCard>
+</ConceptGrid>
+
+The default answer for fintech is RBAC with a thin layer of ABAC rules where the business logic demands it (e.g. per-account limits). Don't reach for full ABAC until RBAC demonstrably can't express what you need.
+
+### Least privilege in practice
+
+A service should only access what it needs *for the specific operation it is performing*. Concretely:
+
+- The read-balance service has a read-only database credential. It cannot insert or delete.
+- The transfer service can read and write the `accounts` table. It cannot touch the `audit_events` table directly (it fires events; the audit service writes them).
+- The admin CLI has a short-lived credential scoped to a single operation, not a standing superuser role.
+
+### Row-level authorization: a user sees only their own accounts
+
+```go
+// WRONG: fetches ANY account by ID — an attacker can enumerate account IDs
+func getAccount(ctx context.Context, db *pgx.Conn, accountID string) (*Account, error) {
+    row := db.QueryRow(ctx,
+        "SELECT id, balance_cents, owner_id FROM accounts WHERE id = $1",
+        accountID,
+    )
+    // ... scan
+}
+```
+
+```go
+// RIGHT: the WHERE clause enforces ownership — even if accountID is guessed,
+// the query returns nothing unless the authenticated user owns that account.
+func getAccount(ctx context.Context, db *pgx.Conn, accountID, authenticatedUserID string) (*Account, error) {
+    row := db.QueryRow(ctx,
+        "SELECT id, balance_cents, owner_id FROM accounts WHERE id = $1 AND owner_id = $2",
+        accountID, authenticatedUserID,
+    )
+    // ... scan
+}
+```
+
+<BeforeAfter
+  badLabel="Missing ownership check"
+  goodLabel="Row-level ownership enforced"
+  bad={`// accountID from URL path — any user can see any account
+row := db.QueryRow(ctx,
+  "SELECT id, balance_cents FROM accounts WHERE id = $1",
+  accountID,
+)`}
+  good={`// userID comes from the verified JWT claim
+row := db.QueryRow(ctx,
+  "SELECT id, balance_cents FROM accounts"+
+  " WHERE id=$1 AND owner_id=$2",
+  accountID, userID,
+)`}
+/>
+
+This pattern — adding the authenticated user's ID to every data-layer query — is called **row-level security** (RLS). Postgres also supports it at the database level (`ALTER TABLE accounts ENABLE ROW LEVEL SECURITY`), which provides a defense-in-depth guarantee even if the application layer has a bug.
+
+<Callout kind="note" title="Tie to Auth & API Design chapter">
+The JWT verification and claim extraction that gives you `authenticatedUserID` is covered in the **Auth & API Design** chapter (Part 1). The rule here is: extract the user ID from the verified token at the handler boundary, propagate it through a request-scoped context value, and enforce it in every data-layer query that touches user-owned resources.
+</Callout>
+
+---
+
+## Replay and Tamper Protection
+
+You've signed your requests. Now let's talk about what an attacker does when they can't forge a new signature: they reuse a valid one.
+
+### Replay attacks in payments
+
+Scenario: a Meridian customer submits a `POST /v1/transfers` for £50. The request is signed. An attacker captures it (a compromised network hop, a leaked log line, a MITM before TLS terminates). They replay it three hours later. The signature is still valid. Without replay protection, the transfer posts three hours later.
+
+The clock-skew window from the request signing section closes this for the HMAC case — a ±5-minute window means a 3-hour-old request is rejected. But some systems allow longer-lived signatures (OAuth tokens, pre-signed URLs). For those you need a **nonce**.
+
+### Nonces for longer-lived operations
+
+A **nonce** (number-used-once) is a unique value included in the request that the server persists after first use and rejects on any subsequent use. (We defined nonce in the AES-GCM section; the concept is the same — a value that must never repeat.)
+
+The flow:
+
+1. Client generates a random nonce (e.g. a UUID or 16 random bytes — from `crypto/rand`).
+2. Client includes the nonce in the signed request payload.
+3. Server verifies the signature.
+4. Server checks the nonce against a store (Redis, Postgres). If the nonce exists: reject (replay). If not: record it with a TTL matching the signature's validity window, then proceed.
+
+The idempotency key you built in the **Idempotency & Exactly-Once Semantics** chapter is a nonce for payment operations. The difference is intent: an idempotency key is the client's promise that retrying is safe; a nonce is the server's enforcement that no request is processed twice regardless of the client's intent.
+
+**On the job:** A payment processor replays a settled webhook 48 hours after the first delivery due to a network hiccup in their retry logic. The idempotency key in the `FieldEncryptor` demo (previous section) is a nonce — the second delivery hits the nonce store, returns 409, and Meridian's ledger is untouched.
+
+<ExecTimeline
+  title="Nonce-guarded replay protection"
+  lanes={[{ id: "client", label: "Client" }, { id: "server", label: "Server" }, { id: "store", label: "Nonce store" }]}
+  steps={[
+    { lane: "client", kind: "run", label: "sign + include nonce=abc123", note: "Client generates a random nonce, includes it in the signed canonical request." },
+    { lane: "server", kind: "recv", label: "verify signature", note: "Server verifies the HMAC signature. Valid — signature checks out." },
+    { lane: "server", kind: "send", label: "check nonce abc123", note: "Server queries the nonce store: has abc123 been seen?" },
+    { lane: "store", kind: "send", label: "MISS — not seen", note: "First time. Store records abc123 with a 10-minute TTL." },
+    { lane: "server", kind: "done", label: "process transfer → 200", note: "Nonce is fresh. Transfer posts. Response returned." },
+    { lane: "client", kind: "send", label: "replay: same signed request", note: "Attacker (or buggy client) replays the identical signed request 2 minutes later." },
+    { lane: "store", kind: "send", label: "HIT — nonce seen", note: "Nonce store returns a hit. Server rejects with 409 Conflict before touching any business logic." }
+  ]}
+  caption="A nonce is consumed on first use. Replaying the same signed request hits a cached nonce and is rejected immediately."
+/>
+
+### Detecting tampering after the fact
+
+Signing prevents accepting tampered requests. But what about data that's already stored — could someone with direct database access modify a balance and cover their tracks?
+
+The answer is the **append-only audit log** you built in the **Auditability & Compliance** chapter, combined with periodic reconciliation: recompute balances from the ledger events and compare against stored balances. Any discrepancy is an anomaly worth investigating.
+
+For extra assurance on the audit log itself, you can hash-chain entries: each event's signature includes the hash of the previous event, making it computationally infeasible to insert or modify a historical event without invalidating everything that follows.
+
+---
+
+## Handling PII
+
+**PII** (Personally Identifiable Information) in fintech includes: name, address, date of birth, national ID numbers, bank account numbers, card numbers, transaction history, device fingerprints, and more. Regulators treat it as a liability. So should you.
+
+The guiding principle is **blast-radius minimization**: if an attacker compromises one component, how much PII can they reach? Every architectural decision should reduce that answer.
+
+**On the job:** After a breach, every second of PII exposure counts. A service whose data contracts were designed around tokenized `account_ref` values rather than raw IBANs means the breach team can say "the compromised service had zero access to account numbers" — a vastly different regulatory conversation than "we're still assessing how many records were exposed."
+
+### The four disciplines
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="1. Minimize collection">Only collect what you legally need to collect for the specific function being performed. A savings account doesn't need a user's employer. A money transfer doesn't need a user's medical history. Data you don't collect can't be breached.</ConceptCard>
+  <ConceptCard label="2. Tokenize / pseudonymize">Replace high-sensitivity identifiers with opaque tokens. Store the actual bank account number encrypted (with envelope encryption, as above) and use an opaque `account_ref` token everywhere else in your system. Only the payments service that must display or use the actual number decrypts it; every other service uses the token.</ConceptCard>
+  <ConceptCard label="3. Encrypt at rest">Sensitive columns (account numbers, national IDs, card numbers) encrypted with AES-GCM via envelope encryption, as covered above. Even with a database dump, the data is useless without KMS access.</ConceptCard>
+  <ConceptCard label="4. Redact in logs">Logs are often the widest-distributed artifact in a system — shipped to multiple services, retained for months, readable by many engineers. A bank account number in a log is a breach waiting to happen. Redact at the logging boundary, not at the call site.</ConceptCard>
+</ConceptGrid>
+
+### Redacting PII in structured logs
+
+The **Application Security Baseline** chapter (Part 2) covers the principle of keeping secrets out of logs. Here is the concrete Go pattern for `slog`:
+
+```go
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+)
+
+// Redacted wraps a string that must never appear in logs.
+// Its LogValue() method returns a static placeholder instead.
+type Redacted string
+
+func (r Redacted) LogValue() slog.Value {
+	return slog.StringValue("[REDACTED]")
+}
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	accountNumber := Redacted("GB29NWBK60161331926819")
+
+	// Even though accountNumber is passed directly, slog calls LogValue()
+	// and logs [REDACTED] — never the actual IBAN.
+	logger.InfoContext(context.Background(), "transfer initiated",
+		slog.String("account", string(accountNumber)), // WRONG: bypasses LogValue
+	)
+
+	// CORRECT: pass the Redacted value as an Any so LogValue() is called.
+	logger.InfoContext(context.Background(), "transfer initiated",
+		slog.Any("account", accountNumber),
+	)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+)
+
+type Redacted string
+
+func (r Redacted) LogValue() slog.Value {
+	return slog.StringValue("[REDACTED]")
+}
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	accountNumber := Redacted("GB29NWBK60161331926819")
+
+	// Correct: pass as Any so slog calls LogValue().
+	logger.InfoContext(context.Background(), "transfer initiated",
+		slog.Any("account", accountNumber),
+		slog.Int("amount_cents", 5000),
+	)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="The slog.String trap">
+`slog.String("account", string(accountNumber))` casts the `Redacted` type to a plain `string`, bypassing `LogValue()` entirely. Always use `slog.Any` when passing a type that implements `LogValue()`. If you're reviewing code that mixes these, flag every `string()` cast on a `Redacted` value — each one is a potential log leak.
+</Callout>
+
+### The blast-radius mindset in system design
+
+Think of each service as a security boundary. Ask: if this service is completely compromised (code execution on the process, full memory dump), what PII does an attacker obtain?
+
+- The API gateway should see only tokens, never decrypted account numbers.
+- The notifications service needs an email address; it does not need a bank account number.
+- The fraud service needs transaction amounts and merchant categories; it should not need to know the full payment card number.
+
+Enforce these boundaries with service-to-service authorization (mTLS, SPIFFE) and data minimization in the API contracts between services. The principle of least privilege applied not just to roles, but to data.
+
+<QuickCheck
+  question={'Why should a Redacted type implement slog.LogValuer rather than overriding String()?'}
+  options={["Because slog ignores the String() method entirely for all types", "Because slog.Any calls LogValue() directly, giving a controlled redaction path, while String() is only called by fmt — a slog.String cast bypasses both", "Because Go does not allow fmt and slog to interoperate", "There is no difference — both approaches are equivalent"]}
+  answer={1}
+  explain="slog's Any handler calls LogValue() on values that implement slog.LogValuer, giving you a clean, type-safe redaction hook. If you use slog.String(key, string(val)), you've cast away the type information before slog ever sees it. fmt.Stringer's String() method is a separate interface that fmt (not slog) calls — implementing it gives you console protection but doesn't help in structured logging pipelines."
+/>
+
+---
+
+## Exercises
+
+Stop nodding along. You are going to write this code. My patience for passive learning ran out around page three of a C textbook I read when I was twelve.
+
+<Exercise n={1} title="AES-GCM round-trip" level="easy">
+
+Write `EncryptField(key, plaintext []byte) ([]byte, error)` and `DecryptField(key, sealed []byte) ([]byte, error)` that use `crypto/aes` + `cipher.NewGCM` and prepend the nonce to the ciphertext. Verify that `DecryptField(key, EncryptField(key, data))` returns `data`, and that decrypting a tampered ciphertext returns a non-nil error.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+)
+
+func EncryptField(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func DecryptField(key, sealed []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	ns := gcm.NonceSize()
+	if len(sealed) < ns {
+		return nil, errors.New("ciphertext too short")
+	}
+	return gcm.Open(nil, sealed[:ns], sealed[ns:], nil)
+}
+
+func main() {
+	key := make([]byte, 32) // AES-256
+	if _, err := rand.Read(key); err != nil {
+		panic(err)
+	}
+	data := []byte("sensitive IBAN: GB29NWBK60161331926819")
+
+	sealed, err := EncryptField(key, data)
+	if err != nil {
+		fmt.Println("encrypt error:", err)
+		return
+	}
+
+	recovered, err := DecryptField(key, sealed)
+	if err != nil {
+		fmt.Println("decrypt error:", err)
+		return
+	}
+	fmt.Println("recovered:", string(recovered))
+
+	sealed[len(sealed)-1] ^= 0x01
+	_, err = DecryptField(key, sealed)
+	fmt.Println("tampered decrypt error:", err) // non-nil
+}
+```
+
+A fresh random nonce per encryption, prepended so the decryptor can split it. The tampered test confirms AES-GCM returns an error rather than corrupt plaintext.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Canonical HMAC signing" level="medium">
+
+Implement `CanonicalRequest(method, path, timestamp, bodyHex string) string` that returns the newline-joined canonical string, and `Sign(secret []byte, canonical string) string` that returns the HMAC-SHA256 hex signature. Write a test that verifies `Sign` with the same inputs always produces the same output, and that changing any field changes the signature.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+)
+
+func CanonicalRequest(method, path, timestamp, bodyHex string) string {
+	return strings.Join([]string{method, path, timestamp, bodyHex}, "\n")
+}
+
+func Sign(secret []byte, canonical string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(canonical))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func main() {
+	secret := []byte("test-secret-key-32bytes!!!!!!!!!!!")
+	body := []byte(`{"amount_cents":1000}`)
+	bodyHash := sha256.Sum256(body)
+	bodyHex := hex.EncodeToString(bodyHash[:])
+
+	canon := CanonicalRequest("POST", "/v1/transfers", "2026-06-03T10:00:00Z", bodyHex)
+	sig1 := Sign(secret, canon)
+	sig2 := Sign(secret, canon)
+	fmt.Println("deterministic:", sig1 == sig2) // true
+
+	// Change one field — completely different signature.
+	canon2 := CanonicalRequest("POST", "/v1/transfers", "2026-06-03T10:00:01Z", bodyHex)
+	sig3 := Sign(secret, canon2)
+	fmt.Println("different timestamp changes sig:", sig1 != sig3) // true
+}
+```
+
+HMAC is deterministic: same key + same input always yields the same output. Any field change — even a 1-second timestamp difference — produces a completely different 32-byte HMAC, which hex-encodes to a 64-character string bearing no resemblance to the original.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Row-level authorization middleware" level="medium">
+
+Write an HTTP handler function `AccountHandler` that extracts an `account_id` path parameter and a `user_id` claim from the request context (assume it was set by auth middleware as a `string` under a typed context key), then calls `fetchAccount(ctx, accountID, userID string) (*Account, error)` where the WHERE clause includes both. The handler should return 403 if `userID` is missing, 404 if the account is not found (for any reason), and 200 with the account JSON otherwise.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+)
+
+type contextKey string
+
+const userIDKey contextKey = "user_id"
+
+type Account struct {
+	ID           string `json:"id"`
+	BalanceCents int64  `json:"balance_cents"`
+}
+
+var errNotFound = errors.New("account not found")
+
+// fetchAccount simulates the parameterized query: WHERE id=$1 AND owner_id=$2
+func fetchAccount(_ context.Context, accountID, userID string) (*Account, error) {
+	// Real implementation uses db.QueryRow with both parameters.
+	if accountID == "acc_123" && userID == "usr_abc" {
+		return &Account{ID: accountID, BalanceCents: 50000}, nil
+	}
+	return nil, errNotFound
+}
+
+func AccountHandler(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(userIDKey).(string)
+	if !ok || userID == "" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	accountID := r.PathValue("account_id") // Go 1.22+ net/http routing
+	if accountID == "" {
+		http.Error(w, "missing account_id", http.StatusBadRequest)
+		return
+	}
+	acc, err := fetchAccount(r.Context(), accountID, userID)
+	if err != nil {
+		// Return 404 regardless of reason — don't leak whether the account
+		// exists at all to unauthorized callers.
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(acc); err != nil {
+		fmt.Println("encode error:", err)
+	}
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /accounts/{account_id}", AccountHandler)
+	fmt.Println("serving on :8080")
+	// http.ListenAndServe(":8080", mux) -- commented out for playground
+}
+```
+
+Always return 404 (not 403) when a user requests an account they don't own — returning 403 would confirm the account exists, leaking information to an enumerating attacker.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Nonce store" level="hard">
+
+Implement `NonceStore` backed by a `sync.Map` with TTL-based expiry. It should have `Record(nonce string, ttl time.Duration) error` (returns an error if the nonce was already recorded) and `Clean()` (removes expired entries). Write a test that records a nonce, attempts to record it again (expect error), waits for it to expire, and confirms it can be recorded again after expiry.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type entry struct {
+	expiresAt time.Time
+}
+
+type NonceStore struct {
+	m sync.Map
+}
+
+var ErrNonceReused = errors.New("nonce already used")
+
+func (s *NonceStore) Record(nonce string, ttl time.Duration) error {
+	e := entry{expiresAt: time.Now().Add(ttl)}
+	_, loaded := s.m.LoadOrStore(nonce, e)
+	if loaded {
+		// nonce already exists — check if it's expired
+		if v, ok := s.m.Load(nonce); ok {
+			if existing := v.(entry); time.Now().Before(existing.expiresAt) {
+				return ErrNonceReused
+			}
+			// expired entry: overwrite
+			s.m.Store(nonce, e)
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *NonceStore) Clean() {
+	now := time.Now()
+	s.m.Range(func(k, v any) bool {
+		if e := v.(entry); now.After(e.expiresAt) {
+			s.m.Delete(k)
+		}
+		return true
+	})
+}
+
+func main() {
+	store := &NonceStore{}
+
+	err := store.Record("nonce-abc", 100*time.Millisecond)
+	fmt.Println("first record:", err) // <nil>
+
+	err = store.Record("nonce-abc", 100*time.Millisecond)
+	fmt.Println("replay attempt:", err) // nonce already used
+
+	time.Sleep(150 * time.Millisecond)
+	store.Clean()
+
+	err = store.Record("nonce-abc", 100*time.Millisecond)
+	fmt.Println("after expiry:", err) // <nil>
+}
+```
+
+`sync.Map.LoadOrStore` is the atomic "set if absent" primitive that makes this race-safe. The `Clean()` sweep uses `Range`, which is safe concurrent with other operations — deleted entries are simply skipped by any concurrent `Load`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Constant-time webhook verifier" level="medium">
+
+Implement `VerifyWebhookSignature(secret, payload []byte, receivedSig string) error` that recomputes HMAC-SHA256 over the payload, then compares using `hmac.Equal`. The function should return a descriptive error if the signature is malformed (not valid hex) and a separate error if it is valid hex but does not match. Write a main that demonstrates a valid verification, a tampered-payload rejection, and a timing-safe mismatch message that doesn't short-circuit.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+)
+
+var (
+	errBadSigFormat = errors.New("signature: invalid hex encoding")
+	errSigMismatch  = errors.New("signature: mismatch")
+)
+
+// VerifyWebhookSignature verifies an HMAC-SHA256 webhook signature.
+// Uses hmac.Equal (constant-time) — safe against timing attacks.
+func VerifyWebhookSignature(secret, payload []byte, receivedSig string) error {
+	got, err := hex.DecodeString(receivedSig)
+	if err != nil {
+		return errBadSigFormat
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(payload)
+	want := mac.Sum(nil)
+	// hmac.Equal examines every byte regardless of where the first mismatch is.
+	if !hmac.Equal(want, got) {
+		return errSigMismatch
+	}
+	return nil
+}
+
+func main() {
+	secret := []byte("meridian-webhook-secret-32bytes!!")
+	payload := []byte(`{"event":"transfer.settled","amount_cents":5000}`)
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(payload)
+	validSig := hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("valid:", VerifyWebhookSignature(secret, payload, validSig))
+
+	tampered := []byte(`{"event":"transfer.settled","amount_cents":999999}`)
+	fmt.Println("tampered payload:", VerifyWebhookSignature(secret, tampered, validSig))
+
+	fmt.Println("bad hex:", VerifyWebhookSignature(secret, payload, "not-hex!!"))
+}
+```
+
+`hmac.Equal` is a thin wrapper around `subtle.ConstantTimeCompare` that also checks length equality first (in constant time). Both are in the standard library with no external dependencies.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Alright, sport. I've shown you AES-GCM, envelope encryption, HMAC signing, constant-time comparison, and tamper detection. Now you're going to put it together under fire.
+
+I've written a payments service that stores bank account numbers and signs outbound requests. It has exactly two bugs: one in the encryption layer and one in the signature verification. Both are the kind of mistakes that look fine in code review but are catastrophic in production. Your job is to find them, exploit them in the sandbox to prove they're real, then fix them so the verifier's tests go green.
+
+This is a **break-fix** lab. Fully sandboxed — the vulnerable service runs only inside this environment. No real accounts, no real money, no real anything. Just you, a deliberately broken program, and the verifier watching your every move.
+
+<Lab
+  title="Break the broken payments service, then fix it"
+  archetype="break-fix"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  objective="The starter code has two security bugs: (1) the AES-GCM nonce is all-zeros instead of random — two encryptions of different plaintexts with the same key and nonce leak the XOR of the plaintexts; (2) the HMAC verification uses bytes.Equal instead of hmac.Equal, making it vulnerable to a timing attack. Exploit both bugs to demonstrate they're real (see the comments), then fix both so the self-check output shows PASS."
+  starter={`package main
+
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
+
+// BUG 1: nonce is all zeros — NEVER do this in production.
+// With a fixed nonce, encrypting two plaintexts with the same key
+// lets an attacker recover the XOR of both plaintexts from the ciphertexts.
+func encryptField(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize()) // all zeros — BUG 1
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// BUG 2: bytes.Equal is not constant-time — vulnerable to timing attacks.
+// An attacker who can measure response time can brute-force the signature
+// one byte at a time. Use hmac.Equal instead.
+func verifySignature(secret, message []byte, gotSig string) bool {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	want := hex.EncodeToString(mac.Sum(nil))
+	return bytes.Equal([]byte(want), []byte(gotSig)) // BUG 2
+}
+
+func main() {
+	key, _ := hex.DecodeString(
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+	)
+
+	// EXPLOIT BUG 1: encrypt two different values, XOR the ciphertexts.
+	// With a fixed nonce, ct1 XOR ct2 == plaintext1 XOR plaintext2.
+	ct1, _ := encryptField(key, []byte("IBAN: GB29NWBK60161331926819"))
+	ct2, _ := encryptField(key, []byte("IBAN: DE89370400440532013000"))
+	xorResult := make([]byte, len(ct1[12:])) // skip the 12-byte nonce prefix
+	for i := range xorResult {
+		if i < len(ct2)-12 {
+			xorResult[i] = ct1[12+i] ^ ct2[12+i]
+		}
+	}
+	// After your fix, xorResult should be random noise, not XOR-of-IBANs.
+	fmt.Printf("XOR of ciphertexts: %x\\n", xorResult)
+
+	secret := []byte("shared-signing-secret-32bytes!!!!!")
+	message := []byte("POST /v1/transfers amount_cents=5000")
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("verify (should be true):", verifySignature(secret, message, sig))
+
+	// Self-check: both nonces must differ and verification must pass.
+	// Uncomment after fixing:
+	// ct3, _ := encryptField(key, []byte("test"))
+	// ct4, _ := encryptField(key, []byte("test"))
+	// if bytes.Equal(ct3[:12], ct4[:12]) {
+	//     fmt.Println("FAIL: nonces are identical")
+	// } else {
+	//     fmt.Println("PASS: nonces differ")
+	// }
+}`}
+  verifier="Self-check: (1) call your fixed encryptField twice with the same key — verify the two nonces differ (random nonces). (2) confirm verifySignature uses hmac.Equal by running it with a correct and an incorrect signature. (3) uncomment the self-check block — it prints PASS when both nonces differ. All three green → flag released."
+  hints={[
+    "Bug 1: the nonce must be random, not zero. Replace make([]byte, gcm.NonceSize()) with a call that fills the slice from crypto/rand — you need to import crypto/rand and io, then use io.ReadFull(rand.Reader, nonce).",
+    "Bug 2: replace bytes.Equal([]byte(want), []byte(gotSig)) with hmac.Equal([]byte(want), []byte(gotSig)). The bytes import can then be removed. That is literally the entire fix for bug 2.",
+    "After fixing bug 1, the XOR-of-ciphertexts output will look like random noise rather than recognizable XOR-of-IBANs, because each ciphertext uses a different random nonce and therefore a different keystream. Uncomment the self-check block to confirm PASS."
+  ]}
+  flag="GO{random_nonces_and_constant_time_comparison}"
+>
+
+Two bugs. Both look innocent. Both are disasters waiting in production. The first one breaks the confidentiality of *every record encrypted under that key*. The second one hands an attacker a brute-force oracle on your HMAC signatures.
+
+Find them. Break them (in the sandbox). Fix them. I'll be watching the verifier.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **Secrets management for finance** goes beyond the Part 2 baseline: KMS/HSM for cryptographic key material, separation of duties, and key rotation as a first-class operational concern. Your service calls the KMS — it never holds master key bytes.
+- **`crypto/rand` is the only correct source** for keys, nonces, tokens, and any security-sensitive value. `math/rand` (and `math/rand/v2`) is deterministic and must never mint a security value. As of Go 1.26, several `crypto/*` functions always use secure randomness regardless of any supplied reader.
+- **AES-GCM** (`crypto/aes` + `crypto/cipher`) provides **authenticated encryption** (AEAD) — confidentiality and integrity in one operation. A tampered ciphertext returns an error, not garbled plaintext. The nonce must be unique per encryption under a given key; `crypto/rand` is the safe source. Nonce reuse destroys confidentiality.
+- **Envelope encryption** uses a per-record DEK (encrypted by the KMS-held KEK) stored beside the ciphertext. A database breach alone yields nothing without KMS access. DEKs and KEKs can be rotated independently.
+- **Field-level PII encryption** applies envelope encryption to individual columns. Only services with the KMS IAM role can decrypt — service isolation is enforced at the infrastructure level, not just the application layer.
+- **Constant-time comparison** (`hmac.Equal`, `subtle.ConstantTimeCompare`) is mandatory for any secret comparison. `bytes.Equal` short-circuits and leaks a timing oracle — this is a real attack used against production HMAC implementations. Always use `hmac.Equal` for HMAC tags.
+- **Request signing** (HMAC or asymmetric) proves authenticity and integrity at the application layer, independent of TLS. A canonical request serializes the elements being signed deterministically; the clock-skew window closes the basic replay window.
+- **Authorization models**: RBAC for most fintech use cases; ABAC for complex attribute-driven rules. Row-level authorization — including the authenticated user's ID in every data-layer query — prevents IDOR (Insecure Direct Object Reference) vulnerabilities.
+- **Replay protection** combines the clock-skew window from request signing with nonces for longer-lived operations. The idempotency key from the **Idempotency & Exactly-Once Semantics** chapter is a nonce by another name.
+- **PII handling**: minimize collection, tokenize high-sensitivity identifiers, encrypt at rest with envelope encryption, and redact at the logging boundary using `slog.LogValuer` — never rely on call-site discipline to keep PII out of logs.
+- **Blast-radius mindset**: every service boundary is a data access boundary. Compromise one service; contain one blast radius. Design data contracts to give each service only the data it needs.
+
+</Recap>
+
+<Scoreboard
+  streak={10}
+  items={[
+    { label: "Quick check — math/rand vs crypto/rand", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — AES-GCM tamper detection", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — canonical request body hash", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — slog.LogValuer vs String()", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — AES-GCM round-trip", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Canonical HMAC signing", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Row-level authorization middleware", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Nonce store", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Constant-time webhook verifier", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Break the broken payments service, then fix it", captured: false, points: 80 }}
+/>
+
+Not bad. Genuinely — for this particular chapter, not bad at all. You've encrypted bank account numbers correctly, generated nonces from the right source, signed requests that can't be forged or replayed, compared secrets in constant time, enforced ownership at the query layer, and kept PII out of logs using types instead of hope. That's the baseline for finance-grade security — not the ceiling. The ceiling is the **Resilience & Correctness Under Load** chapter, where we put all of this under actual load and add rate limiting, fraud-check hooks, and reconciliation as a safety net. Rest up, sport. You're going to need it.

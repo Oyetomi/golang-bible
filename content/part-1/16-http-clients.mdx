@@ -1,0 +1,1492 @@
+---
+title: "HTTP Clients"
+part: 1
+order: 16
+type: "course"
+description: "net/http clients done right: timeouts, transports and connection pooling, retries, context, and decoding responses safely."
+prerequisites: ["networking-web-fundamentals"]
+---
+
+<HeroCard label="Part 1 · Chapter 16" title="HTTP Clients">
+
+Let me paint you a picture, sport. Your checkout service calls a payment processor. No timeout set. The processor is having a rough Tuesday. Your goroutine sits there. Waiting. Holding a connection. Then another request comes in. Same story. Then another. You've just discovered that `http.DefaultClient` has no timeout — and now you have a goroutine pile-up that'll bring your entire service to its knees at 2 a.m.
+
+I've seen engineers ship that exact mistake to production. *Brilliant* engineers, by their own estimation. They were wrong.
+
+By the end of this chapter you'll build HTTP clients that are worthy of my reputation: with timeouts at every layer, a properly tuned transport, context propagation, idiomatic response decoding, and a retry strategy that won't hammer a struggling payment API into oblivion. Let's get to work.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Default Client Is a Trap", "Timeouts at Every Layer", "Transport and Connection Pooling", "Context-Aware Requests", "Retries", "Decoding Responses Safely"]} />
+
+<Scene
+  title="The no-timeout trap: hung API, piling goroutines"
+  actors={[
+    { id: "meridian", label: "Meridian checkout" },
+    { id: "payapi", label: "Payment API" }
+  ]}
+  rows={1}
+  cols={3}
+  frames={[
+    {
+      caption: "Meridian's checkout service is live. Three connection slots available to the payment API.",
+      beat: "neutral",
+      actors: [{ id: "meridian", state: "idle" }, { id: "payapi", state: "idle" }],
+      cells: [{ id: "A1", state: "idle", label: "free" }, { id: "A2", state: "idle", label: "free" }, { id: "A3", state: "idle", label: "free" }]
+    },
+    {
+      caption: "The payment API starts hanging — it accepts connections but never responds. DefaultClient has no timeout, so the first goroutine parks and waits.",
+      beat: "problem",
+      actors: [{ id: "meridian", state: "active" }, { id: "payapi", state: "warn" }],
+      cells: [{ id: "A1", state: "warn", label: "blocked" }, { id: "A2", state: "idle", label: "free" }, { id: "A3", state: "idle", label: "free" }]
+    },
+    {
+      caption: "More requests arrive. Each spawns a goroutine, each goroutine blocks on the hung API. Connections pile up.",
+      beat: "problem",
+      actors: [{ id: "meridian", state: "active" }, { id: "payapi", state: "bad" }],
+      cells: [{ id: "A1", state: "bad", label: "blocked" }, { id: "A2", state: "bad", label: "blocked" }, { id: "A3", state: "warn", label: "blocked" }]
+    },
+    {
+      caption: "With a 5-second timeout + context deadline: the hung call is cancelled after 5s, the goroutine is freed, the connection slot opens back up. The service stays healthy.",
+      beat: "solution",
+      actors: [{ id: "meridian", state: "ok" }, { id: "payapi", state: "warn" }],
+      cells: [{ id: "A1", state: "done", label: "freed" }, { id: "A2", state: "done", label: "freed" }, { id: "A3", state: "done", label: "freed" }]
+    }
+  ]}
+  caption="One missing timeout turns a flaky downstream API into a goroutine pile-up that brings down Meridian's entire checkout service."
+/>
+
+## The Default Client Is a Trap
+
+Here's the scene. Your checkout service is calling an exchange-rate API to convert USD to EUR before charging a card. You reach for the obvious thing:
+
+```go
+// exchangerate.go — the thing that will haunt you
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+)
+
+func fetchRate(from, to string) ([]byte, error) {
+	// http.Get uses http.DefaultClient — and DefaultClient has NO timeout.
+	resp, err := http.Get("https://api.example.com/rates/" + from + "/" + to)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+func main() {
+	data, err := fetchRate("USD", "EUR")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("got %d bytes\n", len(data))
+}
+```
+
+What's wrong with it? Everything you can't see. The call to `http.Get` uses the package-level `http.DefaultClient`, which is defined as:
+
+```go
+// From the Go standard library — net/http/client.go
+var DefaultClient = &Client{}
+```
+
+<Define term="http.Client (and the no-timeout trap)" since="Reliability Patterns (Part 2)">
+`http.Client` is the struct you use to make HTTP requests. Its zero value (`&http.Client{}`) has **no timeout** — if the server never responds, the call blocks forever. In a server handling concurrent requests, one hung downstream call becomes one blocked goroutine per in-flight request, draining file descriptors until the process dies. Always set `Timeout` on any client that calls an external API. `http.DefaultClient` is exactly this zero value — it is safe only for one-off scripts, never for production services.
+</Define>
+
+An empty `&http.Client{}`. Zero fields set. **No timeout.** If the exchange-rate server stops responding, your goroutine blocks forever — or rather, until the OS eventually gives up (which could be minutes). In a request handler, that's a leaked goroutine. Under traffic, it's a leaked goroutine for every concurrent checkout.
+
+The fix is exactly one change: **build your own client.**
+
+```go
+// exchangerate.go — the right way
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// Build ONE client at package level and reuse it.
+// Never create a new http.Client per request.
+var httpClient = &http.Client{
+	Timeout: 5 * time.Second, // end-to-end: dial + TLS + headers + body
+}
+
+func fetchRate(from, to string) ([]byte, error) {
+	resp, err := httpClient.Get("https://api.example.com/rates/" + from + "/" + to)
+	if err != nil {
+		return nil, fmt.Errorf("fetchRate: %w", err)
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+func main() {
+	data, err := fetchRate("USD", "EUR")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("got %d bytes\n", len(data))
+}
+```
+
+`http.Client.Timeout` is the end-to-end deadline: it starts the moment the `Get` call is made and covers dialing, the TLS handshake, sending the request, and reading the full response body. If *anything* in that chain takes longer than five seconds, the whole call returns an error. Your goroutine is never parked forever again.
+
+<BeforeAfter
+  badLabel="DefaultClient (no timeout)"
+  goodLabel="Custom client (timeout set)"
+  bad={`// Blocks forever if server hangs
+resp, err := http.Get(url)`}
+  good={`var client = &http.Client{
+  Timeout: 5 * time.Second,
+}
+resp, err := client.Get(url)`}
+/>
+
+<ExecTimeline
+  title="http.Get vs. a custom client — what happens when the server hangs"
+  lanes={[{ id: "default", label: "DefaultClient" }, { id: "custom", label: "Custom client (5s)" }]}
+  steps={[
+    { lane: "default", kind: "run", label: "http.Get called", note: "http.DefaultClient dials the server. No timeout is configured." },
+    { lane: "custom", kind: "run", label: "client.Get called", note: "Custom client starts the same dial — but a 5-second timer is running." },
+    { lane: "default", kind: "block", label: "server hangs…", note: "The server accepts the connection but never sends a response. The goroutine parks indefinitely." },
+    { lane: "custom", kind: "block", label: "server hangs…", note: "Same stall. But the 5-second countdown is ticking." },
+    { lane: "custom", kind: "done", label: "timeout fires → error", note: "After 5 seconds the client cancels the request and returns context deadline exceeded. Goroutine is free." },
+    { lane: "default", kind: "block", label: "still blocking…", note: "DefaultClient goroutine is still parked. Minutes pass. The OS may eventually reset, but your handler is gone." }
+  ]}
+  caption="Without a Timeout, a hung server holds your goroutine forever. One line saves you."
+/>
+
+<Callout kind="warn" title="Never use http.DefaultClient in production">
+
+`http.DefaultClient` is fine for a quick script. It is a footgun in any server, CLI, or service that makes outbound calls. The moment you run concurrent requests or call an external API you don't control, you need your own client with a `Timeout`.
+
+</Callout>
+
+<QuickCheck
+  question="What does http.DefaultClient.Timeout equal in a freshly created Go program?"
+  options={["30 seconds", "0 — which means no timeout at all", "The OS TCP keepalive, usually 2 hours", "It panics if you don't set it"]}
+  answer={1}
+  explain="The zero value of time.Duration is 0. A zero Timeout on http.Client means no deadline — the client will wait as long as the OS lets it. Always set a Timeout on clients you own."
+/>
+
+## Timeouts at Every Layer
+
+The `Client.Timeout` is a blunt instrument. It covers the entire round trip. Sometimes you need surgical precision: what if the dial takes ages but the response streams fine? What if TLS negotiation stalls? What if headers arrive but the body never finishes?
+
+`http.Transport` exposes those knobs. Here's the full picture:
+
+```go
+// payment/client.go — surgical timeouts for each phase
+package payment
+
+import (
+	"net"
+	"net/http"
+	"time"
+)
+
+// NewClient builds a production-grade HTTP client for the payment API.
+// Inject this via dependency injection — never use a package-level global
+// in library code.
+func NewClient() *http.Client {
+	transport := &http.Transport{
+		// How long to wait for a TCP connection to be established.
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+
+		// How long the TLS handshake may take.
+		TLSHandshakeTimeout: 5 * time.Second,
+
+		// How long to wait for the server's first response byte (headers).
+		ResponseHeaderTimeout: 5 * time.Second,
+
+		// How long an idle connection can sit in the pool.
+		IdleConnTimeout: 90 * time.Second,
+
+		// Connection pool tuning (covered in the next section).
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+	}
+
+	return &http.Client{
+		// End-to-end timeout: the outer safety net.
+		// Must be larger than the sum of your inner timeouts.
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
+}
+```
+
+These timeouts layer on top of each other. Here's a request through all of them:
+
+<ExecTimeline
+  title="Phases of an HTTP request — where each timeout applies"
+  lanes={[{ id: "req", label: "request lifecycle" }]}
+  steps={[
+    { lane: "req", kind: "run", label: "client.Get(url)", note: "Client.Timeout starts counting. The whole trip must finish in 10 seconds." },
+    { lane: "req", kind: "run", label: "TCP dial", note: "DialContext.Timeout fires if the server IP never accepts the connection within 3 seconds." },
+    { lane: "req", kind: "run", label: "TLS handshake", note: "TLSHandshakeTimeout fires if certificate exchange stalls beyond 5 seconds." },
+    { lane: "req", kind: "send", label: "send request headers + body", note: "Request bytes flow to the server. No specific timeout here — Client.Timeout is the guard." },
+    { lane: "req", kind: "recv", label: "wait for response headers", note: "ResponseHeaderTimeout fires if the server takes more than 5 seconds to send the status line and headers." },
+    { lane: "req", kind: "recv", label: "stream response body", note: "Body bytes flow in. Still under Client.Timeout's umbrella — read it promptly." },
+    { lane: "req", kind: "done", label: "resp.Body.Close()", note: "Connection returns to the pool. Total wall time must be under 10 seconds or Client.Timeout fires." }
+  ]}
+  caption="Each timeout guards one phase. Client.Timeout is the overall deadline — bigger than any single phase."
+/>
+
+**Which one to set when?**
+
+| Situation | Reach for |
+|---|---|
+| Simple script or tool | `Client.Timeout` alone is usually enough |
+| Service calling external APIs | `Client.Timeout` + `ResponseHeaderTimeout` at minimum |
+| High-stakes financial calls | All four transport timeouts + `Client.Timeout` |
+| Per-request dynamic deadline | `context` with `WithTimeout` or `WithDeadline` (see Section 4) |
+
+<Callout kind="note" title="Client.Timeout vs. a context deadline">
+
+`Client.Timeout` is a static ceiling on the whole client for every request it makes. A `context.WithTimeout` deadline is per-request and propagates cancellation to everything downstream that receives the context — database calls, sub-requests, log flushes. In a real service handler, you typically carry both: the client's static `Timeout` as the outer safety net, and a per-request context deadline from the incoming HTTP request's context for fine-grained propagation. Section 4 covers this precisely.
+
+</Callout>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+// newClientWithTransport returns a client with explicit phase timeouts.
+func newClientWithTransport() *http.Client {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   2 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: 3 * time.Second,
+		IdleConnTimeout:       60 * time.Second,
+		MaxIdleConns:          50,
+		MaxIdleConnsPerHost:   5,
+	}
+	return &http.Client{Timeout: 8 * time.Second, Transport: tr}
+}
+
+func main() {
+	// Use httptest so this runs in the sandbox — no real network needed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "rate: 1.0823")
+	}))
+	defer srv.Close()
+
+	client := newClientWithTransport()
+
+	resp, err := client.Get(srv.URL + "/rates/USD/EUR")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	fmt.Println("status:", resp.Status)
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question="A server accepts your TCP connection but takes 8 seconds to send the HTTP response headers. Which timeout fires first if you set ResponseHeaderTimeout: 5s and Client.Timeout: 10s?"
+  options={["Client.Timeout fires at 10 seconds", "ResponseHeaderTimeout fires at 5 seconds", "TLSHandshakeTimeout fires instead", "The request succeeds — 8 seconds is within Client.Timeout"]}
+  answer={1}
+  explain="ResponseHeaderTimeout fires at 5 seconds because it targets the wait-for-first-response-byte phase specifically. Client.Timeout would only fire if the total round trip exceeds 10 seconds, but the more specific timeout wins first."
+/>
+
+## Transport and Connection Pooling
+
+<Define term="http.Transport (connection pool and keep-alive)">
+`http.Transport` is the layer beneath `http.Client` that actually manages TCP connections. It maintains a **connection pool** keyed by host — when a request finishes, the connection goes back into the pool and the next request to the same host reuses it, skipping the TCP handshake and TLS negotiation entirely. The pool is the reason you must create one `http.Client` at startup and reuse it: a brand-new client has a brand-new, empty pool, so every request pays the full dial + TLS cost. **On the job:** at 100 requests per second to a payment API, a per-request client means 100 new TLS handshakes per second — 5–10x slower than a pooled client and far more load on the remote service.
+</Define>
+
+Here is the mistake I see constantly, and it makes me genuinely, personally sad:
+
+```go
+// checkout handler — DO NOT DO THIS
+func handleCheckout(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Timeout: 5 * time.Second} // new client per request!
+	resp, err := client.Get("https://payment.example.com/charge")
+	// ...
+}
+```
+
+Every request creates a fresh `http.Client` with a fresh `http.Transport`. The transport has a connection pool — but a brand-new pool. Every request opens a brand-new TCP connection, does a fresh TLS handshake, sends the request, then *discards* the connection. At 100 requests per second that's 100 new TCP + TLS round trips per second to your payment API. You've implemented the slowest possible billing system.
+
+**One client. Reused everywhere.** The transport's connection pool is the whole point.
+
+```go
+// payment/client.go — ONE client, reused for the life of the service
+package payment
+
+import (
+	"net"
+	"net/http"
+	"time"
+)
+
+// Client wraps http.Client with payment-API-specific defaults.
+type Client struct {
+	http *http.Client
+	base string
+}
+
+// NewClient constructs a Client. Call it once at startup; inject it everywhere.
+func NewClient(baseURL string) *Client {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second, // keeps idle TCP connections alive
+		}).DialContext,
+		MaxIdleConns:        100, // total idle connections across all hosts
+		MaxIdleConnsPerHost: 10,  // idle connections to ONE host (payment API)
+		IdleConnTimeout:     90 * time.Second,
+	}
+	return &Client{
+		http: &http.Client{Timeout: 8 * time.Second, Transport: tr},
+		base: baseURL,
+	}
+}
+```
+
+Now let's talk about what the pool actually does.
+
+<Define term="The drain-and-close body rule">
+After every HTTP response, you must **close the body**; to reuse the connection, you must also read the body to completion before closing it. If you close without draining, the transport usually discards the connection — it cannot reuse a TCP stream that still has bytes pending. The idiom is `defer resp.Body.Close()` plus `io.Copy(io.Discard, resp.Body)` for any path where you don't need the bytes. **On the job:** skipping `Close` leaks resources; skipping the drain sacrifices keep-alive reuse and forces extra dials under load.
+</Define>
+
+<UnderTheHood title="How http.Transport pools connections (Go 1.26 baseline)">
+
+`http.Transport` is the real workhorse. It maintains an **idle connection pool** keyed by `{scheme, host, port}` (the "canonical address"). When you make a request:
+
+1. The transport checks the pool for an idle connection to that host. If one exists, it grabs it and skips the TCP + TLS overhead entirely.
+2. If none are available and the pool isn't full, it dials a new connection.
+3. After the response body is fully read and closed, the connection is returned to the pool, ready for the next request.
+
+The pool's size is controlled by two fields:
+
+- **`MaxIdleConns`** — the absolute cap on idle connections across *all* hosts. Default 100. Zero means no limit (dangerous under load).
+- **`MaxIdleConnsPerHost`** — idle connections to a *single* host. Default 2, which is surprisingly small for a high-throughput service calling one payment API. Setting it to match your expected concurrency (e.g. 10–20) prevents "connection churn" — the transport repeatedly opening and closing connections because the two idle slots are always taken.
+
+The pool key includes the full authority (`host:port`) and the scheme. `http://payment.example.com` and `https://payment.example.com` use separate pools. Connections are not shared between clients — each `http.Client` with its own `http.Transport` has its own pool.
+
+**The body-must-be-closed-and-drained rule.** This is where engineers cause themselves pain. The transport can only return a connection to the pool after the response body is fully consumed *and* closed. If you close the body without reading it, the transport has to *discard* the connection — it can't reuse an open TCP stream that still has bytes in it. The pattern is:
+
+```go
+resp, err := client.Do(req)
+if err != nil { return err }
+defer resp.Body.Close()
+// Read the full body (or io.Copy to io.Discard if you don't need it)
+_, _ = io.Copy(io.Discard, resp.Body)
+```
+
+Forgetting to close the body leaks resources. Closing without draining does not usually leak the file descriptor, but it prevents connection reuse, so the transport opens a new connection for the next request. Under load that becomes avoidable dial churn, TLS handshakes, and pool pressure.
+
+**`KeepAlive` on the dialer** sends TCP keepalive probes on idle connections, detecting when a middlebox (load balancer, NAT gateway) silently closes the connection beneath you. Setting it to 30 seconds means the transport detects dead idle connections before trying to use them, avoiding the "stale connection" error your next request would otherwise get.
+
+**Go 1.26 note — `net.Dialer` context-aware dial methods.** As of Go 1.26, `net.Dialer` gained explicit `DialTCP` and related methods that accept a `context.Context` directly, giving you per-dial cancellation without wrapping in `DialContext`. For most services the `DialContext` field on `http.Transport` is still the right integration point, but if you are building a custom transport or a raw TCP dialer, the new methods are the cleaner API.
+
+</UnderTheHood>
+
+<ExecTimeline
+  title="Connection reuse — pooled vs. new, and the body-drain rule"
+  lanes={[{ id: "req1", label: "request 1" }, { id: "req2", label: "request 2" }]}
+  steps={[
+    { lane: "req1", kind: "run", label: "pool miss → TCP dial", note: "No idle connection to payment.example.com. Transport opens a new TCP+TLS connection (40–150ms overhead)." },
+    { lane: "req1", kind: "send", label: "POST /charge", note: "Request bytes sent on the new connection." },
+    { lane: "req1", kind: "recv", label: "drain body + Close()", note: "Body fully read (or discarded) and closed. Transport marks the connection idle and returns it to the pool." },
+    { lane: "req2", kind: "run", label: "pool hit — skip dial!", note: "Request 2 grabs the idle connection. No TCP handshake. No TLS. Straight to sending." },
+    { lane: "req2", kind: "send", label: "POST /charge", note: "Bytes go out on the reused connection. Typically 5–20ms faster than a fresh dial." },
+    { lane: "req2", kind: "recv", label: "body NOT drained", note: "BUG: Body closed without reading. Transport cannot reuse this connection — it must discard it." },
+    { lane: "req2", kind: "done", label: "conn discarded (leak)", note: "Every future request opens a brand-new connection. Pool advantage gone. File descriptors leak." }
+  ]}
+  caption="Drain the body completely before closing — that's the price of admission to the connection pool."
+/>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="MaxIdleConnsPerHost">Cap idle connections to one host. Default 2 is usually too low. Set it to match your expected concurrent calls to that service (10–20 is common).</ConceptCard>
+  <ConceptCard label="KeepAlive (dialer)">TCP keepalive probes detect silently-closed idle connections before you try to use them, preventing cryptic "connection reset" errors.</ConceptCard>
+  <ConceptCard label="One Client, injected">Create the client at startup, inject it via constructor or interface. Never create one per request handler. The pool is the point.</ConceptCard>
+  <Gotcha>For reusable HTTP clients, drain then close `resp.Body`. If you don't need the body bytes, copy to io.Discard: `io.Copy(io.Discard, resp.Body)`. Skipping the drain loses keep-alive reuse; skipping `Close` leaks resources.</Gotcha>
+</ConceptGrid>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+var paymentClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+func callPayment(url string) error {
+	resp, err := paymentClient.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// Always drain before close — keeps the connection in the pool.
+	_, err = io.Copy(io.Discard, resp.Body)
+	return err
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "charged")
+	}))
+	defer srv.Close()
+
+	for i := 0; i < 3; i++ {
+		if err := callPayment(srv.URL); err != nil {
+			fmt.Println("error:", err)
+			return
+		}
+		fmt.Printf("call %d ok\n", i+1)
+	}
+}
+```
+
+</GoPlayground>
+
+## Context-Aware Requests
+
+<Define term="Context deadline" since="The context Package, In Depth (Part 1)">
+A **context deadline** (set via `context.WithTimeout` or `context.WithDeadline`) is an absolute timestamp attached to a `context.Context`. When the deadline expires, `ctx.Done()` is closed and every operation carrying that context — HTTP calls, database queries, downstream sub-requests — is signalled to cancel. Unlike `http.Client.Timeout` (which is a static per-client ceiling), a context deadline is **per-request** and propagates automatically through the entire call tree. **On the job:** in a payment service handler, the gateway gives you a 3-second context; threading it into every downstream call ensures that when the customer times out, *all* the work for that request stops — no zombie goroutines charging cards after the customer already got a 504.
+</Define>
+
+Your checkout service receives an HTTP request with a context. That context has a deadline: if the customer waits more than 3 seconds, the gateway cancels the whole thing. Your downstream payment call should be cancelled *at the same moment* — not left running like a zombie goroutine after the customer already got a timeout page.
+
+The answer is `http.NewRequestWithContext`:
+
+```go
+// checkout/handler.go — propagating the request context to every downstream call
+package checkout
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+)
+
+type PaymentResponse struct {
+	TransactionID string `json:"transaction_id"`
+	Status        string `json:"status"`
+}
+
+func chargeCard(ctx context.Context, client *http.Client, amount int) (*PaymentResponse, error) {
+	// Build the request AND attach the caller's context.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://payment.example.com/charge", nil)
+	if err != nil {
+		return nil, fmt.Errorf("chargeCard: build request: %w", err)
+	}
+
+	// Context cancellation (customer timeout, gateway cancellation)
+	// will automatically abort this HTTP call.
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("chargeCard: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// Drain the error body so the connection can return to the pool.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("chargeCard: unexpected status %d", resp.StatusCode)
+	}
+
+	var pr PaymentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("chargeCard: decode: %w", err)
+	}
+	// Drain any trailing bytes so the connection returns to the pool.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return &pr, nil
+}
+```
+
+<Callout kind="note" title="http.NewRequest vs http.NewRequestWithContext">
+
+`http.NewRequest` attaches `context.Background()` — a context that is never cancelled. Use it only in tests or tools that truly have no caller context. In any server handler or service function, use `http.NewRequestWithContext` and pass the context you received. If you don't have a context, acquire one with `context.WithTimeout` or `context.WithDeadline`. The context chapter covers the full story (Part 1, Chapter 6).
+
+</Callout>
+
+Here's what cancellation actually looks like in flight:
+
+<ExecTimeline
+  title="Context cancellation aborting an in-flight HTTP request"
+  lanes={[{ id: "handler", label: "checkout handler" }, { id: "payment", label: "payment client" }]}
+  steps={[
+    { lane: "handler", kind: "run", label: "ctx from gateway (3s deadline)", note: "Incoming request carries a context with a 3-second deadline set by the API gateway." },
+    { lane: "payment", kind: "spawn", label: "chargeCard(ctx, ...)", note: "The context is threaded into the outbound HTTP request via NewRequestWithContext." },
+    { lane: "payment", kind: "send", label: "POST /charge in-flight", note: "HTTP request is on the wire. The payment API is slow — it hasn't responded yet." },
+    { lane: "handler", kind: "block", label: "ctx.Done() fires (3s)", note: "The gateway's 3-second deadline expires. ctx.Done() is closed, signalling cancellation." },
+    { lane: "payment", kind: "done", label: "request aborted → error", note: "http.Transport detects ctx cancellation and closes the connection. client.Do returns context deadline exceeded." },
+    { lane: "handler", kind: "done", label: "error returned to gateway", note: "chargeCard returns the error. The handler surfaces a 504 to the customer. No zombie goroutines." }
+  ]}
+  caption="Context cancellation flows from the gateway down through every downstream call — as long as you thread the ctx."
+/>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+var client = &http.Client{Timeout: 10 * time.Second}
+
+func fetchWithContext(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return string(body), err
+}
+
+func main() {
+	// A slow server that takes 500ms to respond.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		fmt.Fprintln(w, "payment processed")
+	}))
+	defer srv.Close()
+
+	// Success: 1-second context, server takes 0.5s.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel1()
+	body, err := fetchWithContext(ctx1, srv.URL)
+	fmt.Println("success:", body, err)
+
+	// Cancelled: 100ms context, server takes 0.5s.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+	_, err = fetchWithContext(ctx2, srv.URL)
+	fmt.Println("cancelled:", err)
+}
+```
+
+</GoPlayground>
+
+## Retries
+
+<Define term="Retry with exponential backoff and jitter" since="Reliability Patterns (Part 2)">
+A **retry** re-sends a failed request, hoping a transient error (network hiccup, momentary overload) has cleared. **Exponential backoff** makes each successive retry wait longer (100ms → 200ms → 400ms…) so you don't hammer a struggling server. **Jitter** adds randomness to that wait so thousands of retrying clients don't all fire at the same millisecond — the "thundering herd" that turns a brief overload into a sustained outage. **On the job:** retrying without backoff+jitter at scale is actively harmful — it amplifies the load at exactly the moment the server is already struggling.
+</Define>
+
+The payment API is flaky. Your exchange-rate provider returns 500s every few minutes. You need to retry — but not blindly, and not in a way that makes a struggling server worse.
+
+Two rules before you write a single line of retry logic:
+
+1. **Only retry idempotent requests.** A `GET` is always safe to retry. A `POST /charge` is not — retrying might double-charge the customer. For non-idempotent writes, use an idempotency key (Part 3 covers this in depth). For now, limit retries to `GET` and `HEAD`, or to writes that explicitly fail at the network level (connection refused, timeout) where you can be sure the server never saw the request.
+
+2. **Exponential backoff with jitter.** Retrying immediately at full speed against an overloaded server makes things *worse*. Back off exponentially (wait longer each retry) and add random jitter so thousands of retrying clients don't all slam the server at the same millisecond — the "thundering herd" problem.
+
+```go
+// retry/retry.go — idempotency-aware retry with backoff+jitter
+package retry
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"time"
+)
+
+// Config holds retry policy parameters.
+type Config struct {
+	MaxAttempts int           // total tries (first attempt + retries)
+	BaseDelay   time.Duration // initial wait between retries
+	MaxDelay    time.Duration // cap on the wait
+}
+
+// DefaultConfig is a reasonable baseline for calling external APIs.
+var DefaultConfig = Config{
+	MaxAttempts: 3,
+	BaseDelay:   200 * time.Millisecond,
+	MaxDelay:    2 * time.Second,
+}
+
+// Do executes req with retry logic.
+// Only retries on network errors and 5xx responses.
+// The request must be idempotent (GET, HEAD) or the caller must guarantee safety.
+func Do(ctx context.Context, client *http.Client, req *http.Request, cfg Config) (*http.Response, error) {
+	var (
+		resp *http.Response
+		err  error
+	)
+
+	for attempt := 0; attempt < cfg.MaxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 200ms, 400ms, 800ms… capped at MaxDelay.
+			delay := cfg.BaseDelay * time.Duration(1<<uint(attempt-1))
+			if delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
+			}
+			// Jitter: +/- 20% so clients don't sync up.
+			jitter := time.Duration(rand.Int63n(int64(delay) / 5))
+			if rand.Intn(2) == 0 {
+				delay += jitter
+			} else {
+				delay -= jitter
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("retry: context cancelled during backoff: %w", ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+
+		// Clone the request context from the outer context so cancellation propagates.
+		r := req.WithContext(ctx)
+
+		resp, err = client.Do(r)
+		if err != nil {
+			// Network error (timeout, connection refused) — always retry.
+			continue
+		}
+
+		// Drain + close so the connection returns to the pool on non-success responses.
+		if resp.StatusCode < 500 {
+			// 2xx, 3xx, 4xx: don't retry. 4xx is a client error — retrying won't help.
+			return resp, nil
+		}
+
+		// 5xx: drain and retry.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("retry: all %d attempts failed: %w", cfg.MaxAttempts, err)
+	}
+	return resp, fmt.Errorf("retry: all %d attempts returned 5xx", cfg.MaxAttempts)
+}
+```
+
+<Callout kind="warn" title="Deep reliability lives in Part 2">
+
+What we have here is a clean, intro-level retry with backoff. Part 2's "Reliability Patterns" chapter adds the full story: **circuit breakers** (stop retrying when a downstream is clearly broken), **adaptive timeouts**, **retry budgets**, per-key rate limiting, and using `golang.org/x/sync/errgroup` to fan out and cancel peers when one attempt succeeds. If you're building a payment gateway today, bookmark that chapter. For now, the rule is: backoff + jitter + idempotency awareness. You won't embarrass yourself.
+
+</Callout>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"time"
+)
+
+func doWithRetry(ctx context.Context, client *http.Client, url string, maxAttempts int) (string, error) {
+	base := 100 * time.Millisecond
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := base * time.Duration(1<<uint(attempt-1))
+			jitter := time.Duration(rand.Int63n(int64(delay) / 5))
+			delay += jitter
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("attempt %d: network error: %v\n", attempt+1, err)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			fmt.Printf("attempt %d: server error %d\n", attempt+1, resp.StatusCode)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return string(body), nil
+	}
+	return "", fmt.Errorf("all %d attempts failed", maxAttempts)
+}
+
+func main() {
+	var callCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callCount.Add(1)
+		if n < 3 {
+			// First two calls fail with 500.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "rate: 1.0823")
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	ctx := context.Background()
+
+	result, err := doWithRetry(ctx, client, srv.URL+"/rates", 4)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("result:", result)
+}
+```
+
+</GoPlayground>
+
+## Decoding Responses Safely
+
+The exchange-rate API responds with JSON. You have three enemies: a non-200 status you forgot to check, a body that's 500 MB of garbage from a misconfigured upstream, and a `Content-Type` that doesn't match what you expect. All three are real production bugs.
+
+Here is the full, safe decoding pattern:
+
+```go
+// rates/client.go — safe response decoding
+package rates
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+)
+
+// ExchangeRate is what the API returns.
+type ExchangeRate struct {
+	From string  `json:"from"`
+	To   string  `json:"to"`
+	Rate int64   `json:"rate_millionths"` // e.g. 1_082_300 = 1.0823 USD/EUR
+}
+
+const maxBodyBytes = 1 << 20 // 1 MiB — a rate response has no business being larger
+
+func fetchRate(client *http.Client, url string) (*ExchangeRate, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("fetchRate: request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Step 1: check the status code BEFORE touching the body.
+	if resp.StatusCode != http.StatusOK {
+		// Drain the error body (for connection reuse) then return.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("fetchRate: server returned %d: %s", resp.StatusCode, body)
+	}
+
+	// Step 2: verify Content-Type — reject HTML error pages masquerading as JSON.
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("fetchRate: unexpected Content-Type %q", ct)
+	}
+
+	// Step 3: cap the body size with io.LimitReader — never trust the server.
+	limited := io.LimitReader(resp.Body, maxBodyBytes)
+
+	// Step 4: stream-decode with json.Decoder — no buffering the whole body into []byte first.
+	var rate ExchangeRate
+	if err := json.NewDecoder(limited).Decode(&rate); err != nil {
+		return nil, fmt.Errorf("fetchRate: decode: %w", err)
+	}
+	return &rate, nil
+}
+```
+
+Each step stops a different attack:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Check status first">A 503 or 404 body might be an HTML error page. Decoding it as JSON gives a confusing error. Check status, drain, return early.</ConceptCard>
+  <ConceptCard label="io.LimitReader">Wraps the body so reads stop at your byte ceiling. Without it, a malicious or misconfigured server can stream gigabytes into your process until it OOMs.</ConceptCard>
+  <ConceptCard label="json.Decoder (streaming)">Reads from the reader incrementally. `io.ReadAll + json.Unmarshal` buffers the entire body in memory first. For large responses, streaming is the only sane choice.</ConceptCard>
+  <Gotcha>Never skip the status code check. `json.Decoder` will try to parse an HTML error page and return a cryptic `invalid character` error that tells you nothing about the actual 503 the server sent.</Gotcha>
+</ConceptGrid>
+
+**`io.ReadAll` vs. `json.Decoder` — when to use which:**
+
+<BeforeAfter
+  badLabel="io.ReadAll (buffers all)"
+  goodLabel="json.Decoder (streaming)"
+  bad={`body, _ := io.ReadAll(resp.Body)
+json.Unmarshal(body, &rate)`}
+  good={`limited := io.LimitReader(resp.Body, 1<<20)
+json.NewDecoder(limited).Decode(&rate)`}
+/>
+
+`io.ReadAll` is fine when:
+- The response body is small (a few KB) and you already know that.
+- You need the raw bytes for something else (signature verification, logging).
+
+`json.Decoder` (streaming) is better when:
+- The body can be large or unbounded.
+- You can decode in a single pass without needing the raw bytes.
+- You want to start decoding before the full body arrives.
+
+<Callout kind="note" title="io.ReadAll is ~2x faster in Go 1.26">
+
+As of Go 1.26, `io.ReadAll` was reworked to use a smarter initial buffer strategy, yielding roughly 2x throughput and ~50% fewer allocations on typical response bodies. If your code already uses `io.ReadAll` for small, known-size payloads (webhook bodies, auth tokens, error previews), you get this improvement for free with no code change. The streaming `json.Decoder` path is still preferable for large or unbounded bodies — but the performance gap between the two has narrowed for the small-body case.
+
+</Callout>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"time"
+)
+
+type ExchangeRate struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Rate int64  `json:"rate_millionths"`
+}
+
+const maxBodyBytes = 1 << 20 // 1 MiB
+
+var rateClient = &http.Client{Timeout: 5 * time.Second}
+
+func fetchRate(url string) (*ExchangeRate, error) {
+	resp, err := rateClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("fetchRate: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("fetchRate: status %d: %s", resp.StatusCode, b)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("fetchRate: unexpected content-type %q", ct)
+	}
+
+	var rate ExchangeRate
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&rate); err != nil {
+		return nil, fmt.Errorf("fetchRate: decode: %w", err)
+	}
+	return &rate, nil
+}
+
+func main() {
+	// Good server: returns valid JSON.
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"from":"USD","to":"EUR","rate_millionths":1082300}`)
+	}))
+	defer good.Close()
+
+	rate, err := fetchRate(good.URL)
+	fmt.Println("rate:", rate, "err:", err)
+
+	// Bad server: returns 503.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+		fmt.Fprintln(w, "service unavailable")
+	}))
+	defer bad.Close()
+
+	_, err = fetchRate(bad.URL)
+	fmt.Println("error from 503:", err)
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={'What does io.LimitReader(resp.Body, 1<<20) protect you against?'}
+  options={["A server that returns a non-200 status", "A server that streams a huge body that would exhaust your process memory", "A server that returns invalid JSON", "A server with an expired TLS certificate"]}
+  answer={1}
+  explain="io.LimitReader wraps the reader and returns io.EOF after the byte limit. It prevents a malicious or misconfigured server from sending gigabytes into your process. Status checks, JSON errors, and TLS are separate concerns."
+/>
+
+---
+
+## Exercises
+
+Stop reading, start building. The exchange-rate API is waiting.
+
+<Exercise n={1} title="Your first production client" level="easy">
+
+Write a `NewRateClient()` function that returns an `*http.Client` with:
+- A 5-second end-to-end `Timeout`
+- A `Transport` with `MaxIdleConnsPerHost: 10`, `IdleConnTimeout: 60s`, and `DialContext` timeout of 3 seconds
+
+Test it against a local `httptest.Server` that returns `"ok"`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func NewRateClient() *http.Client {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     60 * time.Second,
+	}
+	return &http.Client{Timeout: 5 * time.Second, Transport: tr}
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	}))
+	defer srv.Close()
+
+	client := NewRateClient()
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println("body:", string(body))
+}
+```
+
+The key discipline: one `http.Client` built once, transport configured for connection reuse. `DialContext` timeout prevents slow DNS or refused connections from blocking forever.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Context propagation" level="easy">
+
+Write a `FetchWithCtx(ctx context.Context, client *http.Client, url string) (int, error)` function that makes a GET request using the provided context and returns the HTTP status code. Use `http.NewRequestWithContext`. Demonstrate that a cancelled context aborts the request.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func FetchWithCtx(ctx context.Context, client *http.Client, url string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		fmt.Fprintln(w, "done")
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Success: 1-second deadline.
+	ctx1, c1 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer c1()
+	status, err := FetchWithCtx(ctx1, client, srv.URL)
+	fmt.Println("status:", status, "err:", err)
+
+	// Failure: 50ms deadline — server is slower.
+	ctx2, c2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer c2()
+	_, err = FetchWithCtx(ctx2, client, srv.URL)
+	fmt.Println("cancelled err:", err)
+}
+```
+
+`http.NewRequestWithContext` is the correct API. Never use `http.NewRequest` in server handlers.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Safe JSON decode" level="medium">
+
+Write `decodePriceResponse(resp *http.Response, out any) error` that:
+1. Returns an error if status is not 200, including the first 512 bytes of the body in the error message.
+2. Wraps the body in `io.LimitReader` with a 512 KB cap before decoding.
+3. Uses `json.NewDecoder` to decode into `out`.
+4. Always drains and closes the body.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func decodePriceResponse(resp *http.Response, out any) error {
+	defer resp.Body.Close()
+	// Always drain so the connection can be reused.
+	// Defers run LIFO: drain fires first (body still open), then close.
+	defer func() { _, _ = io.Copy(io.Discard, resp.Body) }()
+
+	if resp.StatusCode != http.StatusOK {
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, preview)
+	}
+
+	limited := io.LimitReader(resp.Body, 512*1024) // 512 KiB
+	return json.NewDecoder(limited).Decode(out)
+}
+
+type Price struct {
+	Amount   int64  `json:"amount_cents"`
+	Currency string `json:"currency"`
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"amount_cents":4999,"currency":"USD"}`)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, _ := client.Get(srv.URL)
+
+	var p Price
+	if err := decodePriceResponse(resp, &p); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("price: %d cents %s\n", p.Amount, p.Currency)
+}
+```
+
+The two defers run LIFO: the drain closure fires first (body still open, any unread bytes are discarded), then `resp.Body.Close()`. On the error path, `io.ReadAll` has already consumed the body, so the drain is a no-op — both defers still run cleanly. On the success path, the decoder may leave trailing bytes; the drain handles those before close.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Retry with backoff" level="medium">
+
+Write `getWithRetry(ctx context.Context, client *http.Client, url string, maxAttempts int) (*http.Response, error)` that retries on network errors and 5xx status codes with exponential backoff starting at 100ms and capped at 1s. Only attempt the retry if the context is not yet done.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"time"
+)
+
+func getWithRetry(ctx context.Context, client *http.Client, url string, maxAttempts int) (*http.Response, error) {
+	base := 100 * time.Millisecond
+	maxDelay := 1 * time.Second
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := base * time.Duration(1<<uint(attempt-1))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled during backoff: %w", ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("attempt %d: error: %v\n", attempt+1, err)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			fmt.Printf("attempt %d: 5xx %d\n", attempt+1, resp.StatusCode)
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("all %d attempts failed", maxAttempts)
+}
+
+func main() {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) < 3 {
+			w.WriteHeader(503)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := getWithRetry(ctx, client, srv.URL, 5)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println("response:", string(body))
+}
+```
+
+The `select` with `ctx.Done()` is critical — if the context is cancelled during the backoff sleep, the function returns immediately rather than waiting the full delay. This is what makes retries context-aware.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Put it all together" level="hard">
+
+Build a `RateService` struct with a single `FetchRate(ctx context.Context, from, to string) (int64, error)` method that:
+- Uses a custom `*http.Client` with `Timeout: 6s`, `MaxIdleConnsPerHost: 5`
+- Uses `http.NewRequestWithContext`
+- Retries up to 2 extra times (3 total) on 5xx with 200ms base backoff
+- Validates status 200, Content-Type `application/json`, body limit 64 KB
+- Decodes into a struct with a `rate_millionths int64` field
+- Returns the rate or a descriptive wrapped error
+
+Test it with an `httptest.Server` that fails twice then succeeds.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+type RateService struct {
+	client *http.Client
+	base   string
+}
+
+func NewRateService(baseURL string) *RateService {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     60 * time.Second,
+	}
+	return &RateService{
+		client: &http.Client{Timeout: 6 * time.Second, Transport: tr},
+		base:   baseURL,
+	}
+}
+
+type rateResponse struct {
+	Rate int64 `json:"rate_millionths"`
+}
+
+func (s *RateService) FetchRate(ctx context.Context, from, to string) (int64, error) {
+	url := fmt.Sprintf("%s/rates/%s/%s", s.base, from, to)
+	baseDelay := 200 * time.Millisecond
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			delay := baseDelay * time.Duration(1<<uint(attempt-1))
+			select {
+			case <-ctx.Done():
+				return 0, fmt.Errorf("FetchRate: context done in backoff: %w", ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return 0, fmt.Errorf("FetchRate: build request: %w", err)
+		}
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			continue // network error: retry
+		}
+
+		if resp.StatusCode >= 500 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			continue
+		}
+
+		// Non-retryable path: handle here, close explicitly (no defer inside a loop).
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			return 0, fmt.Errorf("FetchRate: status %d: %s", resp.StatusCode, b)
+		}
+		ct := resp.Header.Get("Content-Type")
+		if !strings.Contains(ct, "application/json") {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return 0, fmt.Errorf("FetchRate: unexpected content-type %q", ct)
+		}
+
+		var r rateResponse
+		err = json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&r)
+		_, _ = io.Copy(io.Discard, resp.Body) // drain trailing bytes
+		resp.Body.Close()
+		if err != nil {
+			return 0, fmt.Errorf("FetchRate: decode: %w", err)
+		}
+		return r.Rate, nil
+	}
+	return 0, fmt.Errorf("FetchRate: all 3 attempts failed")
+}
+
+func main() {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n < 3 {
+			w.WriteHeader(503)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"rate_millionths":1082300}`)
+	}))
+	defer srv.Close()
+
+	svc := NewRateService(srv.URL)
+	rate, err := svc.FetchRate(context.Background(), "USD", "EUR")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("rate: %d millionths (%.4f)\n", rate, float64(rate)/1_000_000)
+}
+```
+
+This is production-grade. Dependency injection via constructor, context at every call site, status and content-type validation, streaming decode, retries that respect context. The only thing it's missing is a circuit breaker — which Part 2 covers.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Exercises were the warm-up, sport. This is the *real* test. I designed it personally. I find the results *very* interesting.
+
+<Lab
+  title="Fix the checkout client"
+  archetype="fix-it"
+  difficulty="guided"
+  verify="verifier"
+  points={80}
+  hintCost={15}
+  objective="A junior shipped a checkout service that calls the payment API. It has three production bugs: no timeout on the client, a response body that is never drained before closing, and a missing status-code check before decoding. Fix all three so the verifier's tests pass."
+  starter={`package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+)
+
+// BUG 1: http.DefaultClient has no timeout.
+var paymentClient = http.DefaultClient
+
+type ChargeResult struct {
+	TxID   string \`json:"transaction_id"\`
+	Status string \`json:"status"\`
+}
+
+func chargeCard(url string) (*ChargeResult, error) {
+	resp, err := paymentClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	// BUG 2: body is closed without being drained.
+	// This prevents the connection from being returned to the pool.
+	resp.Body.Close()
+
+	// BUG 3: status code is never checked.
+	// A 500 response body gets decoded and returned as a "result".
+	var result ChargeResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func main() {
+	fmt.Println("verifier will call chargeCard and check all three bugs")
+}`}
+  verifier="The verifier runs three hidden tests: (1) paymentClient must not be http.DefaultClient and must have a non-zero Timeout; (2) chargeCard must drain the body before close (tested by counting pool reuse); (3) chargeCard must return an error when the server responds 500. All three must pass with a clean build."
+  hints={[
+    "Bug 1: declare paymentClient as &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 10}} — never use http.DefaultClient.",
+    "Bug 2: after checking status, drain before close: defer resp.Body.Close() and _, _ = io.Copy(io.Discard, resp.Body). The Decode call should read from resp.Body BEFORE close, so use defer for close and drain, then decode.",
+    "Bug 3: add `if resp.StatusCode != http.StatusOK { b, _ := io.ReadAll(...); return nil, fmt.Errorf(\"status %d: %s\", resp.StatusCode, b) }` after reading the status and before decoding."
+  ]}
+  flag="GO{timeout_set_body_drained_status_checked}"
+>
+
+Three bugs, three lessons from this chapter. Fix them all and the verifier goes green. The flag is yours — but only if you actually fix the code, sport. I'll know.
+
+</Lab>
+
+<Recap>
+
+- **`http.DefaultClient` has no timeout.** Build your own `&http.Client{Timeout: ...}` and inject it. Never create a new client per request.
+- **Timeouts layer:** `Client.Timeout` is the end-to-end deadline; `Transport` fields (dial, TLS, response-header) guard individual phases. Set them surgically, and make `Client.Timeout` larger than any individual phase.
+- **One transport, one pool.** `http.Transport` maintains a connection pool keyed by host. `MaxIdleConnsPerHost` controls how many idle connections are kept per host — default 2 is too low for high-concurrency services.
+- **Drain before close.** Read (or discard) the full response body before calling `Close()`, or the connection cannot be returned to the pool. `io.Copy(io.Discard, resp.Body)` is the idiom.
+- **`http.NewRequestWithContext`** threads cancellation and deadlines from the caller into the outbound request. Use it in every server handler and service function. Never use `http.NewRequest` when you have a context.
+- **Retry idempotent requests only** — `GET` and `HEAD` are safe; `POST /charge` is not without an idempotency key. Exponential backoff + jitter prevents thundering-herd pile-ons.
+- **Decode defensively:** check status before touching the body, gate on `Content-Type`, wrap with `io.LimitReader`, stream with `json.Decoder`. For small, fixed-size payloads where you need raw bytes, `io.ReadAll` is fine — and as of Go 1.26 it is roughly 2x faster with ~50% fewer allocations than before.
+
+</Recap>
+
+<Scoreboard
+  streak={13}
+  items={[
+    { label: "Quick check — DefaultClient timeout", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — ResponseHeaderTimeout vs Client.Timeout", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — io.LimitReader purpose", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Your first production client", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Context propagation", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Safe JSON decode", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Retry with backoff", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Put it all together", kind: "exercise", points: 30, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the checkout client", captured: false, points: 80 }}
+/>
+
+Not bad. Honestly — not bad at all. You set a timeout, you drained the body, you threaded the context, you retried without stampeding. It's no *me*, but it's the kind of code I can almost respect. Next up: we put this client to work in a real API-consuming application. Guided project time, sport — bring everything you've got.

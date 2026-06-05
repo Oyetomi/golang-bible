@@ -1,0 +1,1745 @@
+---
+title: "Reliability Patterns"
+part: 2
+order: 12
+type: "course"
+description: "Timeouts everywhere, retries with backoff and jitter, circuit breakers, graceful shutdown, health checks, idempotency, and rate limiting in depth (token vs leaky bucket, per-key, x/time/rate, distributed with Redis)."
+prerequisites: ["observability"]
+---
+
+<HeroCard label="Part 2 · Chapter 12" title="Reliability Patterns">
+
+Listen up, sport. You built a beautiful service. The metrics are ticking, the traces are flowing, the dashboards look like a work of art. You did all that observability homework and you deserve a little credit.
+
+But there's something you haven't faced yet: **what happens when the world outside your service stops cooperating?** The payment processor goes dark at 11pm. A downstream pod starts crashing under load. A burst of checkout requests hits at the same time a promo email lands. Ten thousand clients all retry at once. A network partition decides to exist.
+
+Your service is about to face all of it — and your job is to make sure it doesn't crumple. That is what **reliability engineering** is: not hoping the world stays well-behaved, but designing the system to keep running even when it isn't. Timeouts, retries, circuit breakers, graceful shutdown, health checks, idempotency, rate limiting — each one is a specific weapon for a specific failure mode, and today you're loading every one of them.
+
+I've been writing Go since before the Go team shipped the first public release, and I am telling you: these patterns are the difference between a service that gets paged at 3am and one that handles the storm and tells you about it in the morning. Let's go.
+
+</HeroCard>
+
+<Scene
+  title="A circuit breaker protecting Meridian from a flaky payment processor"
+  actors={[
+    { id: "meridian", label: "Meridian svc" },
+    { id: "processor", label: "Payment processor" }
+  ]}
+  rows={2}
+  cols={5}
+  frames={[
+    {
+      caption: "Normal operation: checkout requests flow through to the payment processor and return quickly.",
+      beat: "neutral",
+      actors: [{ id: "meridian", state: "ok" }, { id: "processor", state: "ok" }],
+      cells: [
+        { id: "A1", state: "done", label: "200" },
+        { id: "A2", state: "done", label: "200" },
+        { id: "A3", state: "idle", label: "…" }
+      ]
+    },
+    {
+      caption: "The processor starts failing. Without a breaker, every request still goes out and hangs waiting for a timeout.",
+      beat: "problem",
+      actors: [{ id: "meridian", state: "warn" }, { id: "processor", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad", label: "hang" },
+        { id: "A2", state: "bad", label: "hang" },
+        { id: "A3", state: "bad", label: "hang" },
+        { id: "A4", state: "warn", label: "wait" },
+        { id: "A5", state: "warn", label: "wait" },
+        { id: "B1", state: "warn", label: "wait" },
+        { id: "B2", state: "warn", label: "wait" }
+      ]
+    },
+    {
+      caption: "Requests pile up across all slots. Goroutines block, connection pool drains — Meridian looks down to its own callers.",
+      beat: "problem",
+      actors: [{ id: "meridian", state: "bad" }, { id: "processor", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad", label: "hang" },
+        { id: "A2", state: "bad", label: "hang" },
+        { id: "A3", state: "bad", label: "hang" },
+        { id: "A4", state: "bad", label: "hang" },
+        { id: "A5", state: "bad", label: "hang" },
+        { id: "B1", state: "bad", label: "hang" },
+        { id: "B2", state: "bad", label: "hang" },
+        { id: "B3", state: "bad", label: "hang" },
+        { id: "B4", state: "bad", label: "hang" },
+        { id: "B5", state: "bad", label: "hang" }
+      ]
+    },
+    {
+      caption: "Circuit OPENS: failure threshold hit. All requests now fast-fail immediately — no network call made. Processor gets breathing room.",
+      beat: "solution",
+      actors: [{ id: "meridian", state: "warn" }, { id: "processor", state: "idle" }],
+      cells: [
+        { id: "A1", state: "warn", label: "OPEN" },
+        { id: "A2", state: "warn", label: "OPEN" },
+        { id: "A3", state: "warn", label: "OPEN" }
+      ]
+    },
+    {
+      caption: "Circuit HALF-OPENS after the cooldown: one probe is let through to check recovery.",
+      beat: "solution",
+      actors: [{ id: "meridian", state: "active" }, { id: "processor", state: "active" }],
+      cells: [
+        { id: "A1", state: "warn", label: "OPEN" },
+        { id: "A2", state: "warn", label: "OPEN" },
+        { id: "A3", state: "active", label: "probe" }
+      ]
+    },
+    {
+      caption: "Probe succeeds. Circuit CLOSES. Normal traffic resumes; Meridian and the processor are healthy.",
+      beat: "solution",
+      actors: [{ id: "meridian", state: "ok" }, { id: "processor", state: "ok" }],
+      cells: [
+        { id: "A1", state: "done", label: "200" },
+        { id: "A2", state: "done", label: "200" },
+        { id: "A3", state: "done", label: "200" },
+        { id: "A4", state: "done", label: "200" }
+      ]
+    }
+  ]}
+  caption="Without a circuit breaker every slow request holds a goroutine and a connection — the problem cascades. The breaker short-circuits the cascade, lets the downstream breathe, and reopens only when a probe confirms recovery."
+/>
+
+<ChapterTabs tabs={["Timeouts Everywhere", "Retries with Backoff and Jitter", "Circuit Breakers", "Graceful Shutdown", "Health and Readiness", "Idempotency", "Rate Limiting in Depth"]} />
+
+## Timeouts Everywhere
+
+<Define term="Timeout" since="The context Package, In Depth (Part 1)">
+A **timeout** is an upper bound on how long your code will wait for an operation to complete. Without one, a blocked goroutine waits forever — holding a connection, a goroutine stack, and any downstream resources with it. In Go, timeouts are expressed as a `context.WithTimeout` deadline that propagates cancellation through the entire call tree when time is up. **On the job:** the absence of a timeout turns a flaky downstream into a full service freeze — the goroutine pile-up blocks new requests until the whole process looks down.
+</Define>
+
+Here's the scenario. It's Black Friday. Your checkout service calls an external payment processor. The processor doesn't respond. Not an error — it just… says nothing. The goroutine handling that request sits there, blocking, holding a connection from your pool, occupying a slot in your server's goroutine table. More requests come in. More goroutines block. The connection pool drains. New requests start waiting for a free connection. The whole thing seizes up, and now *your* service looks down to upstream callers — even though the processor is the sick one. This is called a **cascading failure**, and the root cause is embarrassingly simple: you made a network call without a timeout.
+
+**Every network call, every I/O operation, every blocking operation must have a deadline.** No exceptions. Not "probably." Not "the SDK handles it." You handle it.
+
+### The Default-No-Timeout Trap
+
+Go's `net/http` package has a trap waiting for anyone who uses the zero-value client:
+
+```go
+// This is the trap. Do NOT do this in production.
+resp, err := http.Get("https://payments.example.com/charge")
+```
+
+`http.Get` uses `http.DefaultClient`, whose `Timeout` field is zero — meaning **no timeout at all**. A request to a hung server will block forever.
+
+The fix is a `http.Client` with an explicit `Timeout`, or better still, a `context` with a deadline so the timeout is composable and cancellation propagates through your whole call tree:
+
+<BeforeAfter
+  badLabel="No timeout (trap)"
+  goodLabel="Context deadline"
+  bad={`// blocks forever if server hangs
+resp, err := http.Get(
+  "https://payments.example.com/charge",
+)`}
+  good={`ctx, cancel := context.WithTimeout(
+  r.Context(), 3*time.Second)
+defer cancel()
+
+req, _ := http.NewRequestWithContext(
+  ctx, http.MethodPost, payURL, body)
+resp, err := client.Do(req)`}
+/>
+
+The `context.WithTimeout` approach is superior to the `http.Client.Timeout` field because:
+
+1. The timeout is **per-request** — different endpoints get different budgets.
+2. Cancellation **propagates** — if the parent handler is cancelled (e.g. the end user closed the browser), the outbound HTTP call is cancelled too, freeing the connection immediately.
+3. The same context flows into DB calls, cache calls, and any goroutine you spawn — one deadline covers the whole operation.
+
+### Timeout Sizing
+
+Every external call needs its own budget. A quick rules-of-thumb grid:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Intra-service (same DC)">50–200ms. If your own database or cache isn't responding in under a second, something is broken — don't mask it with a generous timeout.</ConceptCard>
+  <ConceptCard label="External payment APIs">2–5s. Card networks have their own SLAs. Match your timeout to the documented p99 + a small buffer — not to "infinity just in case."</ConceptCard>
+  <ConceptCard label="Read vs. write">Writes (a POST to create a charge) usually need more time than reads. But they should still have a timeout. Unbounded writes are just unbounded blocking with extra steps.</ConceptCard>
+  <ConceptCard label="DB queries">Each query should carry the parent request context. Set `SetConnMaxLifetime` and `SetConnMaxIdleTime` on the pool too — that's the pool-level backstop.</ConceptCard>
+  <ConceptCard label="Total request budget">The server-side handler timeout (set on `http.Server.ReadHeaderTimeout`, `WriteTimeout`, or via middleware) is the outer envelope. Each downstream call's timeout must fit inside it.</ConceptCard>
+  <Gotcha>Never set a database context deadline that is longer than your HTTP server's `WriteTimeout`. The client will have disconnected long before your DB query returns, and you'll have spent resources on a result nobody will ever read.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="Context deadline propagating through a checkout handler"
+  lanes={[
+    { id: "handler", label: "HTTP handler" },
+    { id: "db", label: "DB query" },
+    { id: "pay", label: "Payment API" }
+  ]}
+  steps={[
+    { lane: "handler", kind: "run",   label: "request arrives",      note: "Handler starts. We create a 5s deadline context wrapping the request's context." },
+    { lane: "db",      kind: "run",   label: "SELECT order ...",      note: "DB query starts, carrying the 5s context. Completes in 12ms — well within budget." },
+    { lane: "db",      kind: "done",  label: "rows returned",         note: "DB is done. ~4.98s of budget remains." },
+    { lane: "pay",     kind: "send",  label: "POST /charge",          note: "Payment call starts with the same context. The processor is slow today." },
+    { lane: "pay",     kind: "block", label: "waiting... (4s)",       note: "The processor hangs. Our context deadline ticks down. At 5s, context.Done() fires." },
+    { lane: "pay",     kind: "done",  label: "ctx deadline exceeded", note: "client.Do returns context.DeadlineExceeded. We return 503 to the caller — fast, not frozen." },
+    { lane: "handler", kind: "done",  label: "503 returned in 5s",    note: "Caller gets a response in exactly 5s. No goroutine leak, no connection stuck in the pool." }
+  ]}
+  caption="A single context deadline covers the whole operation tree. When it fires, every downstream call unblocks immediately."
+/>
+
+Here's a complete, runnable checkout client that shows the right pattern: `http.Client` with no global timeout, `context.WithTimeout` per-call, `http.NewRequestWithContext`, and deliberate error handling on deadline exceeded:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+// slowServer simulates a payment processor that takes too long.
+func slowServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hang for longer than the client's timeout.
+		select {
+		case <-time.After(10 * time.Second):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+			// Server-side: the client cancelled — stop working.
+		}
+	}))
+}
+
+func chargeCard(ctx context.Context, client *http.Client, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Unwrap to check for deadline/cancellation.
+		if errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("payment processor timed out: %w", err)
+		}
+		return fmt.Errorf("payment call failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("payment rejected: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func main() {
+	srv := slowServer()
+	defer srv.Close()
+
+	// Shared client — no Timeout field. Timeout lives on the context instead.
+	client := &http.Client{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := chargeCard(ctx, client, srv.URL+"/charge")
+	elapsed := time.Since(start).Round(10 * time.Millisecond)
+
+	if err != nil {
+		fmt.Printf("charge failed after %v: %v\n", elapsed, err)
+	} else {
+		fmt.Println("charge succeeded")
+	}
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="How context cancellation actually interrupts a blocked network call">
+
+When `context.WithTimeout` fires, it closes the `ctx.Done()` channel. The `net/http` transport watches that channel via a select inside its internal I/O loop. The moment `Done()` closes, the transport **cancels the in-flight request** by calling `CancelRequest` on the underlying `*http.Transport` (Go 1.7+) or setting a deadline directly on the TCP connection via `conn.SetDeadline(time.Now())`. The OS returns an error from the blocked `read`/`write` syscall, which bubbles up as a `*url.Error` wrapping `context.DeadlineExceeded`.
+
+The key insight: **a context cancellation is not a goroutine kill signal.** It sets a deadline on the underlying file descriptor, which causes the OS syscall to return with an error. Your goroutine is never forcibly killed — it unblocks from the syscall and walks the error path normally. This is why proper error handling (`errors.Is(err, context.DeadlineExceeded)`) is required: the error *looks like* a normal network error unless you inspect it.
+
+As of Go 1.24, `http.Transport` also propagates cancellation to HTTP/2 streams via RST_STREAM frames, so the server is notified promptly and can abort its own work — saving resources on both sides.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="You call an external API using http.DefaultClient with no context. The server hangs. What happens to your goroutine?"
+  options={[
+    "It times out after 30 seconds — DefaultClient has a 30s default",
+    "It blocks forever — DefaultClient has no timeout",
+    "Go's scheduler preempts it and returns an error after 5 seconds",
+    "The OS closes the TCP connection after the kernel's keepalive fires"
+  ]}
+  answer={1}
+  explain="http.DefaultClient.Timeout is zero, meaning no timeout. The goroutine blocks indefinitely, holding a connection and a stack. Under load this is how you drain your entire connection pool."
+/>
+
+---
+
+## Retries with Backoff and Jitter
+
+<Define term="Retry with exponential backoff and jitter">
+A **retry** re-sends a failed request automatically, but naive immediate retries can make a struggling downstream worse. **Exponential backoff** grows the wait between retries (`base × 2ⁿ`) so each successive attempt gives the downstream more breathing room. **Jitter** adds randomness to that wait so a fleet of services doesn't all retry at the same instant (the *thundering herd*). Together they turn a wall of hammering retries into a gentle, spread-out drizzle. **On the job:** retries without jitter on a 500-instance fleet can convert a 10 % failure rate into a 100 % failure rate by stampeding the recovering downstream.
+</Define>
+
+You applied a timeout and now your payment call fails fast. Great. But sometimes failure is transient — the processor had a brief hiccup, a pod restarted, a network blip. Failing fast and returning 500 to your customer *every* time is almost as bad as hanging. The right answer is **retrying** — but *only the right operations*, and *only in the right way*.
+
+### Only Retry Idempotent, Safe Operations
+
+This is the rule that separates good retries from catastrophic ones: **you may only blindly retry an operation if retrying it twice produces the same result as retrying it once.**
+
+- A `GET /orders/123` is safe to retry — reading data doesn't change it.
+- A `POST /charge` is **not** safe to retry without an idempotency key — retrying a charge might charge the customer twice.
+
+We'll cover idempotency keys in depth in section 6. For now: before you add a retry loop around anything, ask yourself "if this runs twice, does the customer lose money or data?" If yes, add an idempotency key *first*, then add the retry.
+
+### Exponential Backoff
+
+**Naive retry:** retry immediately, N times. This is almost always wrong. If the downstream service is overwhelmed, hammering it with immediate retries makes the situation worse for everyone.
+
+**Exponential backoff:** after each failure, wait longer before the next attempt. The wait time grows exponentially — typically `base * 2^(attempt-1)`:
+
+| Attempt | Wait (base=200ms) |
+|---------|-------------------|
+| 1 (fail) | 0ms (first try) |
+| 2 (retry) | 200ms |
+| 3 (retry) | 400ms |
+| 4 (retry) | 800ms |
+
+But here's the problem with pure exponential backoff: if 500 instances of your service all fail at the same time (say, a pod restart), they will all compute the *same* wait time and retry at the *same* moment — a perfectly synchronized stampede that overwhelms the recovering downstream. This is called the **thundering herd**.
+
+### Full Jitter: Why It Prevents the Thundering Herd
+
+The fix is **jitter** — randomness added to the backoff delay. The most effective form is **full jitter**: pick a random value in the range `[0, exponential_cap)` rather than waiting the full exponential time.
+
+```go
+// Full jitter: sleep a random duration in [0, base * 2^attempt)
+func backoffDuration(attempt int, base, cap time.Duration) time.Duration {
+	exp := base * (1 << min(attempt, 30)) // 2^attempt, capped to avoid overflow
+	if exp > cap {
+		exp = cap
+	}
+	// rand.N is the modern, goroutine-safe form (Go 1.22+, no seed needed)
+	return time.Duration(rand.N(int64(exp)))
+}
+```
+
+With full jitter, 500 instances retrying simultaneously will now retry at *random* times spread across the backoff window — the thundering herd dissolves into a gentle drizzle.
+
+<ExecTimeline
+  title="5 clients retrying — no jitter vs. full jitter"
+  lanes={[
+    { id: "nojitter", label: "No jitter (herd)" },
+    { id: "jitter",   label: "Full jitter (spread)" }
+  ]}
+  steps={[
+    { lane: "nojitter", kind: "run",   label: "all fail @ t=0",      note: "All 5 clients hit the processor at t=0. It's overloaded — all 5 fail." },
+    { lane: "jitter",   kind: "run",   label: "all fail @ t=0",      note: "Same failure: all 5 clients fail at t=0. Both strategies start the same." },
+    { lane: "nojitter", kind: "block", label: "wait 200ms (all 5)",  note: "With no jitter, all 5 clients sleep exactly 200ms. They will all retry together." },
+    { lane: "jitter",   kind: "block", label: "wait random 0–200ms", note: "With full jitter, each client picks a random wait in [0, 200ms). They spread out." },
+    { lane: "nojitter", kind: "send",  label: "all 5 retry @ 200ms", note: "All 5 hit the processor at exactly t=200ms — the thundering herd hits again." },
+    { lane: "jitter",   kind: "send",  label: "clients retry 1-by-1", note: "Clients retry individually: one at t=17ms, one at t=89ms, one at t=134ms... gentle drizzle." },
+    { lane: "jitter",   kind: "done",  label: "processor recovers",  note: "The processor handles one request at a time and fully recovers. No second stampede." }
+  ]}
+  caption="Full jitter transforms a synchronized thundering herd into a spread-out drizzle. The processor gets to breathe."
+/>
+
+### A Complete Retry Loop with Budget
+
+Here's a self-contained, runnable backoff calculator:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"time"
+)
+
+// ErrMaxRetries is returned when the retry budget is exhausted.
+var ErrMaxRetries = errors.New("max retries exceeded")
+
+// backoffDuration computes a full-jitter exponential backoff duration.
+// attempt is 0-indexed (0 = first retry, not the original attempt).
+func backoffDuration(attempt int, base, cap time.Duration) time.Duration {
+	// 2^attempt, guarded against shift overflow
+	shift := attempt
+	if shift > 30 {
+		shift = 30
+	}
+	exp := base << shift // base * 2^attempt
+	if exp > cap {
+		exp = cap
+	}
+	// Full jitter: random in [0, exp)
+	return time.Duration(rand.N(int64(exp)))
+}
+
+// withRetry calls op up to maxAttempts times using full-jitter backoff.
+// It only retries when op returns a retryable error (checked via isRetryable).
+func withRetry(
+	ctx context.Context,
+	maxAttempts int,
+	base, capDur time.Duration,
+	isRetryable func(error) bool,
+	op func(ctx context.Context) error,
+) error {
+	var lastErr error
+	for attempt := range maxAttempts {
+		lastErr = op(ctx)
+		if lastErr == nil {
+			return nil
+		}
+		if !isRetryable(lastErr) {
+			return lastErr // non-retryable (e.g. 400 Bad Request) — fail fast
+		}
+		if attempt == maxAttempts-1 {
+			break // last attempt failed; don't sleep before returning
+		}
+		wait := backoffDuration(attempt, base, capDur)
+		fmt.Printf("attempt %d failed (%v); retrying in %v\n", attempt+1, lastErr, wait.Round(time.Millisecond))
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf("%w: %v", ErrMaxRetries, lastErr)
+}
+
+func main() {
+	attempts := 0
+	// Simulated flaky operation: fails the first two times, succeeds on the third.
+	flakyOp := func(ctx context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return fmt.Errorf("transient 503 (attempt %d)", attempts)
+		}
+		return nil
+	}
+
+	isRetryable := func(err error) bool {
+		// In real code: check HTTP status or error type — never retry 4xx.
+		return err != nil && !errors.Is(err, context.Canceled)
+	}
+
+	err := withRetry(
+		context.Background(),
+		5,
+		100*time.Millisecond,
+		2*time.Second,
+		isRetryable,
+		flakyOp,
+	)
+	if err != nil {
+		fmt.Println("final error:", err)
+	} else {
+		fmt.Printf("succeeded on attempt %d\n", attempts)
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="The retry budget: don't let retries amplify load">
+
+Each retry multiplies your outbound request rate. Three retries with three replicas means a single user action can produce nine calls to the downstream. Under a high-error-rate event, this is how a retry storm turns a 10% failure rate into a 100% failure rate.
+
+**Fix:** track a *retry budget* — a cap on the total fraction of outbound calls that are retries. If more than (say) 10% of your payment calls are retries, stop retrying entirely and fail fast. The circuit breaker in the next section is the production-grade implementation of this idea.
+
+</Callout>
+
+<QuickCheck
+  question="Why does full jitter prevent the thundering herd, while exponential backoff alone does not?"
+  options={[
+    "Full jitter makes retries faster, so they complete before the next wave hits",
+    "Full jitter randomizes each client's wait time, spreading retries across the window instead of synchronizing them",
+    "Full jitter caps the maximum backoff, preventing clients from waiting too long",
+    "Full jitter is only needed when retrying across multiple data centers"
+  ]}
+  answer={1}
+  explain="Without jitter, all clients compute identical wait times and retry simultaneously — the herd thunders again. Full jitter randomizes each client's wait independently, spreading the load across the backoff window."
+/>
+
+---
+
+## Circuit Breakers
+
+<Define term="Circuit breaker (Closed / Open / Half-Open)">
+A **circuit breaker** is a state machine that sits between your service and a downstream. **Closed** — normal; calls flow through and failures are counted. **Open** — the failure threshold was hit; all calls fail immediately with a sentinel error, no network call made, giving the downstream time to recover. **Half-Open** — after a cooldown, one probe call is allowed through; if it succeeds the circuit closes, if it fails the circuit re-opens. **On the job:** retrying against a genuinely down downstream wastes resources and prolongs its recovery — the circuit breaker is what turns that retry storm into a controlled pause.
+</Define>
+
+A retry loop is the right tool for *transient* failures — brief hiccups that clear on their own. But what about a downstream that is genuinely down for minutes? Retrying against it wastes resources and keeps your users waiting through three doomed attempts on every request. Worse, it prolongs the recovery of the downstream by hammering it while it's trying to come back.
+
+The **circuit breaker** is the solution. It's a state machine that sits between your service and a downstream. When failures pile up past a threshold, it *trips* — opens the circuit — and subsequent calls fail immediately without ever hitting the downstream. After a cooldown period, it lets one probe through. If the probe succeeds, the circuit closes again. If not, it stays open.
+
+### The Three States
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Closed (healthy)">Calls flow normally. The breaker counts failures. Below the threshold, everything passes through. This is the normal operating state.</ConceptCard>
+  <ConceptCard label="Open (tripped)">The failure threshold was exceeded. All calls fail immediately with a sentinel error — no network call is made. The downstream gets breathing room to recover.</ConceptCard>
+  <ConceptCard label="Half-Open (probing)">After the cooldown expires, one probe call is allowed through. If it succeeds, the circuit closes. If it fails, the circuit opens again and the cooldown resets.</ConceptCard>
+  <Gotcha>Don't set the failure threshold too low or the cooldown too short. A threshold of 1 failure means a single transient error trips the breaker. A cooldown of 1 second means you're probing a downstream that's been down for 30 seconds every second — still hammering it. Start with threshold≥5, cooldown≥10s.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="Circuit breaker — closed → open → half-open → closed"
+  lanes={[
+    { id: "cb",   label: "Circuit Breaker" },
+    { id: "down", label: "Downstream" }
+  ]}
+  steps={[
+    { lane: "cb",   kind: "run",   label: "CLOSED: call flows",     note: "Breaker is closed. Requests pass through to the downstream normally." },
+    { lane: "down", kind: "run",   label: "failures accumulate",    note: "The downstream starts returning errors. The breaker counts each failure." },
+    { lane: "cb",   kind: "block", label: "threshold hit → OPEN",   note: "5 consecutive failures. The breaker trips to OPEN. The cooldown timer starts." },
+    { lane: "cb",   kind: "block", label: "OPEN: fast-fail calls",  note: "All incoming calls receive ErrCircuitOpen immediately — no network call made. Downstream breathes." },
+    { lane: "cb",   kind: "run",   label: "cooldown expires",       note: "After 15 seconds the breaker transitions to HALF-OPEN, allowing one probe call." },
+    { lane: "down", kind: "recv",  label: "probe call sent",        note: "One request is allowed through to check if the downstream has recovered." },
+    { lane: "cb",   kind: "done",  label: "probe OK → CLOSED",      note: "The probe succeeds. The breaker closes. Normal traffic resumes. Failure count resets." }
+  ]}
+  caption="The circuit breaker protects your service and gives the downstream room to recover. One probe, not a flood."
+/>
+
+### A Runnable Circuit Breaker State Machine
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// State represents one of the three circuit breaker states.
+type State int
+
+const (
+	StateClosed   State = iota // normal: calls flow through
+	StateOpen                  // tripped: calls fail immediately
+	StateHalfOpen              // probing: one call allowed through
+)
+
+func (s State) String() string {
+	switch s {
+	case StateClosed:
+		return "CLOSED"
+	case StateOpen:
+		return "OPEN"
+	case StateHalfOpen:
+		return "HALF-OPEN"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// ErrCircuitOpen is returned when the circuit is open and a call is rejected.
+var ErrCircuitOpen = errors.New("circuit breaker open")
+
+// CircuitBreaker is a simple three-state circuit breaker.
+type CircuitBreaker struct {
+	mu           sync.Mutex
+	state        State
+	failures     int
+	threshold    int           // failures before opening
+	cooldown     time.Duration // how long to stay open before half-opening
+	openAt       time.Time     // when the circuit opened
+}
+
+// NewCircuitBreaker creates a breaker with the given threshold and cooldown.
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:     StateClosed,
+		threshold: threshold,
+		cooldown:  cooldown,
+	}
+}
+
+// Call executes op through the circuit breaker.
+func (cb *CircuitBreaker) Call(op func() error) error {
+	cb.mu.Lock()
+	switch cb.state {
+	case StateOpen:
+		if time.Since(cb.openAt) >= cb.cooldown {
+			// Cooldown expired: allow one probe through.
+			cb.state = StateHalfOpen
+			fmt.Println("  [CB] → HALF-OPEN: sending probe")
+		} else {
+			cb.mu.Unlock()
+			return ErrCircuitOpen
+		}
+	}
+	cb.mu.Unlock()
+
+	err := op()
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if err != nil {
+		cb.failures++
+		if cb.state == StateHalfOpen || cb.failures >= cb.threshold {
+			cb.state = StateOpen
+			cb.openAt = time.Now()
+			fmt.Printf("  [CB] → OPEN (failures: %d)\n", cb.failures)
+		}
+		return err
+	}
+	// Success: reset.
+	cb.failures = 0
+	cb.state = StateClosed
+	fmt.Println("  [CB] → CLOSED: downstream healthy")
+	return nil
+}
+
+func main() {
+	cb := NewCircuitBreaker(3, 50*time.Millisecond)
+
+	callDownstream := func(healthy bool) func() error {
+		return func() error {
+			if !healthy {
+				return errors.New("downstream error")
+			}
+			return nil
+		}
+	}
+
+	fmt.Println("--- Phase 1: failures accumulate ---")
+	for range 4 {
+		if err := cb.Call(callDownstream(false)); err != nil {
+			fmt.Println(" call result:", err)
+		}
+	}
+
+	fmt.Println("\n--- Phase 2: circuit is open, calls fast-fail ---")
+	for range 2 {
+		if err := cb.Call(callDownstream(false)); err != nil {
+			fmt.Println(" call result:", err)
+		}
+	}
+
+	fmt.Println("\n--- Phase 3: cooldown expires, probe succeeds ---")
+	time.Sleep(60 * time.Millisecond) // wait for cooldown
+	if err := cb.Call(callDownstream(true)); err != nil {
+		fmt.Println(" probe failed:", err)
+	} else {
+		fmt.Println(" probe succeeded, circuit closed")
+	}
+
+	fmt.Println("\n--- Phase 4: normal calls flow again ---")
+	for range 2 {
+		if err := cb.Call(callDownstream(true)); err != nil {
+			fmt.Println(" call result:", err)
+		} else {
+			fmt.Println(" call result: ok")
+		}
+	}
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="The circuit breaker state machine under the hood">
+
+The circuit breaker above uses a `sync.Mutex` to protect the state transitions. This is the correct tool here: the state (`State`, `failures`, `openAt`) is **shared across goroutines** (every concurrent request consults the same breaker) and the transitions are compound operations (read state, maybe change state, update timestamp) that must be atomic. An `atomic.Int32` for `failures` alone wouldn't be enough — you'd have a TOCTOU race between reading `failures` and writing `state`.
+
+In production libraries like [`sony/gobreaker`](https://github.com/sony/gobreaker) (the de facto standard in Go), the same mutex pattern is used, with some additions:
+
+- **Sliding window** counting instead of a simple consecutive-failure counter, so a brief burst of errors in an otherwise-healthy service doesn't trip the breaker permanently.
+- **A `OnStateChange` callback** for emitting a metrics event when the state changes — critical for dashboards and alerting.
+- **Half-open call limiting**: some implementations only allow one goroutine to probe, blocking others with a semaphore so a thundering probe herd doesn't form.
+
+As of Go 1.24, there is no circuit breaker in the standard library. `sony/gobreaker` is the common choice; it's small, dependency-free, and worth reading.
+
+</UnderTheHood>
+
+---
+
+## Graceful Shutdown
+
+<Define term="Graceful shutdown">
+**Graceful shutdown** means stopping a service in an ordered way: stop accepting new work, finish work already in progress, then release resources and exit. The alternative — an abrupt exit on `SIGTERM` — sends a TCP RST to every in-flight connection, which the caller sees as an error. **On the job:** a checkout service that exits immediately on deploy drops every payment in flight; graceful shutdown is the difference between zero dropped requests and a spike of 503s in your error budget on every deploy.
+</Define>
+
+Your service is running. You push a new version. Kubernetes sends `SIGTERM`. If your binary exits immediately, every in-flight request gets a TCP RST — the user sees an error. That's not acceptable for a checkout flow. **Graceful shutdown** means: stop accepting new work, finish the work already in progress, then exit.
+
+The pattern has four ordered steps:
+
+1. **Receive the signal** — `signal.NotifyContext` gives you a context that's cancelled when `SIGTERM` or `SIGINT` arrives.
+2. **Stop accepting new requests** — call `server.Shutdown(ctx)`. This closes the listener so no new TCP connections are accepted.
+3. **Drain in-flight requests** — `server.Shutdown` waits for active requests to complete (up to the shutdown timeout).
+4. **Release resources in reverse order** — close the DB pool, flush metrics, etc. Last opened, first closed.
+
+```go
+// cmd/checkout/main.go — complete graceful shutdown skeleton
+package main
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	// signal.NotifyContext cancels ctx on SIGINT or SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/checkout", checkoutHandler)
+
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Serve in a goroutine so main can wait for the signal.
+	go func() {
+		slog.Info("server listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Block until SIGTERM/SIGINT arrives.
+	<-ctx.Done()
+	slog.Info("shutdown signal received; draining...")
+
+	// Give in-flight requests 30 seconds to complete.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("forced shutdown", "err", err)
+	}
+
+	// Release other resources in reverse-open order.
+	// db.Close()
+	// redisClient.Close()
+	slog.Info("shutdown complete")
+}
+
+func checkoutHandler(w http.ResponseWriter, r *http.Request) {
+	// A real handler; in-flight when SIGTERM arrives, it will complete.
+	w.WriteHeader(http.StatusOK)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+// demonstrateShutdown shows the Shutdown call draining active requests.
+func demonstrateShutdown() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		// Simulate an in-flight request that takes 200ms.
+		select {
+		case <-time.After(200 * time.Millisecond):
+			fmt.Fprintln(w, "done")
+		case <-r.Context().Done():
+			http.Error(w, "cancelled", http.StatusServiceUnavailable)
+		}
+	})
+
+	srv := &http.Server{Addr: ":0", Handler: mux}
+
+	// We can't actually listen on :0 in the playground, so just show the pattern.
+	// In real code: go srv.ListenAndServe()
+	_ = srv
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// srv.Shutdown stops accepting new connections and waits for active ones.
+	// It returns nil if all drained within the timeout, or ctx.Err() if it timed out.
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		fmt.Println("shutdown timed out:", err)
+	} else {
+		fmt.Println("clean shutdown: all in-flight requests completed")
+	}
+}
+
+func main() {
+	demonstrateShutdown()
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Ordered graceful shutdown sequence"
+  lanes={[
+    { id: "main",    label: "main goroutine" },
+    { id: "inflight", label: "in-flight request" }
+  ]}
+  steps={[
+    { lane: "main",    kind: "recv",  label: "SIGTERM received",         note: "signal.NotifyContext cancels ctx. main goroutine unblocks from <-ctx.Done()." },
+    { lane: "main",    kind: "run",   label: "srv.Shutdown(drainCtx)",   note: "Listener closes — no new TCP connections accepted. In-flight requests continue." },
+    { lane: "inflight", kind: "run",  label: "finishing charge (180ms)", note: "This request was in-flight when SIGTERM arrived. Shutdown waits for it." },
+    { lane: "inflight", kind: "done", label: "response sent, conn closed", note: "Handler completes, response written, connection closed gracefully." },
+    { lane: "main",    kind: "run",   label: "Shutdown returns nil",     note: "All active connections drained within the timeout. Shutdown is clean." },
+    { lane: "main",    kind: "run",   label: "db.Close() / flush",       note: "Release resources in reverse order: DB pool, Redis, metrics flusher." },
+    { lane: "main",    kind: "done",  label: "process exits 0",          note: "Clean exit. Kubernetes marks the pod terminated. No dropped requests." }
+  ]}
+  caption="Signal → stop listener → drain requests → release resources → exit. In that order, always."
+/>
+
+<Callout kind="pro" title="Set ReadTimeout and WriteTimeout on every http.Server">
+
+An `http.Server` with no timeouts is the server-side equivalent of `http.DefaultClient`. A misbehaving client that sends a request header 1 byte at a time holds a goroutine and a connection open forever. `ReadHeaderTimeout` (the most important one — cap how long you'll wait for headers), `ReadTimeout`, `WriteTimeout`, and `IdleTimeout` are all load-bearing fields, not optional extras.
+
+</Callout>
+
+<Gotcha title="srv.Shutdown does NOT drain your background goroutines">
+
+Here's the trap that bites teams who think they've nailed graceful shutdown. `srv.Shutdown(ctx)` drains *in-flight HTTP requests* — and nothing else. Say a checkout handler returns `202 Accepted` to the customer and fires the welcome email (or the audit webhook) off into a background goroutine to keep the response fast. The instant the HTTP response is written, that request is no longer "in-flight" as far as `Shutdown` is concerned. It returns, your `main` releases resources and exits — and the half-sent email goroutine is killed mid-flight. The customer exists in your DB but never gets their email.
+
+The fix: launch every async task through a shared `sync.WaitGroup`, then **after** `srv.Shutdown(ctx)` returns, call `wg.Wait()` before exiting — so HTTP requests drain first, *then* the background senders finish. The ordered shutdown becomes: signal → stop listener → drain HTTP → wait for background goroutines → release resources → exit.
+
+</Gotcha>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// background: every async task (welcome email, webhook) is launched through
+// here so the WaitGroup can track it and shutdown can wait for it.
+func background(wg *sync.WaitGroup, name string, work func()) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		work()
+		fmt.Println("  background task finished:", name)
+	}()
+}
+
+func main() {
+	var wg sync.WaitGroup
+
+	// A real handler kicked off two async senders just before the signal hit.
+	background(&wg, "welcome-email", func() { time.Sleep(40 * time.Millisecond) })
+	background(&wg, "audit-webhook", func() { time.Sleep(70 * time.Millisecond) })
+
+	// Simulate SIGTERM: signal.NotifyContext would cancel this ctx for real.
+	ctx, stop := context.WithCancel(context.Background())
+	stop() // "signal" arrives
+	<-ctx.Done()
+	fmt.Println("1. signal received; stop accepting new requests")
+
+	// srv.Shutdown(ctx) drains in-flight HTTP requests. Simulated here.
+	fmt.Println("2. srv.Shutdown: in-flight HTTP requests drained")
+
+	// Shutdown does NOT wait for background goroutines — we must.
+	fmt.Println("3. waiting for background senders...")
+	wg.Wait()
+
+	fmt.Println("4. clean exit")
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="The signal context carries the signal as of Go 1.26">
+
+`signal.NotifyContext` (Go 1.16+) is the clean way to get a context cancelled by `SIGINT`/`SIGTERM`. As of Go 1.26, `os/signal.NotifyContext` cancels that context with a `context.CancelCauseFunc` carrying the signal — so `context.Cause(ctx)` tells you *which* signal triggered the shutdown, useful for distinguishing a `Ctrl+C` from a Kubernetes `SIGTERM` in your shutdown logs. Use `wg.Add(1)`/`defer wg.Done()` (shown above) for portability; `sync.WaitGroup.Go` arrived in Go 1.25.
+
+</Callout>
+
+---
+
+## Health and Readiness
+
+<Define term="Health check (liveness) and readiness check">
+A **liveness check** (`/healthz`) answers "is this process alive?" — it should be fast, cheap, and check only the process itself. Kubernetes kills and restarts the container if liveness fails. A **readiness check** (`/readyz`) answers "is this instance ready to serve traffic?" — it should verify external dependencies (DB, cache). Kubernetes removes the pod from the load balancer pool if readiness fails, with no restart. **On the job:** conflating liveness and readiness — putting a DB ping on `/healthz` — causes Kubernetes to restart your pod every time the database hiccups, turning a brief DB slowdown into cascading pod restarts.
+</Define>
+
+You have two endpoints to build: `/healthz` (liveness) and `/readyz` (readiness). They sound similar. They do completely different jobs, and conflating them is one of the most common Kubernetes foot-guns I've seen — and I've seen a lot.
+
+### Liveness vs. Readiness
+
+**Liveness** (`/healthz`): "Is this process alive and not stuck in a deadlock or infinite loop?" If liveness fails, Kubernetes kills and restarts the container. The check must be **fast, cheap, and almost never fail** — a failed liveness check is a hard restart with potential request loss. It should check the process itself, not external dependencies.
+
+**Readiness** (`/readyz`): "Is this instance ready to receive traffic?" If readiness fails, Kubernetes removes the pod from the load balancer's backend pool. The check *should* verify that dependencies (DB, cache) are reachable. A failed readiness check is gentle — no restart, just traffic rerouting.
+
+<BeforeAfter
+  badLabel="Conflated (dangerous)"
+  goodLabel="Separated (correct)"
+  bad={`// Hits DB on liveness — if DB is slow,
+// K8s restarts your pod forever.
+func liveness(w http.ResponseWriter,
+              r *http.Request) {
+  if err := db.PingContext(r.Context());
+     err != nil {
+    http.Error(w, err.Error(), 503)
+    return
+  }
+  w.WriteHeader(200)
+}`}
+  good={`// Liveness: just "are we alive?"
+func liveness(w http.ResponseWriter,
+              _ *http.Request) {
+  w.WriteHeader(200) // always OK
+}
+
+// Readiness: check dependencies.
+func readiness(w http.ResponseWriter,
+               r *http.Request) {
+  if err := db.PingContext(r.Context());
+     err != nil {
+    http.Error(w, err.Error(), 503)
+    return
+  }
+  w.WriteHeader(200)
+}`}
+/>
+
+```go
+// Wiring both probes onto their own paths.
+mux.HandleFunc("/healthz", livenessHandler)
+mux.HandleFunc("/readyz",  readinessHandler)
+```
+
+The readiness handler should check everything a request depends on: database ping, cache ping, any mandatory config loaded. If *any* dependency is unhealthy, return 503. Kubernetes will stop sending traffic to this instance until it recovers.
+
+<Callout kind="note" title="Structured readiness responses">
+
+Return a JSON body from `/readyz` that names each check and its status — `{"db":"ok","redis":"ok"}`. This makes debugging a failing readiness probe trivially easy from `kubectl exec` or a log. A bare 503 with no body is annoying at 3am.
+
+</Callout>
+
+---
+
+## Idempotency
+
+<Define term="Idempotency" since="Idempotency & Exactly-Once Semantics (Part 3)">
+An operation is **idempotent** if executing it twice produces the same result as executing it once. A `GET /orders/123` is naturally idempotent — reading changes nothing. A `POST /charge` is not — sending it twice charges the customer twice. An **idempotency key** is a unique token the client generates once and attaches to the request; the server stores the result against the key and returns the stored result on any duplicate request instead of re-executing. **On the job:** without idempotency keys, every retry of a failed payment is a potential double-charge — networks always retry, so you must design writes to survive being sent more than once.
+</Define>
+
+Here's a scenario: the customer clicks "Pay." Your service posts to the payment processor. The network hiccups on the response. Did the charge go through? You don't know. If you retry the `POST /charge` naively, you might charge the customer twice.
+
+The solution is an **idempotency key** — a unique token the client generates and sends with the request. The server stores it alongside the result. If the same key arrives again (a retry), the server returns the stored result without re-executing the operation.
+
+```go
+// POST /charge with an idempotency key header.
+// The key is generated by the caller (a UUID), not the server.
+req.Header.Set("Idempotency-Key", "ord_9f2a-user_42-ts_1716480000")
+```
+
+The deep implementation — how to store keys with atomic upsert, how to handle concurrent duplicate requests, the expiry window, and how this integrates with the transactional outbox — lives in **Part 3 (Idempotency & Exactly-Once Semantics)**. What belongs here is the pattern: **before you add retries to any write operation, add an idempotency key.** The retry loop and the idempotency key are a pair — one without the other is incomplete.
+
+<Callout kind="warn" title="Idempotency keys belong on the client, not the server">
+
+The server stores and honors idempotency keys. The *client* generates them — once, before the first attempt — and reuses the same key on every retry of the same logical operation. If the server auto-generates a new key per request, retries will get new keys and the protection is lost.
+
+</Callout>
+
+---
+
+## Rate Limiting in Depth
+
+<Define term="Rate limiting — token bucket vs leaky bucket">
+**Rate limiting** caps how many requests a caller (or the whole service) can make in a time window, protecting capacity from a single bad actor or burst. **Token bucket:** a bucket holds up to N tokens; each request consumes one; tokens refill at a fixed rate. It allows short bursts (draining the bucket) then enforces the fill rate — this is what `golang.org/x/time/rate` implements. **Leaky bucket:** requests queue up and exit at a fixed constant rate regardless of arrival — useful for smoothing output to a downstream that can't absorb bursts. **On the job:** without per-client rate limits, a single misbehaving API key can saturate your entire connection pool and take down the service for everyone else.
+</Define>
+
+Rate limiting answers the question: "how do I prevent one caller from consuming all available capacity?" That sounds simple. The implementation choices matter enormously, because different algorithms behave differently under bursts, and the wrong choice either rejects legitimate traffic or lets bursts through unchecked.
+
+### The Algorithms
+
+There are four main algorithms. Each makes a different trade-off between burst tolerance and steady-state enforcement.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Token Bucket">A bucket holds up to N tokens. Each request consumes one token. Tokens are added at a fixed rate (e.g. 100/s). If the bucket is empty, the request is rejected. **Allows bursts** up to the bucket capacity, then enforces the fill rate. This is what most rate limiters in production actually use.</ConceptCard>
+  <ConceptCard label="Leaky Bucket">Requests enter a queue (the bucket). They exit at a fixed, constant rate. The queue absorbs small bursts, but if it fills, excess requests are dropped. Produces a **smooth, metered output** — useful for traffic shaping toward a downstream that can't handle bursts.</ConceptCard>
+  <ConceptCard label="Fixed Window">Count requests in a fixed time window (e.g. this minute). If count exceeds the limit, reject. Simple, but has a **boundary vulnerability**: 100 requests at 0:59 and 100 requests at 1:01 both pass the per-minute check, letting 200 through in two seconds.</ConceptCard>
+  <ConceptCard label="Sliding Window">Track individual timestamps in a ring buffer, or use a weighted average of two adjacent fixed windows. Eliminates the boundary spike of fixed windows. **More expensive** to compute but fairer.</ConceptCard>
+  <Gotcha>Token bucket and leaky bucket are often confused. Token bucket limits the *rate* while allowing bursts. Leaky bucket shapes the *output rate* to be constant. For protecting your own service from overload, use token bucket. For metering traffic *to* a downstream you control, leaky bucket.</Gotcha>
+</ConceptGrid>
+
+### Visualizing a Token Bucket
+
+<ExecTimeline
+  title="Token bucket — filling and draining under load"
+  lanes={[
+    { id: "bucket", label: "Token bucket (cap=5)" },
+    { id: "reqs",   label: "Incoming requests" }
+  ]}
+  steps={[
+    { lane: "bucket", kind: "run",   label: "tokens: 5/5 (full)",    note: "Bucket starts full. 5 tokens available. Refill rate: 2 tokens/second." },
+    { lane: "reqs",   kind: "recv",  label: "burst: 4 requests",     note: "4 requests arrive simultaneously. Each consumes a token." },
+    { lane: "bucket", kind: "run",   label: "tokens: 1/5",           note: "4 tokens consumed. 1 remains. Requests allowed." },
+    { lane: "reqs",   kind: "recv",  label: "2 more requests",       note: "2 more requests arrive. Only 1 token left." },
+    { lane: "bucket", kind: "block", label: "1 allowed, 1 rejected", note: "One request gets the last token. The second is rejected — bucket empty." },
+    { lane: "bucket", kind: "run",   label: "refill: +2 tokens",     note: "After 1 second, 2 new tokens arrive. Bucket now holds 2/5." },
+    { lane: "reqs",   kind: "done",  label: "next requests allowed", note: "New requests can proceed again. The limiter enforces the rate without blocking." }
+  ]}
+  caption="Token bucket allows short bursts (draining the bucket) then enforces the refill rate. Empty bucket → reject."
+/>
+
+### `golang.org/x/time/rate` — the Go Standard
+
+The Go extended standard library provides a production-ready token-bucket limiter in `golang.org/x/time/rate`. It's the right default for in-process rate limiting in Go.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+func main() {
+	// Allow 3 events per second, with a burst capacity of 5.
+	// rate.Limit(3) = 3 tokens/second fill rate.
+	// Second arg = bucket capacity (max burst).
+	limiter := rate.NewLimiter(rate.Limit(3), 5)
+
+	results := make([]string, 10)
+	for i := range 10 {
+		// Allow checks if a token is available right now.
+		// Use Wait(ctx) if you want to block until a token is available.
+		if limiter.Allow() {
+			results[i] = fmt.Sprintf("req %2d: allowed  (tokens ~%.2f)", i+1, limiter.Tokens())
+		} else {
+			results[i] = fmt.Sprintf("req %2d: rejected (tokens ~%.2f)", i+1, limiter.Tokens())
+		}
+	}
+
+	for _, r := range results {
+		fmt.Println(r)
+	}
+
+	// After a brief pause, tokens refill.
+	fmt.Println("\n--- 500ms later (refill ~1.5 tokens) ---")
+	time.Sleep(500 * time.Millisecond)
+	for i := range 3 {
+		if limiter.Allow() {
+			fmt.Printf("req %2d after pause: allowed\n", i+1)
+		} else {
+			fmt.Printf("req %2d after pause: rejected\n", i+1)
+		}
+	}
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="How x/time/rate computes available tokens from elapsed time">
+
+`rate.Limiter` does **not** run a background goroutine to refill the bucket on a timer. That would be wasteful — a goroutine waking up 100 times per second for each limiter.
+
+Instead, it uses a **lazy computation** pattern. The limiter stores:
+
+1. `last` — the timestamp of the last token-consumption event.
+2. `tokens` — the number of tokens at `last`.
+
+When `Allow()` (or `Wait()`, or `Reserve()`) is called, the limiter computes how many tokens should have been added since `last`:
+
+```
+newTokens = rate * (now - last)
+tokens    = min(tokens + newTokens, burst)
+```
+
+This "virtual refill" is computed entirely from arithmetic on timestamps — no goroutine, no timer, no shared ticker. It's thread-safe via a `sync.Mutex`. The actual token count is never stored as a running value; it's derived from time on every call.
+
+This design has two elegant properties: it scales to thousands of limiters with zero goroutine overhead, and it correctly handles the case where a limiter hasn't been used for a long time — the bucket is simply computed as full (capped at burst capacity) when next consulted.
+
+As of Go 1.24, `x/time/rate` is the authoritative implementation. It handles `Allow()` (non-blocking), `Wait(ctx)` (blocking with context), and `Reserve()` (advanced: reserve a token and query when it will be available, for implementing delay-before-proceed semantics).
+
+</UnderTheHood>
+
+### Per-Key Rate Limiting
+
+A global limiter protects your service from aggregate overload. But you also need **per-client** limiting: API key, user ID, or IP address. Without per-client limits, one bad actor can consume the entire global quota.
+
+```go
+// PerKeyLimiter holds one rate.Limiter per key.
+// In production, use a cache with TTL (e.g. go-cache or sync.Map + expiry)
+// so stale limiters don't accumulate in memory forever.
+type PerKeyLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	r        rate.Limit
+	b        int
+}
+
+func NewPerKeyLimiter(r rate.Limit, b int) *PerKeyLimiter {
+	return &PerKeyLimiter{limiters: make(map[string]*rate.Limiter), r: r, b: b}
+}
+
+func (l *PerKeyLimiter) Allow(key string) bool {
+	l.mu.Lock()
+	lim, ok := l.limiters[key]
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.b)
+		l.limiters[key] = lim
+	}
+	l.mu.Unlock()
+	return lim.Allow()
+}
+```
+
+### Distributed Rate Limiting with Redis
+
+`x/time/rate` is **per-process**. If you run 10 replicas of your checkout service, each has its own limiter, and a client can get 10× the intended quota by round-robining requests across replicas. For a true rate limit across the fleet, the counter must live outside any single process — in Redis.
+
+The standard approach is a Lua script executed atomically in Redis. Because Lua scripts in Redis run atomically (no interleaving), you get the same compare-and-increment atomicity a mutex gives you in-process, but distributed across all replicas:
+
+```lua
+-- distributed_rate_limit.lua
+-- KEYS[1] = rate limit key (e.g. "rl:user:42")
+-- ARGV[1] = max requests allowed
+-- ARGV[2] = window in seconds
+-- Returns 1 if allowed, 0 if rejected.
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+  redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
+end
+if current <= tonumber(ARGV[1]) then
+  return 1
+else
+  return 0
+end
+```
+
+This is a **fixed-window** counter in Redis — simple and fast. For a sliding window or a Redis-native token bucket, libraries like [`go-redis/redis_rate`](https://github.com/go-redis/redis_rate) implement the GCRA (Generic Cell Rate Algorithm) via a Lua script.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// PerKeyLimiter manages one rate.Limiter per API key.
+// In production: add TTL-based eviction so stale keys are cleaned up.
+type PerKeyLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	r        rate.Limit
+	b        int
+}
+
+func NewPerKeyLimiter(r rate.Limit, b int) *PerKeyLimiter {
+	return &PerKeyLimiter{
+		limiters: make(map[string]*rate.Limiter),
+		r:        r,
+		b:        b,
+	}
+}
+
+// Allow checks whether key is within the rate limit.
+func (l *PerKeyLimiter) Allow(key string) bool {
+	l.mu.Lock()
+	lim, ok := l.limiters[key]
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.b)
+		l.limiters[key] = lim
+	}
+	l.mu.Unlock()
+	return lim.Allow()
+}
+
+// RateLimitMiddleware returns an HTTP middleware that limits by API key.
+func RateLimitMiddleware(limiter *PerKeyLimiter) func(key string) bool {
+	return func(key string) bool {
+		return limiter.Allow(key)
+	}
+}
+
+func main() {
+	// 2 requests/second, burst of 3 per API key.
+	limiter := NewPerKeyLimiter(rate.Limit(2), 3)
+	check := RateLimitMiddleware(limiter)
+
+	keys := []string{"api_key_A", "api_key_B", "api_key_A", "api_key_A", "api_key_A", "api_key_B"}
+
+	for _, k := range keys {
+		allowed := check(k)
+		status := "ALLOWED"
+		if !allowed {
+			status = "REJECTED"
+		}
+		fmt.Printf("  key=%-12s  %s\n", k, status)
+	}
+
+	fmt.Println("\n--- 500ms pause: key_A refills ~1 token ---")
+	time.Sleep(500 * time.Millisecond)
+
+	for range 2 {
+		allowed := check("api_key_A")
+		status := "ALLOWED"
+		if !allowed {
+			status = "REJECTED"
+		}
+		fmt.Printf("  key=%-12s  %s\n", "api_key_A", status)
+	}
+
+	// Demonstrate context-aware Wait: block until a token is available or ctx expires.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	lim := rate.NewLimiter(rate.Limit(1), 1)
+	lim.Allow() // drain the single token
+	fmt.Println("\n--- Wait with context (should time out) ---")
+	if err := lim.Wait(ctx); err != nil {
+		fmt.Println("Wait timed out:", err)
+	} else {
+		fmt.Println("Wait succeeded")
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="When distributed rate limiting is actually needed">
+
+Don't reach for Redis rate limiting before you need it. A single Go service with a per-process `x/time/rate` limiter handles **millions of requests per second** — it's fast, it's zero-dependency, and it's correct for a single instance. You only need distributed limiting when:
+
+1. You run multiple replicas and the per-key quota must be enforced across all of them.
+2. You need rate limit state to survive a restart (Redis persists it; in-memory does not).
+3. Different services in your mesh share a quota (e.g. both the API gateway and the checkout service limit the same user).
+
+In a fintech context, per-account rate limiting for fraud prevention (rule: "no account may initiate more than 5 transfers in 60 seconds") almost always requires Redis — because transfers may arrive on any replica.
+
+</Callout>
+
+<QuickCheck
+  question="Your checkout service runs 8 replicas. Each uses an in-process x/time/rate limiter set to 10 req/s per API key. What is the effective rate limit across the fleet?"
+  options={[
+    "10 req/s — the limiter is shared via a shared-memory segment",
+    "80 req/s — each replica allows 10 req/s independently",
+    "1.25 req/s — requests are load-balanced evenly so each replica gets 1/8",
+    "10 req/s, but only if you use rate.NewLimiter with GOMAXPROCS set to 8"
+  ]}
+  answer={1}
+  explain="Each replica has its own independent limiter. A client that round-robins across all 8 replicas can get 10 req/s from each — 80 req/s total. For a true fleet-wide limit, the counter must live in a shared store like Redis."
+/>
+
+---
+
+## Exercises
+
+The patterns are in your hands. Now prove it.
+
+<Exercise n={1} title="Timeout a slow DB call" level="easy">
+
+You have a function `fetchOrder(ctx context.Context, id int) (*Order, error)` that calls a slow database. Write a `fetchOrderWithTimeout` wrapper that applies a 2-second deadline. If the call exceeds the deadline, return a wrapped error that includes the order ID and mentions "timeout."
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+type Order struct{ ID int }
+
+func fetchOrder(ctx context.Context, id int) (*Order, error) {
+	// Simulating a slow query.
+	select {
+	case <-time.After(5 * time.Second):
+		return &Order{ID: id}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func fetchOrderWithTimeout(ctx context.Context, id int) (*Order, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	order, err := fetchOrder(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("fetchOrder(id=%d) timeout: %w", id, err)
+	}
+	return order, nil
+}
+
+func main() {
+	ctx := context.Background()
+	_, err := fetchOrderWithTimeout(ctx, 42)
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+```
+
+Key points: `context.WithTimeout` wraps the parent context; `defer cancel()` ensures the deadline goroutine is released even on success; the error is wrapped with `%w` so callers can `errors.Is(err, context.DeadlineExceeded)`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Backoff calculator" level="easy">
+
+Implement `ExponentialBackoff(attempt int, base, cap time.Duration) time.Duration` that returns a full-jitter backoff duration. `attempt` is zero-indexed (0 = first retry). The result must be in the range `[0, min(base*2^attempt, cap))`. Write a `main` that prints the duration for attempts 0 through 4 with `base=100ms` and `cap=2s`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand/v2"
+	"time"
+)
+
+func ExponentialBackoff(attempt int, base, cap time.Duration) time.Duration {
+	shift := attempt
+	if shift > 30 {
+		shift = 30
+	}
+	exp := base << shift
+	if exp > cap {
+		exp = cap
+	}
+	return time.Duration(rand.N(int64(exp)))
+}
+
+func main() {
+	base := 100 * time.Millisecond
+	capDur := 2 * time.Second
+	for i := range 5 {
+		d := ExponentialBackoff(i, base, capDur)
+		fmt.Printf("attempt %d: wait up to %v, got %v\n",
+			i, min(base<<i, capDur).Round(time.Millisecond),
+			d.Round(time.Millisecond))
+	}
+}
+```
+
+`base << attempt` is equivalent to `base * 2^attempt` using a bit-shift, which avoids `math.Pow` and floating-point. `rand.N` (Go 1.22+) is goroutine-safe with no seeding required.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Circuit breaker with state log" level="medium">
+
+Extend the `CircuitBreaker` from the chapter so it records a `[]StateChange` (each with a `From`, `To` `State`, and `At time.Time`). Add a `StateHistory() []StateChange` method. Write a test scenario that drives the breaker through Closed → Open → Half-Open → Closed and asserts the history has exactly 3 transitions.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type State int
+
+const (
+	StateClosed State = iota
+	StateOpen
+	StateHalfOpen
+)
+
+func (s State) String() string {
+	return [...]string{"CLOSED", "OPEN", "HALF-OPEN"}[s]
+}
+
+var ErrCircuitOpen = errors.New("circuit open")
+
+type StateChange struct {
+	From, To State
+	At       time.Time
+}
+
+type CircuitBreaker struct {
+	mu        sync.Mutex
+	state     State
+	failures  int
+	threshold int
+	cooldown  time.Duration
+	openAt    time.Time
+	history   []StateChange
+}
+
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{threshold: threshold, cooldown: cooldown}
+}
+
+func (cb *CircuitBreaker) transition(to State) {
+	cb.history = append(cb.history, StateChange{From: cb.state, To: to, At: time.Now()})
+	cb.state = to
+}
+
+func (cb *CircuitBreaker) StateHistory() []StateChange {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	out := make([]StateChange, len(cb.history))
+	copy(out, cb.history)
+	return out
+}
+
+func (cb *CircuitBreaker) Call(op func() error) error {
+	cb.mu.Lock()
+	if cb.state == StateOpen {
+		if time.Since(cb.openAt) >= cb.cooldown {
+			cb.transition(StateHalfOpen)
+		} else {
+			cb.mu.Unlock()
+			return ErrCircuitOpen
+		}
+	}
+	cb.mu.Unlock()
+
+	err := op()
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if err != nil {
+		cb.failures++
+		if cb.state == StateHalfOpen || cb.failures >= cb.threshold {
+			cb.openAt = time.Now()
+			cb.transition(StateOpen)
+		}
+		return err
+	}
+	cb.failures = 0
+	cb.transition(StateClosed)
+	return nil
+}
+
+func main() {
+	cb := NewCircuitBreaker(2, 20*time.Millisecond)
+	fail := func() error { return errors.New("err") }
+	succeed := func() error { return nil }
+
+	// Drive Closed → Open (2 failures)
+	_ = cb.Call(fail)
+	_ = cb.Call(fail)
+	// Drive Open → Half-Open (wait cooldown)
+	time.Sleep(30 * time.Millisecond)
+	// Drive Half-Open → Closed (probe succeeds)
+	_ = cb.Call(succeed)
+
+	history := cb.StateHistory()
+	fmt.Printf("transitions: %d\n", len(history))
+	for _, h := range history {
+		fmt.Printf("  %s → %s\n", h.From, h.To)
+	}
+	if len(history) != 3 {
+		fmt.Println("FAIL: expected 3 transitions")
+	} else {
+		fmt.Println("PASS")
+	}
+}
+```
+
+The key is keeping `transition` private and calling it only under the mutex, so the history slice is never written concurrently.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Rate-limit middleware" level="medium">
+
+Write an `http.Handler` middleware `RateLimit(next http.Handler, r rate.Limit, burst int) http.Handler` that uses `golang.org/x/time/rate`. If the limiter rejects the request, write a 429 response with a `Retry-After` header set to 1 second and do not call `next`. Write a table-driven test with `httptest` that verifies: first N requests (≤ burst) are 200, and at least one subsequent request is 429.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+
+	"golang.org/x/time/rate"
+)
+
+func RateLimit(next http.Handler, r rate.Limit, burst int) http.Handler {
+	limiter := rate.NewLimiter(r, burst)
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !limiter.Allow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+func main() {
+	base := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// burst=3, very low rate so tokens don't refill during the test
+	handler := RateLimit(base, rate.Limit(0.01), 3)
+
+	tests := []struct {
+		want int
+	}{
+		{200}, {200}, {200}, // burst of 3 passes
+		{429},               // 4th is rejected
+	}
+
+	for i, tt := range tests {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		handler.ServeHTTP(rec, req)
+		status := "PASS"
+		if rec.Code != tt.want {
+			status = fmt.Sprintf("FAIL (got %d, want %d)", rec.Code, tt.want)
+		}
+		fmt.Printf("request %d: status=%d  %s\n", i+1, rec.Code, status)
+	}
+}
+```
+
+The handler returns 429 with a `Retry-After` header. `limiter.Allow()` is non-blocking and correct here — HTTP handlers can't block waiting for a token (that would hold a goroutine). Use `limiter.Wait(ctx)` only when it's acceptable to queue the request rather than reject it immediately.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Graceful shutdown test" level="hard">
+
+Write a test that:
+1. Starts an `http.Server` on a random port (`:0`) with a handler that sleeps 200ms.
+2. Sends a request to the handler.
+3. While the request is in-flight (after 50ms), calls `srv.Shutdown(ctx)` with a 1-second timeout.
+4. Asserts the request completed with 200 (not dropped) and `Shutdown` returned nil.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"time"
+)
+
+func main() {
+	// Start server on a random port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "ok")
+		case <-r.Context().Done():
+			http.Error(w, "cancelled", http.StatusServiceUnavailable)
+		}
+	})
+
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	addr := "http://" + ln.Addr().String()
+
+	// Fire a request asynchronously.
+	type result struct {
+		status int
+		err    error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resp, err := http.Get(addr + "/slow")
+		if err != nil {
+			ch <- result{0, err}
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		ch <- result{resp.StatusCode, nil}
+	}()
+
+	// Wait 50ms (request is in-flight), then shut down.
+	time.Sleep(50 * time.Millisecond)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutCtx); err != nil {
+		fmt.Println("FAIL: Shutdown error:", err)
+		return
+	}
+
+	r := <-ch
+	if r.err != nil {
+		fmt.Println("FAIL: request error:", r.err)
+		return
+	}
+	if r.status != http.StatusOK {
+		fmt.Printf("FAIL: expected 200, got %d\n", r.status)
+		return
+	}
+	fmt.Println("PASS: in-flight request completed with 200, shutdown was clean")
+}
+```
+
+`srv.Shutdown` stops accepting new connections but waits for active ones. The in-flight 200ms handler completes before the 1-second shutdown timeout, so both the request and the shutdown succeed cleanly.
+
+</Solution>
+
+</Exercise>
+
+---
+
+<Recap>
+
+- **Timeouts everywhere**: every I/O call carries a `context.WithTimeout`. `http.DefaultClient` has zero timeout — never use it in production. The context propagates cancellation down the whole call tree.
+- **Retries with full jitter**: only retry idempotent operations. Exponential backoff slows retries; full jitter (`rand.N(int64(cap))`) randomizes them to prevent the thundering herd. A retry budget caps amplification.
+- **Circuit breakers**: three states — Closed (pass through), Open (fail fast), Half-Open (probe). Protects a flaky downstream and gives it space to recover. `sony/gobreaker` is the standard Go library.
+- **Graceful shutdown**: `signal.NotifyContext` → `srv.Shutdown(drainCtx)` → release resources in reverse order. Always set `ReadHeaderTimeout`, `WriteTimeout`, and `IdleTimeout` on every `http.Server`.
+- **Liveness vs. readiness**: liveness checks the process (cheap, never fails), readiness checks dependencies (returns 503 to pull traffic). Conflating them causes restart loops.
+- **Idempotency keys**: generated by the client, honored by the server. Required on any write operation before you add a retry loop.
+- **Rate limiting in depth**: token bucket allows bursts, leaky bucket smooths output, fixed/sliding window counts calls. `golang.org/x/time/rate` uses lazy timestamp math — no background goroutine. Per-key limiting isolates clients. Distributed limiting across replicas requires Redis.
+
+</Recap>
+
+<Lab
+  title="Build a Token-Bucket Rate Limiter"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  objective="The checkout team needs a rate limiter middleware for the payment endpoint. Implement TokenBucketLimiter with Allow(key string) bool that enforces 5 req/s per API key with a burst of 10, then wire it into a middleware that returns 429 with Retry-After: 1 when the bucket is empty. The hidden verifier fires 50 concurrent requests from three API keys and checks: (a) no key exceeds burst+rate in the test window, (b) all 429 responses carry Retry-After, (c) the race detector is silent."
+  starter={`package main
+
+import (
+	"net/http"
+	"sync"
+	"time"
+)
+
+// TokenBucketLimiter enforces per-key token bucket rate limits.
+// TODO: implement this struct and its Allow method.
+type TokenBucketLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	rate    float64       // tokens per second
+	cap     float64       // maximum bucket capacity
+}
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// NewTokenBucketLimiter creates a limiter with the given rate and burst cap.
+func NewTokenBucketLimiter(ratePerSec float64, burstCap float64) *TokenBucketLimiter {
+	// TODO
+	return nil
+}
+
+// Allow returns true if key has a token available. It must be safe for concurrent use.
+func (l *TokenBucketLimiter) Allow(key string) bool {
+	// TODO: lazily compute available tokens from elapsed time (no background goroutine)
+	return false
+}
+
+// RateLimitHandler wraps next; returns 429+Retry-After when Allow returns false.
+func RateLimitHandler(next http.Handler, limiter *TokenBucketLimiter) http.Handler {
+	// TODO
+	return next // broken: no limiting yet
+}
+
+func main() {
+	limiter := NewTokenBucketLimiter(5, 10)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pay", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	http.ListenAndServe(":8080", RateLimitHandler(mux, limiter))
+}`}
+  verifier="Hidden tests: (1) burst test — fire 10 requests for key X immediately, all must be 200; (2) rate test — fire 20 requests spread over 1s for key Y, count 429s equals expected; (3) 429 headers test — every 429 carries Retry-After header; (4) race test — go test -race must be silent; (5) independence test — key A being exhausted does not affect key B."
+  hints={[
+    "The bucket struct stores tokens (float64) and last (time.Time). In Allow, compute elapsed := time.Since(last), add elapsed.Seconds()*rate to tokens, cap at burstCap, then subtract 1.0 if tokens >= 1.",
+    "All reads and writes to the bucket must happen inside l.mu.Lock()/Unlock(). Compute the new token count, check availability, and update tokens and last — all atomically under the lock.",
+    "For the middleware: if !limiter.Allow(apiKey) { w.Header().Set(\"Retry-After\", \"1\"); http.Error(w, \"rate limit exceeded\", http.StatusTooManyRequests); return }. Extract the API key from r.Header.Get(\"X-API-Key\") or r.RemoteAddr as a fallback."
+  ]}
+  flag="GO{token_bucket_lazy_refill_per_key}"
+>
+
+The payment endpoint gets hammered by a rogue integration partner every Black Friday. I built the circuit breaker. I wrote the backoff. Now I want *you* to build the rate limiter — the lazy-refill token bucket, per key, race-safe — and show me it holds the line. The verifier is *my* test suite, and I wrote it myself, so it's perfect. No pressure.
+
+</Lab>
+
+<Scoreboard
+  streak={10}
+  items={[
+    { label: "Quick check — DefaultClient timeout behavior", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — full jitter vs. exponential backoff", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — per-replica rate limiting", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Timeout a slow DB call", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Backoff calculator", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Circuit breaker with state log", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — Rate-limit middleware", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Graceful shutdown test", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Build a Token-Bucket Rate Limiter", captured: false, points: 80 }}
+/>
+
+Not bad, sport. You built every weapon in the reliability arsenal — timeouts, backoff, jitter, circuit breakers, graceful shutdown, health checks, idempotency, and rate limiting from first principles all the way to distributed Redis. It's no *me*, but it's genuinely solid. The service you ship after this chapter doesn't crumple under load, doesn't freeze when a downstream hangs, and tells clients exactly what they can retry and when. That's the standard. Hold it.

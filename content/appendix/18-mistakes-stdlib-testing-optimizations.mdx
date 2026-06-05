@@ -1,0 +1,809 @@
+---
+title: "Go Mistakes: Standard Library, Testing & Optimizations"
+part: "appendix"
+order: 18
+type: "course"
+description: "The final cluster of Go mistakes: standard-library traps (time.Duration units, time.After allocation churn, JSON and SQL pitfalls, unclosed HTTP/SQL/file resources, missing return after http.Error, timeout-less default HTTP client and server), testing mistakes (categorizing tests, the -race flag, table-driven tests, not sleeping, injecting a clock, httptest, accurate benchmarks), and optimization fundamentals (CPU caches and false sharing, struct alignment, stack vs heap and escape analysis, reducing allocations, inlining, pprof and the tracer, the GC, and running Go in containers with a container-aware GOMAXPROCS)."
+prerequisites: ["mistakes-concurrency"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Go Mistakes #75–100" title="Go Mistakes: Standard Library, Testing & Optimizations">
+
+Here's the thing, sport. You've made it to the end. Ninety-nine mistakes behind you, and you're still standing — barely, but standing. I'm almost impressed. *Almost.*
+
+This is the final chapter of the gauntlet, and it's the one that separates people who *write* Go from people who run it in production at three in the morning when a payment gateway goes slow and your service quietly strangles itself to death. The standard library will hand you a loaded gun and a warm smile: a default HTTP client with no timeout, a `time.After` that allocates a fresh timer every loop iteration, a `sql.Open` that swears it connected and didn't. Then we get to **testing** — the thing separating engineers I trust from engineers I tolerate — and finally **optimization**, where you learn how the machine *actually* works: cache lines, escape analysis, the garbage collector, and why your beautiful Go binary thinks it has 64 CPUs inside a container that gave it one.
+
+We go bug → *why* → flawless fix, grounded in Meridian's backend, same as always. Twenty-six mistakes; we'll do the fourteen that matter most, and we'll do them *right*. This is the last time I get to watch you work. Don't embarrass us. Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Time & Resources", "JSON & SQL", "HTTP Pitfalls", "Testing", "Caches & Memory", "Allocations & Containers"]} />
+
+<Scene
+  title="A timeout-less HTTP client strangles the service under a slow upstream"
+  actors={[
+    { id: "svc", label: "Meridian API" },
+    { id: "up", label: "Slow gateway" }
+  ]}
+  rows={1}
+  cols={4}
+  frames={[
+    {
+      caption: "Meridian calls the payment gateway with http.DefaultClient. Normally each request returns in ~50ms, a goroutine and a connection freed each time. All healthy.",
+      beat: "neutral",
+      actors: [{ id: "svc", state: "active" }, { id: "up", state: "idle" }],
+      cells: [{ id: "A1", state: "active", label: "req ✓" }, { id: "A2", state: "done", label: "200" }, { id: "A3", state: "idle", label: "free" }, { id: "A4", state: "idle", label: "—" }]
+    },
+    {
+      caption: "The gateway degrades — responses now hang for minutes, never erroring. The default client has NO timeout, so every request blocks forever. Goroutines and conns pile up.",
+      beat: "problem",
+      actors: [{ id: "svc", state: "warn" }, { id: "up", state: "bad" }],
+      cells: [{ id: "A1", state: "bad", label: "hung" }, { id: "A2", state: "bad", label: "hung" }, { id: "A3", state: "bad", label: "hung" }, { id: "A4", state: "bad", label: "OOM" }]
+    },
+    {
+      caption: "Fix: a client with Timeout (or a per-request context deadline). Slow requests are cut at 2s, return an error you handle, and free their goroutine and connection.",
+      beat: "solution",
+      actors: [{ id: "svc", state: "ok" }, { id: "up", state: "warn" }],
+      cells: [{ id: "A1", state: "ok", label: "2s ✗" }, { id: "A2", state: "done", label: "freed" }, { id: "A3", state: "done", label: "freed" }, { id: "A4", state: "ok", label: "alive" }]
+    }
+  ]}
+  caption="The default HTTP client never times out. A slow upstream doesn't crash you — it leaks you to death, one stuck goroutine and one held connection at a time, until you run out of both. Almost every mistake in this chapter is this shape: a stdlib default that's wrong for production."
+/>
+
+## Time & Resources
+
+We open with the most embarrassing bug on this list — one a *child* could avoid, yet I see it in real ledgers. **Mistake #75: passing a raw integer where a `time.Duration` is expected.**
+
+<Define term="time.Duration units" since="Go Mistakes (Appendix)">
+A `time.Duration` is an `int64` counting **nanoseconds**, not seconds. So `time.Sleep(1000)` sleeps 1000 *nanoseconds* — one microsecond — not one second. You must multiply by a unit constant: `1000 * time.Millisecond`, `5 * time.Second`. Why it matters: the bare literal compiles fine (it's an untyped constant convertible to `Duration`), so a config that reads `timeout := 30` and passes it as `30` nanoseconds will *look* set and behave as if it's basically zero. Always attach a unit; never pass a naked number.
+</Define>
+
+<BeforeAfter
+  bad={`// 5 NANOSECONDS, not 5 seconds.
+ctx, cancel := context.WithTimeout(
+  ctx, 5,
+)
+// time.Sleep(100) // 100ns ≈ instant
+timer := time.NewTimer(30) // 30ns!`}
+  good={`// Attach a unit. Always.
+ctx, cancel := context.WithTimeout(
+  ctx, 5*time.Second,
+)
+// time.Sleep(100 * time.Millisecond)
+timer := time.NewTimer(30 * time.Second)`}
+  badLabel="Raw int (nanoseconds)"
+  goodLabel="Multiplied by a unit"
+/>
+
+Let's make the arithmetic undeniable. Run it:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	raw := time.Duration(5)                  // 5 nanoseconds
+	real := 5 * time.Second                  // 5 seconds
+	fmt.Println("time.Duration(5) =", raw)   // 5ns
+	fmt.Println("5 * time.Second   =", real) // 5s
+
+	// A config field read as a plain int and used directly is a trap:
+	configSeconds := 30
+	wrong := time.Duration(configSeconds)               // 30ns
+	right := time.Duration(configSeconds) * time.Second // 30s
+	fmt.Println("wrong:", wrong, " right:", right)
+}
+```
+
+</GoPlayground>
+
+Now **mistake #76**, the subtle one: `time.After` inside a hot loop. `time.After(d)` returns a channel that fires after `d` — convenient for a one-shot timeout. Since Go 1.23, an unreferenced abandoned timer can be garbage-collected before it fires, so this is no longer the old pre-Go 1.23 timer-retention trap. But every call still allocates a fresh timer. Call it on every iteration of a busy `for`/`select` loop and you create avoidable allocation churn.
+
+<ExecTimeline
+  title="time.After in a loop — one allocation per pass"
+  lanes={[
+    { id: "loop", label: "consumer loop" },
+    { id: "timers", label: "time.After timers" }
+  ]}
+  steps={[
+    { lane: "loop", kind: "run", label: "for { select { ... } }", note: "A loop reads from a work channel and uses time.After(1h) as an idle timeout in the same select." },
+    { lane: "timers", kind: "spawn", label: "msg 1 -> time.After(1h) #1", note: "Each loop iteration that takes the work branch creates a NEW one-hour timer. The select moves on; the timer is not used or stopped." },
+    { lane: "timers", kind: "spawn", label: "msg 2 -> time.After(1h) #2", note: "Another message, another timer allocation. In Go 1.23+ the abandoned timer can be collected once unreferenced, but the allocation already happened." },
+    { lane: "timers", kind: "block", label: "1000 msgs -> 1000 allocations", note: "Under load the loop spins thousands of times a minute. Even when the GC can reclaim abandoned timers, that churn is unnecessary work." },
+    { lane: "timers", kind: "done", label: "fix: reuse one Timer + Reset", note: "Allocate one time.NewTimer(1h) before the loop; call timer.Reset(1h) per iteration and Stop it on exit. One timer, minimal churn." }
+  ]}
+  caption="time.After is fine for a single, infrequent timeout. In a hot loop it allocates one timer per iteration. Use a reused *time.Timer (Reset/Stop), a *time.Ticker, or a context deadline when allocation churn matters."
+/>
+
+The third trap in this group is **#79: not closing transient resources.** An HTTP response body, an `sql.Rows` cursor, an `os.File` — each holds a file descriptor or a pooled connection that is *not* reclaimed until you `Close` it. Forget, and you leak descriptors until `accept: too many open files`.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="resp.Body">`defer resp.Body.Close()` after checking the error. And **drain** it (`io.Copy(io.Discard, resp.Body)`) before closing so the connection can be reused by the pool instead of dropped.</ConceptCard>
+  <ConceptCard label="sql.Rows">`defer rows.Close()` after a successful `Query`. An unclosed `Rows` holds its connection out of the pool. Closing it returns the connection.</ConceptCard>
+  <ConceptCard label="os.File">`defer f.Close()` — but for *writes*, also check the error from `Close()` (a deferred close can hide a failed flush). For read-only files the deferred close is enough.</ConceptCard>
+  <Gotcha>⚠ `defer resp.Body.Close()` only runs if `err == nil`. On error, `resp` may be nil — closing it panics. Always check `err` *first*, then defer the close.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="A worker loop does `select { case w := <-work: handle(w); case <-time.After(time.Hour): return }` and runs millions of times an hour under load. Profiles show heavy timer allocation. What's the issue?"
+  options={[
+    "handle(w) leaks memory",
+    "Every iteration creates a fresh time.After timer. In Go 1.23+ abandoned timers can be collected before they fire, but the allocation churn is still proportional to throughput. Reuse one *time.Timer with Reset, or use a context deadline",
+    "select statements leak by design",
+    "The work channel is unbuffered"
+  ]}
+  answer={1}
+  explain="time.After(time.Hour) allocates a Timer every time the select is evaluated. Go 1.23+ can garbage-collect an abandoned unreferenced timer before it fires, but it cannot erase the cost of creating one per message. The fix is to create a single time.NewTimer(time.Hour) before the loop, call timer.Reset(time.Hour) each iteration, and timer.Stop() on exit — one timer, reused."
+/>
+
+## JSON & SQL
+
+**Mistake #77: JSON traps.** Three bite people constantly. First, **type embedding can shadow `MarshalJSON`**: if you embed a type that implements `json.Marshaler`, the *outer* struct inherits that method — so marshaling your wrapper silently calls the *inner* type's custom marshaling and drops your own fields. Second, **`time.Time` carries a monotonic-clock reading** that survives in memory but is stripped on marshal, so a round-trip through JSON produces a `Time` that is `!=` the original (use `.Equal`, never `==`). Third, **decoding arbitrary JSON into `map[string]any` turns every number into a `float64`** — so a transaction amount of `100` comes back as `float64(100)`, and large integer IDs lose precision past 2^53.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+func main() {
+	// Numbers decoded into map[string]any become float64 — precision trap.
+	data := []byte(`{"amount_cents": 100, "account_id": 90071992547409921}`)
+	var m map[string]any
+	_ = json.Unmarshal(data, &m)
+	fmt.Printf("amount_cents is %T = %v\n", m["amount_cents"], m["amount_cents"])
+	fmt.Printf("account_id  is %T = %v\n", m["account_id"], m["account_id"])
+	// account_id has lost precision: float64 can't hold that integer exactly.
+
+	// Fix: decode into a typed struct (int64 stays exact), or use
+	// json.Decoder with UseNumber() to keep numbers as json.Number.
+	type Tx struct {
+		AmountCents int64 `json:"amount_cents"`
+		AccountID   int64 `json:"account_id"`
+	}
+	var tx Tx
+	_ = json.Unmarshal(data, &tx)
+	fmt.Printf("typed: amount=%d account=%d (exact)\n", tx.AmountCents, tx.AccountID)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="time.Time and == across a marshal boundary">
+
+A `time.Time` you read from `time.Now()` includes a monotonic-clock component. `json.Marshal` writes only the wall-clock part, so the value you unmarshal lacks the monotonic reading and compares **unequal** with `==` even though it's the same instant. The rule: compare instants with `t1.Equal(t2)`, never `t1 == t2`. The same applies after any serialization round-trip (a DB write, a gob, a protobuf). As of Go 1.25 there's an experimental `encoding/json/v2` (behind `GOEXPERIMENT=jsonv2`) that fixes several long-standing v1 sharp edges and is markedly faster — worth knowing exists, but `encoding/json` is still the default.
+
+</Callout>
+
+Now **#78: the SQL traps**, the cluster that bites every team putting Go in front of Postgres. The headline surprise: **`sql.Open` does not connect.** It validates the DSN format and returns an `*sql.DB` — a *connection pool*, not a connection — and opens the first real connection lazily, on your first query. So a wrong host or password sails through `sql.Open` and only blows up later, far from the cause. Call `db.Ping(ctx)` right after `Open` to fail fast.
+
+<Define term="Connection pool (*sql.DB)" since="Go Mistakes (Appendix)">
+An `*sql.DB` is not one connection — it's a **pool** of reusable connections that `database/sql` manages for you. Each query borrows an idle connection (or opens a new one), runs, and returns it to the pool. Why it matters: the pool's defaults are wrong for production. `SetMaxOpenConns` defaults to *unlimited* (so a traffic spike can open thousands of connections and overwhelm the database), `SetMaxIdleConns` defaults to *2* (so a busy service constantly opens and closes connections). Tune both — typically max-open to match what your database can handle, and max-idle near max-open for a steady workload — plus `SetConnMaxLifetime` so connections recycle.
+</Define>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Ping after Open">`sql.Open` is lazy. Follow it with `db.PingContext(ctx)` to verify the database is actually reachable and the credentials work — fail at startup, not on the first user request.</ConceptCard>
+  <ConceptCard label="Tune the pool">Set `SetMaxOpenConns` (cap it — unlimited is the default and it will flood your DB), `SetMaxIdleConns` (raise it from 2 for busy services), and `SetConnMaxLifetime` (recycle connections so load balancers and DB restarts don't strand stale ones).</ConceptCard>
+  <ConceptCard label="NULL columns">A nullable column scanned into a plain `string` errors on NULL. Use `sql.NullString` / `sql.NullInt64` (or a `*string`) so NULL maps to `Valid == false` instead of a scan failure.</ConceptCard>
+  <Gotcha>⚠ After ranging `rows.Next()`, you MUST check `rows.Err()`. The loop ends both on "no more rows" and on a mid-iteration error — without `rows.Err()` you silently treat a failed query as an empty result set.</Gotcha>
+</ConceptGrid>
+
+This SQL example talks to a real database, so it can't run offline — read it, don't try to execute it. It shows the four fixes together:
+
+```go
+// Illustrative — needs a live Postgres, so it's not a runnable playground.
+db, err := sql.Open("pgx", dsn) // does NOT connect yet
+if err != nil {
+	return err
+}
+if err := db.PingContext(ctx); err != nil { // fail fast on bad DSN/creds
+	return err
+}
+db.SetMaxOpenConns(25)                  // cap, don't leave it unlimited
+db.SetMaxIdleConns(25)                   // raise from the default of 2
+db.SetConnMaxLifetime(5 * time.Minute)   // recycle connections
+
+rows, err := db.QueryContext(ctx, `SELECT id, note FROM ledger WHERE acct = $1`, acct)
+if err != nil {
+	return err
+}
+defer rows.Close() // return the connection to the pool
+
+for rows.Next() {
+	var id int64
+	var note sql.NullString // column is nullable — plain string would fail on NULL
+	if err := rows.Scan(&id, &note); err != nil {
+		return err
+	}
+	_ = id
+	_ = note.String // note.Valid is false when the column was NULL
+}
+return rows.Err() // CRITICAL: the loop can end on error, not just end-of-rows
+```
+
+## HTTP Pitfalls
+
+**Mistake #80: forgetting `return` after `http.Error`.** `http.Error` writes a status code and body — but it does **not** stop your handler. Execution falls straight through to the rest of the function, which then tries to write a *second* response (Go logs `http.superfluous...WriteHeader call`) and, worse, runs the success logic you meant to skip. The fix is one keyword: `return`.
+
+<BeforeAfter
+  bad={`func handler(w http.ResponseWriter, r *http.Request) {
+  acct, err := load(r)
+  if err != nil {
+    http.Error(w, "bad", 400)
+    // BUG: no return — keeps going!
+  }
+  // runs even when err != nil:
+  json.NewEncoder(w).Encode(acct)
+}`}
+  good={`func handler(w http.ResponseWriter, r *http.Request) {
+  acct, err := load(r)
+  if err != nil {
+    http.Error(w, "bad", 400)
+    return // stop the handler here
+  }
+  json.NewEncoder(w).Encode(acct)
+}`}
+  badLabel="No return (double write, runs success path)"
+  goodLabel="return after http.Error"
+/>
+
+And the big one, **#81: the default HTTP client and server have no timeouts.** You saw the Scene: a slow upstream and `http.DefaultClient` (timeout zero == infinite) means requests block forever, leaking a goroutine and a connection each. Same on the *server* side — the default `http.Server` has no `ReadTimeout`/`WriteTimeout`/`IdleTimeout`, so a slow-loris client that dribbles bytes can hold connections open indefinitely. Set timeouts on both sides. (These servers can't bind a port in the offline sandbox, so they're illustrative, not runnable.)
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Client side">`&http.Client{Timeout: 10 * time.Second}` bounds the *whole* request (dial + write + read). For finer control, use a `context.WithTimeout` per request — it also propagates cancellation to the server.</ConceptCard>
+  <ConceptCard label="Server side">Set `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, and `IdleTimeout` on your `http.Server`. The zero defaults mean a misbehaving or malicious client can pin connections open and exhaust the server.</ConceptCard>
+</ConceptGrid>
+
+```go
+// Illustrative — a bound server/listener can't run in the offline sandbox.
+
+// Client with a hard ceiling on every request:
+client := &http.Client{Timeout: 10 * time.Second}
+
+// Server with the timeouts the defaults leave at zero (infinite):
+srv := &http.Server{
+	Addr:              ":8080",
+	Handler:           mux,
+	ReadHeaderTimeout: 5 * time.Second,
+	ReadTimeout:       10 * time.Second,
+	WriteTimeout:      10 * time.Second,
+	IdleTimeout:       60 * time.Second,
+}
+_ = srv.ListenAndServe()
+```
+
+<QuickCheck
+  question={'A Meridian handler validates the request, and on failure calls `http.Error(w, "invalid amount", http.StatusBadRequest)` — then the logs fill with `http: superfluous response.WriteHeader call` and customers occasionally get a 200 with a malformed body. What is wrong?'}
+  options={[
+    "http.Error is deprecated",
+    "There's no `return` after http.Error, so the handler keeps executing past the error branch and writes a second response (the success path). Add `return` immediately after http.Error",
+    "StatusBadRequest is the wrong constant",
+    "The ResponseWriter needs to be flushed"
+  ]}
+  answer={1}
+  explain="http.Error writes the status and body but does not halt the handler. Without a `return`, control flows into the rest of the function — which encodes the success response on top of the error one, producing the 'superfluous WriteHeader' warning and a corrupted body. Every http.Error (and every error-path response write) must be immediately followed by `return`. This is the single most common net/http handler bug."
+/>
+
+## Testing
+
+Now the part I care about most. Anyone can make code that works *once*. Tests are how you prove it keeps working — and the mistakes here are about leaving the safety off.
+
+**Mistake #83: not enabling `-race`.** Go ships a data-race detector. Run `go test -race ./...` and it instruments memory access to catch two goroutines touching the same variable without synchronization — the exact bug class from the concurrency chapter. It's not on by default (it slows execution and inflates memory), so a team that never passes `-race` is *choosing* not to find its races. Wire it into CI.
+
+**Mistake #85: not using table-driven tests.** When you test the same function across many inputs, a table of cases plus subtests beats copy-pasted test functions — you add a case by adding a row, and `t.Run` gives each case a name in the output. The *logic* is plain Go we can run offline (the sandbox has no `go test`, so we exercise the table from `main`):
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// The function under test: clamp a transfer fee to [min, max] cents.
+func clampFee(fee, min, max int64) int64 {
+	if fee < min {
+		return min
+	}
+	if fee > max {
+		return max
+	}
+	return fee
+}
+
+func main() {
+	// A table of cases — exactly what a table-driven test iterates over.
+	cases := []struct {
+		name          string
+		fee, min, max int64
+		want          int64
+	}{
+		{"below min", 5, 10, 100, 10},
+		{"above max", 250, 10, 100, 100},
+		{"in range", 50, 10, 100, 50},
+		{"equals min", 10, 10, 100, 10},
+		{"equals max", 100, 10, 100, 100},
+	}
+
+	allPass := true
+	for _, c := range cases {
+		got := clampFee(c.fee, c.min, c.max)
+		ok := got == c.want
+		if !ok {
+			allPass = false
+		}
+		fmt.Printf("%-10s want=%3d got=%3d %v\n", c.name, c.want, got, ok)
+	}
+	if allPass {
+		fmt.Println("PASS")
+	} else {
+		fmt.Println("FAIL")
+	}
+}
+```
+
+</GoPlayground>
+
+Two more that ruin test suites. **Mistake #86: sleeping in unit tests.** A `time.Sleep(100 * time.Millisecond)` to "wait for the goroutine" is flaky (too short on a loaded CI box, slow everywhere else). Synchronize with a channel, a `sync.WaitGroup`, or — as of Go 1.25 — `testing/synctest`, which runs your concurrent code in a *virtual-time bubble* where time advances instantly and deterministically. **Mistake #87: reading the real clock in tests.** Code that calls `time.Now()` directly can't be tested for "what happens at month boundary" without time travel. Inject a clock (a `func() time.Time` field, or a small `Clock` interface) so tests supply a fixed time.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="#82 Categorize tests">Separate fast unit tests from slow integration tests with `testing.Short()` (`if testing.Short() { t.Skip() }`) or build tags (`//go:build integration`), so `go test -short` stays fast in the inner loop.</ConceptCard>
+  <ConceptCard label="#84 Execution modes">Use `t.Parallel()` to run independent tests concurrently, and `go test -shuffle=on` to randomize order — both surface hidden inter-test dependencies and shared-state bugs.</ConceptCard>
+  <ConceptCard label="#88 Test utilities">Reach for the stdlib helpers: `httptest.NewServer`/`httptest.NewRecorder` for HTTP, `iotest` for tricky readers, `t.TempDir()` for scratch files. Don't hand-roll what the testing packages already give you.</ConceptCard>
+  <ConceptCard label="#90 Test features">Use `t.Cleanup()` for teardown (runs LIFO, even on failure), an external `_test` package to test only the exported API, and `go test -cover` to see what you actually exercise.</ConceptCard>
+  <Gotcha>⚠ A `time.Sleep` in a test is a bet that the machine is fast enough. On a busy CI runner it loses, and you get a flaky failure nobody can reproduce. Synchronize explicitly or use `testing/synctest`.</Gotcha>
+</ConceptGrid>
+
+**Mistake #89: inaccurate benchmarks.** A benchmark lies in three classic ways: setup work counted inside the timed loop (call `b.ResetTimer()` after setup), the compiler **optimizing away** your work because the result is unused (assign it to a package-level sink), and the *observer effect* (a too-tiny benchmark measures loop overhead, not your code). As of Go 1.24, prefer `for b.Loop()` over the old `for range b.N`: it handles timer setup/teardown and keeps the compiler from eliminating the loop body. Go 1.26 also removed the inlining barrier inside `b.Loop` bodies, making it practical for all benchmarks.
+
+<BeforeAfter
+  bad={`func BenchmarkFee(b *testing.B) {
+  txs := loadFixture() // counted!
+  for range b.N {
+    Fee(txs) // result unused -> may be
+             // optimized away entirely
+  }
+}`}
+  good={`var sink int64
+
+func BenchmarkFee(b *testing.B) {
+  txs := loadFixture()
+  b.ResetTimer() // exclude setup
+  for b.Loop() { // Go 1.24+; Go 1.26 allows inlining inside
+    sink = Fee(txs) // sink defeats DCE
+  }
+}`}
+  badLabel="Setup timed, result discarded"
+  goodLabel="ResetTimer + b.Loop + sink"
+/>
+
+<QuickCheck
+  question="A benchmark for `Fee()` reports 0.3 ns/op — suspiciously fast, basically free. The body is `for range b.N { Fee(txs) }` and the return value is ignored. What's the most likely explanation?"
+  options={[
+    "Fee is genuinely that fast",
+    "The compiler saw that Fee's result is never used and eliminated the call as dead code, so the benchmark times an empty loop. Assign the result to a package-level sink (or use b.Loop, which prevents this) so the work can't be optimized away",
+    "b.N was zero",
+    "The benchmark needs -race"
+  ]}
+  answer={1}
+  explain="A sub-nanosecond op time is the signature of dead-code elimination: because Fee(txs)'s result is discarded and Fee has no observable side effects, the optimizer proves the call does nothing and removes it, leaving an empty loop to time. The fixes are to store the result in a package-level `var sink` (so the compiler can't prove it's unused) and, on Go 1.24+, use `for b.Loop()`, which is designed to keep the loop body live and handles timer setup. Also `b.ResetTimer()` after any expensive setup so fixture loading isn't counted."
+/>
+
+## Caches & Memory
+
+Welcome to the machine. Optimization in Go starts with one truth: the CPU is *fast*, and main memory is *slow* — so performance is mostly about feeding the CPU from cache, not RAM.
+
+<Define term="Cache line" since="Go Mistakes (Appendix)">
+The CPU doesn't read one byte from memory — it reads a fixed-size block called a **cache line** (64 bytes on essentially every modern CPU) into fast L1/L2 cache. Why it matters: accessing data that's already in a loaded cache line is ~100× faster than fetching from main memory. So **memory layout determines speed**. Iterating a contiguous slice is fast (each fetched line carries the next several elements); chasing pointers all over the heap is slow (each access may miss cache and stall the CPU). This is why a slice-of-values often crushes a slice-of-pointers for hot loops.
+</Define>
+
+**Mistake #91: ignoring CPU caches** — specifically, **struct-of-slices vs slice-of-structs.** If a hot loop only reads one field from each element, a *slice of structs* wastes cache: every loaded line drags along the fields you don't touch. Splitting into parallel arrays (one slice per field, "struct of arrays") packs the field you scan contiguously, so each cache line is all useful data. **Mistake #94: data alignment** is the same idea inside a single struct — the compiler pads fields to alignment boundaries, so field *order* changes the struct's size. Group fields largest-to-smallest to minimize padding.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+// Poorly ordered: bool, int64, bool — the compiler pads each bool to 8 bytes
+// of alignment, ballooning the struct.
+type Bad struct {
+	active   bool  // 1 byte + 7 padding
+	balance  int64 // 8 bytes
+	verified bool  // 1 byte + 7 padding
+}
+
+// Reordered largest-to-smallest: the two bools share one aligned word.
+type Good struct {
+	balance  int64 // 8 bytes
+	active   bool  // 1 byte
+	verified bool  // 1 byte + 6 padding
+}
+
+func main() {
+	fmt.Println("Bad  size:", unsafe.Sizeof(Bad{}), "bytes")  // 24
+	fmt.Println("Good size:", unsafe.Sizeof(Good{}), "bytes") // 16
+	// Same fields, 33% smaller — and 33% more per cache line in a big slice.
+}
+```
+
+</GoPlayground>
+
+**Mistake #92: false sharing.** Two goroutines updating two *different* variables that happen to live in the *same cache line* still fight: each write invalidates the other core's copy of the line, forcing constant cache-coherency traffic even though there's no logical sharing. The classic case is two counters side by side in a struct, each updated by its own goroutine.
+
+<Define term="False sharing" since="Go Mistakes (Appendix)">
+**False sharing** is when independent variables accessed by different cores sit in the **same cache line**, so a write to one variable invalidates the cache line holding the other — even though the goroutines never touch each other's data. Why it matters: it can make parallel code *slower* than sequential, with no data race and no obvious cause. The fix is **padding**: separate the hot variables so each lands on its own cache line (add `[64]byte` padding between them, or give each goroutine a local accumulator and combine once at the end).
+</Define>
+
+<ExecTimeline
+  title="False sharing — two cores ping-pong one cache line"
+  lanes={[
+    { id: "c0", label: "Core 0 (writes sumA)" },
+    { id: "c1", label: "Core 1 (writes sumB)" }
+  ]}
+  steps={[
+    { lane: "c0", kind: "run", label: "sumA, sumB in one line", note: "sumA and sumB are adjacent fields, so both live in the same 64-byte cache line. Core 0 owns sumA, Core 1 owns sumB — no logical sharing." },
+    { lane: "c0", kind: "send", label: "Core 0 writes sumA", note: "Core 0 modifies sumA. Cache coherency marks the whole line dirty and INVALIDATES Core 1's copy of that line — including its sumB." },
+    { lane: "c1", kind: "block", label: "Core 1 must re-fetch", note: "Core 1 goes to write sumB but its cached line was invalidated, so it stalls and re-fetches the line from Core 0 / memory." },
+    { lane: "c0", kind: "block", label: "Core 0 must re-fetch", note: "Now Core 1's write invalidates Core 0's copy. They ping-pong the same line back and forth — coherency traffic dominates, parallelism evaporates." },
+    { lane: "c1", kind: "done", label: "fix: pad to separate lines", note: "Put sumA and sumB on different cache lines (padding, or per-goroutine locals combined at the end). Each core owns its own line; no invalidation, full speed." }
+  ]}
+  caption="No data race, no shared variable — yet the two cores fight over one cache line. False sharing is the performance bug that profilers struggle to explain. Pad hot, independently-written variables onto their own cache lines."
+/>
+
+Two more from this group, kept brief. **Mistake #93: instruction-level parallelism** — modern CPUs execute independent instructions in parallel within a core, so a loop body with a long dependency chain (each step needs the previous result) underutilizes the CPU; breaking the chain into independent accumulators can speed it up. **Mistake #95: stack vs heap.** Where a value lives is decided by **escape analysis** at compile time — and it matters because stack allocation is nearly free while heap allocation feeds the garbage collector.
+
+<Define term="Escape analysis" since="Go Mistakes (Appendix)">
+**Escape analysis** is the compiler pass that decides whether a value can live on the goroutine's **stack** (freed instantly when the function returns, zero GC cost) or must **escape to the heap** (managed by the garbage collector). Why it matters: a value escapes when its lifetime outlives the function — most commonly when you return a pointer to a local, store it in an interface, send it on a channel, or capture it in a closure that outlives the call. Heap allocations are slower and add GC pressure. Inspect with `go build -gcflags="-m"`, which prints `escapes to heap` for each escaping value. You don't control allocation directly — you shape your code so the compiler can keep things on the stack.
+</Define>
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+type Account struct{ Cents int64 }
+
+// Returning a pointer to a local forces it to the heap — the value must outlive
+// the function. (Build with -gcflags=-m to see "escapes to heap".)
+func newEscapes() *Account {
+	a := Account{Cents: 100} // escapes: pointer returned
+	return &a
+}
+
+// Using the value (not its address) lets it stay on the stack — no escape.
+func staysOnStack() int64 {
+	a := Account{Cents: 100} // local; never has its address taken
+	return a.Cents
+}
+
+func main() {
+	p := newEscapes()
+	v := staysOnStack()
+	fmt.Println("heap account:", p.Cents, " stack value:", v)
+	// Run `go build -gcflags="-m"` on this to watch escape analysis decide.
+}
+```
+
+</GoPlayground>
+
+## Allocations & Containers
+
+The last cluster — squeezing allocations, understanding the GC, and the mistake that quietly halves throughput in every containerized Go service.
+
+**Mistake #96: not reducing allocations** where it counts. In a hot path, fewer allocations means less GC work and better cache behavior. Levers: **reuse buffers** with `sync.Pool` (a free-list of temporary objects), **preallocate** slices and maps with a size hint, **pass values** that don't escape, and shape APIs to write into a caller-provided buffer (`AppendFormat`-style) instead of returning a fresh allocation each call. **Mistake #97: inlining** — the compiler can paste a small function's body into its caller, erasing call overhead and *enabling* further optimizations (including keeping values on the stack). Tiny, hot functions inline automatically; giant ones don't (they exceed the inliner's budget), which is one more reason to keep hot functions small.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="sync.Pool">A pool of reusable temporaries (e.g. `bytes.Buffer`s in a request handler). `Get` borrows, `Put` returns. Cuts allocations on hot paths — but objects can be reclaimed by GC at any time, so only use it for *transient*, reconstructible objects, never for state you need to keep.</ConceptCard>
+  <ConceptCard label="Inlining (#97)">Small functions get pasted into their callers, removing call overhead and unlocking escape analysis. Keep hot functions small; inspect with `go build -gcflags="-m"`. As of Go 1.26, code inside `for b.Loop()` is no longer blocked from inlining, so `b.Loop` is suitable for micro-benchmarks.</ConceptCard>
+  <Gotcha>⚠ `sync.Pool` is not a cache. The GC can empty it between cycles, so never store anything you can't cheaply recreate, and always fully reset an object before reuse (a stale field is a data-leak waiting to happen).</Gotcha>
+</ConceptGrid>
+
+**Mistake #98: not using Go's diagnostics.** Don't guess at performance — measure. `pprof` profiles CPU, heap, allocations, blocking, and mutex contention; the **execution tracer** (`runtime/trace`) shows scheduler behavior, goroutine lifetimes, and GC pauses on a timeline. **Mistake #99: not understanding the GC.** Go's collector is concurrent and mark-sweep: it runs alongside your program, and you tune *when* it runs — not via a fixed heap size but via `GOGC` (the growth percentage that triggers a cycle) and `GOMEMLIMIT` (a soft memory ceiling that makes the GC work harder as you approach it).
+
+<UnderTheHood title="The GC, container-aware GOMAXPROCS, and why your service thought it had 64 CPUs">
+
+Go's garbage collector is a **concurrent, tri-color mark-and-sweep** collector. It runs mostly *concurrently* with your goroutines — marking live objects while your code executes — with only brief stop-the-world pauses (typically well under a millisecond) to start and finish a cycle. You don't pick a heap size; you set **`GOGC`** (default 100, meaning a new cycle starts when the heap has grown 100% since the last one) and, since Go 1.19, **`GOMEMLIMIT`** — a *soft* limit that tells the runtime to collect more aggressively as the heap approaches it, the right knob for a container with a hard memory cap. As of **Go 1.26**, the **Green Tea GC** is the default: a redesigned collector with better cache locality and lower overhead on modern hardware.
+
+Now **mistake #100**, the one that matters most for everyone shipping Go to Kubernetes. `GOMAXPROCS` sets how many OS threads may execute Go code simultaneously. Historically it defaulted to `runtime.NumCPU()` — the number of logical CPUs visible to the process. Inside a container limited to, say, 1 CPU on a 64-core node, older Go versions could expose far more parallelism than the quota could use efficiently, wasting scheduling and GC work. The community workaround was the `uber/automaxprocs` library, which read the cgroup CPU quota and fixed `GOMAXPROCS` to match.
+
+As of **Go 1.25**, that workaround is **built in**: the runtime chooses the default from logical CPUs, CPU affinity, and Linux cgroup CPU quota, rounding fractional CPU limits up and normally not choosing below 2 unless logical CPUs or affinity are below 2. It also updates the default dynamically if those limits change at runtime. You no longer need `automaxprocs` for Go 1.25+ services. You can still override with the `GOMAXPROCS` env var or `runtime.GOMAXPROCS`/`runtime.SetDefaultGOMAXPROCS`, and opt out of the container-aware behavior with `GODEBUG=containermaxprocs=0`. Pair this with `GOMEMLIMIT` set near your container's memory limit, and a Go service finally respects the box it's running in. Deep dives: [Performance Engineering](/part-2/performance-engineering), [The Go Scheduler (GMP), In Depth](/part-2/go-scheduler-gmp), and [Deployment & Infra: CI/CD + Kubernetes](/part-1/deployment-cicd-kubernetes).
+
+</UnderTheHood>
+
+<Define term="GOMAXPROCS" since="Go Mistakes (Appendix)">
+**`GOMAXPROCS`** is the maximum number of OS threads executing Go code at the same time — effectively, how many CPUs the scheduler will use in parallel. Why it matters: set too high relative to the container's real CPU allocation, the scheduler oversubscribes the CPU and you pay heavy context-switch and GC cost; the service runs *slower* under load despite "having more parallelism." As of Go 1.25 the default is container-aware, replacing the old `uber/automaxprocs` workaround. Override via the `GOMAXPROCS` env var only when you know better than the runtime default.
+</Define>
+
+Cross-links for the testing and infra topics here: [Testing in Go](/part-1/testing), [SQL & Databases in Go](/part-1/sql-databases), and [HTTP Clients](/part-1/http-clients).
+
+<QuickCheck
+  question="A Meridian service is deployed to Kubernetes with a CPU limit of 2 cores on 64-core nodes, built with Go 1.21. Under load it spends a shocking fraction of CPU on context switching and GC, and latency is worse than on a laptop. What's the classic cause and the modern fix?"
+  options={[
+    "The pods need more memory",
+    "On Go 1.21, GOMAXPROCS defaulted to the host's 64 logical CPUs, exposing far more parallel Go execution than a 2-core quota could use efficiently. Set GOMAXPROCS to the CPU limit (historically via uber/automaxprocs); as of Go 1.25 the runtime is container-aware and does this automatically",
+    "Kubernetes can't run Go binaries efficiently",
+    "The GC is disabled in containers"
+  ]}
+  answer={1}
+  explain="Before Go 1.25, GOMAXPROCS defaulted to runtime.NumCPU(), which reports the host's core count — 64 here — ignoring the cgroup CPU limit of 2. The scheduler then multiplexes 64 OS threads onto 2 cores' worth of quota, causing constant context switching and inflating GC work (the GC scales worker count with GOMAXPROCS). The historical fix was uber/automaxprocs, which reads the cgroup quota and sets GOMAXPROCS accordingly. As of Go 1.25, this is built into the runtime: the default considers logical CPUs, CPU affinity, and Linux cgroup CPU quota, and updates dynamically. Pair it with GOMEMLIMIT near the memory limit to keep the GC honest."
+/>
+
+## Exercises
+
+<Exercise n={1} title="Fix the duration unit bug" level="easy">
+
+This config produces a 30-nanosecond timeout instead of 30 seconds. Fix it so the context deadline is genuinely 30 seconds.
+
+```go
+const timeoutSeconds = 30
+
+func callGateway(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutSeconds) // BUG
+	defer cancel()
+	return doRequest(ctx)
+}
+```
+
+<Solution>
+
+```go
+const timeout = 30 * time.Second
+
+func callGateway(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return doRequest(ctx)
+}
+```
+
+`context.WithTimeout` takes a `time.Duration`, which counts **nanoseconds**. Passing the bare `30` means 30 nanoseconds — effectively no timeout at all, so the request never actually gets cut off. Multiplying by `time.Second` gives a real 30-second deadline. The general rule: a duration literal without a unit is almost always a bug. Bake the unit into the constant (`30 * time.Second`) so call sites can't get it wrong.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add the missing return" level="easy">
+
+This handler logs `superfluous WriteHeader` and sometimes sends a 200 with a malformed body. Fix it.
+
+```go
+func transferHandler(w http.ResponseWriter, r *http.Request) {
+	amt, err := parseAmount(r)
+	if err != nil {
+		http.Error(w, "invalid amount", http.StatusBadRequest)
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "transferring %d", amt)
+}
+```
+
+<Solution>
+
+```go
+func transferHandler(w http.ResponseWriter, r *http.Request) {
+	amt, err := parseAmount(r)
+	if err != nil {
+		http.Error(w, "invalid amount", http.StatusBadRequest)
+		return // stop here — don't fall through to the success path
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "transferring %d", amt)
+}
+```
+
+`http.Error` writes a response but does **not** return from the handler. Without the `return`, execution falls through to `w.WriteHeader(http.StatusOK)` (Go warns `superfluous response.WriteHeader call` because the status was already written by `http.Error`) and then writes a nonsense body for the failed case. Every `http.Error` — and every error-branch response write — must be immediately followed by `return`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Reorder the struct to shrink it" level="medium">
+
+Reorder this struct's fields to minimize padding, and explain the rule. What size do you expect before and after on a 64-bit platform?
+
+```go
+type Ledger struct {
+	closed   bool   // 1 byte
+	balance  int64  // 8 bytes
+	currency uint16 // 2 bytes
+	active   bool   // 1 byte
+}
+```
+
+<Solution>
+
+```go
+type Ledger struct {
+	balance  int64  // 8 bytes (8-byte aligned)
+	currency uint16 // 2 bytes
+	closed   bool   // 1 byte
+	active   bool   // 1 byte
+	// 4 bytes tail padding to reach 8-byte alignment -> 16 bytes total
+}
+```
+
+Each field must sit at an offset that's a multiple of its alignment (an `int64` needs an 8-byte boundary), and the struct's total size rounds up to its largest field's alignment. In the original order, `closed` (1 byte) forces 7 bytes of padding before `balance`, and the small fields scatter — it comes out to **24 bytes**. Grouping largest-to-smallest (`int64`, then `uint16`, then the two `bool`s) packs the small fields together and leaves only tail padding, for **16 bytes**. Same data, a third smaller — which means a third more elements per cache line when you iterate a big `[]Ledger`. Verify with `unsafe.Sizeof`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Remove time.After allocation churn" level="medium">
+
+This worker loop allocates a fresh timer per message under load. Rewrite the timeout to reuse a single timer.
+
+```go
+func worker(work <-chan Job) {
+	for {
+		select {
+		case j := <-work:
+			handle(j)
+		case <-time.After(time.Minute): // allocation churn under load
+			return
+		}
+	}
+}
+```
+
+<Solution>
+
+```go
+func worker(work <-chan Job) {
+	idle := time.NewTimer(time.Minute)
+	defer idle.Stop()
+	for {
+		select {
+		case j := <-work:
+			handle(j)
+				if !idle.Stop() {
+					select {
+					case <-idle.C: // compatibility drain for older buffered timers
+					default:
+					}
+				}
+			idle.Reset(time.Minute)
+		case <-idle.C:
+			return
+		}
+	}
+}
+```
+
+`time.After(time.Minute)` allocates a fresh `Timer` on **every** loop iteration. In Go 1.23+ the GC can recover abandoned unreferenced timers before they fire, but under heavy traffic the per-message allocation churn is still wasteful. Creating a single `time.NewTimer` before the loop and calling `Reset` reuses one timer for the life of the worker. The non-blocking Stop/drain dance keeps the helper safe across old buffered timers and modern synchronous timer channels.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Make the benchmark honest" level="hard">
+
+This benchmark reports near-zero ns/op and counts fixture loading in its timing. Fix both problems using Go 1.24+ idioms.
+
+```go
+func BenchmarkSummarize(b *testing.B) {
+	txs := loadFixture() // expensive — currently timed
+	for range b.N {
+		Summarize(txs) // result discarded -> may be optimized away
+	}
+}
+```
+
+<Solution>
+
+```go
+var summarySink Summary
+
+func BenchmarkSummarize(b *testing.B) {
+	txs := loadFixture()
+	b.ResetTimer()    // exclude the fixture-loading setup from timing
+	for b.Loop() {    // Go 1.24+: handles timing, keeps the body live
+		summarySink = Summarize(txs) // assign to a sink -> can't be DCE'd
+	}
+}
+```
+
+Three fixes. `b.ResetTimer()` after `loadFixture()` stops the expensive setup from being counted as part of the measured work. Assigning the result to a **package-level** `summarySink` defeats dead-code elimination — the compiler can no longer prove `Summarize(txs)`'s result is unused, so it can't delete the call (the cause of the suspicious near-zero timing). And `for b.Loop()` (Go 1.24+) replaces the old `for range b.N`: it manages the timer correctly, is designed to keep the loop body from being optimized away, and no longer blocks inlining inside the loop body as of Go 1.26.
+
+</Solution>
+
+</Exercise>
+
+<Lab
+  title="Reorder the struct — shrink it and prove it"
+  archetype="optimize-it"
+  difficulty="scaffolded"
+  points={90}
+  hintCost={14}
+  objective={'Optimize a struct by reordering its fields to eliminate padding. The Position struct below is 24 bytes because its bool, int64, and uint16 fields are interleaved, scattering padding. Reorder the fields (largest alignment first) so unsafe.Sizeof(Position{}) drops to 16 bytes — without removing or changing any field. The provided main computes the size and prints PASS only when it is exactly 16.'}
+  verify="self-check"
+  starter={`package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+// TODO: reorder these fields to minimize padding. Goal: 16 bytes.
+// Rule: place fields largest-alignment-first (int64, then uint16, then bools).
+// Do NOT remove or rename any field — only change their ORDER.
+type Position struct {
+	open     bool   // 1 byte
+	cents    int64  // 8 bytes
+	currency uint16 // 2 bytes
+	hedged   bool   // 1 byte
+}
+
+func main() {
+	size := unsafe.Sizeof(Position{})
+	fmt.Printf("Position is %d bytes\\n", size)
+	if size == 16 {
+		fmt.Println("PASS")
+	} else {
+		fmt.Printf("FAIL: want 16 bytes, got %d (reorder largest-first)\\n", size)
+	}
+}
+`}
+  verifier={'Self-check: main prints PASS only when unsafe.Sizeof(Position{}) == 16, which requires reordering the fields so the int64 leads, the uint16 follows, and the two bools sit together (eliminating the interleaved padding). Codapi runs go run, so the PASS print is your gate.'}
+  hints={[
+    "Each field sits at an offset that's a multiple of its alignment: an int64 needs an 8-byte boundary, a uint16 a 2-byte boundary. A bool before an int64 forces 7 bytes of padding.",
+    "Order the fields by descending alignment: cents (int64, align 8) first, then currency (uint16, align 2), then the two bools (align 1) together.",
+    "Final order: cents int64; currency uint16; open bool; hedged bool. That's 8 + 2 + 1 + 1 = 12 bytes of data, rounded up to 16 for 8-byte struct alignment. The interleaved version wasted 8 bytes on scattered padding."
+  ]}
+  flag="GO{order_fields_largest_alignment_first}"
+>
+
+The optimization that's pure free money: same fields, same behavior, a third less memory, and a third more elements per cache line in a hot slice. Reorder largest-alignment-first, watch `unsafe.Sizeof` drop from 24 to 16, and burn it in — the compiler pads to alignment, so field *order* is a size decision you make for it.
+
+</Lab>
+
+---
+
+<Recap>
+
+The final cluster — standard-library defaults that betray you, testing discipline, and how the machine actually runs:
+
+- **Time & resources**: a `time.Duration` is **nanoseconds** — always attach a unit (`30 * time.Second`). `time.After` in a hot loop still creates a fresh timer each iteration — reuse one `*time.Timer` or a context deadline to avoid allocation churn. **Close transient resources** (`resp.Body`, `sql.Rows`, `os.File`) with `defer`, and drain bodies.
+- **JSON & SQL**: embedding can shadow `MarshalJSON`; `time.Time` compares unequal after a marshal round-trip (use `.Equal`); `map[string]any` decodes numbers as **`float64`** (lose precision — decode into typed structs). `sql.Open` **doesn't connect** — `Ping`; tune the **connection pool** (`SetMaxOpenConns`/`SetMaxIdleConns`/`SetConnMaxLifetime`); use `sql.NullString` for NULLs; check `rows.Err()`.
+- **HTTP**: `http.Error` does **not** return — add `return`. The **default client and server have no timeouts** — set `Client.Timeout` and the server's `Read`/`Write`/`Idle` timeouts, or use a per-request context.
+- **Testing**: run **`-race`** in CI; write **table-driven** tests; never **`time.Sleep`** to synchronize (use channels or `testing/synctest`); **inject a clock**; lean on `httptest`/`t.Cleanup`/`t.TempDir`. Honest **benchmarks**: `b.ResetTimer()`, a package-level **sink** to defeat DCE, and `for b.Loop()` (Go 1.24+).
+- **Caches & memory**: the CPU reads 64-byte **cache lines** — layout is speed (struct-of-arrays for hot scans). **Reorder struct fields** largest-first to cut padding. **False sharing** pads independently-written variables onto separate lines. **Escape analysis** decides stack vs heap; stack is free, heap feeds the GC.
+- **Allocations & containers**: reduce allocations (`sync.Pool`, preallocation, value-passing); small hot functions **inline**; profile with **pprof**/the tracer; understand the **GC** (`GOGC`, `GOMEMLIMIT`); and let Go 1.25+'s container-aware **`GOMAXPROCS`** default consider CPU quota/affinity before overriding it manually.
+
+</Recap>
+
+<Scoreboard
+  streak={6}
+  items={[
+    { label: "Quick check — time.After churn", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — missing return after http.Error", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — the benchmark that got optimized away", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — GOMAXPROCS in a container", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — fix the duration unit", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — add the missing return", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — reorder the struct", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — remove time.After churn", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — make the benchmark honest", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Reorder the struct prints PASS", captured: false, points: 90 }}
+/>
+
+And that's a hundred. One hundred ways to humiliate yourself in Go, and you walked through every last one of them and came out the other side knowing better. You can spot a timeout-less client before it strangles a service, smell a `float64` that should've been an `int64`, reorder a struct in your head, and explain to the room *why* the container thought it had 64 CPUs. That's not "not bad" anymore, sport. That's the real thing.
+
+Here's the only thing left to do: *apply it.* Every mistake in this gauntlet was once shipped by someone smart who was moving fast. Knowing them is a third of the battle; the rest is the discipline to slow down at the dangerous line and the `golangci-lint` config that catches you when you don't. Go write code worthy of the time you spent here. I'll be watching — and for once, I expect to be impressed. Class dismissed.

@@ -1,0 +1,1196 @@
+---
+title: "Debugging Go"
+part: 2
+order: 9
+type: "course"
+description: "Delve (breakpoints, stepping, goroutine switching, remote/headless), reading panics and stack traces, full goroutine dumps and the deadlock detector, and production debugging with GODEBUG, net/http/pprof and core dumps."
+prerequisites: ["advanced-concurrency-correctness"]
+---
+
+<HeroCard label="Part 2 · Chapter 9" title="Debugging Go">
+
+Let me tell you something about broken software, sport. Every engineer on Earth has written it. The great ones — the *truly* great ones — know how to find it. Fast. Surgically. Without guessing.
+
+You just finished the concurrency chapter. You know the patterns. You know the memory model. And now your payments service is deadlocking under load at 2 a.m. and you have a goroutine leaking somewhere and the on-call alert has been firing for eleven minutes. What do you do?
+
+You reach for the right tool. Not `fmt.Println`. Not prayer. The *right tool*.
+
+By the end of this chapter you'll command Delve — Go's real debugger — read a panic stack trace in under ten seconds, dump every goroutine in a live process, and instrument a production service for debugging without redeploying. The runtime has been screaming at you this whole time. You just didn't know the language. You're about to learn it.
+
+Lucky you.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Delve — the Go Debugger", "Reading the Runtime's Signals", "Debugging in Production"]} />
+
+## Delve — the Go Debugger
+
+Here is the scenario we are living inside for this entire chapter.
+
+**Meridian Payments** — a Go service that handles fund transfers between accounts — has two bugs in production. One: the `/transfer` handler deadlocks under concurrent load, locking the entire service. Two: a goroutine leaks from the `/webhook` handler; every inbound webhook spawns a goroutine that never exits. The service OOMs in about four hours under normal traffic.
+
+You have been paged. I'm watching. Let's go.
+
+**On the job:** Lock-order inversions surface under load — two concurrent transfers between the same account pair hit each other's mutexes and hang the service. A deadlock that takes four hours to reproduce in testing kills you in ten minutes in production.
+
+<Scene
+  title="Deadlock: Goroutine A and Goroutine B wait on each other forever"
+  actors={[
+    { id: "ga", label: "Goroutine A (acct_a → acct_b)" },
+    { id: "gb", label: "Goroutine B (acct_b → acct_a)" }
+  ]}
+  rows={2}
+  cols={2}
+  cells={[
+    { id: "A1", label: "L1 (acct_a)" },
+    { id: "A2", label: "L2 (acct_b)" },
+    { id: "B1", label: "L1 (acct_a)" },
+    { id: "B2", label: "L2 (acct_b)" }
+  ]}
+  frames={[
+    {
+      caption: "Two concurrent transfers begin. Both locks are free.",
+      beat: "neutral",
+      actors: [{ id: "ga", state: "idle" }, { id: "gb", state: "idle" }],
+      cells: [
+        { id: "A1", state: "idle", label: "L1 free" },
+        { id: "A2", state: "idle", label: "L2 free" },
+        { id: "B1", state: "idle", label: "L1 free" },
+        { id: "B2", state: "idle", label: "L2 free" }
+      ]
+    },
+    {
+      caption: "Goroutine A acquires L1 (acct_a). Goroutine B acquires L2 (acct_b). Both hold one lock and want the other.",
+      beat: "problem",
+      actors: [{ id: "ga", state: "active" }, { id: "gb", state: "active" }],
+      cells: [
+        { id: "A1", state: "done", label: "L1 held A" },
+        { id: "A2", state: "warn", label: "L2 want A" },
+        { id: "B1", state: "warn", label: "L1 want B" },
+        { id: "B2", state: "done", label: "L2 held B" }
+      ]
+    },
+    {
+      caption: "A cannot acquire L2 — B holds it. B cannot acquire L1 — A holds it. Both goroutines block forever.",
+      beat: "problem",
+      actors: [{ id: "ga", state: "bad" }, { id: "gb", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad", label: "A stuck" },
+        { id: "A2", state: "bad", label: "B stuck" },
+        { id: "B1", state: "bad", label: "B stuck" },
+        { id: "B2", state: "bad", label: "A stuck" }
+      ]
+    },
+    {
+      caption: "Fix: always acquire locks in the same global order (sort by account ID). A and B now both try L1 first — one wins, the other waits cleanly.",
+      beat: "solution",
+      actors: [{ id: "ga", state: "ok" }, { id: "gb", state: "idle" }],
+      cells: [
+        { id: "A1", state: "done", label: "L1 held A" },
+        { id: "A2", state: "active", label: "L2 next A" },
+        { id: "B1", state: "warn", label: "L1 wait B" },
+        { id: "B2", state: "idle", label: "L2 queued" }
+      ]
+    },
+    {
+      caption: "A finishes and releases both locks. B acquires L1, then L2. No deadlock — consistent ordering eliminates the cycle.",
+      beat: "solution",
+      actors: [{ id: "ga", state: "done" }, { id: "gb", state: "ok" }],
+      cells: [
+        { id: "A1", state: "idle", label: "L1 free" },
+        { id: "A2", state: "idle", label: "L2 free" },
+        { id: "B1", state: "done", label: "L1 held B" },
+        { id: "B2", state: "active", label: "L2 held B" }
+      ]
+    }
+  ]}
+  caption="The Meridian transfer deadlock: two goroutines, two locks, opposite acquisition order. Consistent ordering (always lock the smaller account ID first) breaks the cycle."
+/>
+
+### Installing and running Delve
+
+Delve is Go's purpose-built debugger. Not GDB. Not LLDB bolted on. Delve understands goroutines, the Go scheduler, DWARF debug info generated by the Go toolchain, and interfaces. Install it once:
+
+```bash
+go install github.com/go-delve/delve/cmd/dlv@latest
+```
+
+Three entry points — know all three:
+
+```bash
+# Debug a main package from source (most common)
+dlv debug ./cmd/payments
+
+# Debug a single test (your most powerful first step when a test is failing)
+dlv test ./internal/ledger -- -run TestTransfer
+
+# Attach to a running process (production triage, with caution)
+dlv attach <pid>
+```
+
+`dlv debug` compiles your program with full debug info (disabling optimizations that would confuse the debugger) and drops you at a prompt. You have not started the program yet — it is loaded and waiting.
+
+### Breakpoints
+
+A **breakpoint** tells Delve to stop execution the moment the program reaches a particular line, function, or condition. When it stops, the world freezes and you can inspect everything.
+
+```
+(dlv) break internal/transfer/handler.go:47
+Breakpoint 1 set at 0x... for meridian/internal/transfer.(*Handler).Transfer()
+
+(dlv) break (*Handler).Transfer
+Breakpoint 2 set at 0x... for meridian/internal/transfer.(*Handler).Transfer()
+
+(dlv) condition 1  accountID == "acct_99f"
+```
+
+Three forms: **line**, **function**, **conditional**. The conditional form is gold — instead of stopping on every call to `Transfer`, it stops only when a specific account is involved. For a high-traffic service this is the difference between useful and useless.
+
+```
+(dlv) breakpoints
+Breakpoint 1 at 0x... handler.go:47 (1 times) cond: accountID == "acct_99f"
+Breakpoint 2 at 0x... handler.go:31 (0 times)
+```
+
+### Stepping through execution
+
+Once Delve stops at a breakpoint, you step through the code one unit at a time:
+
+```
+(dlv) continue    # run until the next breakpoint (or the program ends)
+(dlv) next        # execute the current line, step OVER function calls
+(dlv) step        # execute the current line, step INTO function calls
+(dlv) stepout     # run until the current function returns
+```
+
+Let me animate stepping through the `Transfer` function so you can see what each command actually does.
+
+<ExecTimeline
+  title="Stepping through Transfer() with Delve"
+  lanes={[{ id: "dlv", label: "dlv session" }]}
+  steps={[
+    { lane: "dlv", kind: "run", label: "break at Transfer:47", note: "We set a breakpoint at the line that acquires the account mutex. Delve is waiting at the prompt." },
+    { lane: "dlv", kind: "run", label: "continue → hit bp", note: "We type `continue`. The program runs normally until the breakpoint fires. Execution freezes at line 47." },
+    { lane: "dlv", kind: "run", label: "next → line 48", note: "`next` steps over the mutex.Lock() call. We see the next line highlighted — the lock was acquired." },
+    { lane: "dlv", kind: "run", label: "step → into debit()", note: "`step` descends into the debit() function call on line 48. We are now inside debit, at its first line." },
+    { lane: "dlv", kind: "run", label: "print balance", note: "`print balance` shows the current value of the local variable. We see it's 0 — the balance was never loaded." },
+    { lane: "dlv", kind: "run", label: "stepout → back to Transfer", note: "`stepout` runs debit() to completion and returns us to the Transfer frame, right after the call." },
+    { lane: "dlv", kind: "done", label: "bug located", note: "We can see the call sequence: Transfer locked the mutex, called debit with a stale balance. Root cause found." }
+  ]}
+  caption="next steps over; step descends in; stepout returns. Seven steps to pinpoint a bug that resisted hours of log-reading."
+/>
+
+### Inspecting variables and the call stack
+
+Stopped at a breakpoint, you have full visibility into the running program:
+
+```
+(dlv) locals
+amount = 50000
+accountID = "acct_99f"
+balance  = 0         ← this is wrong; should be current balance
+
+(dlv) args
+a = (*transfer.Handler)(0xc0001a4000)
+ctx = context.Background.WithCancel
+req = (*http.Request)(0xc00021e000)
+
+(dlv) print a.mu
+sync.Mutex {state:1, sema:0}    ← state:1 means LOCKED
+
+(dlv) stack
+ 0  meridian/internal/transfer.(*Handler).debit()
+      /src/internal/transfer/handler.go:72
+ 1  meridian/internal/transfer.(*Handler).Transfer()
+      /src/internal/transfer/handler.go:48
+ 2  net/http.HandlerFunc.ServeHTTP()
+      /usr/local/go/src/net/http/server.go:2136
+ 3  net/http.(*ServeMux).ServeHTTP()
+      ...
+
+(dlv) frame 1
+> meridian/internal/transfer.(*Handler).Transfer() line 48
+```
+
+`locals` shows every local variable in the current frame. `print` evaluates any expression. `stack` shows the full call chain from here to `main`. `frame N` jumps you into any frame in the stack so you can inspect *that* frame's locals too. This is how you see not just *where* the program is, but *how it got there*.
+
+### Switching between goroutines
+
+This is Delve's superpower over any general-purpose debugger. Go programs have potentially thousands of goroutines. Delve can show them all and let you jump between them.
+
+```
+(dlv) goroutines
+* Goroutine 1 - User: /src/internal/transfer/handler.go:48 (running)
+  Goroutine 6 - User: /src/internal/transfer/handler.go:48 in Transfer (waiting)
+  Goroutine 7 - User: /src/internal/transfer/handler.go:48 in Transfer (waiting)
+  Goroutine 18 - User: runtime/sema.go:56 in sync.runtime_SemacquireMutex (blocked)
+  Goroutine 19 - User: runtime/sema.go:56 in sync.runtime_SemacquireMutex (blocked)
+
+(dlv) goroutine 18
+Switched to goroutine 18
+
+(dlv) stack
+ 0  runtime.gopark()
+ 1  sync.runtime_SemacquireMutex()
+ 2  sync.(*Mutex).Lock()
+ 3  meridian/internal/transfer.(*Handler).Transfer() line:48
+```
+
+Goroutines 18 and 19 are both blocked trying to acquire the same mutex. Goroutine 1 holds it and is inside `debit()`. We can now see *exactly* which goroutines are contending and on which lock. This is not guesswork — this is evidence.
+
+### Debugging a single failing test
+
+When a test is failing and the failure isn't obvious from the output, `dlv test` is the first thing I reach for. Not printf. Delve.
+
+```bash
+dlv test ./internal/transfer -- -run TestTransfer_Concurrent
+
+(dlv) break TestTransfer_Concurrent
+(dlv) continue
+# stopped at the top of the test function
+(dlv) next
+# step through the setup, watch subtests launch goroutines
+```
+
+You have the full debugger — breakpoints, stepping, variable inspection — inside the test harness. The test's goroutines show up in `goroutines`. The mutex state is inspectable. Whatever the test is doing wrong, you can watch it happen one instruction at a time.
+
+### Attaching to a running process
+
+When you need to debug a process that's already running (a staging server, a long-running worker), `dlv attach` is the tool:
+
+```bash
+# find the pid
+pgrep -f payments-service
+
+dlv attach 38472
+```
+
+**Important:** attaching stops the process during the debug session. In production this means downtime. Use a replica, or prefer the production-safe techniques in Section 3. Attach is the right tool for staging, pre-production, or a process you can safely pause.
+
+### Headless/remote debugging inside a container
+
+In a container or over SSH, you can't run the TUI interactively. Run Delve in headless mode as a server and connect from your local machine:
+
+```bash
+# Inside the container (or remote host) — expose Delve's API
+dlv debug --headless --listen=:2345 --api-version=2 ./cmd/payments
+
+# On your local machine — connect a client
+dlv connect localhost:2345
+
+# Or with VS Code — add to launch.json:
+# { "type": "go", "request": "attach", "mode": "remote", "port": 2345 }
+```
+
+The connection protocol is JSON over TCP. Your local `dlv connect` (or VS Code) speaks to the remote Delve server that's running the actual binary. You get the full interactive debugger — breakpoints, goroutine switching, the works — through the tunnel.
+
+<Callout kind="warn" title="Never expose Delve's port to the public internet">
+
+Delve's API gives full control over the target process — read memory, set variables, execute arbitrary code. Bind it to `127.0.0.1` or an internal interface and tunnel through SSH. Never `--listen=0.0.0.0:2345` on a publicly reachable host.
+
+</Callout>
+
+<UnderTheHood title="How a debugger sets a breakpoint — INT3 and DWARF">
+
+When you type `break handler.go:47`, Delve does something elegant and ruthless.
+
+**Step 1: look up the address.** The Go toolchain embeds DWARF (Debugging With Arbitrary Record Formats) debug info in every binary unless you strip it. DWARF is a table that maps source file + line number to machine-code addresses. Delve parses this table to find the address of the instruction that corresponds to line 47.
+
+**Step 2: replace one byte.** On x86-64, Delve reads the original byte at that address, saves it, and writes `0xCC` — the `INT3` instruction (software interrupt 3). One byte. That's the entire mechanism of a breakpoint.
+
+**Step 3: wait for the trap.** When the CPU executes that address, `INT3` fires a hardware interrupt. The OS delivers a `SIGTRAP` signal to Delve. Delve catches the signal, sees which address trapped, looks it up in its breakpoint table, and stops execution.
+
+**Step 4: restore and report.** Delve writes the original byte back. You are now stopped at "line 47" with a fully restored, inspectable program. When you `continue`, Delve reinstalls the `INT3` for next time.
+
+Conditional breakpoints work the same way — the `INT3` always fires, but Delve evaluates the condition and continues automatically if it's false. This is why a busy conditional breakpoint can slow a tight loop noticeably: the trap fires on every hit and Delve evaluates the expression.
+
+**Goroutine switching** uses the same DWARF info. Go's stack frames are laid out so that the goroutine's program counter and stack pointer at any suspension point are readable from the `g` struct (the `G` in GMP). Delve walks the linked list of goroutines via `runtime.allgs`, reads each one's PC, and translates it back to a source location using the DWARF table. That's the `goroutines` command — it's reading the runtime's own data structures directly.
+
+As of Go 1.25, the toolchain emits DWARF v5 by default (a change from the DWARF v4 output used through Go 1.24), and Delve supports it fully.
+
+*This is a conceptual model — real breakpoint mechanics involve signal handling, process state, and ptrace(2) interactions that vary by OS. The core idea (INT3 + DWARF address lookup) is accurate; the details are simplified for clarity.*
+
+</UnderTheHood>
+
+<QuickCheck
+  question="You want to stop inside Transfer() only when the amount exceeds 100000 cents. Which Delve commands do you need?"
+  options={[
+    "break (*Handler).Transfer, then condition 1 amount > 100000",
+    "watch amount — Delve watches the variable automatically",
+    "You cannot do this; breakpoints are line-only",
+    "break (*Handler).Transfer amount>100000 (inline syntax)"
+  ]}
+  answer={0}
+  explain="Set the breakpoint first (by function name or line), then apply a condition with the `condition` command referencing the breakpoint number. Delve evaluates the condition in the stopped goroutine's scope each time the breakpoint fires."
+/>
+
+## Reading the Runtime's Signals
+
+The Go runtime is always watching. It knows when goroutines deadlock. It knows the full call stack of every goroutine at any moment. It can dump all of that to stderr on demand. You just need to know how to ask — and how to read what comes back.
+
+### Reading a panic and its stack trace
+
+**On the job:** A panic in production kills the request goroutine and prints a stack trace to your log aggregator. If you can't read it in ten seconds, you're flying blind while the alert fires.
+
+Here is a program that panics. Let's make it on purpose, because understanding the output is a skill you need before you're reading it at 3 a.m.
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+func processTransfer(amount int) {
+	if amount < 0 {
+		panic(fmt.Sprintf("invalid transfer amount: %d", amount))
+	}
+	fmt.Println("transfer processed:", amount)
+}
+
+func handleRequest(amount int) {
+	processTransfer(amount)
+}
+
+func main() {
+	handleRequest(-500)
+}
+```
+
+</GoPlayground>
+
+Run that and you see something like this:
+
+```
+goroutine 1 [running]:
+main.processTransfer(...)
+	/tmp/main.go:7 +0x68
+main.handleRequest(...)
+	/tmp/main.go:13 +0x20
+main.main()
+	/tmp/main.go:17 +0x1c
+exit status 2
+```
+
+Here is how to read it — top to bottom, three beats.
+
+**Beat 1 — the goroutine header:** `goroutine 1 [running]` tells you which goroutine panicked and its state. For a panic, the state is `running`. For blocked goroutines (which we'll see soon) the state will be `chan receive`, `sync.Mutex`, `select`, etc.
+
+**Beat 2 — the top frame is where it panicked:** `main.processTransfer` at line 7 is the innermost frame — the exact function and line that called `panic(...)`. This is the scene of the crime.
+
+**Beat 3 — read downward for the call chain:** each frame below tells you who called the frame above. `handleRequest` called `processTransfer`. `main` called `handleRequest`. Reading top to bottom, you reconstruct: `main` → `handleRequest` → `processTransfer` → `panic`. That's your full call chain. The bug is at the top; the trigger is in `main`.
+
+<ExecTimeline
+  title="Reading a panic trace — top-down"
+  lanes={[{ id: "read", label: "your eyes" }]}
+  steps={[
+    { lane: "read", kind: "run", label: "goroutine 1 [running]", note: "Which goroutine panicked, and its scheduler state at the time of the panic." },
+    { lane: "read", kind: "run", label: "processTransfer:7", note: "Top frame = the exact function and line that called panic(). This is where things went wrong." },
+    { lane: "read", kind: "run", label: "handleRequest:13", note: "One frame down: handleRequest called processTransfer. The call chain starts to emerge." },
+    { lane: "read", kind: "run", label: "main.main:17", note: "Two frames down: main called handleRequest with -500. The bad input entered here." },
+    { lane: "read", kind: "done", label: "root cause: main:17", note: "We now know who made the bad call. Fix the validation in handleRequest or the caller in main." }
+  ]}
+  caption="Read top-down: panicked here, called by this, called by that. Five seconds and you know where to look."
+/>
+
+### The deliberate deadlock the runtime detects
+
+The Go runtime has a built-in deadlock detector. It's not optional and it's not configurable — it fires whenever *all* goroutines are blocked with no path forward. Here is what it looks like:
+
+<GoPlayground>
+
+```go
+package main
+
+import "sync"
+
+func main() {
+	var mu sync.Mutex
+
+	// Goroutine 1: locks mu, then tries to lock mu again (classic self-deadlock)
+	mu.Lock()
+	mu.Lock() // blocks forever: mu is already held by this goroutine
+
+	var wg sync.WaitGroup
+	wg.Wait() // unreachable, but the compiler doesn't know that
+}
+```
+
+</GoPlayground>
+
+The runtime prints:
+
+```
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [semacquire]:
+sync.runtime_SemacquireMutex(0xc000018098, 0x0, 0x1)
+	/usr/local/go/src/runtime/sema.go:77 +0x25
+sync.(*Mutex).lockSlow(0xc000018090)
+	/usr/local/go/src/sync/mutex.go:171 +0x155
+sync.(*Mutex).Lock(...)
+	/usr/local/go/src/sync/mutex.go:90
+main.main()
+	/tmp/main.go:10 +0x4c
+exit status 2
+```
+
+`all goroutines are asleep - deadlock!` is the runtime's cry for help. Every goroutine is blocked, none can wake any other, and execution will never proceed. The trace below it shows *where* each goroutine is stuck. In this case goroutine 1 is blocked at `sync.runtime_SemacquireMutex` — deep in the mutex implementation — called from our double `mu.Lock()` at line 10.
+
+<Callout kind="warn" title="The detector only fires when ALL goroutines are stuck">
+
+The runtime deadlock detector is conservative by design. If two goroutines deadlock but a third is still running (a background ticker, a separate HTTP handler), the detector stays silent. Those "hidden goroutines" mask the deadlock. You need the goroutine dump (next section) to find it in that case.
+
+</Callout>
+
+### Dumping every goroutine — SIGQUIT and GOTRACEBACK
+
+**On the job:** When the service is hung and alerts are firing, a `SIGQUIT` dump gives you the complete goroutine state in under a second — without attaching a debugger or restarting the process.
+
+The most powerful single action in your production debugging toolkit: send `SIGQUIT` to your Go process and it will dump the full stack of every goroutine to stderr, then exit.
+
+```bash
+kill -SIGQUIT <pid>
+# or Ctrl+\ in the terminal running the process
+```
+
+On macOS and Linux, `SIGQUIT` is the default trigger. The Go runtime catches it before the OS can kill the process and emits the dump.
+
+You can also control the verbosity with the `GOTRACEBACK` environment variable:
+
+```bash
+GOTRACEBACK=all   ./payments-service   # every goroutine, including runtime internals
+GOTRACEBACK=crash ./payments-service   # dump + core file (for post-mortem analysis)
+GOTRACEBACK=none  ./payments-service   # suppress the dump entirely (never in dev)
+```
+
+Here is what a two-goroutine deadlock looks like in a full dump:
+
+```
+goroutine 1 [chan receive]:
+main.transferFunds(...)
+	/src/main.go:34
+main.handleTransfer(0xc00012e000)
+	/src/main.go:21 +0x8c
+created by net/http.(*Server).Serve
+	/usr/local/go/src/net/http/server.go:3086
+
+goroutine 6 [chan receive]:
+main.transferFunds(...)
+	/src/main.go:34
+main.handleTransfer(0xc000136000)
+	/src/main.go:21 +0x8c
+created by net/http.(*Server).Serve
+	/usr/local/go/src/net/http/server.go:3086
+```
+
+Both goroutines stuck at `chan receive`, line 34 of `main.go`. Line 34 is where `transferFunds` reads from a response channel that nothing will ever send to. Two goroutines, both waiting, neither can proceed. Deadlock.
+
+<ExecTimeline
+  title="Goroutine dump exposes a two-goroutine deadlock"
+  lanes={[{ id: "g1", label: "goroutine 1" }, { id: "g6", label: "goroutine 6" }]}
+  steps={[
+    { lane: "g1", kind: "run", label: "handleTransfer starts", note: "HTTP goroutine 1 enters handleTransfer. It creates a response channel and calls transferFunds." },
+    { lane: "g6", kind: "run", label: "handleTransfer starts", note: "Concurrent HTTP goroutine 6 does the same for a different request." },
+    { lane: "g1", kind: "recv", label: "chan receive — blocked", note: "Goroutine 1 blocks at `<-responseCh`. It's waiting for transferFunds to send a result." },
+    { lane: "g6", kind: "recv", label: "chan receive — blocked", note: "Goroutine 6 also blocks. Both are waiting on their own channels." },
+    { lane: "g1", kind: "block", label: "stuck — nobody sends", note: "The sender goroutine was never started — a missing `go` keyword left both receivers waiting forever." },
+    { lane: "g6", kind: "block", label: "stuck — nobody sends", note: "Same root cause, same symptom. Two goroutines stuck at the same line." },
+    { lane: "g1", kind: "done", label: "dump: [chan receive]", note: "SIGQUIT dump shows both goroutines in [chan receive] state at line 34. The missing `go` is found." }
+  ]}
+  caption="The goroutine dump doesn't just tell you there's a deadlock — it shows you exactly which goroutines, which channels, and which lines. That's your fix."
+/>
+
+### Hunting goroutine leaks
+
+**On the job:** A leaking webhook handler starts invisible and kills the process in hours — the goroutine count climbs monotonically, memory grows, and by the time the OOM kills you it's too late to attach a debugger. Catch it with pprof while it's still small.
+
+A goroutine leak is subtler than a deadlock. The process keeps running; goroutines just accumulate. Over time, memory grows, CPU may spike, and eventually you OOM or the scheduler bogs down. The signature:
+
+- Goroutine count climbs monotonically over time (visible in `net/http/pprof` — covered in Section 3)
+- A goroutine dump shows many goroutines all stuck at the same line — often waiting on a channel that nothing ever closes
+
+The most common cause in HTTP handlers: a goroutine launched inside the handler but not tied to the request's context. When the client disconnects, `ctx.Done()` fires and the handler returns — but the leaked goroutine has no reference to the context and keeps running.
+
+```go
+// LEAKS: goroutine ignores context cancellation
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	go func() {
+		// This goroutine runs until the program exits.
+		// Nothing stops it when the request is done.
+		result := slowExternalCall()
+		log.Println("result:", result)
+	}()
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// CORRECT: goroutine is tied to the request's lifetime
+func handleWebhookFixed(w http.ResponseWriter, r *http.Request) {
+	go func(ctx context.Context) {
+		result, err := slowExternalCallCtx(ctx)
+		if err != nil {
+			// ctx was cancelled (client disconnected) — this is fine
+			return
+		}
+		log.Println("result:", result)
+	}(r.Context())
+	w.WriteHeader(http.StatusAccepted)
+}
+```
+
+<BeforeAfter
+  badLabel="Leaks goroutines"
+  goodLabel="Context-aware"
+  bad={`go func() {
+  result := slowExternalCall()
+  log.Println(result)
+}()
+// goroutine never stops`}
+  good={`go func(ctx context.Context) {
+  result, err := slowExternalCallCtx(ctx)
+  if err != nil {
+    return // cancelled — clean up
+  }
+  log.Println(result)
+}(r.Context())`}
+/>
+
+<QuickCheck
+  question="A goroutine dump shows 400 goroutines all in [chan receive] state at the same line. What does this most likely indicate?"
+  options={[
+    "Normal behavior — Go uses many goroutines",
+    "A goroutine leak: goroutines are accumulating because they wait on a channel nobody sends to or closes",
+    "A deadlock — all goroutines are stuck",
+    "The program is I/O bound and goroutines are waiting on network"
+  ]}
+  answer={1}
+  explain="400 goroutines all stuck at the same receive site is a classic leak signature. Each request (or event) spawned a goroutine that blocks on a channel that never gets a value. They accumulate because nothing cancels them. If ALL goroutines were stuck, the runtime deadlock detector would have already fired."
+/>
+
+## Debugging in Production
+
+You cannot attach Delve to a production process that serves real traffic. You cannot stop the world for an interactive debug session. But you are not helpless — the runtime has eyes everywhere, and you can wire them up before an incident happens.
+
+### GODEBUG knobs
+
+**On the job:** GC pressure and scheduler saturation show up in `GODEBUG` traces before they show up in latency metrics. Set `gctrace=1` in staging whenever memory usage looks wrong — it tells you if GC is the culprit before you spend an hour profiling.
+
+`GODEBUG` is an environment variable that unlocks runtime telemetry without recompiling. Set it when starting the process:
+
+```bash
+GODEBUG=gctrace=1 ./payments-service
+```
+
+`gctrace=1` prints a line for every GC cycle to stderr:
+
+```
+gc 14 @3.141s 1%: 0.014+1.2+0.004 ms clock, ...
+   [heap_live_bytes, next_gc_target, ...]
+```
+
+Parse it for GC frequency and pause times. If GC is running every 200ms, your heap is under pressure. If pause times exceed a few milliseconds, investigate.
+
+```bash
+GODEBUG=schedtrace=1000 ./payments-service
+```
+
+`schedtrace=1000` dumps scheduler state every 1000ms: how many goroutines are runnable, how many threads are spinning, how many Ps are idle. If `runqueue` grows over time, goroutines are piling up faster than the scheduler can dispatch them.
+
+These knobs are read at startup. They cannot be changed while the process runs. Set them in your process supervisor or container spec so they're available when you need them.
+
+### net/http/pprof — profiling endpoints over HTTP
+
+**On the job:** If pprof isn't wired up before an incident, it isn't available during one. Add it to every service at launch — you'll need the goroutine and heap profiles the moment something goes wrong at 2 a.m.
+
+Every Go HTTP service should import `net/http/pprof` on its admin listener. It adds a suite of debug endpoints you can query live — *without restarting the process*.
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	_ "net/http/pprof" // side-effect import: registers handlers on DefaultServeMux
+)
+
+func main() {
+	// Admin server on a separate port — never expose this to the public internet
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	// Your real service listener
+	http.ListenAndServe(":8080", appMux())
+}
+```
+
+The registered endpoints:
+
+```
+GET /debug/pprof/              — index of all profiles
+GET /debug/pprof/goroutine     — stack trace of ALL goroutines (the live dump!)
+GET /debug/pprof/heap          — heap allocation profile
+GET /debug/pprof/block         — goroutines blocked on synchronization
+GET /debug/pprof/mutex         — goroutines contending on mutexes
+GET /debug/pprof/threadcreate  — OS thread creation
+GET /debug/pprof/trace?seconds=5  — execution trace (different from pprof)
+```
+
+The goroutine endpoint is the live equivalent of `SIGQUIT`:
+
+```bash
+curl -s http://localhost:6060/debug/pprof/goroutine?debug=2
+```
+
+`debug=2` gives you the full, human-readable dump of every goroutine's stack — the same format as a `SIGQUIT` dump, pulled over HTTP while the process keeps serving traffic.
+
+To see goroutine count over time — the leak detector — fetch the goroutine profile and watch the number:
+
+```bash
+# one-liner: fetch goroutine count every 5 seconds
+while true; do
+  curl -s "http://localhost:6060/debug/pprof/goroutine" | head -1
+  sleep 5
+done
+```
+
+For deeper analysis, pull the profile into `go tool pprof`:
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+(pprof) top
+(pprof) tree
+(pprof) web   # opens a flame graph in the browser (flame graph is now the default in Go 1.26)
+```
+
+<Callout kind="note" title="Go 1.26: pprof web UI defaults to flame graphs">
+
+As of Go 1.26, `go tool pprof`'s `web` command opens a flame graph by default instead of the old call-graph SVG. The flame graph makes hot paths and accumulation patterns immediately visible — tall columns are long stacks, wide columns are frequently sampled code. The old graph is still available via `(pprof) callgrind` or the `-http` flag's dropdown.
+
+</Callout>
+
+**Goroutine leak hunting with the `goroutineleak` profile (Go 1.26 experiment)**
+
+Go 1.26 adds a dedicated `goroutineleak` pprof profile that reports goroutines blocked on concurrency primitives that the runtime can prove cannot become unblocked. Enable it with `GOEXPERIMENT=goroutineleakprofile`; that also exposes the `net/http/pprof` endpoint. This is purpose-built for the Meridian webhook leak scenario:
+
+```bash
+# Baseline: record detected leaked goroutines
+curl -s "http://localhost:6060/debug/pprof/goroutineleak" > before.pb.gz
+
+# Wait — let traffic run for a minute
+
+# Second sample
+curl -s "http://localhost:6060/debug/pprof/goroutineleak" > after.pb.gz
+
+# Diff them: shows where detected leak stacks changed
+go tool pprof -diff_base=before.pb.gz after.pb.gz
+(pprof) top
+# If handleWebhook shows +N goroutines per sample, that's your leak.
+```
+
+The `goroutineleak` profile is narrower than the plain `goroutine` profile: it reports only leaks the runtime can prove from reachability. It may miss leaks whose blocking primitive is still reachable through globals or runnable goroutines, so keep the regular goroutine and block profiles in your toolbox.
+
+<Callout kind="pro" title="Separate the admin listener from the app listener">
+
+Register `net/http/pprof` on a private port (`localhost:6060`) that only your internal network or a port-forwarded SSH tunnel can reach. Never expose debug endpoints on your public-facing port. An attacker with access to your goroutine dumps and heap profiles can reconstruct secrets, user data, and the internal structure of your service.
+
+</Callout>
+
+### expvar — live variable inspection
+
+`expvar` is the stdlib's simple key-value store for runtime state. Import it alongside `net/http/pprof` and expose any counters or gauges you care about:
+
+```go
+import "expvar"
+
+var (
+	transfersTotal   = expvar.NewInt("transfers_total")
+	activeGoroutines = expvar.NewInt("active_goroutines")
+)
+
+func handleTransfer(w http.ResponseWriter, r *http.Request) {
+	transfersTotal.Add(1)
+	// ...
+}
+```
+
+They're served at `/debug/vars` as JSON:
+
+```bash
+curl http://localhost:6060/debug/vars
+{
+  "transfers_total": 14827,
+  "active_goroutines": 3,
+  "cmdline": ["./payments-service"],
+  "memstats": { ... }
+}
+```
+
+`memstats` is always present and gives you live heap stats — `HeapAlloc`, `HeapInuse`, `NumGC` — without a full profile.
+
+### Core dumps — GOTRACEBACK=crash
+
+**On the job:** Fatal crashes in containerized services vanish without a trace unless you've set `GOTRACEBACK=crash` in your pod spec. Add it now — you won't be able to add it after the crash you need it for.
+
+For post-mortem debugging of a crash that you can't reproduce interactively:
+
+```bash
+GOTRACEBACK=crash ./payments-service
+```
+
+On a fatal error, the runtime prints the full goroutine dump **and** generates a core file. You can then analyze it with Delve:
+
+```bash
+dlv core ./payments-service core.12345
+```
+
+You have full variable inspection, stack frames, and goroutine switching — but you're in the past. The program has already died; you're examining its corpse. This is invaluable for crashes in production that you can't reproduce on demand.
+
+### Print debugging — and when it actually beats a debugger
+
+Here's the thing, sport. Print debugging isn't beneath you. It has a place.
+
+`fmt.Println` and `slog` (Go 1.21+) are the right tool when:
+- The bug is in concurrent code where attaching a debugger would serialize the goroutines and change the timing, potentially making the race disappear (Heisenbug)
+- You're debugging a system where you can't attach Delve — a remote process, a container with no terminal, a test that must run in CI
+- The reproduction is intermittent and you need the state of many variables over thousands of calls, not a single paused moment
+
+`slog` with structured fields is the production version:
+
+```go
+slog.Info("transfer attempted",
+	"amount", amount,
+	"from_account", fromID,
+	"to_account", toID,
+	"goroutine_count", runtime.NumGoroutine(),
+)
+```
+
+Structured log fields are searchable in any log aggregator. A `fmt.Println` with string concatenation is not. For production: always `slog`. For a local scratch investigation: `fmt.Println` until you know where to look, then clean it up.
+
+The honest hierarchy: use Delve for complex control-flow bugs and goroutine state questions. Use goroutine dumps and pprof for concurrent and production bugs. Use print/slog when a debugger would change the behavior or when you need a stream of observations across many executions.
+
+<UnderTheHood title="How the runtime produces a stack trace">
+
+When `panic` fires — or when `SIGQUIT` arrives, or when the deadlock detector triggers — the runtime needs to walk the stack of every goroutine and translate raw addresses to source locations. Here is how it works, as of Go 1.26 (the baseline for this course).
+
+**Each goroutine's stack is a contiguous allocation** — not the OS thread stack. The runtime allocates goroutine stacks on the heap (starting at 2KB as of Go 1.4, down from 8KB) and can grow them by allocating a new, larger stack and copying the old one over. The goroutine descriptor (`g` struct) holds the stack's low and high bounds and the current stack pointer (`sp`).
+
+**Walking the stack.** The Go compiler emits *stack frame information* — `pcdata` and `funcdata` tables baked into the binary — that tell the runtime: at each program counter (PC), how large is the current frame, where is the saved return address, and which registers are live GC roots. The runtime walks the stack by repeatedly reading the saved return address from the current frame and jumping to the next frame, using these tables to know the frame size at each step. This is a linked-list walk over the call stack.
+
+**Translating PC to source.** Each raw instruction address is looked up in the `pclntab` (PC-to-line table), a compact table the linker embeds in the binary. `pclntab` maps address ranges to (file, line, function name) tuples. This is the same information Delve reads from DWARF; the runtime uses its own optimized format.
+
+**Goroutine state strings.** The states you see in a dump — `[chan receive]`, `[sync.Mutex]`, `[semacquire]` — come from the `waitreason` field of the `g` struct, set by the scheduler when a goroutine blocks. The runtime formats this field as the human-readable label in the dump.
+
+All of this happens in the runtime itself, with no external tools. The entire stack-walking and symbolization infrastructure is compiled into every Go binary — which is why you get a readable trace even from a `FROM scratch` container with nothing else installed.
+
+*This is a simplified model (Go 1.26 baseline). The actual `pclntab` and frame-info structures have evolved across versions; the runtime source in `src/runtime/symtab.go` is the definitive reference if you need the exact layout.*
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+These aren't gentle warmups. The bugs below are exactly the kind that survive code review and surface in production. You've got the tools. Prove it.
+
+<Exercise n={1} title="Read a panic trace" level="easy">
+
+Given this panic output, identify: (a) the goroutine that panicked, (b) the function and line where the panic was called, and (c) the full call chain back to `main`.
+
+```
+goroutine 1 [running]:
+main.validateAmount(...)
+        /src/payments/validate.go:22 +0x7d
+main.processPayment(...)
+        /src/payments/payment.go:55 +0x1a4
+main.handleCheckout(0xc000124000)
+        /src/payments/handler.go:31 +0x88
+net/http.HandlerFunc.ServeHTTP(...)
+        /usr/local/go/src/net/http/server.go:2136
+exit status 2
+```
+
+<Solution>
+
+(a) **Goroutine 1** panicked — the header `goroutine 1 [running]` identifies it.
+
+(b) The panic was called in **`main.validateAmount`** at **`validate.go:22`** — the top frame is always the site of the panic call itself.
+
+(c) The full call chain (bottom → top, i.e., call order): `main.handleCheckout` (handler.go:31) → `main.processPayment` (payment.go:55) → `main.validateAmount` (validate.go:22) → `panic`. To fix the bug, look at what `validateAmount` was validating that caused it to panic, and trace back to how `processPayment` called it (payment.go:55) — that's where the bad data entered.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Spot the goroutine leak" level="medium">
+
+This webhook handler leaks goroutines. Identify why and write the corrected version.
+
+```go
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	ch := make(chan PaymentEvent)
+	go func() {
+		event := parseWebhookBody(r.Body)
+		ch <- event
+	}()
+	w.WriteHeader(http.StatusAccepted)
+	// handler returns here — ch is never read
+}
+```
+
+<Solution>
+
+The goroutine sending to `ch` blocks forever on `ch <- event` because nobody reads from `ch` — the handler returns without reading it, and `ch` goes out of scope. The goroutine is now stuck, holding a reference to the channel and the parsed event, and will never exit. Multiply by every inbound webhook.
+
+Two fixes, depending on what you actually need:
+
+**Fix 1:** If you just need to process asynchronously and don't need the result in the handler, use a buffered channel or drop the channel entirely:
+
+```go
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	// Clone the body before the goroutine reads it — r.Body is consumed.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	go func(ctx context.Context, b []byte) {
+		event := parseWebhookBody(bytes.NewReader(b))
+		if err := processEvent(ctx, event); err != nil {
+			slog.Error("webhook processing failed", "err", err)
+		}
+	}(r.Context(), body)
+	w.WriteHeader(http.StatusAccepted)
+}
+```
+
+**Fix 2:** If you need the result in the handler, read from the channel:
+
+```go
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	ch := make(chan PaymentEvent, 1) // buffered: goroutine won't block
+	go func() {
+		ch <- parseWebhookBody(r.Body)
+	}()
+	select {
+	case event := <-ch:
+		processEvent(r.Context(), event)
+	case <-r.Context().Done():
+		http.Error(w, "request cancelled", http.StatusRequestTimeout)
+	}
+}
+```
+
+The root rule: every goroutine must have a clear exit path. If it sends on a channel, something must receive. If it receives, something must send or close the channel.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Write a self-identifying deadlock" level="medium">
+
+Write a complete Go program with two goroutines that deadlock on channels — each waiting for the other to send first. Confirm the runtime detects it and prints `all goroutines are asleep - deadlock!`. Add a comment explaining exactly why neither goroutine can proceed.
+
+<Solution>
+
+```go
+package main
+
+// Two goroutines, each blocking on a receive that the other would satisfy —
+// but neither ever sends first. Classic channel deadlock.
+//
+// Why neither can proceed:
+//   g1: blocked on <-bCh (waiting for g2 to send)
+//   g2: blocked on <-aCh (waiting for g1 to send)
+//   Neither will ever send, so neither will ever unblock.
+//   The runtime detects: all goroutines asleep → fatal deadlock.
+
+func main() {
+	aCh := make(chan struct{})
+	bCh := make(chan struct{})
+
+	// goroutine 1: waits for b, then sends on a
+	go func() {
+		<-bCh      // blocks: nobody sends on bCh yet
+		aCh <- struct{}{}
+	}()
+
+	// goroutine 2: waits for a, then sends on b
+	go func() {
+		<-aCh      // blocks: nobody sends on aCh yet
+		bCh <- struct{}{}
+	}()
+
+	// main goroutine also blocks, waiting for both to finish
+	// (they never will)
+	select {}
+}
+```
+
+Running this produces:
+```
+fatal error: all goroutines are asleep - deadlock!
+goroutine 1 [select]:
+...
+goroutine 6 [chan receive]:
+...
+goroutine 7 [chan receive]:
+...
+```
+
+The fix is to designate one goroutine to send first (breaking the circular dependency) or to restructure so the channels are never blocking each other simultaneously.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Wire up pprof on an admin port" level="medium">
+
+Write a minimal `main` function for a payments service that:
+1. Registers `net/http/pprof` handlers on `localhost:6060`
+2. Starts a real application handler on `:8080`
+3. Does NOT expose pprof on the public-facing port
+
+Use a proper goroutine for the admin listener and handle its error.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"log/slog"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
+)
+
+func appHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/transfer", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+
+func main() {
+	// Admin listener: pprof on DefaultServeMux, private only.
+	// NEVER expose this port to the public internet.
+	go func() {
+		slog.Info("pprof admin server", "addr", "localhost:6060")
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			slog.Error("admin server failed", "err", err)
+		}
+	}()
+
+	// Application listener on a SEPARATE mux — pprof handlers are NOT registered here.
+	slog.Info("payments service starting", "addr", ":8080")
+	if err := http.ListenAndServe(":8080", appHandler()); err != nil {
+		slog.Error("server failed", "err", err)
+	}
+}
+```
+
+The critical detail: `appHandler()` returns its own `http.NewServeMux()`, not `http.DefaultServeMux`. The `_ "net/http/pprof"` import registers handlers on `http.DefaultServeMux` only — so the admin listener serves pprof and the application listener does not. Swapping `nil` for `appHandler()` in `ListenAndServe(":8080", nil)` would expose pprof publicly. Never do that.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Conditional breakpoint strategy" level="hard">
+
+You're debugging `processTransfer(ctx context.Context, from, to string, amountCents int64)`. This function is called roughly 10,000 times per second. You want to stop in Delve only when:
+- `from == "acct_problematic"`
+- **and** `amountCents > 1_000_000` (transfers over $10,000)
+
+Write the exact sequence of Delve commands you would run. Explain what happens at every step, including why a conditional breakpoint is essential here (what would happen without the condition).
+
+<Solution>
+
+```
+# 1. Start Delve (or connect to a running headless session)
+dlv debug ./cmd/payments
+
+# 2. Set a breakpoint on the function by name
+(dlv) break processTransfer
+Breakpoint 1 set at 0x... for main.processTransfer()
+
+# 3. Apply the compound condition
+#    Delve evaluates this in the goroutine's scope each time bp fires.
+#    Note: string comparison and integer comparison both work directly.
+(dlv) condition 1 from == "acct_problematic" && amountCents > 1000000
+
+# 4. Run. Delve executes the program at full speed.
+#    The INT3 fires 10,000 times per second, but Delve evaluates
+#    the condition and continues automatically on false. Only the
+#    matching calls actually stop at the prompt.
+(dlv) continue
+
+# 5. When we do stop, inspect:
+(dlv) locals        # see from, to, amountCents, ctx
+(dlv) print from    # confirm we matched
+(dlv) stack         # see who called processTransfer
+```
+
+**Without the condition:** the breakpoint fires 10,000 times per second. Delve would stop on every call, you would have to `continue` manually each time, and the program would be effectively halted. At 10k calls/s, a manual step-and-continue cycle would take years to reach the interesting call. Conditional breakpoints are not optional for high-traffic code — they're the difference between a useful tool and a useless one.
+
+**Why this works:** each time the CPU executes the `INT3` at `processTransfer`'s entry point, Delve receives a `SIGTRAP`, checks `from == "acct_problematic" && amountCents > 1000000` by reading the goroutine's current frame, and either stops (condition true) or single-steps past the `INT3` and restores the original byte, then continues — all in microseconds.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Listen to me carefully. This is not a drill.
+
+Meridian Payments has two confirmed bugs in production. I have your pager number. The on-call window is open. You will find both bugs — using the goroutine dump and panic trace provided — and you will patch the starter code so the verifier's tests complete without deadlock or goroutine leak. Every hint you take costs you points, and I will *notice*.
+
+<Lab
+  title="Meridian Payments: Deadlock and Goroutine Leak"
+  archetype="find-it"
+  difficulty="unscaffolded"
+  points={80}
+  hintCost={15}
+  verify="reference"
+  objective="Two bugs in the starter code: (1) the transfer handler deadlocks when two concurrent transfers target the same account — diagnose from the goroutine dump in the brief, then patch the locking to be consistent; (2) the webhook handler leaks goroutines — diagnose from the description, then tie the goroutine to the request context. The verifier runs 50 concurrent transfers under -race and 100 webhook calls, then checks goroutine count. Both must pass: no deadlock, no leak (goroutine count at end must equal goroutine count at start ± 3)."
+  starter={`package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// Account holds a balance protected by a mutex.
+// BUG 1: two concurrent transfers between the same pair of accounts
+// acquire the mutexes in opposite order → deadlock.
+// Goroutine dump shows both goroutines in [semacquire] on each other's mutex.
+type Account struct {
+	mu      sync.Mutex
+	balance int64
+}
+
+var accounts = map[string]*Account{
+	"acct_a": {balance: 1_000_000},
+	"acct_b": {balance: 1_000_000},
+}
+
+// transfer debits from and credits to.
+// Deadlock scenario: transfer(a→b) locks a, then tries to lock b.
+//                   transfer(b→a) locks b, then tries to lock a.
+//                   Both block → deadlock.
+func transfer(from, to string, amount int64) error {
+	f := accounts[from]
+	t := accounts[to]
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t.mu.Lock() // ← BUG: lock order depends on argument order
+	defer t.mu.Unlock()
+
+	if f.balance < amount {
+		return fmt.Errorf("insufficient funds")
+	}
+	f.balance -= amount
+	t.balance += amount
+	return nil
+}
+
+// BUG 2: goroutine leaks because the event processing goroutine
+// is not tied to the request context. When the client disconnects,
+// the handler returns but the goroutine keeps running forever.
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	go func() {
+		// Simulate slow event processing
+		time.Sleep(10 * time.Millisecond)
+		slog.Info("webhook processed")
+		// BUG: no way to cancel this goroutine if the context is cancelled
+	}()
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func handleTransfer(w http.ResponseWriter, r *http.Request) {
+	if err := transfer("acct_a", "acct_b", 100); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/transfer", handleTransfer)
+	mux.HandleFunc("/webhook", handleWebhook)
+	slog.Info("starting", "addr", ":8080")
+	http.ListenAndServe(":8080", mux)
+}
+
+// Goroutine dump from production (two concurrent transfers, opposite direction):
+//
+// goroutine 18 [semacquire]:
+// sync.runtime_SemacquireMutex(0xc000018098, ...)
+//   .../sync/mutex.go:77
+// sync.(*Mutex).lockSlow(0xc000018090)
+//   .../sync/mutex.go:171
+// main.transfer(...)
+//   /src/main.go:38        ← waiting for acct_b's mutex
+//
+// goroutine 19 [semacquire]:
+// sync.runtime_SemacquireMutex(0xc0000180d8, ...)
+// sync.(*Mutex).lockSlow(0xc0000180d0)
+// main.transfer(...)
+//   /src/main.go:38        ← waiting for acct_a's mutex
+//
+// g18 holds acct_a, wants acct_b.
+// g19 holds acct_b, wants acct_a. Classic deadlock.
+`}
+  verifier="Hidden tests run 50 concurrent round-trip transfers (acct_a→acct_b and acct_b→acct_a simultaneously) under -race and assert no deadlock occurs and the total balance is conserved. They also fire 100 webhook requests and assert the goroutine count after all requests complete is within 3 of the goroutine count before. Both checks must pass."
+  hints={[
+    "Bug 1: the deadlock is a lock-order inversion. Both transfer directions must acquire the two mutexes in the SAME global order. Hint: sort the account IDs and always lock the lexicographically-smaller account first.",
+    "Bug 2: pass r.Context() into the goroutine and select on ctx.Done() alongside the slow work. If the context is cancelled, return from the goroutine immediately.",
+    "For Bug 1, use `if from > to { f, t = t, f }` before locking to canonicalize the order. For Bug 2, the goroutine signature becomes `go func(ctx context.Context) { ... }(r.Context())`."
+  ]}
+  flag="GO{consistent_lock_order_context_aware_goroutines}"
+>
+
+The goroutine dump is in the starter code comments — it's exactly what you'd get from `SIGQUIT` or `curl localhost:6060/debug/pprof/goroutine?debug=2`. Read it. Find the lock inversion. Fix both bugs. The verifier is not forgiving, and neither am I.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **Delve** (`dlv debug`, `dlv test`, `dlv attach`) is the Go debugger. Set breakpoints by line, function, or condition. Step with `next` (over), `step` (into), `stepout` (return). Inspect variables with `locals`, `args`, `print`. Switch goroutines with `goroutines` and `goroutine N`. Run headless for containers and remote sessions.
+- **Breakpoints work** by replacing one byte with `INT3` (a hardware trap), using **DWARF** debug info to map addresses to source lines. Conditional breakpoints evaluate in the stopped goroutine's scope.
+- **Panic traces** read top-down: the top frame is where `panic()` was called; each frame below is a caller. The goroutine header tells you which goroutine and its scheduler state.
+- **The runtime deadlock detector** fires when all goroutines are blocked with no exit. It doesn't fire if even one goroutine is still running — use goroutine dumps to find partial deadlocks.
+- **Goroutine dumps** via `SIGQUIT` or `curl /debug/pprof/goroutine?debug=2` show every goroutine's state and stack. Many goroutines stuck at the same site = a leak. Circular blocking = a deadlock.
+- **`GODEBUG=gctrace=1`** and **`schedtrace`** expose GC and scheduler telemetry at startup. **`net/http/pprof`** gives live profiling endpoints — always on a private admin port. As of Go 1.26, `go tool pprof web` defaults to a flame graph, and the experimental `goroutineleak` profile reports goroutines the runtime can prove cannot become unblocked.
+- **Lock-order inversion** is the deadlock you'll hit most often in concurrent Go. Fix it by canonicalizing acquisition order (sort, compare, always lock in the same global order).
+- **Goroutine leaks** happen when a goroutine's exit path depends on a channel nobody sends to or closes, or when a goroutine ignores context cancellation. Tie every goroutine to a `context.Context`.
+- **Print debugging** (`slog` in production) is still legitimate — use it when a debugger would change the timing (Heisenbug territory) or when you need a stream of observations across many executions.
+
+</Recap>
+
+<Scoreboard
+  streak={7}
+  items={[
+    { label: "Quick check — conditional breakpoints", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — goroutine leak signature", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Read a panic trace", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Spot the goroutine leak", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Write a self-identifying deadlock", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Wire up pprof on an admin port", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Conditional breakpoint strategy", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Meridian Payments: Deadlock and Goroutine Leak", captured: false, points: 80 }}
+/>
+
+Not bad work today, sport. You learned to read the runtime's screams, command a real debugger, and instrument a production service without taking it down. The bugs Meridian was dying from? You'd have found them in minutes. It's no *me*, but — honestly? Not bad at all. Next chapter: Performance Engineering. We stop finding what's broken and start finding what's slow. Different tools, same discipline.

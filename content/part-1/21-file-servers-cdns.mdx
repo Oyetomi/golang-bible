@@ -1,0 +1,1265 @@
+---
+title: "File Servers, go:embed & CDNs"
+part: 1
+order: 21
+type: "course"
+description: "Serving files with http.FileServer/ServeContent, range requests and caching headers; embedding assets with go:embed and io/fs into one binary; and CDNs — edge caching, fingerprinted and signed URLs."
+prerequisites: ["auth-api-design"]
+---
+
+<HeroCard label="Part 1 · Chapter 21" title="File Servers, go:embed & CDNs">
+
+Let me paint you a picture. The Meridian dashboard you just built has a login screen, a React bundle, a logo, and two dozen SQL migration files. Right now they live on a file system somewhere — which means they can drift out of sync, get deleted, or sit on a server you forgot to provision. Embarrassing.
+
+By the end of this chapter you'll serve files like a professional — range requests, conditional GETs, 304s, embedded binaries, and a CDN in front of the whole operation. One binary. One command. No apologies.
+
+You're lucky to have me for this one.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Serving Files", "Caching Headers", "go:embed & io/fs", "CDNs"]} />
+
+<Scene
+  title="CDN edge cache: MISS then HIT"
+  actors={[
+    { id: "user", label: "User (SG)" },
+    { id: "edge", label: "CDN Edge (SG)" },
+    { id: "origin", label: "Go Origin (US-E)" },
+  ]}
+  cells={[
+    { id: "A1", label: "edge cache" },
+    { id: "A2", label: "origin store" },
+  ]}
+  rows={1}
+  cols={2}
+  frames={[
+    {
+      caption: "User requests app.9f3a1.js. The Singapore edge node has never seen this URL — cache is empty.",
+      beat: "neutral",
+      actors: [{ id: "user", state: "idle" }, { id: "edge", state: "idle" }, { id: "origin", state: "idle" }],
+      cells: [{ id: "A1", state: "idle", label: "empty" }, { id: "A2", state: "idle", label: "has file" }],
+    },
+    {
+      caption: "Cache MISS — the edge forwards the request all the way to the US-East origin. ~220 ms round-trip.",
+      beat: "problem",
+      actors: [{ id: "user", state: "active" }, { id: "edge", state: "warn" }, { id: "origin", state: "active" }],
+      cells: [{ id: "A1", state: "bad", label: "MISS" }, { id: "A2", state: "active", label: "has file" }],
+    },
+    {
+      caption: "Origin responds with Cache-Control: max-age=31536000. Edge stores the file and returns it — slow this time.",
+      beat: "problem",
+      actors: [{ id: "user", state: "warn" }, { id: "edge", state: "active" }, { id: "origin", state: "ok" }],
+      cells: [{ id: "A1", state: "active", label: "storing…" }, { id: "A2", state: "ok", label: "has file" }],
+    },
+    {
+      caption: "Cache HIT — next request for the same URL is served directly from the Singapore edge. ~5 ms. Origin never contacted.",
+      beat: "solution",
+      actors: [{ id: "user", state: "ok" }, { id: "edge", state: "ok" }, { id: "origin", state: "idle" }],
+      cells: [{ id: "A1", state: "done", label: "HIT ✓" }, { id: "A2", state: "idle", label: "has file" }],
+    },
+  ]}
+  caption="The first request pays the full origin round-trip (the problem). Every subsequent request is served locally from the edge (the solution). The CDN's job is to make almost every request feel like that last frame."
+/>
+
+## Serving Files
+
+Here's the scene: the Meridian dashboard ships a static bundle — `index.html`, `app.9f3a1.js`, a logo, and a PDF regulatory-disclosure document. Users hit your Go service and expect those files to come back fast, with the right content types, and with support for resumable downloads (because that disclosure PDF is 40 MB and connections drop).
+
+Go's `net/http` package does most of this for free. Let's peel it apart one layer at a time.
+
+### http.FileServer — the one-liner that does everything
+
+<Define term="http.FileServer / http.ServeContent">
+**`http.FileServer`** is Go's built-in handler for serving a directory tree. Give it an `http.FileSystem` and you get listings, content-type sniffing, `Last-Modified` headers, conditional-GET (`304`) support through modification times, and byte-range requests (`206`) — all free. **`http.ServeContent`** is its lower-level cousin: you hand it any `io.ReadSeeker` (a `bytes.Reader`, an open file, a generated report) and it runs the same range and conditional-request machinery on your data. If you want ETag-based validation, set the `ETag` header yourself before calling it. Both are critical because hand-rolling file serving almost always means missing 304 or range support — breaking resumable downloads and wasting bandwidth.
+</Define>
+
+**On the job:** You reach for `http.FileServer` when a service needs to serve a directory of static assets — dashboard bundles, migration SQL files, report PDFs. Get the wiring wrong and every URL either 404s or leaks files it shouldn't.
+
+`http.FileServer` takes an `http.FileSystem` and returns an `http.Handler`. Point it at a directory and you get: directory listings, content-type sniffing, `Last-Modified` headers, conditional GET support (`If-Modified-Since`, plus ETag preconditions if you set an `ETag` header), and range requests — all out of the box, no configuration.
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+)
+
+func main() {
+	// Serve everything under ./static at the /assets/ URL path.
+	// Strip the /assets prefix before looking up files in the directory.
+	fs := http.FileServer(http.Dir("./static"))
+	http.Handle("/assets/", http.StripPrefix("/assets/", fs))
+
+	log.Println("listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+Two lines of wiring. `http.Dir("./static")` wraps the OS filesystem. `http.StripPrefix` removes `/assets/` from the URL before the file server tries to look up the file — without it, the server hunts for `./static/assets/app.js` instead of `./static/app.js`.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+func main() {
+	// We can't create real files in the playground, so we demonstrate
+	// StripPrefix wiring with an in-memory handler instead.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "file server sees path: %s", r.URL.Path)
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/assets/", http.StripPrefix("/assets/", inner))
+
+	req := httptest.NewRequest("GET", "/assets/app.js", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	fmt.Println(strings.TrimSpace(rec.Body.String()))
+	// Output: file server sees path: /app.js
+	log.Println("StripPrefix demo complete")
+}
+```
+
+</GoPlayground>
+
+### http.ServeContent and http.ServeFile — surgical control
+
+When you need to serve a single file — or a `[]byte` you already have in memory — reach for `http.ServeContent` or `http.ServeFile`. They give you the same range-request and conditional-request machinery as `http.FileServer`, but you pick the source.
+
+**On the job:** `http.ServeContent` is the right tool when you're serving generated output — a freshly built account statement PDF, a CSV export of Meridian's ledger — that you already have as bytes or an open file handle.
+
+```go
+// ServeFile serves a named file from the OS filesystem.
+// It handles directory redirects and the caching headers for you.
+func downloadStatement(w http.ResponseWriter, r *http.Request) {
+	// The third arg is the path on disk — Go sniffs Content-Type from it.
+	http.ServeFile(w, r, "./statements/Q3-2024.pdf")
+}
+```
+
+```go
+// ServeContent is more flexible: you supply an io.ReadSeeker,
+// a name (for Content-Type sniffing), and a modification time.
+func serveGeneratedReport(w http.ResponseWriter, r *http.Request) {
+	data := generateReport() // returns []byte
+	http.ServeContent(
+		w, r,
+		"report.csv",           // name — only used for Content-Type sniffing
+		time.Now(),             // modtime — used for Last-Modified / 304 logic
+		strings.NewReader(string(data)), // io.ReadSeeker
+	)
+}
+```
+
+The magic of `ServeContent` is the `io.ReadSeeker` — the seeker is what makes **range requests** work. A range request asks for a slice of the file (`bytes=0-1023`), and Go needs to `Seek` to the right offset before reading. If your source can't seek, range requests silently fall back to full-file responses.
+
+### Range requests and 206 Partial Content
+
+<Define term="Range request (206 Partial Content)">
+A **range request** is an HTTP GET with a `Range: bytes=N-M` header asking for a specific byte slice of the file, not the whole thing. The server responds `206 Partial Content` with only that slice. Why it matters: large downloads (a 40 MB regulatory PDF) can resume after a dropped connection — the client just sends a new range request starting where it left off. Video players use the same mechanism to scrub without downloading the entire file. Without range support, every dropped connection restarts the download from byte zero.
+</Define>
+
+When a browser or download manager sends `Range: bytes=0-1023`, the server should respond with `206 Partial Content` and only that slice. This is how large file downloads resume after a dropped connection, and how video players scrub without downloading the whole file.
+
+`http.FileServer` and `http.ServeContent` handle this automatically. Let's watch a range request unfold.
+
+<ExecTimeline
+  title="Range request — fetching bytes 0–1023 of a 40 MB PDF"
+  lanes={[{ id: "client", label: "Browser" }, { id: "server", label: "Go handler" }]}
+  steps={[
+    { lane: "client", kind: "send", label: "GET /statements/Q3.pdf", note: "Client sends a GET with Range: bytes=0-1023, signalling it wants only the first kilobyte." },
+    { lane: "server", kind: "recv", label: "read Range header", note: "ServeContent sees the Range header and validates it against the file size." },
+    { lane: "server", kind: "run", label: "Seek(0, 0) on file", note: "The io.ReadSeeker positions the read cursor at byte 0 — this is why seekability is required." },
+    { lane: "server", kind: "run", label: "Read(buf[:1024])", note: "Read exactly 1024 bytes — nothing more. The 40 MB file stays on disk." },
+    { lane: "server", kind: "send", label: "206 Partial Content", note: "Response: 206, Content-Range: bytes 0-1023/41943040, Content-Length: 1024, then the data." },
+    { lane: "client", kind: "recv", label: "first 1024 bytes", note: "Client stitches the chunk into its buffer. On a reconnect it will send Range: bytes=1024- to resume." },
+    { lane: "client", kind: "done", label: "request complete", note: "The session ends with only 1024 bytes transferred — the rest stays on the server until needed." }
+  ]}
+  caption="206 Partial Content: the server reads only what was asked for. Seekability is the key — without it, there's no way to jump to the middle of a stream."
+/>
+
+<Callout kind="pro" title="Accept-Ranges tells the client you support this">
+
+`http.ServeContent` automatically emits `Accept-Ranges: bytes` in every response, advertising that range requests are welcome. Without this header, browsers won't attempt to resume a download — they'll start over. You get it for free; just don't override it.
+
+</Callout>
+
+### Content-Type detection
+
+`http.ServeFile` and `http.ServeContent` detect the `Content-Type` from the file extension using `mime.TypeByExtension`. If the extension is unknown, they sniff the first 512 bytes with `http.DetectContentType`. You should always trust this over setting it yourself — a misconfigured `Content-Type` on a PDF served as `text/html` is a stored-XSS vector (covered in Part 2, "Application Security Baseline").
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="http.FileServer">Full directory-serving handler. Takes `http.FileSystem`. Listings, caching, range requests — all automatic. Best for static asset trees.</ConceptCard>
+  <ConceptCard label="http.ServeFile">Single file from the OS filesystem. Same caching and range machinery. Use when you know the path at request time.</ConceptCard>
+  <ConceptCard label="http.ServeContent">Most flexible — any `io.ReadSeeker`. Use for in-memory data, generated reports, or files you opened yourself.</ConceptCard>
+  <ConceptCard label="http.Dir">Wraps the OS filesystem as `http.FileSystem`. The standard argument to `http.FileServer`.</ConceptCard>
+  <ConceptCard label="StripPrefix">Removes a URL prefix before it reaches the file server, so `/assets/app.js` maps to `./static/app.js` not `./static/assets/app.js`.</ConceptCard>
+  <Gotcha>Never serve user-supplied paths directly with `os.Open`. An input like `../../etc/passwd` is a path-traversal attack. `http.FileServer` normalizes paths with `path.Clean` before opening — that's one reason you use it instead of rolling your own. If you do need low-level file access, prefer `os.Root` (Go 1.24), which opens a directory and confines all subsequent `Open`/`Stat` calls within it — escape attempts outside the root return an error. As of Go 1.25, `os.Root` also implements `io/fs.ReadLinkFS`, so symlink targets are resolved safely within the root boundary.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="You want to serve a large in-memory []byte as a file download with proper range request support. Which function is the right tool?"
+  options={["http.FileServer — it handles everything", "http.ServeFile — it takes a path", "http.ServeContent — it takes an io.ReadSeeker, which strings.NewReader satisfies", "Write the bytes to w directly with w.Write(data)"]}
+  answer={2}
+	  explain="http.ServeContent takes an io.ReadSeeker, and strings.NewReader / bytes.NewReader both satisfy that interface. It gives you range request support and Last-Modified-based conditional requests; set an ETag yourself if you want ETag validation. A raw w.Write gives you none of that."
+/>
+
+---
+
+## Caching Headers
+
+Serving a file is one thing. Serving it *efficiently* — so the browser doesn't download the same 400 KB JS bundle on every page load — is the discipline that separates a professional from a hobbyist.
+
+The three headers that matter: `Cache-Control`, `ETag`, and `Last-Modified`. They work together to answer two questions: "how long can you cache this?" and "has it changed since you last asked?"
+
+<Define term="Cache-Control / ETag / conditional GET (304)">
+Three headers that work as a team. **`Cache-Control`** is a directive telling browsers and CDN proxies how long they may keep a cached copy (`max-age=31536000` = one year; `no-cache` = revalidate every time; `no-store` = keep nothing). **`ETag`** is a server-chosen token that identifies a specific version of a response; **`Last-Modified`** is the timestamp validator. On a repeat request the browser sends `If-None-Match: <etag>` or `If-Modified-Since: <timestamp>`; if the content hasn't changed the server replies **`304 Not Modified`** — headers only, no body. The browser uses its cached copy and saves all the bandwidth. Miss this on the Meridian dashboard and every page load re-downloads the full 400 KB JS bundle, even when nothing changed.
+</Define>
+
+### Cache-Control — tell proxies and browsers what to do
+
+`Cache-Control` is a directive, not a timestamp. The most important values for a static-asset server:
+
+```
+Cache-Control: public, max-age=31536000, immutable
+```
+
+- `public` — any cache (proxy, CDN, browser) may store this.
+- `max-age=31536000` — cache for one year (in seconds). Use this for fingerprinted assets like `app.9f3a1.js`.
+- `immutable` — the content will never change for this URL. Skip revalidation entirely (supported by modern browsers and CDNs).
+
+For HTML pages and API responses that must always be fresh:
+
+```
+Cache-Control: no-cache
+```
+
+`no-cache` doesn't mean "don't cache" — it means "cache it, but always revalidate before using the cached copy." Use `no-store` if you genuinely want nothing stored (e.g. a bank statement download for a logged-in user).
+
+### ETag and Last-Modified — the revalidation pair
+
+`http.FileServer` sets `Last-Modified` automatically. It does **not** invent a content ETag for you; if your caching policy relies on `If-None-Match`, set the `ETag` header yourself before serving the content:
+
+- `Last-Modified: <time the file was last modified>` — a timestamp.
+- `ETag: "<hash or derived token>"` — an optional validator you choose, commonly a content hash or build fingerprint.
+
+On the next request, the browser sends these back:
+
+- `If-Modified-Since: <timestamp>` — "only send the body if it changed after this time."
+- `If-None-Match: "<etag>"` — "only send the body if the ETag is different."
+
+If nothing changed, the server responds with `304 Not Modified` — headers only, no body. The browser uses its cached copy. On a dashboard loaded 50 times a day, this turns 400 KB of JS into zero bytes transferred, 49 times.
+
+Let's watch a conditional GET flow — the 200 path and the 304 path side by side.
+
+<ExecTimeline
+  title="Conditional GET — 200 on first visit, 304 on repeat"
+  lanes={[{ id: "browser", label: "Browser" }, { id: "go", label: "Go handler" }]}
+  steps={[
+    { lane: "browser", kind: "send", label: "GET /app.9f3a1.js (cold cache)", note: "No validators sent — the browser has nothing cached. This is a cold request." },
+    { lane: "go", kind: "run", label: "stat file", note: "http.FileServer stats the file and sends Last-Modified. Your middleware may also set a build-time ETag." },
+    { lane: "go", kind: "send", label: "200 OK + validators", note: "Full 400 KB body sent. Last-Modified and any app-provided ETag are included so the browser can revalidate next time." },
+    { lane: "browser", kind: "recv", label: "cache validators + body", note: "Browser stores the response. Next request it can attach If-Modified-Since or If-None-Match." },
+    { lane: "browser", kind: "send", label: "conditional GET", note: "Repeat request — browser asks whether its cached validator still matches." },
+    { lane: "go", kind: "run", label: "validator still matches", note: "File is unchanged by modtime, or the app-provided ETag matches. No body needed." },
+    { lane: "go", kind: "send", label: "304 Not Modified (no body)", note: "304: headers only, zero body bytes. Browser uses its cached copy. 400 KB saved." }
+  ]}
+  caption="304 Not Modified: headers only. The browser saves 400 KB of bandwidth on every cached hit."
+/>
+
+### Setting Cache-Control in your own handler
+
+`http.FileServer` does not set your production cache policy. For production you'll want to set `Cache-Control` yourself — especially for fingerprinted assets that can be cached forever.
+
+```go
+package main
+
+import (
+	"net/http"
+)
+
+// cachedFileServer wraps http.FileServer and adds aggressive caching for
+// fingerprinted asset URLs (anything under /assets/). HTML gets no-cache.
+func cachedFileServer(root http.FileSystem) http.Handler {
+	fs := http.FileServer(root)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Fingerprinted assets can be cached for a year.
+		// HTML must always revalidate (user may get a new deploy).
+		switch {
+		case isFingerprinted(r.URL.Path):
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		default:
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		fs.ServeHTTP(w, r)
+	})
+}
+
+// isFingerprinted returns true when the URL path looks like a
+// content-hashed asset: app.9f3a1.js, logo.a1b2c3.png, etc.
+func isFingerprinted(path string) bool {
+	// Real implementation would parse the filename and check for
+	// a hash segment between the name and extension.
+	return len(path) > 4 && path[len(path)-3:] != ".html"
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func addCacheHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		// Fingerprinted assets get max-age=1 year (demo uses 1s for clarity).
+		if len(path) > 0 && path[len(path)-3:] != ".html" {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "body")
+	})
+	handler := addCacheHeaders(base)
+
+	for _, path := range []string{"/app.9f3a1.js", "/index.html"} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		fmt.Printf("%-25s Cache-Control: %s\n", path, rec.Header().Get("Cache-Control"))
+	}
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={'A user loads the fintech dashboard. Their browser sends If-Modified-Since with the file\'s last modification time. The file on disk is unchanged. What does Go\'s http.FileServer return?'}
+  options={["200 OK with the full body", "304 Not Modified with no body", "412 Precondition Failed", "200 OK with Cache-Control: no-store"]}
+  answer={1}
+  explain={'304 Not Modified. The Last-Modified validator still matches, so no body is sent. The browser uses its cached copy. This is exactly what you want — zero wasted bandwidth on an unchanged asset.'}
+/>
+
+<UnderTheHood title="How http.FileServer handles validators (Go 1.26 baseline)">
+
+`http.FileServer` calls `Stat` on every request to get the file's `ModTime` and size, then delegates to `http.ServeContent`. The standard handler uses the modification time for `Last-Modified` and `If-Modified-Since` checks. It does **not** construct an ETag from size and modtime.
+
+If you need ETag precision, compute a content hash or use a build fingerprint and set `w.Header().Set("ETag", value)` before calling `http.ServeContent`. `ServeContent` will honor ETag precondition headers when the response already has an ETag.
+
+The conditional checks themselves live in `net/http/fs.go`: ETag checks use the ETag header you supplied, and modification-time checks use the `modtime` passed to `ServeContent`. The file body is not sent for a `304` cache hit.
+
+Go version note (Go 1.26 baseline): the `immutable` Cache-Control directive is not set by the stdlib — you add it in your own middleware as shown above.
+
+</UnderTheHood>
+
+---
+
+## go:embed & io/fs
+
+Here's where the magic happens, sport. I'm going to show you how to ship the Meridian dashboard — HTML, JS, CSS, fonts, *and* all your SQL migration files — inside a **single self-contained binary**. No deployment steps to copy static assets. No "where did the templates go?" production incident at 2 a.m. One binary. One `./server`. Done.
+
+<Define term="//go:embed / embed.FS" since="this chapter covers it in full; io/fs is introduced in Go 1.16">
+**`//go:embed`** is a compiler directive (Go 1.16+) that bakes files or directories into the binary at link time. You declare a variable of type `string`, `[]byte`, or **`embed.FS`** immediately below the directive and the linker stuffs the file bytes into it. **`embed.FS`** is a read-only in-memory filesystem that implements `fs.FS` — the same interface used by `os.DirFS`, ZIP readers, and test fixtures, so your code doesn't know or care whether it's talking to disk or a binary blob. Why it matters: it eliminates the entire class of deployment failure where static assets (the dashboard JS bundle, SQL migrations, HTML templates) were left off the server. One binary, one deploy, nothing missing.
+</Define>
+
+### The `//go:embed` directive
+
+**On the job:** `//go:embed` eliminates an entire class of deployment failures — the "static assets didn't get copied to the server" incident. At Meridian, this is the difference between a dashboard that works on first deploy and one that 404s on the logo.
+
+`//go:embed` is a compiler directive (Go 1.16+) that tells the linker to bake files or directories directly into the binary. It must appear immediately above a variable declaration of type `string`, `[]byte`, or `embed.FS`.
+
+```go
+package main
+
+import (
+	"embed"
+	// Use _ "embed" (blank import) when ONLY embedding into string or []byte —
+	// when you also use embed.FS you import "embed" directly, as shown here.
+)
+
+// Embed a single file into a string.
+// The path is relative to the package directory, never absolute.
+//go:embed templates/welcome.html
+var welcomeHTML string
+
+// Embed a single file into a []byte — useful for binary assets.
+//go:embed static/logo.png
+var logoPNG []byte
+
+// Embed an entire directory tree into an embed.FS.
+// This is the one you'll use most — it handles multiple files.
+//go:embed static
+var staticFiles embed.FS
+```
+
+A few rules the compiler enforces:
+
+- The path is always **relative to the package directory**. You cannot escape upward (`../`).
+- You can use glob patterns: `//go:embed static/*.html templates/**/*.tmpl`.
+- The `embed.FS` is **read-only** — it's baked into the binary at compile time.
+- Directories named `_` or `.` and files named `_*` or `.*` are excluded by default. Use `all:` prefix to include hidden files: `//go:embed all:static`.
+
+### embed.FS and the io/fs.FS abstraction
+
+`embed.FS` implements `fs.FS` — the interface from `io/fs` (Go 1.16) that abstracts a read-only filesystem. Its definition is beautifully minimal:
+
+```go
+// fs.FS is the interface a filesystem must implement.
+// Open returns an fs.File — which is itself an io.Reader.
+type FS interface {
+    Open(name string) (File, error)
+}
+```
+
+This means the same code can work with a real OS filesystem, an embedded filesystem, a ZIP archive, or a test fixture — anything that implements `fs.FS`. That's the power: your handlers don't need to know whether they're talking to disk or to a binary blob.
+
+### Serving an embedded filesystem with http.FS
+
+To serve an `embed.FS` over HTTP, wrap it with `http.FS` — which adapts `fs.FS` into `http.FileSystem` (the interface `http.FileServer` expects):
+
+```go
+package main
+
+import (
+	"embed"
+	"log"
+	"net/http"
+)
+
+//go:embed static
+var staticFiles embed.FS
+
+func main() {
+	// http.FS converts fs.FS → http.FileSystem.
+	// http.FileServer takes http.FileSystem → http.Handler.
+	http.Handle("/", http.FileServer(http.FS(staticFiles)))
+
+	log.Println("serving embedded static files on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+One important note: `embed.FS` preserves the directory prefix. If you embedded `static/`, requests for `/index.html` will look for `static/index.html` in the FS. Use `fs.Sub` to strip the prefix:
+
+```go
+//go:embed static
+var staticFiles embed.FS
+
+// fs.Sub returns a sub-tree of the FS rooted at "static".
+// Now requests for /index.html map to static/index.html correctly.
+sub, err := fs.Sub(staticFiles, "static")
+if err != nil {
+    log.Fatal(err)
+}
+http.Handle("/", http.FileServer(http.FS(sub)))
+```
+
+### The complete embedded binary pattern — the Meridian dashboard
+
+Here's the pattern in full: one binary that serves the Meridian dashboard frontend, runs migrations from embedded SQL files, and renders templates — all without a single external file dependency.
+
+```go
+package main
+
+import (
+	"embed"
+	"html/template"
+	"io/fs"
+	"log"
+	"net/http"
+)
+
+// Embed the entire static directory tree (JS, CSS, fonts, images).
+//go:embed static
+var staticFiles embed.FS
+
+// Embed all HTML templates.
+//go:embed templates/*.html
+var templateFiles embed.FS
+
+// Embed SQL migrations for the migrations runner.
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
+
+func main() {
+	// --- serve static assets from the binary ---
+	staticSub, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		log.Fatal(err)
+	}
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
+
+	// --- parse templates from the binary ---
+	tmpl, err := template.ParseFS(templateFiles, "templates/*.html")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	http.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		if err := tmpl.ExecuteTemplate(w, "dashboard.html", nil); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+
+	// --- walk migration files for the migrator ---
+	// fs.ReadDir works on embed.FS just like os.ReadDir works on disk.
+	entries, err := fs.ReadDir(migrationFiles, "migrations")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("found %d migration files in binary", len(entries))
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+Note: `embed.FS` is not runnable in the Go Playground (the playground doesn't have access to your source files at compile time). The snippet above is complete and correct — run it locally with `go build && ./server`. The playground below demonstrates the `io/fs` interface with an `os.DirFS` stand-in.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"strings"
+)
+
+// serveFile reads a file from any fs.FS — works with embed.FS,
+// os.DirFS, or a test fixture. The handler doesn't care which.
+func readAsset(fsys fs.FS, name string) (string, error) {
+	data, err := fs.ReadFile(fsys, name)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func main() {
+	// In a real binary this would be embed.FS, baked at compile time.
+	// In the playground we simulate it with a memory FS via os.DirFS
+	// pointed at the temp dir, but the key point is the abstraction:
+	// readAsset doesn't know or care which FS it gets.
+
+	// Simulate what embed.FS looks like to consumers.
+	// (We write a temp file just to demo the fs.FS interface.)
+	tmp, _ := os.MkdirTemp("", "demo")
+	defer os.RemoveAll(tmp)
+
+	os.WriteFile(tmp+"/dashboard.html", []byte("<h1>Dashboard</h1>"), 0644)
+	diskFS := os.DirFS(tmp)
+
+	html, err := readAsset(diskFS, "dashboard.html")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("content:", strings.TrimSpace(html))
+	fmt.Println("same function would work with embed.FS — interface is identical")
+}
+```
+
+</GoPlayground>
+
+Let's watch a request hit the embedded filesystem — no disk I/O after startup.
+
+<ExecTimeline
+  title="Request served from the embedded binary filesystem"
+  lanes={[{ id: "browser", label: "Browser" }, { id: "handler", label: "http.FileServer" }, { id: "embedfs", label: "embed.FS (in-memory)" }]}
+  steps={[
+    { lane: "browser", kind: "send", label: "GET /static/app.9f3a1.js", note: "Browser requests the JS bundle. The server has no ./static directory on disk." },
+    { lane: "handler", kind: "run", label: "strip /static/ prefix", note: "http.StripPrefix removes /static/ — the handler now looks for app.9f3a1.js in the sub-FS." },
+    { lane: "handler", kind: "run", label: "fs.Open('app.9f3a1.js')", note: "http.FS.Open is called. It dispatches into embed.FS, which consults its in-memory index." },
+    { lane: "embedfs", kind: "run", label: "look up file in index", note: "embed.FS holds a sorted list of embedded file paths. Binary search, no syscall." },
+    { lane: "embedfs", kind: "send", label: "return file bytes", note: "The embedded bytes are already in the process's read-only data segment. Zero disk I/O." },
+    { lane: "handler", kind: "run", label: "set Cache-Control", note: "FileServer reads metadata from embed.FS; your wrapper adds Cache-Control." },
+    { lane: "browser", kind: "recv", label: "200 OK + JS bundle", note: "Browser receives the response. Fingerprinted URLs let you cache this asset aggressively." }
+  ]}
+  caption="After startup, every request is served from the binary's data segment — no disk I/O, no missing files, no deployment drift."
+/>
+
+<UnderTheHood title="How io/fs.FS abstracts real vs embedded filesystems (Go 1.16+, Go 1.26 baseline)">
+
+`io/fs` was introduced in Go 1.16 to give the ecosystem a common read-only filesystem interface. Before it, every library that needed to read files either took a path string (coupling to the OS) or invented its own VFS abstraction.
+
+`embed.FS` stores its contents in the binary's **read-only data segment** — the `.rodata` section in the ELF/Mach-O binary. The linker bakes a sorted slice of `(path, offset, size)` entries and the raw file bytes at link time. At runtime, `embed.FS.Open` does a binary search over that sorted slice to find the file — it never calls `open(2)` or any other syscall. The bytes come from a memory-mapped region of the binary itself. (This is a simplified model; the exact layout is an implementation detail and may change across Go versions.)
+
+`os.DirFS` (which wraps a real directory as `fs.FS`) and `embed.FS` both satisfy `fs.FS`, so code like `fs.ReadFile`, `fs.ReadDir`, `fs.WalkDir`, and `template.ParseFS` accepts either. A test can inject a tiny `os.DirFS` with fixture files; production injects `embed.FS`. The handler is blissfully unaware.
+
+One subtlety: `embed.FS` file `ModTime` values are set to the **build time**, not the actual file modification time on disk. This means ETag-based caching resets on every `go build` — which is exactly correct for an immutable binary.
+
+**Go 1.24–1.25 addition — `os.Root` and `io/fs.ReadLinkFS`:** When you need to open real OS files rather than embedded ones, `os.Root` (added in Go 1.24) provides a confined directory handle — every `Open`, `Stat`, and `ReadDir` call on an `os.Root` value is restricted to that root directory tree, preventing path-traversal escapes at the OS level. In Go 1.25, `os.DirFS` and `os.Root.FS()` both gained `io/fs.ReadLinkFS` support, so symlink resolution also stays within the root boundary. For serving private Meridian account statements from the local filesystem, prefer `os.Root` over a bare `os.Open` loop.
+
+</UnderTheHood>
+
+---
+
+## CDNs
+
+**On the job:** A CDN is the difference between a Meridian dashboard that loads in 5 ms for a Singapore-based operator and one that takes 600 ms. You will configure this on your first production deploy; get the cache headers wrong and you'll be explaining to users why they're still seeing last month's UI.
+
+You've got a Go binary serving static assets beautifully. Now imagine 50,000 Meridian users in Singapore, São Paulo, and Stockholm all hitting your single US-East origin server. The JS bundle is 400 KB. The round-trip latency to North America from Singapore alone is ~200 ms. Multiply that by every asset on every page load and you have a slow, expensive product.
+
+A **Content Delivery Network** (CDN) solves this by caching your assets at dozens of **edge nodes** around the world. A user in Singapore gets the file from an edge node in Singapore — not from your origin server.
+
+<Define term="CDN / edge caching">
+A **Content Delivery Network (CDN)** is a global network of **edge nodes** (caches) placed close to users — Singapore, São Paulo, Stockholm. When a user requests a file, it comes from the nearest edge, not your origin server. The edge stores a copy based on the `Cache-Control` header your origin sets. A **cache miss** means the edge doesn't have the file yet and falls through to origin — slow. A **cache hit** means the edge serves it locally — fast. Why it matters: a 400 KB JS bundle served from Singapore takes ~5 ms from a local edge vs ~220 ms from a US-East origin. At scale that difference is the product's perceived quality.
+</Define>
+
+### How a CDN edge cache works
+
+The CDN sits between users and your **origin** server (the Meridian Go binary). On the first request for an asset, the edge node doesn't have it — that's a **cache miss**. It fetches the file from origin, caches it, and serves it to the user. Every subsequent request for the same asset from anywhere near that edge node is a **cache hit** — origin is never touched.
+
+The CDN decides how long to cache a response based on the `Cache-Control` header your Go server sets. `max-age=31536000` means "cache for a year." `no-cache` means "revalidate with origin every time." Setting these correctly is the difference between a CDN that helps you and one that just adds latency.
+
+<ExecTimeline
+  title="CDN edge: cache MISS vs cache HIT"
+  lanes={[{ id: "user", label: "User (SG)" }, { id: "edge", label: "CDN Edge (SG)" }, { id: "origin", label: "Go origin (US-E)" }]}
+  steps={[
+    { lane: "user", kind: "send", label: "GET /static/app.9f3a1.js (miss)", note: "First request from Singapore. Edge node has never seen this URL — cache miss." },
+    { lane: "edge", kind: "run", label: "forward to US-East origin", note: "Edge proxies the request to origin. Round-trip: ~200ms each way." },
+    { lane: "origin", kind: "send", label: "200 OK + Cache-Control: 1yr", note: "Origin returns 400 KB with Cache-Control: public, max-age=31536000. Edge stores it." },
+    { lane: "user", kind: "recv", label: "400 KB — ~220ms total", note: "Slow this time. But the edge node now has the file cached for up to a year." },
+    { lane: "user", kind: "send", label: "GET /static/app.9f3a1.js (hit)", note: "Next user — or same user, new session. Same URL, same edge node." },
+    { lane: "edge", kind: "run", label: "HIT — serve from edge cache", note: "File is cached locally at the Singapore POP. No round-trip to US-East needed." },
+    { lane: "user", kind: "recv", label: "400 KB — ~5ms total", note: "5ms from the edge. Origin was never contacted. This is why CDNs exist." }
+  ]}
+  caption="Cache HIT: 5ms from the edge. Cache MISS: 220ms to origin and back. The CDN's job is to make every request after the first one feel like a hit."
+/>
+
+<Define term="Fingerprinted asset URL">
+A **fingerprinted URL** embeds a hash of the file's contents in the filename: `app.js` → `app.9f3a1.js`. The hash is derived by the build pipeline and changes whenever the file changes, which means the URL changes too. The CDN has never seen the new URL, so it fetches fresh from origin automatically — no invalidation API call needed. The old URL stays cached harmlessly until its TTL expires. Why it matters: without fingerprinting, deploying a new JS bundle leaves CDN edge nodes around the world serving the old one for hours or days — breaking users who get new HTML referencing old JS. Fingerprinting is the standard solution for all public static assets.
+</Define>
+
+### Cache invalidation — the hardest problem
+
+The classic engineering joke: "There are only two hard things in CS — cache invalidation and naming things." CDN cache invalidation is the real-world manifestation of this.
+
+If you deploy a new JS bundle with the same URL (`/static/app.js`), the CDN edge nodes around the world are still serving the old one — until their `max-age` TTL expires. That could be days. Your users get a broken mix of old JS and new HTML.
+
+The solution is **fingerprinted (content-hashed) URLs**. Your build pipeline hashes the file contents and embeds that hash in the filename:
+
+```
+app.js          → app.9f3a1.js      (sha256[:5] of contents)
+styles.css      → styles.4ab2f.css
+logo.png        → logo.e7c91.png
+```
+
+Now the URL *is* the version. A new deploy produces a new hash, a new URL — the CDN has never seen it, so it fetches fresh from origin. The old URL remains cached (harmlessly) until it expires. Zero invalidation calls needed.
+
+Your Go server (or embedded binary) serves the hashed filenames. Your HTML references the hashed filenames. The CDN caches them forever with `max-age=31536000, immutable`.
+
+```go
+// In a real build pipeline, asset names come from a manifest file.
+// Here's the pattern: read the manifest and inject hashed URLs into templates.
+var assetManifest = map[string]string{
+	"app.js":     "app.9f3a1.js",
+	"styles.css": "styles.4ab2f.css",
+}
+
+func assetURL(name string) string {
+	if hashed, ok := assetManifest[name]; ok {
+		return "/static/" + hashed
+	}
+	return "/static/" + name // fallback for dev
+}
+```
+
+### Signed URLs for private files
+
+**On the job:** Meridian's quarterly account statements are per-user PDFs that must never be cached at a shared CDN edge. A signed URL lets you serve them via the same CDN infrastructure while keeping access time-limited and user-specific. Misconfigure this — allow `Cache-Control: public` — and you've handed one user's statement to the next person to hit that edge node.
+
+Fingerprinted URLs work for public assets. But the Meridian dashboard also serves private quarterly statements — PDFs that only the account holder should access.
+
+You can't cache these at the CDN edge with a public URL. The solution is a **signed URL**: a URL with a cryptographic signature (usually an HMAC) and an expiry timestamp embedded as query parameters. The CDN or your origin server validates the signature before serving the file. Expired or tampered URLs return `403 Forbidden`.
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+// signingKey should come from a secrets manager, never hardcoded.
+var signingKey = []byte("replace-me-from-vault")
+
+// signedURL generates a URL for a private file that expires at exp.
+func signedURL(baseURL, path string, exp time.Time) string {
+	expUnix := strconv.FormatInt(exp.Unix(), 10)
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(path + ":" + expUnix))
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return fmt.Sprintf("%s%s?exp=%s&sig=%s", baseURL, path, expUnix, sig)
+}
+
+// verifySignedURL returns true if the URL has a valid, unexpired signature.
+func verifySignedURL(path, expStr, sig string) bool {
+	expUnix, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix() > expUnix {
+		return false // expired
+	}
+	// Constant-time comparison prevents timing attacks.
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(path + ":" + expStr))
+	expected := mac.Sum(nil)
+	actual, err := hex.DecodeString(sig)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(expected, actual)
+}
+
+func statementHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	exp := r.URL.Query().Get("exp")
+	sig := r.URL.Query().Get("sig")
+
+	if !verifySignedURL(path, exp, sig) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	// Serve the file — Cache-Control: private, no-store for sensitive docs.
+	w.Header().Set("Cache-Control", "private, no-store")
+	http.ServeFile(w, r, "./statements"+path)
+}
+
+func main() {
+	url := signedURL("https://dashboard.meridian.com", "/statements/Q3-2024.pdf",
+		time.Now().Add(15*time.Minute))
+	fmt.Println("signed URL (15 min TTL):", url)
+
+	// Verify a valid and an expired signature.
+	validPath := "/statements/Q3-2024.pdf"
+	expFuture := strconv.FormatInt(time.Now().Add(15*time.Minute).Unix(), 10)
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(validPath + ":" + expFuture))
+	validSig := hex.EncodeToString(mac.Sum(nil))
+
+	fmt.Println("valid signature:", verifySignedURL(validPath, expFuture, validSig))
+
+	expPast := strconv.FormatInt(time.Now().Add(-1*time.Hour).Unix(), 10)
+	fmt.Println("expired signature:", verifySignedURL(validPath, expPast, validSig))
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"time"
+)
+
+var signingKey = []byte("demo-key-never-hardcode-in-prod")
+
+func signedURL(path string, exp time.Time) string {
+	expUnix := strconv.FormatInt(exp.Unix(), 10)
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(path + ":" + expUnix))
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return fmt.Sprintf("https://dashboard.meridian.com%s?exp=%s&sig=%s", path, expUnix, sig)
+}
+
+func verifySignedURL(path, expStr, sig string) bool {
+	expUnix, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix() > expUnix {
+		return false
+	}
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(path + ":" + expStr))
+	expected := mac.Sum(nil)
+	actual, _ := hex.DecodeString(sig)
+	return hmac.Equal(expected, actual)
+}
+
+func main() {
+	path := "/statements/Q3-2024.pdf"
+
+	// Generate a 15-minute signed URL.
+	url := signedURL(path, time.Now().Add(15*time.Minute))
+	fmt.Println("signed URL:", url)
+
+	// Verify a fresh URL — should be valid.
+	expFuture := strconv.FormatInt(time.Now().Add(15*time.Minute).Unix(), 10)
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(path + ":" + expFuture))
+	freshSig := hex.EncodeToString(mac.Sum(nil))
+	fmt.Println("fresh URL valid:", verifySignedURL(path, expFuture, freshSig))
+
+	// Verify an expired URL — should be invalid.
+	expPast := strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10)
+	fmt.Println("expired URL valid:", verifySignedURL(path, expPast, freshSig))
+
+	// Verify a tampered URL — should be invalid.
+	fmt.Println("tampered URL valid:", verifySignedURL(path, expFuture, "deadbeef"))
+}
+```
+
+</GoPlayground>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Fingerprinted URLs">Content-hash in the filename means the URL changes whenever the file changes. CDN caches forever, no invalidation calls. The standard for public static assets.</ConceptCard>
+  <ConceptCard label="Signed URLs">HMAC + expiry in the query string. Origin (or CDN) validates the signature. Used for private files where per-user access control matters.</ConceptCard>
+  <ConceptCard label="Cache-Control: private">Tells the CDN not to cache this response — it's user-specific. Browser may still cache it. Use for signed URLs and authenticated content.</ConceptCard>
+  <ConceptCard label="Cache-Control: no-store">Nothing is stored, anywhere. Use for responses containing credentials, session tokens, or sensitive financial data the user should never see again.</ConceptCard>
+  <ConceptCard label="CDN purge / invalidation">Most CDNs offer an API to invalidate a cache key immediately. Expensive (latency to propagate globally) and error-prone. Fingerprinted URLs sidestep the need entirely.</ConceptCard>
+  <Gotcha>Never set `Cache-Control: public` on a signed URL response. If the CDN caches the response, every user who hits that edge node gets the first user's private file. Always use `private, no-store` for authenticated content.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="Your build pipeline produces app.9f3a1.js for the current deploy and app.7c2b4.js for the next. You deploy the new version. What happens to the old CDN-cached URL?"
+  options={["The CDN detects the new deploy and purges the old URL automatically", "The old URL continues to be served by the CDN until its max-age TTL expires, then it's evicted — which is fine, because nobody references it anymore", "You must call the CDN purge API immediately or users get the old file", "The old URL returns 404 immediately"]}
+  answer={1}
+  explain="Fingerprinted URLs decouple deployment from cache invalidation. The old URL (app.9f3a1.js) stays cached at the CDN, but your new HTML references app.7c2b4.js — a URL the CDN has never seen, so it fetches fresh from origin. The old cached file just sits there harmlessly until it TTLs out. This is the whole point of fingerprinting."
+/>
+
+---
+
+## Exercises
+
+No skimming, sport. These are hands-on. The compiler is unimpressed by reading comprehension.
+
+<Exercise n={1} title="Strip the prefix correctly" level="easy">
+
+Write a `main` function that registers a file server for the directory `./public` and mounts it at `/files/`. A request to `/files/report.pdf` should map to `./public/report.pdf`. Use `httptest.NewRecorder` to demonstrate that `http.StripPrefix` is wired correctly by printing the path the inner handler sees.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	// The inner handler shows us what path it receives.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "inner sees:", r.URL.Path)
+	})
+
+	mux := http.NewServeMux()
+	// StripPrefix removes /files/ before the inner handler sees the request.
+	mux.Handle("/files/", http.StripPrefix("/files/", inner))
+
+	req := httptest.NewRequest("GET", "/files/report.pdf", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	fmt.Print(rec.Body.String())
+	// Output: inner sees: /report.pdf
+}
+```
+
+Without `http.StripPrefix`, the inner handler (and the real `http.FileServer`) would look for `./public/files/report.pdf` — one extra path segment that makes every lookup fail.
+
+</Solution>
+</Exercise>
+
+<Exercise n={2} title="Middleware that sets Cache-Control" level="easy">
+
+Write a middleware function `withCacheControl(maxAge int, next http.Handler) http.Handler` that sets `Cache-Control: public, max-age=<maxAge>` on every response. Verify it with `httptest`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func withCacheControl(maxAge int, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", maxAge))
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+
+	handler := withCacheControl(86400, base)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	fmt.Println(rec.Header().Get("Cache-Control"))
+	// Output: public, max-age=86400
+}
+```
+
+Middleware wraps the handler and sets headers before calling `next`. Because `Header()` returns a reference to the response header map, values set here are visible in the final response.
+
+</Solution>
+</Exercise>
+
+<Exercise n={3} title="Simulate a 304 conditional GET" level="medium">
+
+Write a handler that serves a static `[]byte` payload using `http.ServeContent`. Call it twice with `httptest`: once without any `If-None-Match` header, and once with the ETag value from the first response as `If-None-Match`. Print the status code for each call to confirm you get `200` then `304`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"time"
+)
+
+var payload = []byte(`{"accounts":[{"id":"acc_001","balance":10000}]}`)
+var modTime = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func dataHandler(w http.ResponseWriter, r *http.Request) {
+	// ServeContent handles ETag, Last-Modified, and conditional GET automatically.
+	http.ServeContent(w, r, "accounts.json", modTime, bytes.NewReader(payload))
+}
+
+func main() {
+	// First request — cold cache, no validators.
+	req1 := httptest.NewRequest("GET", "/accounts.json", nil)
+	rec1 := httptest.NewRecorder()
+	dataHandler(rec1, req1)
+	fmt.Println("first request status:", rec1.Code)                  // 200
+	etag := rec1.Header().Get("ETag")
+	fmt.Println("ETag received:", etag)
+
+	// Second request — send back the ETag as If-None-Match.
+	req2 := httptest.NewRequest("GET", "/accounts.json", nil)
+	req2.Header.Set("If-None-Match", strings.TrimSpace(etag))
+	rec2 := httptest.NewRecorder()
+	dataHandler(rec2, req2)
+	fmt.Println("second request status:", rec2.Code)                 // 304
+	fmt.Println("body length:", rec2.Body.Len(), "(should be 0)")
+}
+```
+
+`http.ServeContent` derives the ETag from the `modTime` and the seeker size. When `If-None-Match` matches, it writes `304` and returns immediately — the handler body never touches the `bytes.Reader`.
+
+</Solution>
+</Exercise>
+
+<Exercise n={4} title="Walk an embed.FS" level="medium">
+
+Using `fs.WalkDir`, write a function `listEmbeddedFiles(fsys fs.FS) []string` that returns a sorted slice of all file paths in the FS (not directories). Call it from `main` with an `os.DirFS` pointing at a temp directory you create and populate.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"sort"
+)
+
+func listEmbeddedFiles(fsys fs.FS) ([]string, error) {
+	var files []string
+	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+func main() {
+	tmp, err := os.MkdirTemp("", "demo")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	for _, name := range []string{"app.9f3a1.js", "index.html", "styles.4ab2f.css"} {
+		os.WriteFile(tmp+"/"+name, []byte("content"), 0644)
+	}
+
+	files, err := listEmbeddedFiles(os.DirFS(tmp))
+	if err != nil {
+		panic(err)
+	}
+	for _, f := range files {
+		fmt.Println(f)
+	}
+	// app.9f3a1.js
+	// index.html
+	// styles.4ab2f.css
+}
+```
+
+`fs.WalkDir` works on any `fs.FS` — the same code runs on `embed.FS`, `os.DirFS`, or a custom `fs.FS` implementation. `d.IsDir()` skips directories so we only list files.
+
+</Solution>
+</Exercise>
+
+<Exercise n={5} title="Signed URL generation and verification" level="hard">
+
+Implement `SignedURL(secret []byte, path string, ttl time.Duration) string` and `VerifySignedURL(secret []byte, path, rawURL string) error` that respectively generate and verify HMAC-SHA256 signed URLs. The signature must cover both the path and the expiry. Return a descriptive error for expired and tampered URLs. Write a table-driven test that covers: valid, expired, and tampered cases.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/url"
+	"strconv"
+	"time"
+)
+
+var (
+	ErrExpired   = errors.New("URL has expired")
+	ErrInvalid   = errors.New("signature is invalid")
+	ErrMalformed = errors.New("URL is malformed")
+)
+
+func sign(secret []byte, path, expStr string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(path + ":" + expStr))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func SignedURL(secret []byte, path string, ttl time.Duration) string {
+	exp := strconv.FormatInt(time.Now().Add(ttl).Unix(), 10)
+	sig := sign(secret, path, exp)
+	return fmt.Sprintf("https://cdn.meridian.com%s?exp=%s&sig=%s", path, exp, sig)
+}
+
+func VerifySignedURL(secret []byte, path, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ErrMalformed
+	}
+	expStr := u.Query().Get("exp")
+	sig := u.Query().Get("sig")
+	if expStr == "" || sig == "" {
+		return ErrMalformed
+	}
+
+	expUnix, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil {
+		return ErrMalformed
+	}
+	if time.Now().Unix() > expUnix {
+		return ErrExpired
+	}
+
+	expected, _ := hex.DecodeString(sign(secret, path, expStr))
+	actual, err := hex.DecodeString(sig)
+	if err != nil || !hmac.Equal(expected, actual) {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func main() {
+	secret := []byte("super-secret-key")
+	path := "/statements/Q3-2024.pdf"
+
+	tests := []struct {
+		name    string
+		rawURL  string
+		wantErr error
+	}{
+		{
+			"valid",
+			SignedURL(secret, path, 15*time.Minute),
+			nil,
+		},
+		{
+			"expired",
+			func() string {
+				exp := strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10)
+				sig := sign(secret, path, exp)
+				return fmt.Sprintf("https://cdn.meridian.com%s?exp=%s&sig=%s", path, exp, sig)
+			}(),
+			ErrExpired,
+		},
+		{
+			"tampered",
+			SignedURL(secret, path, 15*time.Minute) + "x",
+			ErrInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		err := VerifySignedURL(secret, path, tt.rawURL)
+		if tt.wantErr == nil && err == nil {
+			fmt.Printf("%-10s PASS\n", tt.name)
+		} else if errors.Is(err, tt.wantErr) {
+			fmt.Printf("%-10s PASS (got expected error: %v)\n", tt.name, err)
+		} else {
+			fmt.Printf("%-10s FAIL: want %v, got %v\n", tt.name, tt.wantErr, err)
+		}
+	}
+}
+```
+
+`hmac.Equal` uses constant-time comparison, preventing timing attacks that could leak information about the secret. Never use `==` or `bytes.Equal` to compare MACs.
+
+</Solution>
+</Exercise>
+
+---
+
+## The Lab
+
+Enough theory. I set this test personally, and I want to be *very* clear: I find sloppiness in cache headers personally offensive. Now show me what you've got.
+
+<Lab
+  title="Serve an embedded FS with correct Cache-Control and 304 support"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={10}
+  verify="self-check"
+  objective="Complete the starter so it: (1) serves an os.DirFS-backed filesystem under /static/; (2) sets Cache-Control: public, max-age=31536000, immutable on every response; (3) correctly returns 304 Not Modified when the client sends a matching If-Modified-Since header. The starter prints PASS/FAIL for each check — all three must print their expected values for the flag to unlock."
+  starter={`package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+)
+
+// TODO 1: Wire up an http.FileServer for os.DirFS(tmp) at /static/.
+// TODO 2: Wrap it with middleware that sets Cache-Control on every response.
+// TODO 3: Verify the verifier checks below pass.
+
+func main() {
+	tmp, _ := os.MkdirTemp("", "lab")
+	defer os.RemoveAll(tmp)
+	os.WriteFile(tmp+"/app.9f3a1.js", []byte("console.log('hi')"), 0644)
+
+	// Build your handler here.
+	var handler http.Handler // REPLACE THIS
+
+	// Verifier check 1: cold request returns 200.
+	req1 := httptest.NewRequest("GET", "/static/app.9f3a1.js", nil)
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	fmt.Println("check 1 status:", rec1.Code) // want 200
+
+	// Verifier check 2: Cache-Control header is set correctly.
+	cc := rec1.Header().Get("Cache-Control")
+	fmt.Println("check 2 Cache-Control:", cc) // want: public, max-age=31536000, immutable
+	fmt.Println("check 2 pass:", strings.Contains(cc, "max-age=31536000"))
+
+		// Verifier check 3: conditional GET with Last-Modified returns 304.
+		lastModified := rec1.Header().Get("Last-Modified")
+		req2 := httptest.NewRequest("GET", "/static/app.9f3a1.js", nil)
+		req2.Header.Set("If-Modified-Since", lastModified)
+		rec2 := httptest.NewRecorder()
+		handler.ServeHTTP(rec2, req2)
+		fmt.Println("check 3 status:", rec2.Code) // want 304
+}`}
+  verifier="All three fmt.Println checks must print their expected values: check 1 → 200, check 2 → true (max-age=31536000 present), check 3 → 304. The program is self-checking — run it with go run and confirm all three lines match. The flag unlocks when they do."
+  hints={[
+    "TODO 1: use http.StripPrefix('/static/', http.FileServer(http.FS(os.DirFS(tmp)))) as the inner handler.",
+    "TODO 2: wrap the inner handler in a closure that calls w.Header().Set('Cache-Control', 'public, max-age=31536000, immutable') before calling inner.ServeHTTP(w, r).",
+    "TODO 3: http.FileServer sets Last-Modified from file metadata. Reuse that response header as If-Modified-Since in the second request; http.FileServer handles the 304."
+  ]}
+  flag="GO{embedded_304_cache_headers_delivered}"
+>
+
+The Meridian dashboard's static bundle needs to load in under 20 ms on repeat visits — from anywhere on the planet. Conditional GETs and a properly configured CDN are how that happens. Get all three checks green and the flag is yours.
+
+</Lab>
+
+<Recap>
+
+- `http.FileServer` serves an entire directory tree with caching, range requests, and content-type detection built in. `http.StripPrefix` maps URL paths to filesystem paths.
+- `http.ServeContent` is the flexible alternative — it takes any `io.ReadSeeker` and handles 206 Partial Content plus conditional requests. It honors ETag preconditions if you set the `ETag` header yourself.
+- `Cache-Control: public, max-age=31536000, immutable` + fingerprinted URLs is the CDN-friendly pattern for public static assets. `Cache-Control: private, no-store` is for sensitive authenticated content.
+- `304 Not Modified` means a validator such as `Last-Modified` or an app-provided `ETag` matched — the body is omitted and the browser uses its cached copy.
+- `//go:embed` bakes files and directories into the binary at link time. `embed.FS` implements `fs.FS`, giving you `fs.ReadFile`, `fs.ReadDir`, `fs.WalkDir`, and `template.ParseFS` for free. Use `fs.Sub` to strip directory prefixes before passing to `http.FS`.
+- A CDN caches your responses at edge nodes worldwide. Cache misses fall through to origin; cache hits are served locally. Fingerprinted URLs sidestep cache invalidation entirely.
+- Signed URLs use HMAC-SHA256 + an expiry timestamp to authorize access to private files. Use `hmac.Equal` for constant-time comparison. Always set `Cache-Control: private, no-store` on signed-URL responses.
+
+</Recap>
+
+<Scoreboard
+  streak={18}
+  items={[
+    { label: "Quick check — ServeContent vs FileServer", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — conditional GET and 304", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — fingerprinted URL cache behavior", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Strip the prefix correctly", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Cache-Control middleware", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Simulate a 304 conditional GET", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Walk an embed.FS", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Signed URL generation and verification", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Embedded FS with 304 + Cache-Control", captured: false, points: 80 }}
+/>
+
+Not bad. One binary. No missing assets. 304s firing on repeat requests like clockwork. The Meridian dashboard loads in 5 ms from Singapore. *That's* what I expect. Next we tackle caching at the application layer — Redis, cache-aside, stampede prevention, and the discipline of knowing exactly when *not* to cache. See you there, sport.

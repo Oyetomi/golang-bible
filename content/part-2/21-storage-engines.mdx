@@ -1,0 +1,575 @@
+---
+title: "Storage Engines: LSM-Trees vs B-Trees"
+part: 2
+order: 21
+type: "course"
+description: "What actually happens on disk when a database stores your data — explained from zero: the append-only log and the index trade-off, log-structured (LSM) engines with memtables, SSTables, compaction and Bloom filters, B-trees with pages, splits and the write-ahead log, how to choose between them (write amplification, sequential vs random writes), and why analytics uses column storage — all grounded in Meridian's ledger."
+prerequisites: ["sharding"]
+---
+
+<HeroCard label="Part 2 · Chapter 21" title="Storage Engines: LSM-Trees vs B-Trees">
+
+You've kept copies (replication) and split the data (sharding). Now we go down one more level — *inside a single shard* — to the thing that actually puts bytes on disk and finds them again: the **storage engine**. You will never write one from scratch. But you choose one every time you pick Postgres over Cassandra, or turn on a RocksDB backend, or wonder why your write-heavy table is slow — and those choices are unguessable until you know what the engine is doing under the hood.
+
+I'll teach this from absolute zero — no assumed knowledge of disks, trees, or indexes. We'll build the world's simplest database in a few lines, watch it fall over, and fix it twice, two completely different ways: the **log-structured (LSM)** way that powers Cassandra and RocksDB, and the **B-tree** way that powers Postgres and MySQL. By the end you'll know exactly why Meridian's transaction firehose loves one engine and its balance lookups love the other, what "write amplification" is and why it wears out your SSD, and why the finance dashboard stores the same data sideways. Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Index Trade-off", "LSM-Trees", "B-Trees", "LSM vs B-Tree", "Bloom Filters", "Row vs Column"]} />
+
+<Scene
+  title="An append-only log grows forever → compaction reclaims it"
+  actors={[
+    { id: "writer", label: "Ledger writes" },
+    { id: "engine", label: "Storage engine" }
+  ]}
+  rows={1}
+  cols={5}
+  frames={[
+    {
+      caption: "Every write appends to a log — the fastest possible write. acct_7 is set to 5000, then updated to 9000. The old 5000 is still sitting there.",
+      beat: "neutral",
+      cells: [{ id: "A1", state: "active", label: "7=5000" }, { id: "A2", state: "active", label: "7=9000" }, { id: "A3", state: "idle", label: "—" }, { id: "A4", state: "idle", label: "—" }, { id: "A5", state: "idle", label: "—" }]
+    },
+    {
+      caption: "Thousands of updates later, the log is full of stale, overwritten versions. Reads slow down, disk fills with garbage. An append-only log that never cleans up runs out of space.",
+      beat: "problem",
+      cells: [{ id: "A1", state: "bad", label: "7=5000 ✗" }, { id: "A2", state: "bad", label: "7=9000 ✗" }, { id: "A3", state: "bad", label: "7=8800 ✗" }, { id: "A4", state: "warn", label: "7=9100" }, { id: "A5", state: "bad", label: "disk full" }]
+    },
+    {
+      caption: "Compaction merges the segments in the background, keeping only the newest value per key and discarding the rest. One live value for acct_7; the garbage is gone.",
+      beat: "solution",
+      cells: [{ id: "A1", state: "done", label: "7=9100 ✓" }, { id: "A2", state: "ok", label: "reclaimed" }, { id: "A3", state: "ok", label: "reclaimed" }, { id: "A4", state: "ok", label: "reclaimed" }, { id: "A5", state: "ok", label: "free" }]
+    }
+  ]}
+  caption="The whole story of a log-structured engine in one picture: append fast, then merge-and-compact in the background to keep only what's live. Everything else in this chapter is detail on top of this idea."
+/>
+
+## The Index Trade-off
+
+A database does exactly two things: you give it data, it stores it; you ask for data, it gives it back. Here's the entire thing, as simple as it can possibly be — an **append-only log**:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// The world's simplest storage engine: an append-only log of values, plus an
+// in-memory hash index mapping each key to the position of its NEWEST value.
+type Engine struct {
+	log   []string       // append-only; old values are never erased in place
+	index map[string]int // key -> position of newest entry in log
+}
+
+func newEngine() *Engine { return &Engine{index: map[string]int{}} }
+
+func (e *Engine) set(key, val string) {
+	e.log = append(e.log, val) // O(1): appending is the cheapest write there is
+	e.index[key] = len(e.log) - 1
+}
+
+func (e *Engine) get(key string) (string, bool) {
+	i, ok := e.index[key]
+	if !ok {
+		return "", false
+	}
+	return e.log[i], true // O(1): the index jumps straight to the newest value
+}
+
+func main() {
+	e := newEngine()
+	e.set("acct_7", "balance=5000")
+	e.set("acct_7", "balance=9000") // update: appended; the old value still lingers
+	bal, _ := e.get("acct_7")
+	fmt.Println("acct_7 ->", bal) // balance=9000 (newest)
+	fmt.Println("log holds", len(e.log), "entries (old version still present)")
+}
+```
+
+</GoPlayground>
+
+Two ideas in those few lines carry the whole chapter:
+
+<Define term="Log (append-only file)" since="Storage Engines (Part 2)">
+A **log** here is not application log output — it's an **append-only sequence of records on disk**. Writes only ever go on the *end*; existing bytes are never modified. Why it matters: appending is the single fastest write a disk can do (no seeking, no rewriting), so almost every storage engine has a log at its core. The cost: old versions pile up, and finding a key means knowing *where* it is.
+</Define>
+
+<Define term="Index" since="Storage Engines (Part 2)">
+An **index** is an extra structure *derived* from your data that makes reads faster — like the in-memory hash map above (key → byte offset). Why it matters: without an index, finding a key means scanning the whole file, `O(n)` — double the data, double the wait. *With* one, it's a direct jump. But every index must be **updated on every write**, so indexes speed up reads and **slow down writes**. That trade-off — pay on writes to save on reads — is the central tension of all storage engines, and why databases don't index every column by default.
+</Define>
+
+<Callout kind="warn" title="The toy engine has three fatal flaws — and fixing them gives us real engines">
+
+Our append-log-plus-hash-index is fast, but: (1) it never reclaims space — stale values pile up until the disk is full; (2) the hash index must fit entirely in RAM, and rebuilding it on restart means rescanning everything; (3) **range queries are impossible** — "every transaction for acct_7 in March" has to look up each key individually. The two real engine families are two different ways of fixing all three. **LSM-trees** keep the log idea but sort and merge it. **B-trees** throw out the log and update sorted pages in place. Same goal, opposite philosophy.
+
+</Callout>
+
+## LSM-Trees
+
+The first fix keeps the append-only spirit but makes the on-disk files **sorted**. A sorted file of key-value pairs is called an **SSTable**, and the engine built around them is the **LSM-tree** (Log-Structured Merge-tree) — the heart of Cassandra, ScyllaDB, RocksDB, HBase, and Bigtable.
+
+<Define term="SSTable & memtable" since="Storage Engines (Part 2)">
+An **SSTable** (Sorted String Table) is an on-disk file of key-value pairs **sorted by key**, with each key appearing once. A **memtable** is an in-memory sorted structure (a balanced tree or skip list) that buffers recent writes. Why it matters: sorting unlocks cheap range scans and lets two files be merged with a memory-light mergesort. Writes go to the fast memtable; when it's full, it's flushed to disk as a new immutable SSTable. You get log-speed writes *and* sorted files.
+</Define>
+
+Here is the write path. Notice every write is durable *before* it's acknowledged, via a separate write-ahead log:
+
+<ExecTimeline
+  title="The LSM write path"
+  lanes={[
+    { id: "client", label: "Ledger write" },
+    { id: "wal", label: "Write-ahead log" },
+    { id: "mem", label: "Memtable (RAM)" },
+    { id: "disk", label: "SSTables (disk)" }
+  ]}
+  steps={[
+    { lane: "client", kind: "run", label: "write acct_7=9000", note: "A transaction updates an account." },
+    { lane: "wal", kind: "send", label: "append to WAL", note: "First, append the write to an on-disk log. If we crash now, we can replay this to rebuild the memtable. Durability before acknowledgement." },
+    { lane: "mem", kind: "run", label: "insert into memtable", note: "Then insert into the in-memory sorted structure. Fast — it's RAM. The write is acknowledged here." },
+    { lane: "mem", kind: "block", label: "memtable full?", note: "When the memtable passes a threshold (a few MB), it's frozen and a fresh one takes over incoming writes." },
+    { lane: "disk", kind: "done", label: "flush as new SSTable", note: "The frozen memtable is written out in one sequential pass as a new immutable SSTable. Its slice of the WAL can now be discarded." }
+  ]}
+  caption="Writes hit RAM (fast) but survive crashes (WAL). The expensive disk work — flushing — happens in big sequential batches, not per write. That's the LSM superpower for write-heavy workloads like a ledger."
+/>
+
+Reads are trickier: a key might be in the memtable, or the newest SSTable, or an older one. You check **newest to oldest** and stop at the first hit (newer overrides older). Deletes are just another write — a special **tombstone** marker. And to avoid touching every SSTable for keys that aren't there, each SSTable carries a **Bloom filter** (its own section below). Left alone, SSTables would accumulate forever, so a background **compaction** merges them:
+
+<ExecTimeline
+  title="Compaction: merging two SSTables"
+  lanes={[
+    { id: "newer", label: "Newer SSTable" },
+    { id: "older", label: "Older SSTable" },
+    { id: "merge", label: "Merge (mergesort)" },
+    { id: "out", label: "Output SSTable" }
+  ]}
+  steps={[
+    { lane: "newer", kind: "run", label: "acct_7=9000, acct_9=del", note: "The newer segment has the latest value for acct_7 and a tombstone deleting acct_9." },
+    { lane: "older", kind: "run", label: "acct_7=5000, acct_8=200", note: "The older segment has a stale acct_7 and a live acct_8." },
+    { lane: "merge", kind: "run", label: "walk both, take lowest key", note: "Like the merge step of mergesort: read both sorted files side by side, emit the smallest key. On a tie, keep the NEWER value." },
+    { lane: "merge", kind: "block", label: "drop stale + tombstones", note: "The old acct_7=5000 is discarded (newer wins); acct_9's tombstone removes it entirely once merged into the oldest level." },
+    { lane: "out", kind: "done", label: "one clean sorted file", note: "Result: acct_7=9000, acct_8=200. Sorted, one value per key, garbage reclaimed. Old files are deleted." }
+  ]}
+  caption="Compaction is a background mergesort. It uses almost no memory (one key at a time per file) and turns a growing pile of segments back into a tidy set — reclaiming the space the toy engine never could."
+/>
+
+<Callout kind="note" title="Compaction strategies: size-tiered vs leveled">
+
+*When* and *which* SSTables to merge is configurable. **Size-tiered** merges smaller SSTables into successively bigger ones — great for write-heavy loads (data is rewritten only a few times). **Leveled** keeps fixed-size SSTables in growing levels (L0, L1, L2…), merging incrementally — uses less disk space and is faster for reads (fewer files to check). Rule of thumb: write-heavy → size-tiered; read-heavy → leveled. Meridian's transaction ingest (write-heavy) leans size-tiered; a read-heavy lookup table leans leveled. Most engines let you pick per table.
+
+</Callout>
+
+## B-Trees
+
+The other family throws out the log entirely. Instead of immutable sorted files, a **B-tree** divides the disk into fixed-size **pages** (typically 4–16 KiB) and **updates them in place**. It's the most widespread index structure on earth — every major relational database (Postgres, MySQL, SQL Server, Oracle) uses one.
+
+<Define term="B-tree (pages & branching factor)" since="Storage Engines (Part 2)">
+A **B-tree** stores sorted key-value pairs in fixed-size **pages** arranged as a balanced tree. One page is the **root**; it holds keys and references to child pages, each child covering a key range, down to **leaf** pages holding the actual values. The **branching factor** (references per page, often several hundred) keeps the tree shallow — three or four levels can address hundreds of terabytes. Why it matters: a lookup reads just one page per level (≈3–4 disk reads), giving fast, *predictable* read performance — the B-tree's headline strength.
+</Define>
+
+A lookup walks the tree from the root, following the one child whose range contains your key:
+
+<ExecTimeline
+  title="A B-tree lookup, then a page split"
+  lanes={[
+    { id: "q", label: "Query" },
+    { id: "root", label: "Root page" },
+    { id: "branch", label: "Branch page" },
+    { id: "leaf", label: "Leaf page" }
+  ]}
+  steps={[
+    { lane: "q", kind: "run", label: "find acct 251", note: "We want the value for key 251." },
+    { lane: "root", kind: "run", label: "251 is in 200-300", note: "The root says keys 200-300 live via this child reference. Follow it." },
+    { lane: "branch", kind: "run", label: "251 is in 250-270", note: "The branch page narrows further: 250-270 is over here. Follow that." },
+    { lane: "leaf", kind: "done", label: "read value at 251", note: "The leaf page holds key 251's value inline. Found in ~3 page reads, every time. Predictable." },
+    { lane: "leaf", kind: "block", label: "insert into a FULL page", note: "Now insert key 334 into a page that's full: the page SPLITS into two half-full pages, and the parent is updated to point at both. Splits can cascade to the root." }
+  ]}
+  caption="Reads are a short, predictable walk down the tree. Inserts can trigger a page split, and a split overwrites several pages at once — which is exactly where crashes get dangerous."
+/>
+
+<Define term="Write-ahead log (WAL) & in-place overwrite" since="Storage Engines (Part 2)">
+A B-tree's basic write **overwrites a page on disk in place**. A page split overwrites *several* pages at once — and if the database crashes mid-split, the tree is corrupted (an orphan page, or a half-written "torn" page). The fix is a **write-ahead log (WAL)**: every change is appended to a durable log *before* the tree pages are touched, so a crash can be recovered by replaying it. Why it matters: in-place updates make B-trees fast to read but fragile to crash — the WAL (filesystem people call it *journaling*) is what makes them safe. Data is durable once it's in the WAL and `fsync`'d to disk.
+</Define>
+
+So both families use a WAL for durability — but for opposite reasons. The LSM uses it to recover the in-memory memtable; the B-tree uses it to survive a dangerous in-place page overwrite. Same tool, different fear.
+
+## LSM vs B-Tree
+
+Now the decision you'll actually make. The one-line rule: **LSM-trees are better for writes, B-trees are better (and more predictable) for reads.** Here's *why*, in the four dimensions that matter.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Sequential vs random writes">LSM flushes whole segments — big **sequential** writes. B-trees overwrite scattered pages — small **random** writes. Disks (even SSDs) do sequential far faster, so LSMs sustain higher write throughput on the same hardware.</ConceptCard>
+  <ConceptCard label="Write amplification">One logical write becomes several physical writes: LSM (WAL + flush + each compaction), B-tree (WAL + the full page, even for a few changed bytes). Lower amplification = more app writes per unit of disk bandwidth, and less SSD wear. LSMs usually win here.</ConceptCard>
+  <ConceptCard label="Read performance">B-tree: one page per level, ~3–4 reads, **predictable**. LSM: may check several SSTables (Bloom filters help), so reads are less predictable and range queries must merge segments. B-trees generally read faster.</ConceptCard>
+  <ConceptCard label="Disk space & latency spikes">LSM compresses SSTables well and rewrites them, so less fragmentation — but compaction competes with live traffic and can cause **latency spikes** under heavy writes. B-trees fragment over time (Postgres needs `VACUUM`).</ConceptCard>
+</ConceptGrid>
+
+<Define term="Write amplification" since="Storage Engines (Part 2)">
+**Write amplification** is the ratio of bytes actually written to disk versus the bytes the application asked to write. If a 100-byte write causes 600 bytes of disk I/O (log, flush, compactions), amplification is 6×. Why it matters: in write-heavy systems the bottleneck is disk write bandwidth, so high amplification directly caps your writes per second — *and* it wears out SSDs faster (flash has a limited number of write cycles). Choosing the lower-amplification engine for a write-heavy ledger is a real, measurable win.
+</Define>
+
+<UnderTheHood title="Why sequential beats random, even on SSDs — and the Go durability detail">
+
+On spinning disks, a random write means physically moving the head — milliseconds, an eternity. SSDs have no moving parts, yet sequential *still* wins, for a subtler reason: flash can be **written** one ~4 KiB page at a time but only **erased** one ~512 KiB block at a time. A big sequential write fills whole blocks that can later be erased cleanly; scattered random writes leave blocks half-valid, forcing the SSD's **garbage collector** to relocate live pages before erasing — stealing bandwidth and adding wear. So an LSM's large sequential flushes are gentler on the drive than a B-tree's scattered page overwrites.
+
+**The Go angle:** none of this durability is real until the bytes are physically on the disk, and the OS buffers writes in a page cache. A normal `file.Write` can be lost in a crash. You must call `file.Sync()` — Go's wrapper around the `fsync` syscall — to force the WAL to durable storage before acknowledging a write. As of Go 1.26, prefer `os.OpenFile` with `O_APPEND` for the log, `bufio.Writer` to batch, then `Sync()` at the commit point; and `slices.SortFunc` (Go 1.21+) to keep a memtable's flush sorted. The engine is only as durable as its last successful `Sync()`.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Meridian's transaction ingest is overwhelmingly writes (every payment is an append), with occasional point lookups by account. Which storage engine family fits the ingest table best, and why?"
+  options={[
+    "B-tree — it has predictable reads",
+    "LSM-tree — its large sequential flushes and lower write amplification sustain far higher write throughput, which is the bottleneck for a write-heavy ledger ingest",
+    "It makes no difference",
+    "Neither — use the in-memory toy engine"
+  ]}
+  answer={1}
+  explain="Write-heavy means disk write bandwidth is the constraint. LSM-trees turn writes into big sequential flushes and have lower write amplification than B-trees (which must write a full page per change), so they push more writes per second and wear SSDs less. That's exactly why Cassandra/RocksDB-style engines back write-heavy ingest. The occasional point lookup is well-served by Bloom filters."
+/>
+
+## Bloom Filters
+
+An LSM read may have to check many SSTables — and most of them won't contain your key. Reading each one to discover that is wasteful. A **Bloom filter** is a tiny, fast, *probabilistic* gate that says "definitely not here" or "maybe here," letting you skip most SSTables without touching them.
+
+<Define term="Bloom filter" since="Storage Engines (Part 2)">
+A **Bloom filter** is a bit array plus a few hash functions that answers "is this key in this set?" with **no false negatives** (a "no" is always correct) but occasional **false positives** (a "maybe" might be wrong). To add a key, hash it to several bit positions and set them to 1; to test a key, check those bits — if any is 0, it's definitely absent. Why it matters: a few bits per key (≈10 bits → 1% false positives) lets an LSM skip SSTables that can't contain the key, turning many disk reads into one cheap in-memory check.
+</Define>
+
+The whole thing is just bit-setting and bitwise checks — watch it run:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"hash/fnv"
+)
+
+// A Bloom filter: "is this key MAYBE in this SSTable?" No false negatives.
+type Bloom struct{ bits []bool }
+
+func newBloom(size int) *Bloom { return &Bloom{bits: make([]bool, size)} }
+
+// Derive two bit positions from one hash (cheap, good enough for a demo).
+func (b *Bloom) positions(key string) (uint32, uint32) {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	x := h.Sum32()
+	n := uint32(len(b.bits))
+	return x % n, (x>>13 | 1) % n
+}
+
+func (b *Bloom) add(key string) {
+	i, j := b.positions(key)
+	b.bits[i], b.bits[j] = true, true
+}
+
+func (b *Bloom) mightContain(key string) bool {
+	i, j := b.positions(key)
+	return b.bits[i] && b.bits[j] // any 0 -> definitely absent
+}
+
+func main() {
+	b := newBloom(128)
+	for _, k := range []string{"acct_7", "acct_42", "acct_99"} {
+		b.add(k)
+	}
+	fmt.Println("acct_7  ->", b.mightContain("acct_7"))    // true  (present)
+	fmt.Println("acct_500 ->", b.mightContain("acct_500")) // almost always false
+	fmt.Println("A 'false' means SKIP this SSTable entirely — zero disk reads.")
+}
+```
+
+</GoPlayground>
+
+The magic is the asymmetry: a "no" is *guaranteed*, so it's always safe to skip. A "yes" might be a coincidence (other keys set those same bits), so you then do the real lookup — and on a false positive you've only wasted a little work. For an LSM checking a stack of segments for a key that doesn't exist, that's the difference between many disk reads and almost none.
+
+## Row vs Column
+
+One last twist, and it's about *layout*. Everything so far stored a whole record together — fine for "fetch account 7." But Meridian's finance dashboard asks different questions: *"sum the amount of every settled transaction this quarter."* That scans **millions of rows** but needs **one column**. Storing rows together makes you read everything to get a little.
+
+<Define term="Row-oriented vs column-oriented storage" since="Storage Engines (Part 2)">
+**Row-oriented** storage keeps all of a row's fields next to each other (great for "give me this whole record" — OLTP). **Column-oriented** (columnar) storage keeps all values of *one column* together across rows (great for "aggregate this one field over millions of rows" — OLAP/analytics). Why it matters: an analytics query touching 3 of 100 columns reads only those 3 columns off disk in a column store, instead of dragging every full row through memory. Columnar storage also compresses far better, because a single column's values repeat. It's why warehouses (BigQuery, Snowflake, DuckDB, Parquet) are columnar.
+</Define>
+
+The bytes-read difference is stark — one aggregate query, same data, two layouts:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// One analytics query: SUM(amount) over a million transactions. It needs ONE
+// column out of ~20. Row storage must read every field of every row; column
+// storage reads only the amount column.
+func main() {
+	const rows, fields, fieldBytes = 1_000_000, 20, 8
+
+	rowStoreBytes := rows * fields * fieldBytes // whole rows, every field
+	colStoreBytes := rows * 1 * fieldBytes      // only the amount column
+
+	fmt.Printf("row store reads %d MB\n", rowStoreBytes/1_000_000)
+	fmt.Printf("col store reads %d MB\n", colStoreBytes/1_000_000)
+	fmt.Printf("column storage reads %dx less for this query\n",
+		rowStoreBytes/colStoreBytes)
+	fmt.Println("...and a single column compresses far better (its values repeat).")
+}
+```
+
+</GoPlayground>
+
+<Callout kind="pro" title="The senior framing: it's the same data, stored for a different question">
+
+Don't think "row store good, column store bad" or vice versa. It's the OLTP/OLAP split you met at the start of Part 2, made physical. Meridian's *operational* ledger — "debit account 7, did it succeed?" — is row-oriented (Postgres B-tree or an LSM): it touches whole records, one at a time, with strong transactions. The *analytical* copy — "revenue by product by weekday this year" — is column-oriented (a warehouse): it scans few columns over billions of rows. The data flows from one to the other (you'll see how in the streaming chapters). Using a row store for analytics, or a column store for transactions, is the classic "wrong tool" mistake — and now you can explain exactly why each is wrong.
+
+</Callout>
+
+<QuickCheck
+  question="The finance team's dashboard runs SELECT SUM(amount), category FROM transactions GROUP BY category over 2 billion rows, touching 2 of ~40 columns. Reads are slow on the operational Postgres database. What's the right fix?"
+  options={[
+    "Add more B-tree indexes to Postgres",
+    "Run the analytics on a column-oriented store (a warehouse): it reads only the 2 needed columns instead of dragging all 40 through memory, and compresses them heavily — orders of magnitude less I/O",
+    "Buy a bigger Postgres machine",
+    "Cache the query result forever"
+  ]}
+  answer={1}
+  explain="This is an OLAP query — a big aggregation over few columns. A row-oriented OLTP store must read every column of every row even though 38 of 40 are ignored. A column store reads just the 2 columns it needs and compresses them well, cutting disk I/O by orders of magnitude. The fix is the right storage layout (a columnar warehouse fed from Postgres), not more indexes or a bigger box."
+/>
+
+## Exercises
+
+Build the engine internals. Each is a real storage-engine mechanism in miniature.
+
+<Exercise n={1} title="Append-only log with a hash index" level="easy">
+
+Implement `set(key, val)` and `get(key)` over an append-only `log []string` plus an `index map[string]int`. Updating a key appends a new value and repoints the index. Why does `get` stay fast even though old values are never erased?
+
+<Solution>
+
+```go
+func (e *Engine) set(key, val string) {
+	e.log = append(e.log, val)
+	e.index[key] = len(e.log) - 1 // index always points at the NEWEST value
+}
+
+func (e *Engine) get(key string) (string, bool) {
+	i, ok := e.index[key]
+	if !ok {
+		return "", false
+	}
+	return e.log[i], true
+}
+```
+
+`get` is fast because the index always points at the latest position for a key, so a lookup is a single hash-map hit plus one indexed read — `O(1)`. The stale old values still sitting in the log are never visited; they only cost *disk space*, not read time. Reclaiming that space is exactly what compaction does.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Merge two sorted segments" level="medium">
+
+Write `merge(newer, older []KV) []KV` where each input is sorted by key and `KV` is `{Key, Val string}`. Produce one sorted slice with one entry per key, preferring `newer` on conflicts. This is the core of compaction.
+
+<Solution>
+
+```go
+type KV struct{ Key, Val string }
+
+func merge(newer, older []KV) []KV {
+	var out []KV
+	i, j := 0, 0
+	for i < len(newer) && j < len(older) {
+		switch {
+		case newer[i].Key < older[j].Key:
+			out = append(out, newer[i]); i++
+		case newer[i].Key > older[j].Key:
+			out = append(out, older[j]); j++
+		default: // same key: newer wins, advance both
+			out = append(out, newer[i]); i++; j++
+		}
+	}
+	out = append(out, newer[i:]...) // drain the rest
+	out = append(out, older[j:]...)
+	return out
+}
+```
+
+Walking both sorted inputs with two pointers and always emitting the smaller key keeps the output sorted with `O(n)` work and `O(1)` extra memory beyond the result — the merge step of mergesort. On a key tie, taking `newer` and advancing *both* pointers is what discards the stale value.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Bloom filter with no false negatives" level="medium">
+
+Implement `add(key)` and `mightContain(key)` over a `[]bool`, using two derived bit positions. Then argue why `mightContain` can return a false *positive* but never a false *negative*.
+
+<Solution>
+
+```go
+func (b *Bloom) add(key string)               { i, j := b.positions(key); b.bits[i], b.bits[j] = true, true }
+func (b *Bloom) mightContain(key string) bool { i, j := b.positions(key); return b.bits[i] && b.bits[j] }
+```
+
+When you `add` a key, you set *its* bits to 1, and bits are never cleared — so a key you added will always find all its bits set: **no false negatives**. A false *positive* can happen because a key you never added might hash to bits that *other* keys happened to set. That asymmetry is the whole point: a "no" is trustworthy (skip the SSTable safely), a "maybe" just triggers a real lookup.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Tombstone deletes through compaction" level="medium">
+
+Extend `merge` to handle deletes. `KV` gains `Tomb bool`. A tombstone in `newer` must suppress the same key from `older`; once merged against the oldest segment, drop the tombstone entirely. Show that deleting then compacting removes the key.
+
+<Solution>
+
+```go
+type KV struct {
+	Key, Val string
+	Tomb     bool
+}
+
+func merge(newer, older []KV) []KV {
+	var out []KV
+	i, j := 0, 0
+	emit := func(kv KV) { if !kv.Tomb { out = append(out, kv) } } // drop tombstones
+	for i < len(newer) && j < len(older) {
+		switch {
+		case newer[i].Key < older[j].Key:
+			emit(newer[i]); i++
+		case newer[i].Key > older[j].Key:
+			emit(older[j]); j++
+		default: // same key: newer wins (a tombstone here suppresses older)
+			emit(newer[i]); i, j = i+1, j+1
+		}
+	}
+	for ; i < len(newer); i++ { emit(newer[i]) }
+	for ; j < len(older); j++ { emit(older[j]) }
+	return out
+}
+```
+
+A delete isn't an in-place erase — it's a *write* of a tombstone that shadows older values during the newest-to-oldest read. Compaction is where the deletion is finally *applied*: the tombstone wins over any older value for that key (suppressing it), and because `older` is the oldest segment, the tombstone itself is dropped from the output — the key is now truly gone.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Write amplification calculator" level="hard">
+
+Write `lsmAmp(compactions int) int` and `btreeAmp(pageBytes, recordBytes int) int` returning the write amplification of each. Model LSM as `2 + compactions` (WAL + flush + one rewrite per compaction level) and B-tree as `1 + pageBytes/recordBytes` (WAL once, plus a full page written for a small record). Compare for a write-heavy workload.
+
+<Solution>
+
+```go
+func lsmAmp(compactions int) int           { return 2 + compactions }       // WAL + flush + per-level rewrite
+func btreeAmp(pageBytes, recordBytes int) int { return 1 + pageBytes/recordBytes } // WAL + a whole page
+
+// e.g. LSM with 3 compaction levels: amp = 5.
+// B-tree, 8 KiB page, 100-byte record: amp = 1 + 8192/100 ≈ 82.
+```
+
+For tiny records, a B-tree pays brutally: changing 100 bytes can force writing an entire 8 KiB page, so its amplification dwarfs an LSM's handful of rewrites. That's why write-heavy workloads with small records (a transaction ledger) favor LSM engines — lower amplification means more application writes fit in the disk's bandwidth, and the SSD lasts longer. (Real numbers depend on key/value sizes and overwrite patterns — always measure your workload, run long enough for compaction to kick in.)
+
+</Solution>
+
+</Exercise>
+
+<Lab
+  title="Implement LSM compaction"
+  archetype="build-it"
+  difficulty="scaffolded"
+  points={85}
+  hintCost={13}
+  objective="Build the beating heart of every log-structured engine: compaction. Implement compact(newer, older []Entry) []Entry that merges two key-sorted segments into one sorted segment, keeping the NEWER value on a key conflict and DROPPING tombstones (deletions) entirely — since `older` is the oldest segment, a deleted key disappears. The provided main runs a fixed case (an updated key, a kept key, a deleted key) and prints PASS only when your merge keeps the newest values, preserves sort order, and removes the tombstoned key."
+  verify="self-check"
+  starter={`package main
+
+import "fmt"
+
+type Entry struct {
+	Key  string
+	Val  string
+	Tomb bool // true = tombstone: this key was deleted
+}
+
+// compact merges two SORTED segments into one sorted segment.
+//   - newer wins over older for the same key
+//   - a tombstone removes the key (drop it from the output; older is the oldest segment)
+// TODO: implement the merge (two pointers, like the merge step of mergesort).
+func compact(newer, older []Entry) []Entry {
+	// TODO
+	return nil
+}
+
+func main() {
+	newer := []Entry{{Key: "a", Val: "1"}, {Key: "c", Tomb: true}}
+	older := []Entry{{Key: "a", Val: "old"}, {Key: "b", Val: "2"}, {Key: "c", Val: "3"}}
+
+	got := compact(newer, older)
+	want := []Entry{{Key: "a", Val: "1"}, {Key: "b", Val: "2"}} // a updated, b kept, c deleted
+
+	pass := len(got) == len(want)
+	for i := range want {
+		if i >= len(got) || got[i] != want[i] {
+			pass = false
+		}
+	}
+	if pass {
+		fmt.Printf("compacted -> %v\\nPASS\\n", got)
+	} else {
+		fmt.Printf("FAIL: got %v, want %v\\n", got, want)
+	}
+}
+`}
+  verifier="Self-check: main prints PASS only when compact correctly merges the two sorted segments — key 'a' takes the newer value '1', key 'b' is preserved, and key 'c' (a tombstone in the newer segment) is removed entirely. Output must stay sorted by key. Codapi runs go run, so the PASS print is your gate."
+  hints={[
+    "Two pointers i, j over newer and older. Compare newer[i].Key with older[j].Key: if newer's key is smaller, take newer[i] and i++; if larger, take older[j] and j++; if equal, take newer[i] (it wins) and advance BOTH.",
+    "Wrap every append in a helper that skips tombstones: if e.Tomb, don't append it. That makes a deleted key vanish from the output. Apply it in all three branches and in the drain loops.",
+    "After the main loop, drain the leftovers: for the rest of newer, then the rest of older — still skipping tombstones. The fixed case expects exactly [{a 1 false} {b 2 false}]."
+  ]}
+  flag="GO{lsm_compaction_keeps_newest_drops_tombstones}"
+>
+
+This is the single most important operation in a log-structured engine, made executable. Merge the two segments, let the newer value win, and let a tombstone erase a key for good. Get PASS and you've built the core of RocksDB, Cassandra, and every LSM-tree on the planet — in one function.
+
+</Lab>
+
+---
+
+<Recap>
+
+You can now reason about what a database actually does on disk — and pick the right engine on purpose:
+
+- A database is an **append-only log** (fast writes) plus an **index** (fast reads). Indexes are the central trade-off: they speed reads and **slow writes**, because every write must update them.
+- **LSM-trees** keep the log idea: writes go to a **WAL** (durability) then a **memtable** (RAM); full memtables flush to immutable sorted **SSTables**; a background **compaction** merges them, keeping the newest value per key and dropping **tombstones**. Powers Cassandra, RocksDB, ScyllaDB, HBase.
+- **B-trees** abandon the log: sorted **pages** updated **in place**, in a shallow balanced tree (≈3–4 reads per lookup). A **WAL** guards the dangerous in-place page splits. Powers Postgres, MySQL, every major SQL DB.
+- **Choosing:** LSMs win **writes** (big **sequential** flushes, lower **write amplification**, less SSD wear); B-trees win **reads** (predictable, ≈one page per level). Meridian's write-heavy ingest leans LSM; predictable point lookups lean B-tree.
+- **Bloom filters** are a tiny probabilistic gate — **no false negatives** — that lets an LSM skip SSTables that can't hold a key, turning disk reads into one in-memory check.
+- **Row vs column** is the OLTP/OLAP split made physical: row storage for whole-record operational work (the ledger), **column storage** for aggregations over few columns of many rows (the analytics warehouse — reads less, compresses more).
+- Durability is only real after `file.Sync()` (`fsync`) — the engine is as safe as its last successful sync.
+
+</Recap>
+
+<Scoreboard
+  streak={8}
+  items={[
+    { label: "Quick check — LSM for write-heavy ingest", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — column store for analytics", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — append-only log with hash index", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — merge two sorted segments", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Bloom filter, no false negatives", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — tombstone deletes through compaction", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — write amplification calculator", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — LSM compaction prints PASS", captured: false, points: 85 }}
+/>
+
+Storage engines — the log, the index, the trees, and the wisdom to know which one your workload wants. You now understand why a write-heavy ledger and a read-heavy lookup table want opposite engines, why your SSD wears out, and why the dashboard stores the data sideways. We've gone from copies, to splits, to the bytes on the disk. Next we look the danger in the eye: **The Trouble with Distributed Systems** — networks that lie, clocks that drift, and processes that freeze at the worst possible moment. Everything you've built so far assumed the machines mostly behave. They don't. Let's go.

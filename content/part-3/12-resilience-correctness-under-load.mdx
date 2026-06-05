@@ -1,0 +1,1337 @@
+---
+title: "Resilience & Correctness Under Load"
+part: 3
+order: 12
+type: "course"
+description: "High availability, graceful degradation, per-account rate limiting, fraud-check hooks, and reconciliation as a safety net."
+prerequisites: ["security-financial-systems"]
+---
+
+<HeroCard label="Part 3 · Chapter 12" title="Resilience & Correctness Under Load">
+
+Here's the thing, sport. Any cowboy can write a payments service that works when nothing is on fire. The test of a *real* engineer — the kind worth knowing — is what the service does at 2am when one availability zone is down, the fraud service is throwing 503s, Account 7 is getting hammered by a bot, and the reconciliation job just flagged a twelve-cent discrepancy that shouldn't exist.
+
+Does your service collapse in a heap and corrupt the ledger? Or does it stay correct — maybe slower, maybe limited, but *never wrong*?
+
+By the end of this chapter you'll know how to build the second kind. Per-account rate limiting, pluggable fraud hooks, graceful degradation that chooses correctness over availability, and a nightly reconciliation job that acts as your safety net. The ledger will be right. It will stay up. And if it can't do both, it will choose right every single time. You're welcome.
+
+</HeroCard>
+
+<ChapterTabs tabs={["High Availability", "Graceful Degradation", "Per-Account Rate Limiting", "Fraud-Check Hooks", "Reconciliation"]} />
+
+## High Availability
+
+<Define term="High availability (HA)" since="Reliability Patterns (Part 2)">
+**High availability** means a system stays operational even when individual components fail — by eliminating single points of failure and tolerating failures without a total outage. For Meridian's ledger service, HA is the difference between "the payment API is down for 20 minutes" and "users never noticed the zone failure." It is quantified as uptime percentage (five nines = 5 min of downtime per year) and backed by two concrete numbers: RTO and RPO.
+</Define>
+
+**On the job:** You hit HA engineering the first time a host's disk dies in production and you realize your single-VM deployment is down. Every payment until the VM is replaced is a missed revenue event — and the pressure to cut corners on the recovery path is intense.
+
+Let me set the scene with something real.
+
+Meridian's payments service processes wire transfers. A single VM hosts the API, the ledger logic, and the database. At 11:47am on a Tuesday, the host's NVMe controller fails. The VM is gone. Transfers stop. Support tickets pile up. Every second the ledger is unreachable is a second your users cannot move money.
+
+That is a **single point of failure** (SPOF). High availability is the engineering discipline of eliminating them — or at least tolerating their failure without a total outage.
+
+### The vocabulary
+
+**RTO and RPO** are the two numbers you agree on before you build anything:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="RTO — Recovery Time Objective">How long can the service be down before the business is materially harmed? "We can survive 30 seconds of downtime" → RTO = 30s. Everything after that costs real money and trust.</ConceptCard>
+  <ConceptCard label="RPO — Recovery Point Objective">How much data can we afford to lose? "We can tolerate losing at most 5 seconds of writes" → RPO = 5s. For a financial ledger, RPO is often zero: no committed transaction can ever disappear.</ConceptCard>
+  <ConceptCard label="SPOF — Single Point of Failure">Any component whose failure takes the whole system down. A single DB primary, a single API host, a single load balancer — all are SPOFs to eliminate.</ConceptCard>
+  <ConceptCard label="Multi-AZ">Distributing replicas across Availability Zones (independent data centers in one region). A zone failure takes out at most one replica; the rest keep running.</ConceptCard>
+  <Gotcha>HA is a spectrum, not a binary. "Five nines" (99.999% uptime = 5 min/year) demands a very different architecture than "three nines" (8.7 hr/year). Know your SLO before you architect — the Observability: Telemetry & Acting On It chapter (Part 2) covers SLOs and error budgets.</Gotcha>
+</ConceptGrid>
+
+### The hard part: the database
+
+Running three API replicas behind a load balancer is the easy part. The hard part is the **stateful ledger** — the Postgres database that holds the ground truth.
+
+A stateless API replica failing is painless: the load balancer stops sending it traffic. A database primary failing is existential: you have to decide what happens to transactions in flight and which replica becomes the new primary.
+
+Here is what a production-grade HA ledger deployment looks like conceptually:
+
+<ExecTimeline
+  title="Multi-AZ ledger under a primary failure"
+  lanes={[
+    { id: "client", label: "Client" },
+    { id: "api", label: "API (replica)" },
+    { id: "primary", label: "DB primary (AZ-1)" },
+    { id: "replica", label: "DB replica (AZ-2)" },
+  ]}
+  steps={[
+    { lane: "client", kind: "send", label: "POST /transfers", note: "A transfer request arrives. The load balancer routes it to any healthy API replica." },
+    { lane: "api", kind: "run", label: "BEGIN; SELECT FOR UPDATE; INSERT; COMMIT", note: "The API opens a transaction on the primary, locks the account rows, posts the double-entry, commits." },
+    { lane: "primary", kind: "run", label: "WAL → replica", note: "Postgres streams the write-ahead log to the replica in AZ-2 continuously. With synchronous_commit=on, the primary waits for the replica to acknowledge before returning." },
+    { lane: "replica", kind: "recv", label: "Apply WAL", note: "The replica applies the log. If synchronous replication is on, the data is durable in both AZes before the commit returns to the client." },
+    { lane: "primary", kind: "block", label: "Primary fails", note: "The NVMe in AZ-1 dies. The primary is gone." },
+    { lane: "replica", kind: "spawn", label: "Promoted to primary", note: "Patroni / the cloud failover agent detects the primary is down and promotes the replica. The DNS entry for the DB host is updated." },
+    { lane: "api", kind: "run", label: "Reconnect → new primary", note: "The API's connection pool notices the break and reconnects. Transactions in flight are rolled back and retried by the client with an idempotency key." },
+  ]}
+  caption="With synchronous replication the RPO is near zero — no committed write is lost. The RTO is the failover time: typically 10–30 seconds for modern cloud failover agents."
+/>
+
+<UnderTheHood title="Why synchronous_commit matters for money — Go 1.26 / Postgres 17+">
+
+Postgres has a knob called `synchronous_commit`. When set to `on` (the default for a synchronous standby), the primary waits for at least one replica to confirm it has flushed the WAL record before returning success to the client.
+
+The alternative — `synchronous_commit = off` or async replication — is faster, but on a primary failure you can lose the last few seconds of committed transactions. For a payments ledger, that is unacceptable: a user received a "transfer complete" confirmation, but the transaction was never replicated and is now gone. That is money appearing from nothing, or money vanishing.
+
+**For a financial ledger, always use synchronous replication.** Accept the small latency hit. The alternative is telling a customer their transfer succeeded when it didn't.
+
+Your Go service does not control `synchronous_commit` directly — it is a server configuration. But you *do* control the connection string and whether you run with a replica-aware driver. The `pgx` driver supports multi-host connection strings for automatic failover:
+
+```go
+// pgx multi-host connection string — tries each host in order.
+// The pool reconnects automatically on a primary failure.
+dsn := "postgres://app:pass@primary:5432,replica:5432/ledger?target_session_attrs=primary"
+```
+
+The `target_session_attrs=primary` ensures writes always go to the node that is currently the writable primary — never a read replica.
+
+</UnderTheHood>
+
+## Graceful Degradation
+
+<Define term="Graceful degradation" since="Reliability Patterns (Part 2)">
+**Graceful degradation** is the practice of continuing to serve users in a reduced capacity when a dependency is unavailable — rather than failing completely. A payments service that degrades gracefully might reject high-value transfers when the fraud service is down, while still processing low-value ones. The key word is *deliberate*: the degraded behavior is a documented policy, not an accident.
+</Define>
+
+**On the job:** You hit graceful degradation the first time a vendor dependency goes down during peak traffic and you have to decide in real time whether to kill revenue or absorb risk. The right answer depends on which dependency is down and what it does — which is exactly why you encode the policy before the outage.
+
+Now the situation everyone ignores until 2am: a *dependency* is down, not your own service.
+
+Say Meridian's payments service calls an external fraud-detection microservice before authorizing each transfer. That fraud service starts returning 503s. What do you do?
+
+**Option A — fail every transfer.** Zero fraud risk. Also zero revenue. Your fraud vendor's SLA is not your user's problem.
+
+**Option B — let every transfer through.** Revenue preserved. Also an open door for fraudsters the moment the outage starts.
+
+**Option C — graceful degradation.** Queue transfers for async fraud review; continue processing with heightened monitoring; reject only high-risk transfers based on local heuristics.
+
+That's the right call for *most* microservices. But here is where fintech diverges from the rest of backend engineering, so listen up.
+
+### The CAP trade-off applied to money
+
+<Define term="CAP trade-off (consistency over availability for a ledger)">
+CAP theorem says a distributed system can guarantee at most two of: **C**onsistency (every read sees the latest write), **A**vailability (every request gets a response), and **P**artition-tolerance (the system keeps running despite network splits). Networks always partition, so in practice the real choice is **C vs. A** when a partition occurs. For a financial ledger the answer is always C: a temporarily-unavailable correct ledger beats an available wrong one. Money that appears to have moved but hasn't is a compliance disaster that may be unrecoverable.
+</Define>
+
+For most services, you choose Availability: degrade gracefully, keep serving users, reconcile later. But for the **authoritative ledger**, the calculus flips:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="AVAILABILITY for the fraud service">If fraud detection is unavailable, degrade gracefully. Queue payments for later review. Keep processing. The cost of a wrong decision here is a fraudulent transaction — recoverable with chargebacks.</ConceptCard>
+  <ConceptCard label="CONSISTENCY for the ledger">If the ledger DB is unavailable, reject the transfer. Do not try to "approximate" a balance. Do not double-post to an in-memory fallback. A temporarily-unavailable correct ledger beats an available wrong one every time.</ConceptCard>
+  <Gotcha>Never cache or approximate an authoritative balance to avoid a DB call. If the DB is down for a transfer write, return an error. The user retries. Money is not created or destroyed. An inconsistent ledger, on the other hand, is a compliance nightmare and may be irreversible.</Gotcha>
+</ConceptGrid>
+
+### Degradation in code: the circuit breaker pattern
+
+The fraud service is the right place to apply a circuit breaker (covered in depth in the Reliability Patterns chapter, Part 2). Here is the fintech-specific twist: when the circuit is open (the fraud service is down), you do not just "let it through" blindly — you have a defined fallback policy:
+
+```go
+// FraudDecision is what the fraud service returns.
+type FraudDecision struct {
+	Allow  bool
+	Reason string
+}
+
+// fraudCheck calls the fraud service and falls back when it is unavailable.
+// ctx carries the deadline from the incoming request.
+func fraudCheck(ctx context.Context, cb *CircuitBreaker, t Transfer) (FraudDecision, error) {
+	decision, err := cb.Call(ctx, func() (FraudDecision, error) {
+		return callFraudService(ctx, t)
+	})
+	if err != nil {
+		// Fraud service is down. Apply the degradation policy:
+		// - Reject high-value transfers outright.
+		// - Queue low-value transfers for async review.
+		if t.AmountCents > 100_000 { // $1,000 threshold
+			return FraudDecision{Allow: false, Reason: "fraud service unavailable; high-value transfer rejected"}, nil
+		}
+		return FraudDecision{Allow: true, Reason: "fraud service unavailable; queued for async review"}, nil
+	}
+	return decision, nil
+}
+```
+
+The policy is explicit and documented. Not "hope for the best," not "block everything" — a deliberate, risk-calibrated choice encoded in the system.
+
+<Callout kind="warn" title="Write the degradation policy before the outage, not during it">
+
+The worst time to decide "what do we do if fraud detection is down?" is at 2am during an incident. Write the policy — the thresholds, the fallback behavior, the async-review queue — as code in the happy path, before anything is on fire. When the circuit opens, the policy executes automatically. You sleep.
+
+</Callout>
+
+## Per-Account Rate Limiting
+
+<Define term="Per-account rate limiting (token bucket)" since="Reliability Patterns (Part 2)">
+A **token bucket** rate limiter grants each account a fixed number of tokens (its burst capacity). Every request consumes one token; tokens refill at a steady rate. When the bucket is empty, requests are rejected with HTTP 429. **Per-account** means each account has its own independent bucket — one account's burst cannot consume tokens from another account's bucket. This is the correct granularity for a payments service: you are protecting individual accounts, not network addresses.
+</Define>
+
+**On the job:** Per-account rate limiting surfaces when a bot starts hammering a single account with rapid-fire transfer attempts — a common pattern in credential-stuffing attacks on payment APIs. A global rate limit would throttle *all* users. A per-IP limit misses bots that rotate IPs. Per-account catches the attack at the resource being targeted.
+
+In the Reliability Patterns chapter (Part 2) we covered the token bucket and leaky bucket algorithms, per-client limiting with Redis, and the `golang.org/x/time/rate` limiter. Go read that chapter if the concepts are fuzzy; I'll wait.
+
+Back? Good. Now let's apply them at the **account** granularity — which is the right unit for a payments service.
+
+### Why per-account, not per-IP?
+
+A single account might fund thousands of API calls from different IPs (a corporate treasury system). An attacker draining an account via an API vulnerability might use one IP per request from a botnet. IP-level limiting catches neither. Account-level limiting catches both.
+
+The key insight: **rate limit the thing being protected**, not the network location of the caller. For a ledger, the account is the protected resource.
+
+### The per-account token bucket — illustrated
+
+Here is the core problem in Meridian's domain: a global rate limit looks fair but isn't. Per-account limiting isolates the blast radius.
+
+<Scene
+  title="Global limit vs per-account limit under a burst"
+  actors={[
+    { id: "acct7", label: "Account 7 (bot)" },
+    { id: "acct9", label: "Account 9 (user)" },
+    { id: "acct11", label: "Account 11 (user)" },
+  ]}
+  rows={2}
+  cols={6}
+  frames={[
+    {
+      caption: "Steady state: all accounts make occasional transfers. Global and per-account limits both look the same.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "idle" }, { id: "A2", state: "idle" }, { id: "A3", state: "idle" },
+        { id: "A4", state: "idle" }, { id: "A5", state: "idle" }, { id: "A6", state: "idle" },
+        { id: "B1", state: "idle" }, { id: "B2", state: "idle" }, { id: "B3", state: "idle" },
+        { id: "B4", state: "idle" }, { id: "B5", state: "idle" }, { id: "B6", state: "idle" },
+      ],
+    },
+    {
+      caption: "Account 7 (bot) floods the API with 10 rapid requests — exhausting the GLOBAL bucket shared by all accounts.",
+      beat: "problem",
+      actors: [{ id: "acct7", state: "bad" }, { id: "acct9", state: "warn" }, { id: "acct11", state: "warn" }],
+      cells: [
+        { id: "A1", state: "bad", label: "7✕" }, { id: "A2", state: "bad", label: "7✕" },
+        { id: "A3", state: "bad", label: "7✕" }, { id: "A4", state: "bad", label: "7✕" },
+        { id: "A5", state: "bad", label: "7✕" }, { id: "A6", state: "bad", label: "7✕" },
+        { id: "B1", state: "warn", label: "9?" }, { id: "B2", state: "warn", label: "11?" },
+        { id: "B3", state: "idle" }, { id: "B4", state: "idle" },
+        { id: "B5", state: "idle" }, { id: "B6", state: "idle" },
+      ],
+    },
+    {
+      caption: "Global bucket empty. Account 9 and Account 11 are throttled (429) even though they did nothing wrong. Collateral damage.",
+      beat: "problem",
+      actors: [{ id: "acct7", state: "bad" }, { id: "acct9", state: "bad" }, { id: "acct11", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad", label: "✕" }, { id: "A2", state: "bad", label: "✕" },
+        { id: "A3", state: "bad", label: "✕" }, { id: "A4", state: "bad", label: "✕" },
+        { id: "A5", state: "bad", label: "✕" }, { id: "A6", state: "bad", label: "✕" },
+        { id: "B1", state: "bad", label: "✕" }, { id: "B2", state: "bad", label: "✕" },
+        { id: "B3", state: "bad", label: "✕" }, { id: "B4", state: "bad", label: "✕" },
+        { id: "B5", state: "bad", label: "✕" }, { id: "B6", state: "bad", label: "✕" },
+      ],
+    },
+    {
+      caption: "With per-account buckets: Account 7's burst empties its own bucket. Accounts 9 and 11 each have a full independent bucket — they flow freely.",
+      beat: "solution",
+      actors: [{ id: "acct7", state: "warn" }, { id: "acct9", state: "ok" }, { id: "acct11", state: "ok" }],
+      cells: [
+        { id: "A1", state: "bad", label: "7✕" }, { id: "A2", state: "bad", label: "7✕" },
+        { id: "A3", state: "bad", label: "7✕" }, { id: "A4", state: "idle" },
+        { id: "A5", state: "idle" }, { id: "A6", state: "idle" },
+        { id: "B1", state: "done", label: "9✓" }, { id: "B2", state: "done", label: "9✓" },
+        { id: "B3", state: "done", label: "11✓" }, { id: "B4", state: "done", label: "11✓" },
+        { id: "B5", state: "idle" }, { id: "B6", state: "idle" },
+      ],
+    },
+  ]}
+  caption="Per-account limiting isolates the blast radius: one account's burst cannot starve others. This is the correct granularity for a ledger service — rate limit the thing being protected."
+/>
+
+<ExecTimeline
+  title="Per-account token bucket throttling a burst"
+  lanes={[
+    { id: "acct7", label: "Account 7 (burst)" },
+    { id: "acct9", label: "Account 9 (normal)" },
+    { id: "limiter", label: "Rate limiter" },
+  ]}
+  steps={[
+    { lane: "acct7", kind: "send", label: "req 1 of 10 (burst)", note: "Account 7 fires 10 requests in 100ms — a bot draining the account." },
+    { lane: "limiter", kind: "run", label: "bucket[7]: 5 tokens", note: "Account 7's bucket starts full (5 tokens). Request 1 consumes one token. Allowed." },
+    { lane: "acct9", kind: "send", label: "req 1 (normal)", note: "Account 9 fires one request at a normal pace." },
+    { lane: "limiter", kind: "run", label: "bucket[9]: 5 tokens", note: "Account 9's bucket is independent — full. Request allowed." },
+    { lane: "acct7", kind: "send", label: "req 2–5 (burst cont.)", note: "Account 7's burst continues. Tokens 2–5 are consumed rapidly." },
+    { lane: "limiter", kind: "block", label: "bucket[7]: 0 tokens", note: "Account 7's bucket is empty. Requests 6–10 are rejected with HTTP 429." },
+    { lane: "acct9", kind: "run", label: "req 2 passes normally", note: "Account 9's limiter is unaffected — it has its own bucket, still full." },
+  ]}
+  caption="Per-account limiting isolates the blast radius: one account's burst cannot starve others."
+/>
+
+Here is a complete, runnable per-account token-bucket rate limiter using `golang.org/x/time/rate` and a `sync.Mutex`-protected map for the per-account state:
+
+<Callout kind="note" title="Sandbox note">
+The GoPlayground below uses `golang.org/x/time/rate`, which is not in the stdlib. The Codapi sandbox cannot run it directly — paste it into a local module (`go get golang.org/x/time/rate`) or the Go Playground at play.golang.org. The race test further down is the runnable standalone demo.
+</Callout>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// AccountLimiter maps account IDs to individual token-bucket limiters.
+// A mutex protects the map; each *rate.Limiter is itself concurrent-safe.
+type AccountLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	r        rate.Limit // tokens per second
+	b        int        // bucket capacity (burst)
+}
+
+func NewAccountLimiter(r rate.Limit, b int) *AccountLimiter {
+	return &AccountLimiter{
+		limiters: make(map[string]*rate.Limiter),
+		r:        r,
+		b:        b,
+	}
+}
+
+// getLimiter returns the per-account limiter, creating it on first use.
+// The limiter is keyed by account ID — one bucket per account.
+func (al *AccountLimiter) getLimiter(accountID string) *rate.Limiter {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	lim, ok := al.limiters[accountID]
+	if !ok {
+		lim = rate.NewLimiter(al.r, al.b)
+		al.limiters[accountID] = lim
+	}
+	return lim
+}
+
+// Allow reports whether account accountID may proceed right now.
+func (al *AccountLimiter) Allow(accountID string) bool {
+	return al.getLimiter(accountID).Allow()
+}
+
+func main() {
+	// 2 requests/second, burst of 3 per account.
+	lim := NewAccountLimiter(2, 3)
+
+	var wg sync.WaitGroup
+
+	// Simulate Account "acct-7" firing 6 rapid requests (bot behaviour).
+	for i := range 6 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if lim.Allow("acct-7") {
+				fmt.Printf("acct-7 req %d: ALLOWED\n", n+1)
+			} else {
+				fmt.Printf("acct-7 req %d: THROTTLED (429)\n", n+1)
+			}
+		}(i)
+	}
+
+	// Simulate Account "acct-9" firing 2 normal requests concurrently.
+	for i := range 2 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if lim.Allow("acct-9") {
+				fmt.Printf("acct-9 req %d: ALLOWED\n", n+1)
+			} else {
+				fmt.Printf("acct-9 req %d: THROTTLED (429)\n", n+1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// After a refill delay, acct-7 should be allowed again.
+	time.Sleep(600 * time.Millisecond)
+	if lim.Allow("acct-7") {
+		fmt.Println("acct-7 after refill: ALLOWED (tokens refilled)")
+	}
+}
+```
+
+<UnderTheHood title="Why the limiter map is keyed by account ID — and what it costs (Go 1.26)">
+
+`rate.NewLimiter(r, b)` (from `golang.org/x/time/rate`, a stable extended-stdlib package) allocates a small struct: a token count (`float64`), a timestamp, and a mutex. A few dozen fields, roughly 64 bytes total. For a service with one million active accounts that each have a limiter, that's roughly 64 MB — perfectly fine.
+
+The subtlety is **eviction**. Limiters created for rarely-used accounts accumulate in memory forever if you never clean them up. In production, add a background sweeper that removes limiters not touched in the last N minutes:
+
+```go
+// Sketch — add to AccountLimiter for production use.
+type entry struct {
+	lim     *rate.Limiter
+	lastUse time.Time
+}
+```
+
+Then sweep on a ticker, evicting entries with `lastUse` older than your TTL.
+
+The **distributed** case — multiple API replicas, each with their own in-memory limiter map — means each replica enforces the limit independently. An account that sends 5 req/s with a 3 req/s limit will slip through if it round-robins across two replicas (each sees 2.5 req/s). For strict per-account limiting across a fleet, move the bucket to Redis with Lua scripts or the `redis-cell` module (covered in the Reliability Patterns chapter, Part 2). For a fraud-throttle use case (not a hard cap), in-process per-replica limiting is often good enough and far simpler.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Your payments service runs three API replicas. Each uses an in-process per-account token bucket with a limit of 5 req/s. An attacker fires 12 req/s at one account, evenly round-robined across all three replicas. How many requests per second does each replica see — and does the rate limit hold?"
+  options={[
+    "Each replica sees 12 req/s; the limit is violated on every replica.",
+    "Each replica sees 4 req/s; all three allow through — the per-process limit of 5 is never hit.",
+    "Each replica sees 4 req/s; two-thirds pass (12 allowed), one-third throttled per-replica.",
+    "Each replica sees 4 req/s; the limit holds globally because replicas share state via the Go runtime."
+  ]}
+  answer={1}
+  explain="Each replica sees 4 req/s (12 ÷ 3), which is under the 5 req/s per-process limit. All requests are allowed. The attacker bypasses the rate limit entirely by round-robining. For strict per-account global limiting, you need distributed state (Redis). In-process limiting works when each account is sticky to one replica, or when an approximate limit is acceptable."
+/>
+
+## Fraud-Check Hooks
+
+<Define term="Fraud-check hook">
+A **fraud-check hook** is a defined seam in the payment flow — an interface point where fraud-detection logic plugs in. The payment flow calls the hook before committing a transfer; the hook returns allow/deny. By expressing the hook as a Go interface, you can swap implementations without touching the transfer path: a no-op in tests, a velocity checker in staging, an ML-model call in production. It is not a feature bolted on after launch — it is an extension point designed in from the start.
+</Define>
+
+**On the job:** Fraud hooks matter the day you discover that a single fraudulent account drained $40,000 before anyone noticed. After that, every team is motivated to add fraud signals — and the hook interface is how you do it without a six-week refactor of the payment path.
+
+Fraud prevention is not a feature you bolt on after launch. It is a first-class seam in the payment flow — a hook point that must be designed in from the start.
+
+### Where fraud checks live
+
+There are two fundamentally different moments you can check for fraud:
+
+**Synchronous pre-authorization** — the check runs *before* the transfer is committed. If fraud is detected, the transfer is rejected before any money moves. This is the safest model for the ledger.
+
+**Asynchronous post-flagging** — the transfer is committed immediately, but a fraud signal is written to a queue. A fraud worker processes the signal and may trigger a reversal, a manual review, or an account freeze. This is faster for the user but exposes a window where fraudulent money has moved.
+
+For an authoritative ledger, the synchronous model is preferred for the happy path. The async model handles the cases where the synchronous check cannot run (fraud service unavailable, as we covered above).
+
+### The velocity-check pattern
+
+The most reliable local fraud signal you have — with no external dependency — is **velocity**: how many transactions has this account initiated in the last N minutes?
+
+A legitimate customer doesn't send 40 wire transfers in five minutes. A bot does.
+
+Here is a pluggable fraud-check hook interface and a velocity-check implementation:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Transfer holds the essentials for a fraud check.
+// AmountCents is always an integer — never a float.
+type Transfer struct {
+	AccountID   string
+	AmountCents int64
+	CreatedAt   time.Time
+}
+
+// FraudResult is what every FraudChecker returns.
+type FraudResult struct {
+	Allow  bool
+	Reason string
+}
+
+// FraudChecker is the hook interface. Any fraud logic that implements
+// Check can be plugged in — velocity check, ML model, rules engine.
+// Defined by the consumer (the payment flow), not the implementer.
+type FraudChecker interface {
+	Check(ctx context.Context, t Transfer) (FraudResult, error)
+}
+
+// VelocityChecker flags accounts that exceed N transactions in a window.
+// It is a pure, in-process check — no external dependency.
+type VelocityChecker struct {
+	mu      sync.Mutex
+	history map[string][]time.Time // accountID → timestamps of recent transfers
+	max     int                    // max transfers allowed in the window
+	window  time.Duration          // the lookback window
+}
+
+func NewVelocityChecker(max int, window time.Duration) *VelocityChecker {
+	return &VelocityChecker{
+		history: make(map[string][]time.Time),
+		max:     max,
+		window:  window,
+	}
+}
+
+func (v *VelocityChecker) Check(ctx context.Context, t Transfer) (FraudResult, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	now := t.CreatedAt
+	cutoff := now.Add(-v.window)
+
+	// Prune events older than the window.
+	recent := v.history[t.AccountID]
+	kept := recent[:0]
+	for _, ts := range recent {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	v.history[t.AccountID] = kept
+
+	if len(kept) >= v.max {
+		return FraudResult{
+			Allow:  false,
+			Reason: fmt.Sprintf("velocity: %d transfers in %s exceeds limit of %d", len(kept), v.window, v.max),
+		}, nil
+	}
+
+	// Record this transfer.
+	v.history[t.AccountID] = append(v.history[t.AccountID], now)
+	return FraudResult{Allow: true, Reason: "velocity check passed"}, nil
+}
+
+// ChainChecker runs multiple FraudCheckers in order, stopping at the first denial.
+type ChainChecker struct {
+	checkers []FraudChecker
+}
+
+func NewChainChecker(checkers ...FraudChecker) *ChainChecker {
+	return &ChainChecker{checkers: checkers}
+}
+
+func (c *ChainChecker) Check(ctx context.Context, t Transfer) (FraudResult, error) {
+	for _, ch := range c.checkers {
+		result, err := ch.Check(ctx, t)
+		if err != nil {
+			return FraudResult{}, err
+		}
+		if !result.Allow {
+			return result, nil // first denial wins
+		}
+	}
+	return FraudResult{Allow: true, Reason: "all checks passed"}, nil
+}
+
+func main() {
+	// Allow at most 3 transfers per account per minute.
+	checker := NewVelocityChecker(3, time.Minute)
+
+	base := time.Now()
+	account := "acct-7"
+
+	for i := range 5 {
+		t := Transfer{
+			AccountID:   account,
+			AmountCents: 10_000, // $100.00
+			CreatedAt:   base.Add(time.Duration(i) * 10 * time.Second),
+		}
+		result, _ := checker.Check(context.Background(), t)
+		fmt.Printf("transfer %d: allow=%v reason=%q\n", i+1, result.Allow, result.Reason)
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="pro" title="Fraud checkers are a seam, not a monolith">
+
+The `FraudChecker` interface keeps fraud logic decoupled from the payment flow. In tests, inject a `noopChecker` that always returns `Allow: true`. In staging, inject the `VelocityChecker`. In production, inject a `ChainChecker` that runs velocity first (local, fast, no dependency) and then the external ML model (slower, requires a network call). Adding a new fraud signal means implementing one method — not touching the transfer path.
+
+This is the "accept interfaces, return structs" principle from the Idiomatic Go & the Go Mindset chapter (Part 2) applied where it actually pays for itself in production.
+
+</Callout>
+
+<QuickCheck
+  question="A velocity check detects 10 transfers in 60 seconds from one account, above your limit of 5. The FraudChecker.Check returns Allow=false. What should the payment service do next?"
+  options={[
+    "Commit the transfer to the ledger and add a fraud flag to the row.",
+    "Reject the transfer before writing anything to the ledger; return an error to the caller.",
+    "Write the transfer to a separate fraud_pending table and process it later.",
+    "Retry the fraud check three times before rejecting."
+  ]}
+  answer={1}
+  explain="The synchronous pre-auth model rejects the transfer before any ledger write. Nothing is committed. No compensating transaction is needed. The caller gets a clear error (HTTP 429 or a domain error). The ledger stays clean. Option A corrupts the ledger with a half-approved transaction. Option C is the async model, appropriate only when the check cannot run synchronously."
+/>
+
+## Reconciliation
+
+<Define term="Reconciliation" since="Batch & Large-File Processing (Part 3)">
+**Reconciliation** is the practice of comparing two independent sources of truth — your internal ledger and an external record (your payment processor, your bank, your card network) — and finding the differences. It is your safety net: no matter how carefully you wrote your double-entry logic, idempotency keys, and saga compensations, the external financial world is outside your control. Reconciliation finds the gaps. Corrections are written as new append-only journal entries — never updates to existing rows.
+</Define>
+
+**On the job:** Reconciliation becomes mandatory the day your processor's settlement file shows a charge that your ledger has no record of — meaning you billed a customer for something that didn't settle. At scale, a discrepancy rate of 0.001% is still hundreds of transactions per day.
+
+Reconciliation is the practice of comparing two independent sources of truth — your internal ledger and an external source (your payment processor, your bank, your card network) — and finding the differences.
+
+It is your safety net. No matter how carefully you write your double-entry logic, your idempotency keys, and your saga compensations, the external financial world is not under your control. Processors have bugs. Bank feeds have delays. Network partitions cause a charge to succeed on the processor side but fail to commit on yours. Reconciliation is how you find out.
+
+### The mindset: trust but verify
+
+Meridian's internal ledger says Account 7 transferred $500 to Account 9 at 14:32:07. Your payment processor says it settled a $500 charge at 14:32:05. Close enough? Maybe. Does your processor's settlement file show any charges *you* have no record of? That would be money you owe someone. Any charges *you* have a record of but the processor does not? That is a charge you told the user succeeded but didn't actually settle.
+
+Reconciliation finds both. At scale, a discrepancy rate of 0.001% is still hundreds of transactions per day.
+
+### Idempotent, append-only corrections
+
+When reconciliation finds a discrepancy, the correction is **never** an UPDATE to an existing ledger row. The ledger is append-only (see the Double-Entry Ledgers chapter, Part 3). The correction is a new journal entry — a reversal, an adjustment, or a write-off — with a clear reason code and a reference to the reconciliation job run that found it.
+
+This preserves the audit trail (see the Auditability & Compliance chapter, Part 3) and means the reconciliation job is safe to run multiple times: if it has already written an adjustment for a discrepancy, the idempotency check on the adjustment's external reference prevents a double-correction.
+
+Here is a runnable reconciliation diff demo — comparing an internal ledger snapshot to an external processor settlement record and flagging the discrepancies:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// LedgerEntry is one row from our internal double-entry ledger.
+type LedgerEntry struct {
+	ExternalRef string // the reference we sent to the processor
+	AmountCents int64  // always integer cents
+	AccountID   string
+}
+
+// SettlementRecord is one row from the processor's daily settlement file.
+type SettlementRecord struct {
+	ExternalRef string
+	AmountCents int64
+	SettledAt   time.Time
+}
+
+// Discrepancy describes a single reconciliation finding.
+type Discrepancy struct {
+	Kind        string // "missing_in_ledger", "missing_in_processor", "amount_mismatch"
+	ExternalRef string
+	Detail      string
+}
+
+// Reconcile compares the internal ledger against the processor settlement
+// and returns all discrepancies found. It is idempotent: run it as many
+// times as you like; calling it again produces the same findings.
+func Reconcile(ledger []LedgerEntry, settlement []SettlementRecord) []Discrepancy {
+	// Index the ledger by external reference for O(1) lookup.
+	ledgerByRef := make(map[string]LedgerEntry, len(ledger))
+	for _, e := range ledger {
+		ledgerByRef[e.ExternalRef] = e
+	}
+
+	var discrepancies []Discrepancy
+
+	// Walk every settlement record and compare to the ledger.
+	settledRefs := make(map[string]struct{}, len(settlement))
+	for _, s := range settlement {
+		settledRefs[s.ExternalRef] = struct{}{}
+		le, ok := ledgerByRef[s.ExternalRef]
+		if !ok {
+			discrepancies = append(discrepancies, Discrepancy{
+				Kind:        "missing_in_ledger",
+				ExternalRef: s.ExternalRef,
+				Detail: fmt.Sprintf("processor settled %d cents but no ledger entry found",
+					s.AmountCents),
+			})
+			continue
+		}
+		if le.AmountCents != s.AmountCents {
+			discrepancies = append(discrepancies, Discrepancy{
+				Kind:        "amount_mismatch",
+				ExternalRef: s.ExternalRef,
+				Detail: fmt.Sprintf("ledger=%d cents, processor=%d cents, drift=%d cents",
+					le.AmountCents, s.AmountCents, le.AmountCents-s.AmountCents),
+			})
+		}
+	}
+
+	// Walk every ledger entry and find any not present in the settlement.
+	for _, le := range ledger {
+		if _, settled := settledRefs[le.ExternalRef]; !settled {
+			discrepancies = append(discrepancies, Discrepancy{
+				Kind:        "missing_in_processor",
+				ExternalRef: le.ExternalRef,
+				Detail: fmt.Sprintf("ledger has %d cents for %s but processor has no settlement record",
+					le.AmountCents, le.AccountID),
+			})
+		}
+	}
+
+	return discrepancies
+}
+
+func main() {
+	// Meridian's internal ledger: three transfers we believe settled.
+	ledger := []LedgerEntry{
+		{ExternalRef: "txn-001", AmountCents: 50_000, AccountID: "acct-7"},
+		{ExternalRef: "txn-002", AmountCents: 12_000, AccountID: "acct-9"},
+		{ExternalRef: "txn-003", AmountCents: 8_000, AccountID: "acct-7"},
+	}
+
+	// The processor's settlement file for the same period.
+	// txn-002 has a $0.12 amount mismatch (processor rounded differently).
+	// txn-003 is absent (the charge silently failed on the processor side).
+	// txn-999 settled on the processor but we have no record (ghosted charge).
+	settlement := []SettlementRecord{
+		{ExternalRef: "txn-001", AmountCents: 50_000, SettledAt: time.Now()},
+		{ExternalRef: "txn-002", AmountCents: 11_988, SettledAt: time.Now()}, // mismatch
+		{ExternalRef: "txn-999", AmountCents: 1_200, SettledAt: time.Now()},  // ghost
+	}
+
+	discrepancies := Reconcile(ledger, settlement)
+	if len(discrepancies) == 0 {
+		fmt.Println("reconciliation clean — no discrepancies")
+		return
+	}
+
+	fmt.Printf("found %d discrepancy(s):\n\n", len(discrepancies))
+	for _, d := range discrepancies {
+		fmt.Printf("  [%s] ref=%s\n    %s\n\n", d.Kind, d.ExternalRef, d.Detail)
+	}
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Nightly reconciliation job — finding a drift"
+  lanes={[
+    { id: "job", label: "Recon job" },
+    { id: "ledger", label: "Internal ledger" },
+    { id: "processor", label: "Processor API" },
+  ]}
+  steps={[
+    { lane: "job", kind: "run", label: "Fetch ledger snapshot", note: "The job reads all ledger entries for the settlement window (e.g. yesterday's transfers)." },
+    { lane: "ledger", kind: "send", label: "N entries returned", note: "The ledger returns a read-consistent snapshot of all journal entries in the window." },
+    { lane: "job", kind: "run", label: "Fetch settlement file", note: "The job pulls the processor's settlement CSV or API response for the same window." },
+    { lane: "processor", kind: "send", label: "Settlement records", note: "The processor returns its authoritative list of settled charges with amounts." },
+    { lane: "job", kind: "run", label: "Diff: index + compare", note: "Index ledger by external ref. Walk every processor record. Flag missing or mismatched. Walk ledger; flag unsettled." },
+    { lane: "job", kind: "block", label: "Discrepancy found: txn-003", note: "txn-003 is in the ledger (marked successful) but absent from the processor's settlement. The transfer did not actually settle." },
+    { lane: "job", kind: "done", label: "Write Discrepancy record", note: "The job appends a Discrepancy row — never updates the original ledger entry. The operations team is alerted for manual review." },
+  ]}
+  caption="The job is idempotent: re-running it finds the same discrepancy and skips writing a duplicate (idempotency key on the discrepancy record)."
+/>
+
+<UnderTheHood title="Why reconciliation is append-only and why that matters for audits">
+
+A reconciliation job that **updates** existing ledger rows to fix amounts is an audit trail destroyer. An auditor looking at the ledger after the fact sees a `$119.88` row where the original transfer was `$120.00` and has no idea what happened or when.
+
+The correct model: every correction is a **new journal entry** of type `reconciliation_adjustment`, referencing the original entry and the job run that created it. The original entry is untouched — still readable, still part of the audit trail. The adjustment entry records the delta, the reason, and the timestamp.
+
+This means the final authoritative balance for an account is always `SUM of all journal entries` where the entry type includes adjustments. The ledger's append-only nature is what makes this possible without locking or versioning complexity — and it is the same property that makes the ledger safe for concurrent writes (with appropriate `SELECT FOR UPDATE` locking on the account rows, as covered in the Transactions, Consistency & Sagas chapter, Part 3).
+
+</UnderTheHood>
+
+### The race test — per-account limiting is correct under concurrency
+
+For fintech, a race test is not optional. Here is the mandatory race test pattern for the per-account limiter: fire concurrent requests across multiple accounts under `-race` and verify that one account is throttled while others are not, with no data races.
+
+<Callout kind="note" title="Run this with go test -race">
+Codapi runs plain `go run` only — it cannot execute `go test -race`. Copy this block into a local `_test.go` file and run `go test -race ./...`. The race detector must be silent. This test is `verify="self-check"` — the assertions print clearly if the invariant is violated.
+</Callout>
+
+```go
+package ratelimit_test
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// testAccountLimiter is a minimal copy of AccountLimiter for the test.
+type testAccountLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	r        rate.Limit
+	b        int
+}
+
+func newTestAccountLimiter(r rate.Limit, b int) *testAccountLimiter {
+	return &testAccountLimiter{
+		limiters: make(map[string]*rate.Limiter),
+		r:        r,
+		b:        b,
+	}
+}
+
+func (al *testAccountLimiter) allow(accountID string) bool {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	lim, ok := al.limiters[accountID]
+	if !ok {
+		lim = rate.NewLimiter(al.r, al.b)
+		al.limiters[accountID] = lim
+	}
+	return lim.Allow()
+}
+
+// TestAccountLimiterUnderRace verifies that:
+//  1. An account burst beyond the bucket capacity is throttled.
+//  2. A separate account is unaffected (no cross-account contamination).
+//  3. No data races occur under concurrent access (-race flag).
+func TestAccountLimiterUnderRace(t *testing.T) {
+	// 1 token/second, burst of 3.
+	lim := newTestAccountLimiter(1, 3)
+
+	const burstAccount = "acct-burst"
+	const normalAccount = "acct-normal"
+	const goroutines = 20
+
+	var (
+		wg           sync.WaitGroup
+		burstAllowed int
+		burstDenied  int
+		mu           sync.Mutex
+	)
+
+	// Fire goroutines concurrently all targeting the burst account.
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			allowed := lim.allow(burstAccount)
+			mu.Lock()
+			if allowed {
+				burstAllowed++
+			} else {
+				burstDenied++
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	// With a burst of 3 and 20 concurrent requests, at most 3 should be allowed.
+	if burstAllowed > 3 {
+		t.Errorf("burst account: allowed %d requests, want at most 3 (bucket capacity)", burstAllowed)
+	}
+	if burstDenied < goroutines-3 {
+		t.Errorf("burst account: denied %d requests, want at least %d", burstDenied, goroutines-3)
+	}
+
+	// The normal account must not be polluted by the burst account's state.
+	normalAllowed := 0
+	for range 3 {
+		time.Sleep(10 * time.Millisecond) // let any goroutine scheduling settle
+		if lim.allow(normalAccount) {
+			normalAllowed++
+		}
+	}
+	if normalAllowed == 0 {
+		t.Error("normal account: should have tokens; got none — possible cross-account contamination")
+	}
+}
+```
+
+Run this with `go test -race ./...` — the race detector must be silent.
+
+---
+
+## Exercises
+
+Right. Time to prove you were paying attention. These escalate. Don't skip straight to hard and then wonder why you're confused.
+
+<Exercise n={1} title="Implement Allow with Wait" level="easy">
+
+Extend `AccountLimiter` with a `Wait(ctx context.Context, accountID string) error` method that blocks until a token is available for the account or the context is cancelled. Use `rate.Limiter.Wait`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"sync"
+
+	"golang.org/x/time/rate"
+)
+
+type AccountLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	r        rate.Limit
+	b        int
+}
+
+func NewAccountLimiter(r rate.Limit, b int) *AccountLimiter {
+	return &AccountLimiter{
+		limiters: make(map[string]*rate.Limiter),
+		r:        r,
+		b:        b,
+	}
+}
+
+func (al *AccountLimiter) getLimiter(accountID string) *rate.Limiter {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	if lim, ok := al.limiters[accountID]; ok {
+		return lim
+	}
+	lim := rate.NewLimiter(al.r, al.b)
+	al.limiters[accountID] = lim
+	return lim
+}
+
+func (al *AccountLimiter) Allow(accountID string) bool {
+	return al.getLimiter(accountID).Allow()
+}
+
+// Wait blocks until the account has an available token or ctx is done.
+// Returns ctx.Err() if the context is cancelled before a token is available.
+func (al *AccountLimiter) Wait(ctx context.Context, accountID string) error {
+	return al.getLimiter(accountID).Wait(ctx)
+}
+```
+
+`rate.Limiter.Wait` handles the blocking and context cancellation for you. The key detail is that `getLimiter` must be called once to get the same limiter consistently — never call `getLimiter` twice and get two different objects for the same account (a bug the mutex prevents).
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add an amount threshold to the fraud checker" level="easy">
+
+Write an `AmountThresholdChecker` that implements `FraudChecker` and rejects any single transfer above a configurable amount (e.g., `$10,000.00` = `1_000_000` cents). Compose it with `VelocityChecker` in a `ChainChecker`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+type AmountThresholdChecker struct {
+	maxCents int64
+}
+
+func NewAmountThresholdChecker(maxCents int64) *AmountThresholdChecker {
+	return &AmountThresholdChecker{maxCents: maxCents}
+}
+
+func (a *AmountThresholdChecker) Check(_ context.Context, t Transfer) (FraudResult, error) {
+	if t.AmountCents > a.maxCents {
+		return FraudResult{
+			Allow: false,
+			Reason: fmt.Sprintf(
+				"amount %d cents exceeds single-transfer limit of %d cents",
+				t.AmountCents, a.maxCents,
+			),
+		}, nil
+	}
+	return FraudResult{Allow: true, Reason: "amount within threshold"}, nil
+}
+```
+
+Then compose:
+
+```go
+checker := NewChainChecker(
+	NewVelocityChecker(3, time.Minute),          // fast, local check first
+	NewAmountThresholdChecker(1_000_000),         // $10,000 single-transfer cap
+)
+```
+
+The chain runs velocity first (cheaper, no external call) and the amount check second. Add the external ML fraud service third — only reached after local checks pass.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Make the reconciler idempotent" level="medium">
+
+The `Reconcile` function currently returns a slice of `Discrepancy` values on every call. In production it writes those to a database. Add an `alreadyFlagged map[string]bool` parameter so that if a discrepancy's `ExternalRef` was already flagged in a previous run, it is skipped (not returned again). This makes the job safe to re-run without creating duplicate alert records.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func ReconcileIdempotent(
+	ledger []LedgerEntry,
+	settlement []SettlementRecord,
+	alreadyFlagged map[string]bool,
+) []Discrepancy {
+	ledgerByRef := make(map[string]LedgerEntry, len(ledger))
+	for _, e := range ledger {
+		ledgerByRef[e.ExternalRef] = e
+	}
+
+	var discrepancies []Discrepancy
+
+	emit := func(d Discrepancy) {
+		if alreadyFlagged[d.ExternalRef] {
+			return // already flagged in a prior run — skip
+		}
+		discrepancies = append(discrepancies, d)
+	}
+
+	settledRefs := make(map[string]struct{}, len(settlement))
+	for _, s := range settlement {
+		settledRefs[s.ExternalRef] = struct{}{}
+		le, ok := ledgerByRef[s.ExternalRef]
+		if !ok {
+			emit(Discrepancy{
+				Kind:        "missing_in_ledger",
+				ExternalRef: s.ExternalRef,
+				Detail:      fmt.Sprintf("processor settled %d cents; no ledger entry", s.AmountCents),
+			})
+			continue
+		}
+		if le.AmountCents != s.AmountCents {
+			emit(Discrepancy{
+				Kind:        "amount_mismatch",
+				ExternalRef: s.ExternalRef,
+				Detail: fmt.Sprintf("ledger=%d, processor=%d",
+					le.AmountCents, s.AmountCents),
+			})
+		}
+	}
+
+	for _, le := range ledger {
+		if _, settled := settledRefs[le.ExternalRef]; !settled {
+			emit(Discrepancy{
+				Kind:        "missing_in_processor",
+				ExternalRef: le.ExternalRef,
+				Detail:      fmt.Sprintf("ledger has %d cents; processor has no record", le.AmountCents),
+			})
+		}
+	}
+
+	return discrepancies
+}
+```
+
+In production, `alreadyFlagged` is populated by a query like `SELECT external_ref FROM reconciliation_discrepancies WHERE run_date = ?` before calling `Reconcile`. New discrepancies are inserted; known ones are skipped. Re-running the job is harmless.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Circuit-breaker-aware fraud check" level="medium">
+
+Write a `CircuitBreakerFraudChecker` that wraps an external `FraudChecker`. When the external checker returns an error, it increments an error counter. If the counter exceeds a threshold (e.g., 5 consecutive errors), it enters an `open` state and returns a configurable fallback `FraudResult` without calling the external checker. After a cool-down period, it re-enters `half-open` and allows one probe call through. Use a mutex for the state.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+type cbState int
+
+const (
+	cbClosed   cbState = iota // normal: all calls go through
+	cbOpen                    // tripped: all calls return the fallback
+	cbHalfOpen                // probe: one call allowed through
+)
+
+type CircuitBreakerFraudChecker struct {
+	inner     FraudChecker
+	fallback  FraudResult
+	mu        sync.Mutex
+	state     cbState
+	failures  int
+	threshold int
+	resetAt   time.Time
+	cooldown  time.Duration
+}
+
+func NewCBFraudChecker(inner FraudChecker, fallback FraudResult, threshold int, cooldown time.Duration) *CircuitBreakerFraudChecker {
+	return &CircuitBreakerFraudChecker{
+		inner:     inner,
+		fallback:  fallback,
+		threshold: threshold,
+		cooldown:  cooldown,
+	}
+}
+
+func (cb *CircuitBreakerFraudChecker) Check(ctx context.Context, t Transfer) (FraudResult, error) {
+	cb.mu.Lock()
+	switch cb.state {
+	case cbOpen:
+		if time.Now().After(cb.resetAt) {
+			cb.state = cbHalfOpen
+		} else {
+			cb.mu.Unlock()
+			return cb.fallback, nil
+		}
+	}
+	cb.mu.Unlock()
+
+	result, err := cb.inner.Check(ctx, t)
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if err != nil {
+		cb.failures++
+		if cb.failures >= cb.threshold {
+			cb.state = cbOpen
+			cb.resetAt = time.Now().Add(cb.cooldown)
+		}
+		return cb.fallback, nil
+	}
+	// Success: reset failure counter and close the circuit.
+	cb.failures = 0
+	cb.state = cbClosed
+	return result, nil
+}
+```
+
+The fallback policy is injected at construction — it might be `FraudResult{Allow: false}` for a strict posture (reject all when the service is down) or `FraudResult{Allow: true}` for a lenient one (allow through, queue for review). The right choice depends on your risk model — encode it explicitly, never guess.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Table-driven reconciliation test with -race" level="hard">
+
+Write a table-driven test for `Reconcile` covering: (a) clean case — no discrepancies, (b) missing in ledger, (c) missing in processor, (d) amount mismatch. Use `t.Run` for subtests. Add a parallel subtest that fires `Reconcile` concurrently from N goroutines (N=10) with independent inputs to verify it is safe under `-race`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestReconcile(t *testing.T) {
+	base := time.Now()
+
+	tests := []struct {
+		name       string
+		ledger     []LedgerEntry
+		settlement []SettlementRecord
+		wantKinds  []string
+	}{
+		{
+			name: "clean",
+			ledger: []LedgerEntry{
+				{ExternalRef: "t1", AmountCents: 1000, AccountID: "a1"},
+			},
+			settlement: []SettlementRecord{
+				{ExternalRef: "t1", AmountCents: 1000, SettledAt: base},
+			},
+			wantKinds: nil,
+		},
+		{
+			name:   "missing_in_ledger",
+			ledger: nil,
+			settlement: []SettlementRecord{
+				{ExternalRef: "t2", AmountCents: 500, SettledAt: base},
+			},
+			wantKinds: []string{"missing_in_ledger"},
+		},
+		{
+			name: "missing_in_processor",
+			ledger: []LedgerEntry{
+				{ExternalRef: "t3", AmountCents: 750, AccountID: "a2"},
+			},
+			settlement: nil,
+			wantKinds:  []string{"missing_in_processor"},
+		},
+		{
+			name: "amount_mismatch",
+			ledger: []LedgerEntry{
+				{ExternalRef: "t4", AmountCents: 2000, AccountID: "a3"},
+			},
+			settlement: []SettlementRecord{
+				{ExternalRef: "t4", AmountCents: 1988, SettledAt: base},
+			},
+			wantKinds: []string{"amount_mismatch"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Reconcile(tc.ledger, tc.settlement)
+			if len(got) != len(tc.wantKinds) {
+				t.Fatalf("got %d discrepancies, want %d", len(got), len(tc.wantKinds))
+			}
+			for i, d := range got {
+				if d.Kind != tc.wantKinds[i] {
+					t.Errorf("discrepancy[%d]: got kind %q, want %q", i, d.Kind, tc.wantKinds[i])
+				}
+			}
+		})
+	}
+
+	// Parallel concurrency test — Reconcile must be race-free.
+	t.Run("concurrent_race", func(t *testing.T) {
+		t.Parallel()
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ledger := []LedgerEntry{
+					{ExternalRef: "tx-par", AmountCents: 100, AccountID: "ax"},
+				}
+				settlement := []SettlementRecord{
+					{ExternalRef: "tx-par", AmountCents: 100, SettledAt: time.Now()},
+				}
+				_ = Reconcile(ledger, settlement)
+			}()
+		}
+		wg.Wait()
+	})
+}
+```
+
+Run with `go test -race -v ./...`. The race detector must be silent. `Reconcile` creates fresh local maps on each call and takes no mutable shared state, so it is inherently safe for concurrent callers — the test confirms it.
+
+</Solution>
+
+</Exercise>
+
+---
+
+<Recap>
+
+You now know how to keep Meridian's payments service correct *and* up under load:
+
+- **High availability** means eliminating single points of failure. For a stateful ledger, the hard part is the database: synchronous replication to a replica in a second AZ gives near-zero RPO. Use a multi-host connection string with `target_session_attrs=primary` so your Go service reconnects to the new primary automatically after failover.
+- **Graceful degradation** means having a documented fallback policy for every dependency. For the fraud service — degrade. For the authoritative ledger DB — reject and return an error. A temporarily-unavailable correct ledger beats an available wrong one every time. Choose consistency over availability for money.
+- **Per-account rate limiting** protects individual accounts from being drained by bots or runaway clients. The key is per-account state — one bucket per account, independent of all others. In-process limiting (`golang.org/x/time/rate` keyed by account ID) works for a single replica. For strict limits across a fleet, move the state to Redis.
+- **Fraud-check hooks** are a seam, not a monolith. Define a `FraudChecker` interface the payment flow depends on; plug in velocity checks, amount thresholds, and external ML models behind `ChainChecker`. Test with a `noopChecker`; protect the external call with a circuit breaker and an explicit fallback policy.
+- **Reconciliation** is your safety net. Nightly jobs compare the ledger to the processor's settlement file and flag discrepancies. Corrections are append-only new journal entries — never updates. The job is idempotent; run it twice, get the same findings without double-alerting.
+- The mandatory race test pattern: fire concurrent requests under `-race`, assert the throttled account is actually throttled, assert independent accounts are unaffected, verify the race detector is silent.
+
+</Recap>
+
+<Lab
+  title="The Per-Account Fortress"
+  archetype="load"
+  difficulty="unscaffolded"
+  points={80}
+  hintCost={10}
+  verify="self-check"
+  objective="Build a per-account token-bucket rate limiter that is provably correct under concurrent load. The verifier fires 50 goroutines per account across 3 accounts simultaneously: account 'acct-a' gets a burst of 50, 'acct-b' gets 50, 'acct-c' gets 50. With a bucket capacity of 5 and a refill rate of 1/s, at most 5 requests per account must be allowed. All other requests must be denied. The race detector must be silent. Accounts must be independent: throttling acct-a must not affect acct-b or acct-c."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+
+	"golang.org/x/time/rate"
+)
+
+// TODO: implement AccountLimiter with per-account token buckets.
+// Fields: a map from accountID to *rate.Limiter, a mutex,
+// and the rate/burst parameters.
+type AccountLimiter struct {
+	// your fields here
+}
+
+// TODO: NewAccountLimiter constructs an AccountLimiter.
+func NewAccountLimiter(r rate.Limit, b int) *AccountLimiter {
+	return nil // replace with real implementation
+}
+
+// TODO: Allow reports whether accountID may proceed right now.
+// It must create a new limiter on first use for each account.
+func (al *AccountLimiter) Allow(accountID string) bool {
+	return false // replace with real implementation
+}
+
+// verifier — do not modify below this line.
+func verify(lim *AccountLimiter) {
+	accounts := []string{"acct-a", "acct-b", "acct-c"}
+	results := make(map[string]int) // accountID -> allowed count
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, acct := range accounts {
+		for range 50 {
+			wg.Add(1)
+			acctCopy := acct
+			go func() {
+				defer wg.Done()
+				if lim.Allow(acctCopy) {
+					mu.Lock()
+					results[acctCopy]++
+					mu.Unlock()
+				}
+			}()
+		}
+	}
+	wg.Wait()
+
+	passed := true
+	for _, acct := range accounts {
+		allowed := results[acct]
+		if allowed > 5 {
+			fmt.Printf("FAIL: %s allowed %d (want <= 5)\\n", acct, allowed)
+			passed = false
+		} else {
+			fmt.Printf("OK:   %s allowed %d\\n", acct, allowed)
+		}
+	}
+	if passed {
+		fmt.Println("\\nVerifier passed. Flag: GO{per_account_fortress_rate_correct_under_load}")
+	}
+}
+
+func main() {
+	lim := NewAccountLimiter(1, 5) // 1 token/sec, burst 5
+	verify(lim)
+}`}
+  verifier="The verifier fires 50 concurrent goroutines per account (3 accounts). For each account: allowed count must be <= 5 (the burst capacity). go test -race must report no data races. Accounts must be independent (throttling one must not affect others). Flag reveals only when all conditions hold."
+  hints={[
+    "AccountLimiter needs a sync.Mutex and a map[string]*rate.Limiter. Lock the mutex in Allow before reading or writing the map.",
+    "In Allow: lock → check if map has the limiter → if not, create with rate.NewLimiter(al.r, al.b) and store it → unlock → call .Allow() on the retrieved limiter.",
+    "After retrieving the *rate.Limiter from the map, release the mutex BEFORE calling .Allow(). The rate.Limiter is itself concurrent-safe — you only need the outer mutex to protect the map, not the limiter call itself."
+  ]}
+  flag="GO{per_account_fortress_rate_correct_under_load}"
+>
+
+I built the payments service that kept the lights on when everything else was burning. Now you build the rate limiter that makes it fair. The verifier does not care about your feelings — only whether the counts are right and the race detector is quiet. I'm watching. Don't embarrass either of us.
+
+</Lab>
+
+<Scoreboard
+  streak={11}
+  items={[
+    { label: "Quick check — in-process limiting across replicas", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — velocity check denial action", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Allow with Wait", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Amount threshold checker", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Idempotent reconciler", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Circuit-breaker fraud check", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Table-driven reconciliation test", kind: "exercise", points: 25, done: false },
+  ]}
+  flag={{ label: "Lab — The Per-Account Fortress", captured: false, points: 80 }}
+/>
+
+Not bad, sport. A ledger that's still right after a zone failure, a bot assault, a fraud-service outage, and a processor settlement gap — that's not most engineers' work. It's not *my* level, obviously. But it's close enough that I'll admit you to the next chapter: the capstone. We wire everything together. Bring your A-game. I'll know if you don't.

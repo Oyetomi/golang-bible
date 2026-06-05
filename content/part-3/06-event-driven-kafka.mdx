@@ -1,0 +1,1507 @@
+---
+title: "Event-Driven Architecture & Kafka"
+part: 3
+order: 6
+type: "course"
+description: "Event sourcing, CQRS, the outbox and reconciliation; then Kafka deep: topics, partitions, offsets, consumer groups, rebalancing and partition-key design."
+prerequisites: ["messaging-pubsub-foundations"]
+---
+
+<HeroCard label="Part 3 · Chapter 6" title="Event-Driven Architecture & Kafka">
+
+Listen up, sport. We just covered the *theory* of messaging — topics, queues, delivery guarantees. Adorable foundation. Now we're going to build something that actually runs real payments at scale, because theory without architecture is just philosophy, and philosophy doesn't clear ACH.
+
+You are going to leave this chapter understanding why the payments system you're building stores facts instead of states, why your read models are separate from your write models, and — most importantly — how Kafka turns a partition offset into one of the most elegant ordering guarantees in distributed systems. By the time we're done, you'll be able to design partition keys like you've been doing it for years. Which you haven't. But you will.
+
+Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Event-Driven Paradigm", "Event Sourcing", "CQRS", "Transactional Outbox & Reconciliation", "Kafka Deep Dive — Part 1", "Kafka Deep Dive — Part 2"]} />
+
+<Scene
+  title="Kafka partitioning: one account, one partition, one order"
+  actors={[
+    { id: "prod", label: "Producer" },
+    { id: "ca", label: "Consumer A" },
+    { id: "cb", label: "Consumer B" },
+    { id: "cc", label: "Consumer C" }
+  ]}
+  rows={2}
+  cols={6}
+  frames={[
+    {
+      caption: "Three partitions (P0–P2) are empty. The consumer group has two members: A owns P0, B owns P1–P2.",
+      beat: "neutral",
+      actors: [{ id: "prod", state: "idle" }, { id: "ca", state: "idle" }, { id: "cb", state: "idle" }],
+      cells: [
+        { id: "A1", label: "P0", state: "idle" },
+        { id: "A2", label: "P0", state: "idle" },
+        { id: "A3", label: "P0", state: "idle" },
+        { id: "A4", label: "P1", state: "idle" },
+        { id: "A5", label: "P1", state: "idle" },
+        { id: "A6", label: "P2", state: "idle" },
+        { id: "B1", label: "→A", state: "idle" },
+        { id: "B2", label: "→A", state: "idle" },
+        { id: "B3", label: "→A", state: "idle" },
+        { id: "B4", label: "→B", state: "idle" },
+        { id: "B5", label: "→B", state: "idle" },
+        { id: "B6", label: "→B", state: "idle" }
+      ]
+    },
+    {
+      caption: "Problem: events for ACC-001 (credit, debit, credit) land in P0, P1, and P2 — no partition key used. Consumer B processes the debit before Consumer A processes the first credit. Balance goes negative.",
+      beat: "problem",
+      actors: [{ id: "prod", state: "active" }, { id: "ca", state: "warn" }, { id: "cb", state: "bad" }],
+      cells: [
+        { id: "A1", label: "credit", state: "warn" },
+        { id: "A4", label: "debit", state: "bad" },
+        { id: "A6", label: "credit", state: "warn" }
+      ]
+    },
+    {
+      caption: "Solution: key every event by account ID. hash('ACC-001') % 3 = P0. All three events for ACC-001 land in P0, in order, processed by one consumer.",
+      beat: "solution",
+      actors: [{ id: "prod", state: "active" }, { id: "ca", state: "ok" }, { id: "cb", state: "idle" }],
+      cells: [
+        { id: "A1", label: "credit", state: "done" },
+        { id: "A2", label: "debit", state: "done" },
+        { id: "A3", label: "credit", state: "done" }
+      ]
+    },
+    {
+      caption: "Rebalance: Consumer C joins. The coordinator moves P2 from B to C. A and B continue processing their retained partitions without interruption (cooperative-sticky rebalance).",
+      beat: "solution",
+      actors: [{ id: "prod", state: "idle" }, { id: "ca", state: "ok" }, { id: "cb", state: "ok" }, { id: "cc", state: "active" }],
+      cells: [
+        { id: "A1", label: "P0→A", state: "done" },
+        { id: "A4", label: "P1→B", state: "done" },
+        { id: "A6", label: "P2→C", state: "active" },
+        { id: "B6", label: "→C", state: "active" }
+      ]
+    }
+  ]}
+  caption="Key by account ID — same key always hashes to the same partition, giving you per-account ordering for free. One consumer owns each partition; no concurrent writes to the same account's event stream."
+/>
+
+## The Event-Driven Paradigm
+
+<Define term="Event-Driven Architecture (EDA)" since="Messaging & Pub/Sub Foundations (Part 3)">
+In **event-driven architecture**, services communicate by publishing and consuming **events** — immutable records of things that happened — through a durable broker instead of calling each other directly. The producer fires and forgets; consumers react on their own schedule. This decouples operational availability: a crashed consumer doesn't block the producer, and new consumers can replay the event log without any producer changes. We need it because synchronous HTTP coupling turns every downstream outage into a payments outage.
+</Define>
+
+Here's the scene: your payments system has a dozen services — `account-service`, `ledger-service`, `notification-service`, `fraud-service`, `analytics-service`. Every time a payment completes, all of them need to know. The naïve implementation has `payment-service` making five synchronous HTTP calls in sequence. You ship it. Three weeks later, `notification-service` has a bad deploy, and suddenly *payments stop processing* because your synchronous call is timing out.
+
+You've coupled your write path to the operational health of every downstream consumer. That's not architecture. That's a hostage situation.
+
+**Event-driven architecture breaks that coupling.** The rule is simple: **producers publish facts; they do not know who is listening.**
+
+**On the job:** You reach for EDA the moment a single write path needs to notify more than one downstream service — payment completed, account opened, transfer settled. The failure mode without it is cascading outages: one slow consumer stalls every caller.
+
+### Events are facts, not commands
+
+<Define term="Event">
+An **event** is an immutable, timestamped record of something that already happened: `payment.completed`, `account.credited`. It is not a command and carries no expectation of a response. Events are facts — you cannot un-publish them, and consumers must handle them idempotently because a broker may deliver them more than once.
+</Define>
+
+An **event** is an immutable record of something that happened in the past. It is not an instruction.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Command (imperative)">Tells a service what to do. `ProcessPayment`. `SendEmail`. The producer knows the consumer and expects a response.</ConceptCard>
+  <ConceptCard label="Event (declarative)">Records what happened. `payment.completed`. `account.credited`. The producer knows nothing about consumers — it just records the fact.</ConceptCard>
+  <ConceptCard label="Query">Asks for current state. Separate from both — we'll formalize this split with CQRS.</ConceptCard>
+  <Gotcha>The naming matters. `send_payment_email` is a command disguised as an event — you're still coupling the producer to the consumer's behavior. `payment.completed` is a true event: the producer's job ended when the payment completed. What happens next is none of its business.</Gotcha>
+</ConceptGrid>
+
+### The benefits — and the real costs
+
+I will not sugarcoat this. Event-driven systems are genuinely powerful and genuinely hard to reason about. Know both before you commit.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Benefits">**Temporal decoupling:** producer and consumer don't need to be up at the same time. **Operational independence:** a consumer crash doesn't take down the producer. **Fan-out at no producer cost:** ten consumers read the same event; the producer published once. **Audit trail:** every event is a permanent record of what happened.</ConceptCard>
+  <ConceptCard label="Real costs">**Eventual consistency:** consumers may lag seconds or minutes behind. **Harder to trace:** a request doesn't have a single call stack — it fans out across services and time. **Schema evolution is painful:** you can't change an event's shape without coordinating every consumer. **Debugging is non-trivial:** the action and its effect are separated in time.</ConceptCard>
+</ConceptGrid>
+
+Let's animate what the decoupling looks like at runtime. Compare the synchronous approach to the event-driven one:
+
+<ExecTimeline
+  title="Synchronous vs. event-driven: a payment completes"
+  lanes={[
+    { id: "pay", label: "payment-service" },
+    { id: "ledger", label: "ledger-service" },
+    { id: "notify", label: "notification-service" },
+    { id: "broker", label: "message broker" }
+  ]}
+  steps={[
+    { lane: "pay", kind: "run", label: "payment.Complete()", note: "payment-service finishes processing. In the sync model it now calls ledger-service, waits, then calls notification-service, waits. A failure anywhere blocks the response." },
+    { lane: "pay", kind: "send", label: "publish payment.completed", note: "In the event-driven model, payment-service publishes ONE event to the broker and returns immediately. Its work is done." },
+    { lane: "broker", kind: "recv", label: "event stored", note: "The broker durably stores the event. Neither ledger-service nor notification-service need to be alive right now." },
+    { lane: "ledger", kind: "recv", label: "consume event (async)", note: "ledger-service reads the event from the broker at its own pace. Even if it was down for 2 minutes, it catches up when it restarts." },
+    { lane: "notify", kind: "recv", label: "consume event (async)", note: "notification-service reads the same event independently. A deploy or crash here has zero effect on payment-service or ledger-service." },
+    { lane: "pay", kind: "done", label: "response returned", note: "The HTTP response was already returned to the client after step 2. The downstream side effects happen asynchronously, in parallel, independently." }
+  ]}
+  caption="The producer publishes once and is done. Consumers process on their own schedule, in parallel, with no coupling to each other or the producer."
+/>
+
+<Define term="Eventual Consistency">
+A distributed system is **eventually consistent** when all replicas or consumers will converge to the same state, given enough time and no new updates. It does not mean "broken" or "wrong" — it means "not yet." In Meridian's ledger, a `payment.completed` event processed by the projection worker 200ms after the payment commits is temporarily inconsistent; it will converge. The engineering discipline is knowing *which* reads need strong consistency (balance before a new transfer) and *which* can tolerate lag (a dashboard showing yesterday's summary).
+</Define>
+
+<Callout kind="pro" title="Eventual consistency is not broken">
+
+When `notification-service` processes the `payment.completed` event 200ms after the payment was recorded, the system is not wrong — it is **eventually consistent**. The notification will be sent. The ledger will be updated. It just hasn't happened *yet* from a wall-clock perspective. The key discipline is knowing which operations require strong consistency (balance reads before a transfer) and which can be eventually consistent (email notifications). We will return to this in the Outbox section.
+
+</Callout>
+
+<QuickCheck
+  question="A payment service publishes a 'payment.completed' event. Which statement is true about the event-driven model?"
+  options={[
+    "The payment service must wait for all consumers to acknowledge before returning a response",
+    "The payment service publishes the fact and has no knowledge of or dependency on its consumers",
+    "Events are commands sent to specific named services",
+    "If the notification service is down, the payment service must retry until it comes back up"
+  ]}
+  answer={1}
+  explain="Events are facts. The producer publishes and moves on. Consumers read at their own pace from a durable broker. The producer has no dependency on consumer availability — that decoupling is the entire point."
+/>
+
+## Event Sourcing
+
+<Define term="Event Sourcing" since="Double-Entry Ledgers (Part 3)">
+**Event sourcing** is the practice of storing an entity's history as an ordered, append-only sequence of events rather than storing the entity's current state. The current state (e.g., an account balance) is derived by **replaying** those events from the beginning — or from the most recent snapshot. We need it in fintech because an append-only event log is intrinsically auditable, immutable, and replayable: regulators love it, and it makes "what happened to this account?" a query rather than a forensic investigation.
+</Define>
+
+Most databases store **current state**. Your `accounts` table has a row per account with its current balance. That's the snapshot you care about today — but it silently discards everything that happened to get there.
+
+**Event sourcing flips this.** Instead of storing the current state of an entity, you store the complete sequence of events that happened to it. Current state is derived by **replaying** the event log.
+
+This is not new to you. The double-entry ledger in **Double-Entry Ledgers (Part 3)** was event sourcing in disguise: every transaction was an immutable entry; the balance was a sum over those entries. Event sourcing is that pattern applied universally.
+
+**On the job:** You reach for event sourcing when you need a full audit trail (regulatory requirement), the ability to replay history into a new read model, or time-travel queries ("what was this account's balance on March 1st?"). The cost is query complexity — you cannot `SELECT balance FROM accounts WHERE balance > 10000` against the event store directly.
+
+### The event store
+
+The source of truth is the **event store** — an append-only log of events for each entity.
+
+```go
+// AccountEvent represents something that happened to an account.
+// This is Part 3 — money is int64 cents, never a float.
+type AccountEvent struct {
+	ID          int64           // surrogate primary key
+	AccountID   string          // the entity this event belongs to
+	Sequence    int64           // monotonically increasing per account — for ordering
+	OccurredAt  time.Time
+	EventType   string          // "account.opened", "payment.credited", "payment.debited"
+	AmountCents int64           // positive for credits, negative for debits; 0 for meta events
+	Metadata    json.RawMessage // correlation ID, idempotency key, etc.
+}
+```
+
+To get an account's balance, replay the events:
+
+```go
+// ReplayBalance computes the current balance for an account by replaying all
+// events from the store. Idiomatic fintech: accumulate int64 cents, never float.
+func ReplayBalance(ctx context.Context, events []AccountEvent) (int64, error) {
+	var balanceCents int64
+	for _, ev := range events {
+		switch ev.EventType {
+		case "account.opened":
+			// no balance change — meta event
+		case "payment.credited":
+			balanceCents += ev.AmountCents
+		case "payment.debited":
+			balanceCents += ev.AmountCents // AmountCents is negative for debits
+		default:
+			return 0, fmt.Errorf("unknown event type %q for account %s", ev.EventType, ev.AccountID)
+		}
+	}
+	return balanceCents, nil
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+)
+
+type AccountEvent struct {
+	EventType   string
+	AmountCents int64 // positive = credit, negative = debit
+}
+
+// ReplayBalance derives the current balance by replaying account events.
+// This is the event sourcing model: no stored "current balance" column.
+func ReplayBalance(events []AccountEvent) (int64, error) {
+	var balanceCents int64
+	for _, ev := range events {
+		switch ev.EventType {
+		case "account.opened":
+			// meta event — no balance change
+		case "payment.credited":
+			balanceCents += ev.AmountCents
+		case "payment.debited":
+			balanceCents += ev.AmountCents // negative cents
+		default:
+			return 0, fmt.Errorf("unknown event type %q", ev.EventType)
+		}
+	}
+	return balanceCents, nil
+}
+
+func main() {
+	events := []AccountEvent{
+		{EventType: "account.opened", AmountCents: 0},
+		{EventType: "payment.credited", AmountCents: 100_00},  // $100.00
+		{EventType: "payment.debited", AmountCents: -25_00},   // -$25.00
+		{EventType: "payment.credited", AmountCents: 50_00},   // $50.00
+	}
+	balance, err := ReplayBalance(events)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	// Balance: $125.00
+	fmt.Printf("Balance: $%d.%02d\n", balance/100, balance%100)
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Event replay: deriving balance from the event log"
+  lanes={[{ id: "replay", label: "ReplayBalance()" }]}
+  steps={[
+    { lane: "replay", kind: "run", label: "account.opened → balance=0", note: "Meta event: account was opened. No monetary movement. Balance stays at zero cents." },
+    { lane: "replay", kind: "run", label: "payment.credited +10000 → 10000", note: "Credit of $100.00 (10000 cents). Balance is now 10000 cents." },
+    { lane: "replay", kind: "run", label: "payment.debited -2500 → 7500", note: "Debit of $25.00 (stored as -2500 cents). Balance is now 7500 cents." },
+    { lane: "replay", kind: "run", label: "payment.credited +5000 → 12500", note: "Credit of $50.00 (5000 cents). Balance is now 12500 cents ($125.00)." },
+    { lane: "replay", kind: "done", label: "return 12500 cents", note: "Final balance derived purely from replaying the ordered event sequence. No 'current balance' column was ever stored." }
+  ]}
+  caption="Balance is computed, not stored. The event log IS the truth; the balance is a projection."
+/>
+
+### Snapshots: don't replay ten million events
+
+Replaying the full history is elegant but impractical once an account has ten million events. The solution is **snapshots**: periodically serialize the derived state and store it alongside the event log. To rebuild state, load the most recent snapshot and replay only the events that occurred after it.
+
+```go
+// AccountSnapshot captures computed state at a point in time.
+type AccountSnapshot struct {
+	AccountID     string
+	AtSequence    int64     // the event sequence number this snapshot reflects
+	BalanceCents  int64
+	SnapshotAt    time.Time
+}
+
+// RebuildFromSnapshot loads a snapshot then replays only the newer events.
+// This keeps replay O(events_since_snapshot), not O(all_events).
+func RebuildFromSnapshot(snap AccountSnapshot, newEvents []AccountEvent) (int64, error) {
+	balance := snap.BalanceCents
+	for _, ev := range newEvents {
+		switch ev.EventType {
+		case "payment.credited":
+			balance += ev.AmountCents
+		case "payment.debited":
+			balance += ev.AmountCents
+		}
+	}
+	return balance, nil
+}
+```
+
+<UnderTheHood title="Why append-only + replay is a superpower in fintech (Go 1.26)">
+
+Traditional state-storage systems have a deeply uncomfortable property: **you can update or delete a row**. In fintech, this means you can silently lose history — an accidental `UPDATE accounts SET balance = 0 WHERE id = $1` is catastrophic and potentially undetectable.
+
+Event sourcing makes this class of bug **impossible**: the event log is append-only. You can never modify a past event (your schema enforces it with no `UPDATE`/`DELETE` grants on the events table). Every balance change is recorded as a new event. Auditors love this. Regulators love this. Your on-call engineers love this because "what happened to this account?" is just a query.
+
+The Go implementation leans on this naturally: events are value types (no pointers that could be mutated), the slice is iterated with `range` (copying values, not sharing pointers), and the running total is a plain `int64` — no rounding, no float drift. As of Go 1.22+, the `range` loop variable is per-iteration by default, so there's no accidental closure capture of a stale event reference. This baseline chapter assumes **Go 1.26**.
+
+One cost: **query performance**. If you need "all accounts with balance > $10,000," you cannot query the event store directly — you'd replay every account. This is why event sourcing and CQRS go together: you project events into read-optimized query stores (the next section).
+
+</UnderTheHood>
+
+<QuickCheck
+  question="In an event-sourced account system, where is the authoritative account balance stored?"
+  options={[
+    "In a dedicated `current_balance` column, updated on every transaction",
+    "Nowhere — it is computed by replaying the event sequence",
+    "In a Redis cache, populated at account creation",
+    "In a materialized view that is refreshed every minute"
+  ]}
+  answer={1}
+  explain="Event sourcing stores the sequence of events as the source of truth. Balance is derived by replaying those events. Snapshots exist as a performance optimization, but the event log is always the authoritative source."
+/>
+
+## CQRS
+
+<Define term="CQRS — Command Query Responsibility Segregation">
+**CQRS** separates the model that handles writes (the **command side** — enforces invariants, appends events) from the models that serve reads (the **query side** — projections optimized for specific query shapes). We need it because the write model optimizes for correctness and the read model optimizes for query performance; trying to do both in one table produces neither. The eventual consistency window between "command succeeds" and "projection updated" is the main trade-off.
+</Define>
+
+Event sourcing raises an immediate problem: if the balance is computed by replaying events, how do you efficiently answer "show me all accounts with balance > $10,000" or "show me this user's transaction history paginated"?
+
+You don't query the event store for that. You **project** events into purpose-built read models. This is **CQRS** — Command Query Responsibility Segregation.
+
+The insight is simple: **the model that handles writes (commands) should be separate from the models that serve reads (queries).** They optimize for different things.
+
+**On the job:** You hit CQRS when your dashboard queries start timing out against the same table your transfer handler writes to. The tell is asymmetric load: thousands of balance reads per second against a write table with serializable transactions. CQRS fixes the contention by routing reads to a denormalized projection.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Write side (command model)">Receives commands (`CreditAccount`, `DebitAccount`). Enforces invariants. Appends events to the event store. Optimized for correctness and durability — not for queryability.</ConceptCard>
+  <ConceptCard label="Read side (query model / projection)">Consumes events from the event store. Builds denormalized, query-optimized views. Can be rebuilt from scratch by replaying events. May have multiple projections for different query shapes.</ConceptCard>
+</ConceptGrid>
+
+```go
+// Command — the write side receives this.
+type CreditAccountCommand struct {
+	AccountID      string
+	AmountCents    int64  // int64 cents — always
+	IdempotencyKey string
+	CorrelationID  string
+}
+
+// A projection — the read side builds and maintains this.
+// Denormalized, fast to query, derived entirely from events.
+type AccountBalanceProjection struct {
+	AccountID     string
+	BalanceCents  int64
+	LastUpdated   time.Time
+	EventSequence int64
+}
+```
+
+The critical insight is that **projections can be rebuilt**. If you add a new query requirement (e.g., "show accounts that had a debit in the last 24 hours"), you create a new projection by replaying the event log from the beginning. No schema migration. No backfill job that might fail halfway. Just replay.
+
+<ExecTimeline
+  title="CQRS: command writes events; projections serve reads"
+  lanes={[
+    { id: "cmd", label: "command handler" },
+    { id: "store", label: "event store" },
+    { id: "proj", label: "projection worker" },
+    { id: "api", label: "read API" }
+  ]}
+  steps={[
+    { lane: "cmd", kind: "recv", label: "CreditAccount cmd arrives", note: "A command arrives: credit account ACC-001 with $50.00. The command handler validates it and enforces invariants." },
+    { lane: "cmd", kind: "send", label: "append payment.credited event", note: "The command handler appends a payment.credited event to the event store. This is the only write. Command handler's job is done." },
+    { lane: "store", kind: "run", label: "event durably stored", note: "The event store records the event with a sequence number and timestamp. This is the authoritative record." },
+    { lane: "proj", kind: "recv", label: "projection reads new event", note: "The projection worker polls or subscribes to the event store. It reads the new payment.credited event." },
+    { lane: "proj", kind: "run", label: "update balance read model", note: "The projection updates the AccountBalanceProjection table: balance += 5000 cents. This is the denormalized read model." },
+    { lane: "api", kind: "recv", label: "GET /accounts/ACC-001/balance", note: "A read request arrives. It queries the projection table directly — a simple SELECT, no event replay." },
+    { lane: "api", kind: "done", label: "return $125.00", note: "Fast, indexed read from the projection. The read API never touches the event store for balance queries." }
+  ]}
+  caption="Commands flow left-to-right: command handler → event store → projection worker → read model. Reads are served from the projection, never from the event store directly."
+/>
+
+### When CQRS is overkill
+
+I respect you too much to pretend CQRS is always the right call. It adds real complexity: you now have two models to maintain, event-to-projection consistency lag, and projection rebuild procedures. For a small internal admin tool with five users? Use a single model and call it a day.
+
+CQRS shines when:
+- Read and write loads are asymmetric (many reads, few writes — typical for fintech dashboards)
+- Different queries need radically different data shapes (transaction history vs. aggregate balances vs. fraud signals)
+- You need auditability (the event store is your audit log for free)
+- You're already doing event sourcing
+
+<Callout kind="warn" title="The CQRS consistency window">
+
+There is a window between "command succeeds" and "projection updated" during which a read might return stale data. In most fintech systems this is acceptable (showing a slightly stale balance on a dashboard is fine). For operations that *depend* on the current balance — like a new transfer — you read from the write model (or replay events for that account), not from the projection. Know the difference and design explicitly.
+
+</Callout>
+
+## Transactional Outbox & Reconciliation
+
+We covered the outbox pattern in **Idempotency & Exactly-Once Semantics (Part 3)**. Let's revisit it in the event-driven context, then go deeper on the reconciliation side — because the outbox solves "did I publish?" and reconciliation solves "do our systems agree?"
+
+<Define term="Reconciliation">
+**Reconciliation** is the periodic process that compares two systems — the authoritative source (e.g., Meridian's event store) and a downstream system (e.g., a balance projection or a partner bank's ledger) — diffs the two, and emits corrections for any drift. We need it because bugs, crashes, and redelivered messages mean systems drift over time even when each individual step was correct. Reconciliation is the safety net that proves eventual consistency actually converges.
+</Define>
+
+**On the job:** You need reconciliation whenever two systems must agree on a number that has financial meaning — your ledger vs. a partner bank's settlement report, your balance projection vs. the event store replay. The failure mode without it is silent drift accumulating until a customer notices a wrong balance.
+
+### The outbox: atomic write + publish
+
+The core problem: you want to update your database **and** publish an event to Kafka in one atomic operation. These are two different systems. You cannot do a distributed transaction across them cheaply. So you use the **transactional outbox**:
+
+1. In a single database transaction: update your entity state AND insert a row into an `outbox` table.
+2. A separate outbox worker reads undelivered outbox rows and publishes them to Kafka.
+3. Once published (and acknowledged by Kafka), mark the row as delivered.
+
+```go
+// OutboxMessage — written in the same DB transaction as the business event.
+type OutboxMessage struct {
+	ID          int64
+	AggregateID string   // e.g. account ID
+	EventType   string   // "payment.completed"
+	Payload     []byte   // JSON-encoded event payload
+	CreatedAt   time.Time
+	PublishedAt *time.Time // nil until the outbox worker delivers it
+}
+
+// PostPaymentWithOutbox posts a ledger entry and writes an outbox message
+// in a single transaction. Either both succeed or neither does.
+func PostPaymentWithOutbox(ctx context.Context, tx *sql.Tx, accountID string, amountCents int64, idemKey string) error {
+	// 1. Write the ledger event (from the Double-Entry Ledgers chapter's model).
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO account_events (account_id, event_type, amount_cents, idempotency_key)
+		 VALUES ($1, 'payment.credited', $2, $3)`,
+		accountID, amountCents, idemKey)
+	if err != nil {
+		return fmt.Errorf("insert account event: %w", err)
+	}
+	// 2. Write the outbox message atomically in the same transaction.
+	payload, err := json.Marshal(map[string]any{
+		"account_id":    accountID,
+		"amount_cents":  amountCents,
+		"idempotency_key": idemKey,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal outbox payload: %w", err)
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO outbox_messages (aggregate_id, event_type, payload, created_at)
+		 VALUES ($1, 'payment.completed', $2, NOW())`,
+		accountID, payload)
+	if err != nil {
+		return fmt.Errorf("insert outbox message: %w", err)
+	}
+	// No Kafka call here — the outbox worker handles that separately.
+	return nil
+}
+```
+
+<ExecTimeline
+  title="Transactional outbox: atomic write, async publish"
+  lanes={[
+    { id: "api", label: "API handler" },
+    { id: "db", label: "Postgres" },
+    { id: "worker", label: "outbox worker" },
+    { id: "kafka", label: "Kafka" }
+  ]}
+  steps={[
+    { lane: "api", kind: "run", label: "BEGIN transaction", note: "The API handler opens a Postgres transaction. Everything inside is atomic — all succeeds or all rolls back." },
+    { lane: "db", kind: "run", label: "INSERT account_events row", note: "The ledger event is written: account credited, amount, idempotency key." },
+    { lane: "db", kind: "run", label: "INSERT outbox_messages row", note: "The outbox message is written in the same transaction. It has published_at = NULL — not yet delivered." },
+    { lane: "api", kind: "send", label: "COMMIT", note: "Transaction commits. Both rows are now durable. The API returns success to the caller." },
+    { lane: "worker", kind: "run", label: "poll outbox for unpublished rows", note: "The outbox worker runs every few seconds (or is triggered by Postgres LISTEN/NOTIFY). It finds the new row." },
+    { lane: "worker", kind: "send", label: "produce to Kafka", note: "Worker calls kafka.Produce(event). This may be retried if Kafka is temporarily unavailable — safe because the DB row tracks state." },
+    { lane: "kafka", kind: "recv", label: "ack — message stored", note: "Kafka acknowledges. The event is durably in the Kafka partition." }
+  ]}
+  caption="The atomic transaction couples DB write and outbox row. The worker decouples Kafka publish from the request path. No dual-write problem."
+/>
+
+### Reconciliation: when eventual consistency needs a safety net
+
+The outbox solves the publish problem. But what about drift between systems over time? Bugs, crashes, and network glitches mean that sometimes a consumer processes an event twice, skips one, or applies it out of order. **Reconciliation** is the periodic process that compares two systems and fixes the drift.
+
+In fintech, the canonical reconciliation pattern is:
+
+1. **Compute expected state** from the authoritative source (your event store).
+2. **Query actual state** from the system being reconciled (e.g., the balance projection, or a partner bank's API).
+3. **Diff the two** and identify discrepancies.
+4. **Emit correction events** or trigger repair actions for anything that doesn't match.
+
+```go
+// ReconciliationReport summarizes drift found between the event store and a projection.
+type ReconciliationReport struct {
+	RunAt            time.Time
+	AccountsChecked  int
+	Discrepancies    []Discrepancy
+}
+
+type Discrepancy struct {
+	AccountID        string
+	ExpectedCents    int64  // balance from event store replay
+	ActualCents      int64  // balance from the projection / read model
+	DeltaCents       int64  // expected - actual
+}
+
+// ReconcileBalances compares event-sourced balances against a projection.
+// Any drift is reported; callers decide the repair action.
+func ReconcileBalances(ctx context.Context, expected map[string]int64, actual map[string]int64) ReconciliationReport {
+	report := ReconciliationReport{RunAt: time.Now()}
+	for accountID, expBalance := range expected {
+		report.AccountsChecked++
+		actBalance, ok := actual[accountID]
+		if !ok || actBalance != expBalance {
+			report.Discrepancies = append(report.Discrepancies, Discrepancy{
+				AccountID:     accountID,
+				ExpectedCents: expBalance,
+				ActualCents:   actBalance,
+				DeltaCents:    expBalance - actBalance,
+			})
+		}
+	}
+	return report
+}
+```
+
+<Callout kind="note" title="Eventual consistency: it's not broken, it's consistent later">
+
+When a consumer lags and the projection shows a balance that's $50 lower than the event store says it should be, that's not a bug — that's the system being temporarily inconsistent, heading toward eventual consistency. Your job as the engineer is to:
+
+1. **Know which invariants must be strongly consistent** (a transfer must see the authoritative balance before it executes).
+2. **Know which can be eventually consistent** (the balance projection shown on a dashboard can lag by seconds).
+3. **Have a reconciliation job** that detects and corrects drift before it compounds.
+
+"Eventual consistency" is a guarantee, not an excuse. The system *will* converge — your reconciliation job is the safety net that proves it.
+
+</Callout>
+
+## Kafka Deep Dive — Part 1
+
+<Define term="Kafka" since="Messaging & Pub/Sub Foundations (Part 3)">
+**Apache Kafka** is a distributed, durable, high-throughput event streaming platform. A Kafka **cluster** is a set of **broker** servers that store event streams in durable, append-only **topic partitions**. Producers write to topics; consumers read from them at their own pace. Kafka is the dominant event broker in fintech because it gives you: durable storage (events survive broker restarts), replay (consumers can re-read from any offset), fan-out (many consumer groups read the same topic independently), and — with careful partition-key design — per-entity ordering guarantees. The two major Go clients are `segmentio/kafka-go` and `twmb/franz-go`; this chapter uses `segmentio/kafka-go` for examples.
+</Define>
+
+With the paradigm and patterns in place, let's go deep on the actual technology. Kafka is the dominant event streaming platform in fintech, and for good reason: it gives you durability, scale, and — with the right partition-key design — per-entity ordering. Understanding *why* requires understanding its internal model precisely.
+
+**On the job:** You reach for Kafka when you need durable, replayable, high-throughput event streams that fan out to multiple independent consumer groups. The failure mode of getting the internals wrong: silent message loss (wrong ack setting), duplicate charges (wrong delivery semantics), or ledger projections that apply debits before credits (wrong partition-key design).
+
+### Topics, partitions, and offsets
+
+<Define term="Kafka Topic">
+A **topic** is the logical name for a stream of related events: `account.events`, `payment.completed`. A topic is divided into one or more **partitions**. You publish to a topic by name; the broker routes each message to a specific partition based on the message key.
+</Define>
+
+<Define term="Partition (Kafka)">
+A **partition** is the physical unit of storage and parallelism in Kafka. Each partition is an ordered, append-only log on disk. **Ordering is guaranteed within a partition** — messages in partition 3 are always delivered in the order they were produced. Messages across different partitions have no ordering relationship. Each partition is owned by exactly one consumer in a consumer group at a time, which makes the partition both the unit of ordering and the unit of parallelism.
+</Define>
+
+<Define term="Offset">
+An **offset** is the monotonically increasing integer position of a message within a partition. Offset 0 is the first message; offset 100 is the 101st. Consumers track their progress through a partition by tracking the last offset they processed. If a consumer restarts, it resumes from its committed offset — no message is lost and no message before that offset is re-processed.
+</Define>
+
+A **topic** is the logical name for a stream of related events. `payment.completed`. `account.events`. `fraud.signals`. You publish to a topic; you consume from a topic.
+
+But a topic is not a single queue. A topic is divided into **partitions**.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Topic">The logical stream name. `account.events`. A topic has one or more partitions.</ConceptCard>
+  <ConceptCard label="Partition">The physical unit. A partition is an ordered, append-only log on disk. Within a partition, ordering is guaranteed. Messages are never reordered inside a partition.</ConceptCard>
+  <ConceptCard label="Offset">A monotonically increasing integer that identifies a message's position within a partition. Offset 0 is the first message. Offset 100 is the 101st. A consumer tracks its position by tracking offsets.</ConceptCard>
+  <Gotcha>Ordering is guaranteed ONLY within a single partition. If a topic has 8 partitions and account ACC-001 has events in partitions 3 and 7, those events have NO ordering guarantee relative to each other. This is why partition-key design is critical — we'll get there.</Gotcha>
+</ConceptGrid>
+
+<ExecTimeline
+  title="Topic with 3 partitions: messages arrive and are assigned"
+  lanes={[
+    { id: "prod", label: "producer" },
+    { id: "p0", label: "partition 0" },
+    { id: "p1", label: "partition 1" },
+    { id: "p2", label: "partition 2" }
+  ]}
+  steps={[
+    { lane: "prod", kind: "send", label: "produce: key=ACC-001", note: "Producer sends an event with partition key ACC-001. Kafka hashes the key to determine the partition: hash(ACC-001) % 3 = partition 1." },
+    { lane: "p1", kind: "recv", label: "offset=0: ACC-001 event", note: "This is the first message in partition 1 — it gets offset 0. All future ACC-001 events will land in partition 1 (same key → same hash → same partition)." },
+    { lane: "prod", kind: "send", label: "produce: key=ACC-002", note: "Another event, different account. hash(ACC-002) % 3 = partition 0." },
+    { lane: "p0", kind: "recv", label: "offset=0: ACC-002 event", note: "Partition 0's first message. ACC-002 will always land here." },
+    { lane: "prod", kind: "send", label: "produce: key=ACC-001 (again)", note: "Another event for ACC-001. Same key → same hash → same partition 1." },
+    { lane: "p1", kind: "recv", label: "offset=1: ACC-001 event", note: "This event gets offset 1 in partition 1. Kafka guarantees: all ACC-001 events are in partition 1, in the order they were produced." },
+    { lane: "prod", kind: "done", label: "partition 2 still empty", note: "No keys happened to hash to partition 2 yet. Load balance depends on key distribution — a badly chosen key can hot-spot one partition." }
+  ]}
+  caption="Key hash determines partition. Same key always → same partition. Ordering within the partition is guaranteed. Cross-partition ordering is not."
+/>
+
+### Consumer groups: the unit of parallel consumption
+
+<Define term="Consumer Group">
+A **consumer group** is a named set of consumer instances that cooperatively read a topic. Kafka's group coordinator distributes partitions across the group's members so that each partition is assigned to **at most one consumer** in the group at any time. Multiple independent groups can read the same topic simultaneously — each gets its own cursor (offset) per partition. Adding consumers to a group scales throughput up to the partition count; excess consumers sit idle.
+</Define>
+
+A **consumer group** is a set of consumer instances that share the work of reading a topic. Kafka distributes partitions across the group members.
+
+The rules:
+- Each partition is assigned to **at most one consumer** within a group at a time.
+- Multiple groups can read the same topic independently (fan-out at zero producer cost).
+- Adding consumers to a group scales throughput — up to the partition count. A group with more consumers than partitions means some consumers are idle.
+
+```go
+// Consumer group: 3 consumers, 6 partitions → 2 partitions per consumer.
+// Adding a 4th consumer would trigger a rebalance, redistributing partitions.
+//
+// Group "ledger-projectors":
+//   Consumer-A → partitions [0, 1]
+//   Consumer-B → partitions [2, 3]
+//   Consumer-C → partitions [4, 5]
+//
+// Group "fraud-detectors" reads the SAME topic independently:
+//   Consumer-X → partitions [0, 1, 2]
+//   Consumer-Y → partitions [3, 4, 5]
+```
+
+<ExecTimeline
+  title="Consumer group: 6 partitions distributed across 3 consumers"
+  lanes={[
+    { id: "ca", label: "Consumer A" },
+    { id: "cb", label: "Consumer B" },
+    { id: "cc", label: "Consumer C" }
+  ]}
+  steps={[
+    { lane: "ca", kind: "run", label: "assigned p0, p1", note: "Group coordinator assigns partitions. Consumer A owns partitions 0 and 1. It will receive all messages from those partitions." },
+    { lane: "cb", kind: "run", label: "assigned p2, p3", note: "Consumer B owns partitions 2 and 3. Parallelism: B's processing runs concurrently with A and C." },
+    { lane: "cc", kind: "run", label: "assigned p4, p5", note: "Consumer C owns partitions 4 and 5. All 6 partitions are covered; all 3 consumers are active." },
+    { lane: "ca", kind: "recv", label: "read p0:offset=0", note: "Consumer A reads the next message from partition 0, offset 0. It processes it and will commit this offset." },
+    { lane: "cb", kind: "recv", label: "read p2:offset=0", note: "Simultaneously, Consumer B reads from partition 2. This is true parallelism — no locks between consumers." },
+    { lane: "cc", kind: "recv", label: "read p4:offset=0", note: "Consumer C reads from partition 4. Three messages are being processed in parallel right now." },
+    { lane: "ca", kind: "done", label: "commit p0:offset=0", note: "Consumer A commits its offset for partition 0. If A crashes and restarts, it will resume from offset 1 — it will not re-process offset 0." }
+  ]}
+  caption="Each partition is processed by exactly one consumer in the group. Parallelism = number of active consumers (up to the partition count). Offset commits track per-partition progress."
+/>
+
+<UnderTheHood title="How Kafka stores partitions and offsets (Go 1.26 / Kafka 3.x)">
+
+Each partition is a directory on disk containing **log segment files** — append-only files where new messages are written sequentially. Kafka never overwrites. Writes are sequential and therefore fast (sequential disk I/O saturates a modern SSD at GB/s).
+
+An **offset** is just an integer that indexes into this log. When a consumer reads from partition 3 at offset 47, Kafka uses the partition's **index file** (a sparse index mapping every N-th offset to a byte position in the segment file) to binary-search to the right segment and seek directly to the message. No full-log scan.
+
+Consumer group offsets are stored in a special internal topic `__consumer_offsets`. When a consumer commits offset 47 for partition 3, it produces a message to `__consumer_offsets` keyed by `(group, topic, partition)`. This is a compacted topic — only the latest offset per key is retained.
+
+**Rebalancing** — when a consumer joins or leaves the group — is coordinated by one of the brokers acting as the **group coordinator**. The coordinator uses a configurable **partition assignment strategy** (range, round-robin, sticky, or cooperative-sticky). The modern default is **cooperative-sticky**: consumers only revoke the partitions they must give up (not all partitions), so in-flight processing of retained partitions isn't interrupted. Before cooperative-sticky (the classic "eager" rebalance), every consumer in the group stopped processing, revoked all partitions, and waited for new assignments — a multi-second pause in throughput. With cooperative-sticky, the pause is minimal and incremental.
+
+**Go client landscape (as of Go 1.26):** Two mature options exist. `segmentio/kafka-go` is straightforward and widely used; it supports the cooperative-sticky protocol. `twmb/franz-go` has more complete support for newer Kafka protocol features (including KIP-848 consumer rebalance protocol) and is preferred for high-throughput or protocol-edge-case scenarios. Both are production-ready; this chapter's examples use `segmentio/kafka-go` for its simpler Reader/Writer API.
+
+</UnderTheHood>
+
+## Kafka Deep Dive — Part 2
+
+### Rebalancing: when consumers join and leave
+
+<Define term="Rebalancing (Kafka)">
+A **rebalance** is the process by which the Kafka group coordinator redistributes partition ownership among a consumer group's members. It is triggered whenever the group membership changes: a consumer joins, crashes, or leaves, or a new partition is added. During a rebalance, some partitions briefly pause while ownership transfers. The modern **cooperative-sticky** strategy minimizes the pause by only revoking the partitions that must change hands — consumers retain their other partitions and keep processing. The classic "eager" strategy revoked all partitions from all consumers and is now deprecated for most use cases.
+</Define>
+
+A **rebalance** happens whenever the consumer group's membership changes: a new consumer joins, an existing one crashes, or one leaves gracefully. During a rebalance, partition ownership is redistributed.
+
+This is the part fintech engineers must understand cold, because a rebalance during high-throughput payment processing has real consequences.
+
+**On the job:** A rebalance caused by a consumer crash during ledger projection means some partitions briefly stop advancing. If offset commits were incomplete, those messages replay from the last committed offset on restart. Your `UpdateBalance` handler must be idempotent — a sequence-number check prevents double-crediting an account when the same event replays.
+
+<ExecTimeline
+  title="Rebalance: a 4th consumer joins a group of 3"
+  lanes={[
+    { id: "coord", label: "group coordinator" },
+    { id: "ca", label: "Consumer A" },
+    { id: "cb", label: "Consumer B" },
+    { id: "cd", label: "Consumer D (new)" }
+  ]}
+  steps={[
+    { lane: "cd", kind: "spawn", label: "D joins group, sends JoinGroup", note: "Consumer D starts and sends a JoinGroup request to the group coordinator. This triggers a rebalance." },
+    { lane: "coord", kind: "run", label: "rebalance begins", note: "The coordinator marks the group as rebalancing. It waits for all current members to rejoin (heartbeat-based detection)." },
+    { lane: "ca", kind: "block", label: "revoke p0 (cooperative)", note: "With cooperative-sticky, Consumer A only revokes the partition that will be given to D (e.g. p0). It keeps p1." },
+    { lane: "coord", kind: "send", label: "assign p0 to Consumer D", note: "The coordinator completes the rebalance assignment. D gets p0. A keeps p1. B and C are unaffected." },
+    { lane: "cd", kind: "recv", label: "D assigned p0 → starts consuming", note: "Consumer D begins reading from partition 0 at the last committed offset. Processing is now distributed across 4 consumers." },
+    { lane: "ca", kind: "run", label: "A continues on p1", note: "Consumer A never stopped processing p1. Cooperative rebalance minimizes disruption: only the transferred partition paused." }
+  ]}
+  caption="Cooperative-sticky rebalancing: only the transferred partition briefly pauses. A, B, C continue processing their retained partitions throughout."
+/>
+
+### Delivery semantics and idempotent producers
+
+<Define term="Idempotent Producer (Kafka)">
+An **idempotent producer** is one configured so that retried produce requests cannot result in duplicate messages at the broker. Kafka achieves this by assigning the producer a **producer ID (PID)** and tracking a **sequence number** per partition. If the producer retries a message after a transient failure, the broker recognizes the duplicate PID + sequence-number pair and discards it. For a payment event stream this is not optional — a non-idempotent producer can double-publish `payment.completed` events under network flaps, leading to double charges. Requires `acks=all` (RequireAll in kafka-go).
+</Define>
+
+Kafka supports three delivery semantics. Know exactly what you're buying:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="at-most-once">Producer doesn't retry on failure. A message may be lost if the broker crashes before acknowledging. Fast. Never acceptable for payments.</ConceptCard>
+  <ConceptCard label="at-least-once">Producer retries until it gets an ack. A message may be delivered more than once if the ack is lost after the message was stored. The default. Requires idempotent consumers.</ConceptCard>
+  <ConceptCard label="exactly-once (EOS)">Idempotent producer + transactional API. Kafka assigns a producer ID and sequence number to detect and deduplicate retried messages at the broker. Complex to configure; correct for financial message flows.</ConceptCard>
+</ConceptGrid>
+
+**On the job:** Most fintech teams use **at-least-once** delivery with idempotent DB writes on the consumer side — it's simpler than the full transactional EOS API and achieves the same correctness guarantee: even if a message is delivered twice, the consumer's sequence-number check makes the second application a no-op.
+
+**Idempotent producer configuration** (Go — not runnable in sandbox; Kafka requires a real broker):
+
+```go
+// Using segmentio/kafka-go — requires a real Kafka broker.
+// NOT runnable in the Go playground.
+//
+// This is how you configure an idempotent producer for a payments system.
+// The producer ID + sequence number are managed by the Kafka broker;
+// if a retried produce has the same sequence number for the same partition,
+// the broker deduplicates it — no double-publish.
+
+import kafka "github.com/segmentio/kafka-go"
+
+func newPaymentEventWriter(brokers []string) *kafka.Writer {
+	return &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Topic:        "account.events",
+		Balancer:     &kafka.Hash{}, // partition by key hash — same key → same partition
+		RequiredAcks: kafka.RequireAll, // wait for all ISR replicas — durability
+		// Idempotent delivery: the writer will retry and the broker deduplicates.
+		// MaxAttempts controls how many times we retry a failed produce.
+		MaxAttempts: 10,
+		// Compression saves broker disk and network bandwidth.
+		Compression: kafka.Snappy,
+	}
+}
+```
+
+<Callout kind="warn" title="RequiredAcks matters for durability">
+
+`RequireAll` (acks=-1) means the leader waits for all in-sync replicas (ISR) to acknowledge before responding. This is the only setting that guarantees durability when a broker crashes immediately after an ack. `RequireOne` means only the leader confirms — if the leader crashes before replicating, the message is lost. For a payments event stream, `RequireAll` is not optional.
+
+</Callout>
+
+### Partition-key design: the most important decision you'll make
+
+<Define term="Partition Key">
+The **partition key** is a string value attached to each Kafka message that determines which partition it lands in. The broker (or client) hashes the key and takes the result modulo the partition count: `partition = hash(key) % numPartitions`. The same key always produces the same partition — this is the property that gives you ordering guarantees. For Meridian's account event stream, the right key is the **account ID**: all events for `ACC-001` hash to the same partition, in the order they were produced, processed by one consumer.
+</Define>
+
+This is where theory becomes operational. **The partition key determines two things simultaneously: which partition a message lands in, and therefore which consumer processes it.** Getting this wrong either loses per-account ordering or creates hot spots.
+
+**On the job:** The wrong partition key in a payments system means events for the same account land in different partitions, processed by different consumers in undefined order. A debit can be applied before a credit. The balance projection goes negative. Your reconciliation job catches it — but only after the damage is done.
+
+The rule for a payments system: **key by account ID**.
+
+Why? Because ordering guarantees are **per-partition**, not global. If account ACC-001's events land in multiple partitions, you have no guarantee that a credit at offset 0 in partition 3 is processed before a debit at offset 0 in partition 7. You cannot rebuild a correct balance from out-of-order events without expensive re-sorting.
+
+By keying on account ID, all events for ACC-001 always land in the same partition — in the order they were produced. That's your per-account ordering guarantee, backed by Kafka's partition model.
+
+Here's how partition assignment actually works — a FNV hash modulo partition count. This is runnable stdlib:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"hash/fnv"
+)
+
+// partitionForKey returns the partition number [0, numPartitions) for a given key.
+// This mirrors what kafka-go's Hash balancer does internally.
+// Understanding this lets you reason about which accounts hot-spot which partitions.
+func partitionForKey(key string, numPartitions int) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	// The modulo maps the hash to [0, numPartitions).
+	// Same key always produces the same partition for the same numPartitions.
+	return int(h.Sum32()) % numPartitions
+}
+
+func main() {
+	accounts := []string{
+		"ACC-001", "ACC-002", "ACC-003", "ACC-004",
+		"ACC-005", "ACC-006", "ACC-007", "ACC-008",
+	}
+
+	numPartitions := 6
+	fmt.Printf("Partition assignment with %d partitions:\n\n", numPartitions)
+	partitionLoad := make(map[int]int)
+
+	for _, id := range accounts {
+		p := partitionForKey(id, numPartitions)
+		partitionLoad[p]++
+		fmt.Printf("  %-10s → partition %d\n", id, p)
+	}
+
+	fmt.Println("\nLoad distribution:")
+	for p := range numPartitions { // range-over-int: Go 1.22+
+		fmt.Printf("  partition %d: %d account(s)\n", p, partitionLoad[p])
+	}
+
+	// Demonstration: same key ALWAYS maps to the same partition.
+	fmt.Printf("\nACC-001 repeated 3 times → partitions: %d, %d, %d\n",
+		partitionForKey("ACC-001", numPartitions),
+		partitionForKey("ACC-001", numPartitions),
+		partitionForKey("ACC-001", numPartitions),
+	)
+}
+```
+
+</GoPlayground>
+
+Run that. Notice that the same key always produces the same partition number. That's the property your ledger projectors depend on.
+
+### The hot-spot problem: choosing keys wisely
+
+There is a trap. If your payments system processes accounts of wildly different sizes — a retail customer sends 10 payments a day, a corporate customer sends 100,000 — and they both happen to hash to partition 2, partition 2 processes orders of magnitude more work than others. One consumer instance handles a disproportionate share of the load. This is a **hot partition**.
+
+<BeforeAfter
+  badLabel="Hot-spot key"
+  goodLabel="Distributed key"
+  bad={`// Keying by country code.
+// All US payments → partition 1.
+// Partition 1 handles 80% of volume.
+// Other partitions idle.
+key = "US"`}
+  good={`// Keying by account ID.
+// Distributes load across partitions.
+// All events for one account are ordered.
+// Hot accounts exist but are isolated.
+key = accountID`}
+/>
+
+For fintech, account ID is almost always the right partition key because:
+1. It distributes load reasonably well across thousands of accounts.
+2. It keeps all events for one account ordered in one partition.
+3. A "hot" corporate account only affects one partition, not all of them.
+
+<Callout kind="pro" title="How many partitions?">
+
+You cannot easily decrease the partition count of a live topic (it requires consumer-group rebalancing and potential ordering disruption). Start with more than you think you need — 12 or 24 for a payment events topic is not unusual. Partitions are cheap. Re-partitioning a live system is expensive and risky. This is one of the few places where "over-provision at the start" is the right answer.
+
+</Callout>
+
+### Putting it all together: a Go consumer for ledger projection
+
+This is the real-world integration — a Go consumer group that reads `account.events` keyed by account ID and updates the balance projection. This requires a real Kafka cluster, so it's clearly labeled as non-runnable reference code:
+
+```go
+// ledger_consumer.go — requires a real Kafka cluster.
+// Uses segmentio/kafka-go. NOT runnable in the Go playground.
+
+package ledger
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog" // Go 1.21+ structured logging
+
+	kafka "github.com/segmentio/kafka-go"
+)
+
+// AccountEventPayload is the shape of events in the account.events topic.
+// Money is always int64 cents — never float. This rule has no exceptions.
+type AccountEventPayload struct {
+	AccountID      string `json:"account_id"`
+	EventType      string `json:"event_type"`
+	AmountCents    int64  `json:"amount_cents"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Sequence       int64  `json:"sequence"`
+}
+
+// BalanceProjector reads from Kafka and updates the balance projection in Postgres.
+// It is a consumer-group member — Kafka handles partition assignment.
+// Consumer group ID "ledger-projectors" means all instances share the work;
+// each partition is processed by exactly one instance at a time.
+type BalanceProjector struct {
+	reader *kafka.Reader
+	db     BalanceStore // injected dependency — no globals
+	logger *slog.Logger
+}
+
+// BalanceStore is the interface the projector needs — defined by the consumer.
+// Small, precise, testable.
+type BalanceStore interface {
+	UpdateBalance(ctx context.Context, accountID string, deltaAmountCents int64, sequence int64) error
+}
+
+func NewBalanceProjector(brokers []string, groupID string, db BalanceStore, log *slog.Logger) *BalanceProjector {
+	r := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     brokers,
+		Topic:       "account.events",
+		GroupID:     groupID, // consumer group — partitions auto-assigned
+		MinBytes:    10e3,    // 10KB min batch — reduces poll frequency
+		MaxBytes:    10e6,    // 10MB max batch
+		// StartOffset: kafka.LastOffset, // for new groups: start from latest
+	})
+	return &BalanceProjector{reader: r, db: db, logger: log}
+}
+
+// Run reads from the assigned partitions and projects balance updates.
+// ctx cancellation triggers a clean shutdown.
+func (p *BalanceProjector) Run(ctx context.Context) error {
+	defer p.reader.Close()
+
+	for {
+		// FetchMessage reads the next message from our assigned partitions.
+		// It blocks until a message is available or ctx is cancelled.
+		msg, err := p.reader.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				// Context cancelled — clean shutdown.
+				p.logger.Info("projector shutting down")
+				return nil
+			}
+			return fmt.Errorf("fetch message: %w", err)
+		}
+
+		var payload AccountEventPayload
+		if err := json.Unmarshal(msg.Value, &payload); err != nil {
+			// Bad payload — log and skip. Don't commit until we decide.
+			p.logger.Error("unmarshal event payload",
+				"error", err,
+				"partition", msg.Partition,
+				"offset", msg.Offset,
+			)
+			// Commit even bad messages to advance the offset.
+			// In production, dead-letter this to a DLQ topic instead.
+			if err := p.reader.CommitMessages(ctx, msg); err != nil {
+				return fmt.Errorf("commit bad-payload message: %w", err)
+			}
+			continue
+		}
+
+		p.logger.Info("projecting event",
+			"account_id", payload.AccountID,
+			"event_type", payload.EventType,
+			"amount_cents", payload.AmountCents,
+			"partition", msg.Partition,
+			"offset", msg.Offset,
+		)
+
+		// Apply the event to the balance projection.
+		if err := p.db.UpdateBalance(ctx, payload.AccountID, payload.AmountCents, payload.Sequence); err != nil {
+			// Don't commit the offset — we'll retry this message on restart.
+			return fmt.Errorf("update balance for account %s: %w", payload.AccountID, err)
+		}
+
+		// Commit the offset AFTER successful processing.
+		// This is the at-least-once guarantee: if we crash before committing,
+		// we'll re-process this message on restart. The DB update must be
+		// idempotent (sequence number check prevents double-application).
+		if err := p.reader.CommitMessages(ctx, msg); err != nil {
+			return fmt.Errorf("commit offset: %w", err)
+		}
+	}
+}
+```
+
+<UnderTheHood title="Why commit offset AFTER processing — and what happens when you crash">
+
+The ordering of "process then commit" versus "commit then process" is the core of Kafka's delivery guarantee:
+
+**Commit before processing (at-most-once):** If the consumer crashes between the commit and the actual DB write, the offset is already advanced. On restart, the message is skipped. The balance projection is missing that update. For a payments system, this is unacceptable.
+
+**Commit after processing (at-least-once):** If the consumer crashes between the DB write and the commit, on restart it will re-read and re-process the same message. This is why `UpdateBalance` must be **idempotent** — the `sequence` number check ensures a second application of the same event is a no-op rather than double-crediting an account.
+
+**Exactly-once:** Kafka transactions can make Kafka writes and offset commits atomic inside Kafka, which is powerful for read-process-write pipelines that stay within Kafka. They do **not** automatically include an external Postgres write in the same atomic transaction. For a projection that writes to a database, the pragmatic fintech pattern is still at-least-once consumption plus an idempotent DB update, or a transactional outbox/inbox around the database boundary.
+
+The partition model also helps here: since all events for `ACC-001` are in one partition and one consumer processes that partition, there's no concurrent race on that account's balance from two consumers. Kafka's partition assignment is the concurrency primitive.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="A consumer group has 4 members and a topic has 6 partitions. How are partitions distributed, and what happens to ordering within each partition?"
+  options={[
+    "6 partitions / 4 consumers = 1.5 each, so some consumers get 2 and some get 1. Ordering within each partition is still guaranteed.",
+    "The topic is re-partitioned to 4 to match the consumer count. Ordering is preserved.",
+    "All 4 consumers read all 6 partitions simultaneously. Ordering is not guaranteed.",
+    "2 consumers are idle because there are more consumers than partitions minus the group size."
+  ]}
+  answer={0}
+  explain="Kafka distributes N partitions across M consumers as evenly as possible. With 6 partitions and 4 consumers: 2 consumers get 2 partitions each, 2 consumers get 1 partition each. Ordering within each partition is always preserved — the partition is assigned to exactly one consumer at a time."
+/>
+
+<QuickCheck
+  question="Your payments system keys Kafka messages by account ID. Account ACC-CORP processes 50,000 transactions per day while a typical retail account processes 20. What is the implication?"
+  options={[
+    "All ACC-CORP events land in one partition, which may be a hot spot, but ordering is guaranteed for that account",
+    "Kafka automatically re-routes heavy accounts to multiple partitions for load balancing",
+    "You should use a random key for large accounts so events spread across partitions",
+    "The consumer assigned to ACC-CORP's partition crashes due to overload and triggers a rebalance"
+  ]}
+  answer={0}
+  explain="Account ID as the key guarantees all ACC-CORP events go to the same partition (and thus the same consumer), preserving order. The trade-off is that partition becomes proportionally busier. This is a known hot-partition trade-off in fintech Kafka design: you accept it because per-account ordering is non-negotiable. Scale the partition's consumer vertically or use a separate topic for high-volume accounts."
+/>
+
+---
+
+## Exercises
+
+You've absorbed the concepts. Now make the compiler your sparring partner.
+
+<Exercise n={1} title="Replay a balance from events" level="easy">
+
+Write a function `ReplayBalance(events []AccountEvent) (int64, error)` that sums `AmountCents` across all events, returning an error for any unrecognized `EventType`. Event types to handle: `"account.opened"` (no delta), `"payment.credited"` (positive delta), `"payment.debited"` (negative delta — `AmountCents` already negative). Test it with at least three events totaling a known balance.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+)
+
+type AccountEvent struct {
+	EventType   string
+	AmountCents int64
+}
+
+func ReplayBalance(events []AccountEvent) (int64, error) {
+	var balance int64
+	for _, ev := range events {
+		switch ev.EventType {
+		case "account.opened":
+			// no monetary change
+		case "payment.credited", "payment.debited":
+			balance += ev.AmountCents
+		default:
+			return 0, fmt.Errorf("unknown event type %q", ev.EventType)
+		}
+	}
+	return balance, nil
+}
+
+func main() {
+	events := []AccountEvent{
+		{EventType: "account.opened", AmountCents: 0},
+		{EventType: "payment.credited", AmountCents: 50_00},
+		{EventType: "payment.debited", AmountCents: -15_00},
+		{EventType: "payment.credited", AmountCents: 10_00},
+	}
+	bal, err := ReplayBalance(events)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("balance: $%d.%02d\n", bal/100, bal%100) // $45.00
+}
+```
+
+`payment.debited` stores negative cents, so `balance += ev.AmountCents` handles both credits and debits with the same addition. The `switch` also handles the unknown-type error case required by the exercise.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Partition-key assignment with load stats" level="easy">
+
+Write `partitionForKey(key string, numPartitions int) int` using `hash/fnv` FNV-32a. Then write `partitionLoadStats(keys []string, numPartitions int) map[int]int` that returns how many keys hash to each partition. Print the result for 10 account IDs and 4 partitions.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"hash/fnv"
+)
+
+func partitionForKey(key string, numPartitions int) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32()) % numPartitions
+}
+
+func partitionLoadStats(keys []string, numPartitions int) map[int]int {
+	stats := make(map[int]int, numPartitions)
+	for _, k := range keys {
+		stats[partitionForKey(k, numPartitions)]++
+	}
+	return stats
+}
+
+func main() {
+	accounts := []string{
+		"ACC-001", "ACC-002", "ACC-003", "ACC-004", "ACC-005",
+		"ACC-006", "ACC-007", "ACC-008", "ACC-009", "ACC-010",
+	}
+	stats := partitionLoadStats(accounts, 4)
+	for p := range 4 {
+		fmt.Printf("partition %d: %d key(s)\n", p, stats[p])
+	}
+}
+```
+
+The `range 4` range-over-int idiom (Go 1.22+) iterates 0..3. The `map[int]int` accumulates the count per partition — a direct application of the frequency-map pattern.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Reconciliation diff" level="medium">
+
+Write `Reconcile(expected, actual map[string]int64) []Discrepancy` where `Discrepancy` is a struct with `AccountID string`, `ExpectedCents int64`, `ActualCents int64`, and `DeltaCents int64`. Return one entry per account where expected != actual (including accounts present in `expected` but missing from `actual`). Test with two maps that have one mismatch and one missing account.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+)
+
+type Discrepancy struct {
+	AccountID     string
+	ExpectedCents int64
+	ActualCents   int64
+	DeltaCents    int64
+}
+
+func Reconcile(expected, actual map[string]int64) []Discrepancy {
+	var result []Discrepancy
+	for id, exp := range expected {
+		act := actual[id] // zero if missing — int64 zero value is useful here
+		if act != exp {
+			result = append(result, Discrepancy{
+				AccountID:     id,
+				ExpectedCents: exp,
+				ActualCents:   act,
+				DeltaCents:    exp - act,
+			})
+		}
+	}
+	return result
+}
+
+func main() {
+	expected := map[string]int64{
+		"ACC-001": 12500, // $125.00
+		"ACC-002": 5000,  // $50.00
+		"ACC-003": 7500,  // $75.00 — missing from actual
+	}
+	actual := map[string]int64{
+		"ACC-001": 12500, // matches
+		"ACC-002": 4500,  // $5.00 drift
+		// ACC-003 missing
+	}
+	for _, d := range Reconcile(expected, actual) {
+		fmt.Printf("account %s: expected $%d.%02d, actual $%d.%02d (delta $%d.%02d)\n",
+			d.AccountID,
+			d.ExpectedCents/100, d.ExpectedCents%100,
+			d.ActualCents/100, d.ActualCents%100,
+			d.DeltaCents/100, d.DeltaCents%100,
+		)
+	}
+}
+```
+
+The `int64` zero value handles the missing-account case naturally: `actual[id]` returns `0` for a missing key, so the diff is `expected - 0 = expected`. No special nil check needed — that's the zero value working for you.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Consumer group offset simulation" level="medium">
+
+Simulate a consumer group tracking offsets. Create a type `OffsetTracker` with methods `Commit(partition int, offset int64)` and `Position(partition int) int64` (returns -1 if no offset committed). Then write a `ConsumerGroup` that has three consumers, distributes 6 partitions among them (partitions 0-1 to consumer 0, 2-3 to consumer 1, 4-5 to consumer 2), processes 3 messages per partition, and asserts that each partition's committed offset reaches 2 (0-indexed).
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type OffsetTracker struct {
+	mu      sync.Mutex
+	offsets map[int]int64
+}
+
+func NewOffsetTracker() *OffsetTracker {
+	return &OffsetTracker{offsets: make(map[int]int64)}
+}
+
+func (ot *OffsetTracker) Commit(partition int, offset int64) {
+	ot.mu.Lock()
+	defer ot.mu.Unlock()
+	ot.offsets[partition] = offset
+}
+
+func (ot *OffsetTracker) Position(partition int) int64 {
+	ot.mu.Lock()
+	defer ot.mu.Unlock()
+	if off, ok := ot.offsets[partition]; ok {
+		return off
+	}
+	return -1
+}
+
+func main() {
+	tracker := NewOffsetTracker()
+	// Partition assignment: consumer 0 → [0,1], consumer 1 → [2,3], consumer 2 → [4,5]
+	assignment := [][]int{{0, 1}, {2, 3}, {4, 5}}
+	var wg sync.WaitGroup
+
+	for consumerID, partitions := range assignment {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, p := range partitions {
+				// Process 3 messages (offsets 0, 1, 2) and commit each.
+				for offset := range int64(3) { // range-over-int: Go 1.22+
+					// Simulate processing message at (partition=p, offset=offset).
+					tracker.Commit(p, offset)
+				}
+				_ = consumerID
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify all 6 partitions reached offset 2.
+	allGood := true
+	for p := range 6 {
+		pos := tracker.Position(p)
+		if pos != 2 {
+			fmt.Printf("FAIL partition %d: expected offset 2, got %d\n", p, pos)
+			allGood = false
+		}
+	}
+	if allGood {
+		fmt.Println("All 6 partitions reached offset 2 — consumer group simulation passed.")
+	}
+}
+```
+
+Go 1.22+ loop variables are per-iteration, so the goroutine closure captures the correct `partitions` slice without the old `p := p` shadow trick. The `sync.WaitGroup` ensures we check results only after all goroutines complete.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="CQRS command and projection types" level="hard">
+
+Design a minimal in-memory CQRS system. Define a `CreditAccountCommand` with `AccountID`, `AmountCents int64`, and `IdempotencyKey`. Define an `AccountProjection` with `AccountID` and `BalanceCents int64`. Implement a `CommandHandler` that:
+1. Checks for duplicate idempotency keys (return `nil, ErrDuplicate` if seen).
+2. Appends a `payment.credited` `AccountEvent` to an in-memory slice.
+3. Updates the `AccountProjection` map.
+4. Returns the event.
+
+Write a test that issues 5 commands (2 of which are duplicates) and verifies: exactly 3 events in the store, the correct final balance, and that duplicate commands return `ErrDuplicate`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrDuplicate = errors.New("duplicate idempotency key")
+
+type CreditAccountCommand struct {
+	AccountID      string
+	AmountCents    int64  // cents — never float
+	IdempotencyKey string
+}
+
+type AccountEvent struct {
+	AccountID   string
+	EventType   string
+	AmountCents int64
+}
+
+type AccountProjection struct {
+	AccountID    string
+	BalanceCents int64
+}
+
+type CommandHandler struct {
+	events      []AccountEvent
+	projections map[string]*AccountProjection
+	seen        map[string]struct{} // idempotency key dedup set
+}
+
+func NewCommandHandler() *CommandHandler {
+	return &CommandHandler{
+		projections: make(map[string]*AccountProjection),
+		seen:        make(map[string]struct{}),
+	}
+}
+
+func (h *CommandHandler) Handle(cmd CreditAccountCommand) (*AccountEvent, error) {
+	if _, dup := h.seen[cmd.IdempotencyKey]; dup {
+		return nil, ErrDuplicate
+	}
+	h.seen[cmd.IdempotencyKey] = struct{}{}
+
+	ev := &AccountEvent{
+		AccountID:   cmd.AccountID,
+		EventType:   "payment.credited",
+		AmountCents: cmd.AmountCents,
+	}
+	h.events = append(h.events, *ev)
+
+	proj := h.projections[cmd.AccountID]
+	if proj == nil {
+		proj = &AccountProjection{AccountID: cmd.AccountID}
+		h.projections[cmd.AccountID] = proj
+	}
+	proj.BalanceCents += cmd.AmountCents
+	return ev, nil
+}
+
+func main() {
+	h := NewCommandHandler()
+	commands := []CreditAccountCommand{
+		{AccountID: "ACC-001", AmountCents: 10_00, IdempotencyKey: "idem-1"},
+		{AccountID: "ACC-001", AmountCents: 25_00, IdempotencyKey: "idem-2"},
+		{AccountID: "ACC-001", AmountCents: 10_00, IdempotencyKey: "idem-1"}, // duplicate
+		{AccountID: "ACC-001", AmountCents: 5_00, IdempotencyKey: "idem-3"},
+		{AccountID: "ACC-001", AmountCents: 25_00, IdempotencyKey: "idem-2"}, // duplicate
+	}
+
+	for _, cmd := range commands {
+		_, err := h.Handle(cmd)
+		if errors.Is(err, ErrDuplicate) {
+			fmt.Printf("duplicate skipped: %s\n", cmd.IdempotencyKey)
+		}
+	}
+
+	fmt.Printf("events in store: %d (expected 3)\n", len(h.events))
+	proj := h.projections["ACC-001"]
+	// Expected: 10 + 25 + 5 = 40 cents ($0.40 in this demo)
+	fmt.Printf("balance: %d cents (expected 4000)\n", proj.BalanceCents)
+}
+```
+
+The `map[string]struct{}` dedup set is the idiomatic Go set type — zero allocation per entry compared to `map[string]bool`. The projection is updated in the same `Handle` call as the event append, keeping the in-memory CQRS model simple and consistent without a separate projection worker.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Alright. I've been generous with the explanations. Now it's time to find out if you were *actually* paying attention or just nodding along like the last three engineers I had to let go.
+
+I built you a partition-key function and a consumer-group offset tracker. They're both broken in exactly the ways that would send a payments system sideways in production. Find the bugs. Fix them. Make the verifier pass. I'll be watching.
+
+<Lab
+  title="Fix the partition router and offset tracker"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={15}
+  verify="self-check"
+  objective="Two bugs: (1) the partition router uses a broken hash that maps EVERY key to partition 0, destroying per-key ordering. (2) the offset tracker has a concurrency bug — a missing mutex means concurrent consumers corrupt the offset map. Fix both so the self-check passes: same-account events map to one stable non-zero partition, and committed offsets advance correctly under concurrent access. Run with -race locally to confirm the data race is gone."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// BUG 1: This "hash" always returns 0, so every key maps to partition 0.
+// One hot partition; no per-account ordering isolation at all.
+func partitionForKey(key string, numPartitions int) int {
+	var h int
+	for _, c := range key {
+		h += int(c) // summing runes — deterministic but NOT a good hash
+	}
+	// BUG: h is never used for the modulo. Fix this.
+	return 0
+}
+
+// BUG 2: OffsetTracker has no mutex — concurrent Commit calls race on the map.
+type OffsetTracker struct {
+	offsets map[int]int64
+}
+
+func NewOffsetTracker() *OffsetTracker {
+	return &OffsetTracker{offsets: make(map[int]int64)}
+}
+
+func (ot *OffsetTracker) Commit(partition int, offset int64) {
+	// BUG: no mutex — concurrent goroutines race here.
+	ot.offsets[partition] = offset
+}
+
+func (ot *OffsetTracker) Position(partition int) int64 {
+	if off, ok := ot.offsets[partition]; ok {
+		return off
+	}
+	return -1
+}
+
+func main() {
+	// Test 1: partition stability
+	p1 := partitionForKey("ACC-001", 6)
+	p2 := partitionForKey("ACC-001", 6)
+	if p1 != p2 {
+		fmt.Println("FAIL: same key mapped to different partitions")
+	}
+	// All keys MUST NOT map to 0 (the trivial broken case).
+	allZero := true
+	for _, acc := range []string{"ACC-001","ACC-002","ACC-003","ACC-004","ACC-005"} {
+		if partitionForKey(acc, 6) != 0 {
+			allZero = false
+		}
+	}
+	if allZero {
+		fmt.Println("FAIL: all keys map to partition 0 — broken hash")
+	}
+
+	// Test 2: concurrent offset commits (run with -race to catch the bug)
+	tracker := NewOffsetTracker()
+	var wg sync.WaitGroup
+	for p := range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for offset := range int64(100) {
+				tracker.Commit(p, offset)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify all partitions reached offset 99.
+	for p := range 6 {
+		if tracker.Position(p) != 99 {
+			fmt.Printf("FAIL: partition %d offset = %d, expected 99\\n", p, tracker.Position(p))
+		}
+	}
+	fmt.Println("verifier complete")
+}`}
+  verifier="Self-check: the program prints no FAIL lines and ends with 'verifier complete'. (1) partitionForKey returns the same value on repeated calls AND not all 5 test keys map to partition 0 (uses fnv.New32a). (2) OffsetTracker.Commit and Position are protected by a sync.Mutex — run locally with -race to confirm the race is gone (Codapi runs plain go run, not -race)."
+  hints={[
+    "Bug 1: replace the rune-sum with hash/fnv. Import hash/fnv, create fnv.New32a(), call h.Write([]byte(key)), and use h.Sum32() % uint32(numPartitions) cast to int. Don't forget to actually USE the result in the return statement.",
+    "Bug 2: add a sync.Mutex field to OffsetTracker. Call mu.Lock() / defer mu.Unlock() at the top of both Commit and Position. The map access is safe once the mutex guards it.",
+    "Double-check: after fixing partitionForKey, verify that 'ACC-001' and 'ACC-002' hash to different partitions (they should with FNV — try it). After fixing OffsetTracker, run go test -race on a test that spawns 6 goroutines committing concurrently — it should be silent."
+  ]}
+  flag="GO{fnv_hash_partition_key_mutex_offset_tracker}"
+>
+
+Two bugs. One destroys per-account ordering — everything goes to partition 0. One is a data race on the offset map that corrupts your consumer's position tracking under concurrent load. Either bug in production means incorrect Meridian ledger projections. Fix them. The self-check prints no FAIL lines when you're done. Run with `-race` locally to confirm the mutex fix — Codapi runs plain `go run` so the race detector check is yours to verify.
+
+</Lab>
+
+<Recap>
+
+You now own the full event-driven architecture stack for fintech:
+
+- **Events are immutable facts** — `payment.completed`, not `processPayment`. Producers publish and move on; consumers are decoupled in time and operational status.
+- **Event sourcing** stores the event sequence as the source of truth. Balances are derived by replay. Snapshots optimize performance. The append-only model is intrinsically auditable — critical for fintech.
+- **CQRS** separates the write model (events → event store) from the read model (projection workers → query-optimized tables). Projections are rebuildable from the event log. Consistency lag is acceptable for read models; not for authoritative operations.
+- **The transactional outbox** solves the dual-write problem atomically: write the DB event and the outbox row in one transaction; a worker publishes to Kafka separately. Reconciliation jobs detect and fix drift between systems over time.
+- **Kafka topics** are divided into **partitions** — the unit of parallelism AND the unit of ordering. Ordering is guaranteed ONLY within a partition, never across them.
+- **Offsets** are monotonically increasing message positions within a partition. Consumers commit offsets to track their position. Commit AFTER processing for at-least-once semantics.
+- **Consumer groups** distribute partitions across members. Each partition goes to exactly one consumer in the group. Adding consumers scales throughput up to the partition count; a rebalance redistributes on membership changes.
+- **Partition-key design** is the most consequential Kafka decision in fintech: key by account ID to keep all events for one account in one partition (ordered), distributed across the fleet. Hot accounts exist but are isolated to one partition — an acceptable trade-off for ordering correctness.
+- **Idempotent consumers** are mandatory under at-least-once delivery: a message may arrive twice; your handler must produce the same result both times.
+
+</Recap>
+
+<Scoreboard
+  streak={6}
+  items={[
+    { label: "Quick check — event vs. command", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — event sourcing source of truth", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — partition distribution in a consumer group", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — partition key hot-spot trade-off", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Replay a balance from events", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — Partition-key assignment with load stats", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Reconciliation diff", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — Consumer group offset simulation", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — CQRS command and projection types", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the partition router and offset tracker", captured: false, points: 100 }}
+/>
+
+Not bad. For someone who hasn't built a Kafka-backed ledger before, that was… genuinely not embarrassing. Next chapter we stop doing this the hard way and let Watermill carry the broker-plumbing weight — the same event sourcing and CQRS patterns, but with a clean Go abstraction that runs on Kafka, NATS, or in-memory for tests without changing a line of business logic. That's engineering, sport.

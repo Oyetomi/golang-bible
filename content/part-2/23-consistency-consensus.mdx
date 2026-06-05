@@ -1,0 +1,522 @@
+---
+title: "Consistency & Consensus"
+part: 2
+order: 23
+type: "course"
+description: "How unreliable machines agree on a single truth — explained from zero: linearizability (the illusion of one always-fresh copy) and why it's a recency guarantee, when you actually need it (leader election, uniqueness, no double-spend), the cost (the CAP trade-off, CP vs AP), logical clocks (Lamport, hybrid) for causal ordering, and consensus itself — agreeing on one value, total order broadcast, Raft, and the majority that makes it safe — grounded in keeping Meridian's ledger correct."
+prerequisites: ["distributed-systems-trouble"]
+---
+
+<HeroCard label="Part 2 · Chapter 23" title="Consistency & Consensus">
+
+Last chapter we turned the pessimism to maximum: networks vanish messages, clocks lie, processes freeze, and a node can't trust its own judgment. This chapter is the payoff — how you build something *correct* on top of all that chaos. How a pile of unreliable, paranoid machines can be made to agree on a single, fault-tolerant truth: who the leader is, what the balance is, which write came first.
+
+I'll teach it from absolute zero — no assumed knowledge of consistency models, clocks, or consensus algorithms. We'll start with the strongest promise a distributed system can make — **linearizability**, "behave as if there's just one always-up-to-date copy" — see exactly when Meridian *needs* it (and the surprising price it charges, every single read). Then we'll meet **logical clocks** that order events without trusting quartz, and finally **consensus** itself: the one hard problem that locks, leaders, uniqueness, and atomic commit all secretly reduce to — and which Raft and etcd solve with nothing more exotic than a majority vote. This is the summit of the distributed-data track. From chaos, order. Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Linearizability", "When You Need It", "The Cost (CAP)", "Logical Clocks", "Consensus", "Coordination in Practice"]} />
+
+<Scene
+  title="Two screens, one balance → the stale read that breaks trust"
+  actors={[
+    { id: "ada", label: "Ada (phone)" },
+    { id: "support", label: "Support (dashboard)" }
+  ]}
+  rows={1}
+  cols={3}
+  frames={[
+    {
+      caption: "Ada deposits ₦9,000. The write commits on the leader. Her app, reading the leader, shows the new balance: 9000.",
+      beat: "neutral",
+      actors: [{ id: "ada", state: "ok" }, { id: "support", state: "idle" }],
+      cells: [{ id: "A1", state: "done", label: "leader: 9000" }, { id: "A2", state: "idle", label: "replica: ?" }, { id: "A3", state: "idle", label: "—" }]
+    },
+    {
+      caption: "Ada calls support about the deposit. The agent's dashboard reads a LAGGING replica and sees the OLD balance: 0. Ada says '₦9,000', the agent says 'I see nothing'. Trust evaporates.",
+      beat: "problem",
+      actors: [{ id: "ada", state: "warn" }, { id: "support", state: "bad" }],
+      cells: [{ id: "A1", state: "done", label: "leader: 9000" }, { id: "A2", state: "bad", label: "replica: 0 (stale)" }, { id: "A3", state: "bad", label: "they disagree" }]
+    },
+    {
+      caption: "Linearizability: the system behaves as if there's ONE copy, always current. Once Ada's deposit is visible to anyone, it's visible to everyone after. Both screens read 9000.",
+      beat: "solution",
+      actors: [{ id: "ada", state: "ok" }, { id: "support", state: "ok" }],
+      cells: [{ id: "A1", state: "done", label: "9000" }, { id: "A2", state: "done", label: "9000" }, { id: "A3", state: "ok", label: "agree ✓" }]
+    }
+  ]}
+  caption="The replication chapter showed why this stale read happens (lag). This chapter is about the guarantee that forbids it — linearizability — when it's worth its price, and the consensus that implements it."
+/>
+
+## Linearizability
+
+Replication gives you many copies, which means the copies can *disagree* (the stale read above). The strongest cure is a guarantee that makes all those copies *look like one*.
+
+<Define term="Linearizability" since="Consistency & Consensus (Part 2)">
+**Linearizability** (also "strong" or "atomic" consistency) makes a replicated system behave **as if there were a single copy of the data and every operation on it were instantaneous**. Concretely it's a **recency guarantee**: the moment a write completes, every subsequent read — on any client, any replica — must return that value (or a newer one), never an older one. Why it matters: with linearizability the application stops worrying about replicas, lag, and conflicts entirely; it can pretend there's one perfect database. That simplicity is powerful — and, as we'll see, expensive.
+</Define>
+
+The precise rule is about *ordering in real time*: once **any** read has observed the new value, **every** later read must observe it too. There's an imaginary instant where the value atomically flips, and nothing may read "backward" across it:
+
+<ExecTimeline
+  title="The recency rule: no read may go backward"
+  lanes={[
+    { id: "c", label: "Writer C" },
+    { id: "a", label: "Reader A" },
+    { id: "b", label: "Reader B" }
+  ]}
+  steps={[
+    { lane: "c", kind: "run", label: "write balance = 9000", note: "C's write is in flight. There's some instant inside this window where the value atomically becomes 9000." },
+    { lane: "a", kind: "recv", label: "read -> 0 (before flip)", note: "A reads early, before the flip. Returning the old 0 is fine — the write hadn't taken effect yet." },
+    { lane: "a", kind: "done", label: "read -> 9000 (after flip)", note: "A reads again, now sees 9000. The value has flipped. From here on, the new value is 'out'." },
+    { lane: "b", kind: "done", label: "read -> 9000 (must!)", note: "B's read STARTS after A already saw 9000. Linearizability FORBIDS B from seeing 0 — that would be reading backward in time. It must return 9000." }
+  ]}
+  caption="That last constraint is the whole game: once anyone sees the new value, everyone after must too. A system that lets B read 0 here (a lagging replica) is not linearizable — it's the Ada/support disagreement."
+/>
+
+You can even *check* a history for the violation — if a read that started later returns an older value than one that already finished, the recency rule is broken:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// Linearizability is a RECENCY guarantee: if read B starts after read A finishes,
+// B must see a value at least as new as A saw. (Here the balance only grows, so
+// "newer" = larger.) This checks that rule on two reads.
+type Read struct {
+	value     int
+	startTime int
+	endTime   int
+}
+
+func violatesRecency(a, b Read) bool {
+	return b.startTime > a.endTime && b.value < a.value // b is later but saw older
+}
+
+func main() {
+	// Ada's app reads the new balance 9000, finishing at t=5.
+	ada := Read{value: 9000, startTime: 3, endTime: 5}
+	// Support's dashboard reads AFTER (starts t=6) but hits a lagging replica -> 0.
+	support := Read{value: 0, startTime: 6, endTime: 8}
+
+	fmt.Println("support read started after ada's finished but saw an older value?")
+	fmt.Println("linearizability violated:", violatesRecency(ada, support)) // true
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="Linearizability is NOT serializability — don't conflate them">
+
+They sound alike but guarantee different things. **Serializability** (from the transactions chapter) is about *transactions over multiple objects* behaving like *some* serial order — it can put that order anywhere in time, and even allows stale reads. **Linearizability** is about *single objects* and *real-time recency* — it says nothing about grouping operations into transactions, but it forbids reading backward in time. A database can offer one, the other, both (that combo is "strict serializability," like Spanner and FoundationDB), or neither. Money systems often want both: serializable transactions *and* linearizable recency.
+
+</Callout>
+
+## When You Need It
+
+Linearizability is expensive, so you spend it deliberately — only where stale reads cause *real* harm. There are a few places that genuinely require it, and Meridian hits all of them.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Leader election & locks">A single-leader system must have exactly **one** leader (no split-brain). Electing one via a lease *requires* linearizability — two nodes must never both "win." This is the fencing/zombie problem from last chapter, and it's why coordination services exist.</ConceptCard>
+  <ConceptCard label="Uniqueness constraints">A unique username, one account per email, **a balance that never goes negative**, no double-booked seat — each needs a single up-to-date value all nodes agree on, checked atomically (like a compare-and-set). Without linearizability, two concurrent requests both "succeed."</ConceptCard>
+  <ConceptCard label="Cross-channel races">Two paths carry related info (a file write + a "process it" queue message). If the storage isn't linearizable, the message can outrun the data, and the consumer reads a stale or missing file. Recency closes the race.</ConceptCard>
+</ConceptGrid>
+
+The "no negative balance" case is the one that should make a fintech engineer sit up: it's exactly an atomic **compare-and-set** on a single agreed value. Two withdrawals racing on the last ₦5,000 must not *both* see ₦5,000 and *both* succeed — that invents money. Only a linearizable check (one current balance, all nodes agree, updated atomically) prevents the double-spend.
+
+<QuickCheck
+  question="Ada has ₦5,000. Two withdrawals of ₦5,000 arrive at the same instant, hitting two different replicas. On a non-linearizable (lagging-replica) system, what can happen, and what guarantee prevents it?"
+  options={[
+    "Nothing bad — replicas always agree",
+    "Both reads can see ₦5,000 and both withdrawals succeed, overdrawing the account (money invented). Linearizability — a single up-to-date balance all nodes agree on, updated with an atomic compare-and-set — prevents it",
+    "The second withdrawal is always rejected automatically",
+    "Replication lag makes withdrawals faster, which is fine"
+  ]}
+  answer={1}
+  explain="Without a single up-to-date value, each replica independently sees ₦5,000 and approves its withdrawal — a classic double-spend that overdraws the account. Enforcing 'balance never negative' is a uniqueness/constraint problem that requires linearizability: one current balance that every node agrees on, checked and updated atomically (compare-and-set). That atomic CAS, made fault-tolerant, is exactly what consensus provides."
+/>
+
+Which replication methods can actually deliver it? **Single-leader** can (*if* you always read/write the real leader — but a deluded zombie leader breaks it). **Consensus algorithms** can (they're single-leader with safe, automatic failover — that's the point). **Multi-leader** and **leaderless** generally cannot — concurrent writes on multiple nodes, and even quorum reads (`w + r > n`) can race into a non-linearizable result. The lesson rhymes with the replication chapter: for money, keep it single-leader, and back the leader election with consensus.
+
+## The Cost (CAP)
+
+Here's the price. Suppose the network **partitions** — replicas split into two groups that can't reach each other (last chapter's netsplit). What does a linearizable system do?
+
+<Define term="The CAP trade-off (CP vs AP)" since="Consistency & Consensus (Part 2)">
+During a **network partition**, a replicated system must choose: stay **linearizable** by refusing requests on replicas that can't reach the leader/majority (it becomes **unavailable** there — "**CP**"), or stay **available** by letting every replica serve independently (giving up linearizability — "**AP**"). Why it matters: you can't have perfect consistency *and* availability when the network is split — that's the kernel of the (much-abused) **CAP theorem**. Note partitions aren't something you *choose*; they happen. You only choose what to do when one does. And linearizable systems pay a latency tax *all the time*, not just during faults.
+</Define>
+
+For Meridian's ledger the choice is not close — money picks **CP**:
+
+<BeforeAfter
+  bad={`// AP: stay available during a partition.
+// Minority replica keeps taking writes
+// with no leader -> two sides diverge,
+// balances conflict, double-spend risk.
+if partitioned {
+    serveWriteAnyway() // available, WRONG
+}`}
+  good={`// CP: stay correct during a partition.
+// A replica that can't reach the
+// majority refuses writes rather than
+// risk split-brain. Down > wrong.
+if !canReachMajority() {
+    return ErrUnavailable // safe
+}`}
+  badLabel="AP (avail, may double-spend)"
+  goodLabel="CP (consistent, may pause)"
+/>
+
+<Callout kind="warn" title="CAP is real but widely abused — and the cost isn't only partitions">
+
+"Pick two of three (Consistency, Availability, Partition-tolerance)" is a misleading slogan. Partitions aren't optional — the only way to "avoid" them is to have a single machine, which isn't available either. The honest statement: *when the network is healthy you can have both; when it partitions you must choose consistency or availability.* And formal CAP only covers linearizability and partitions — it says nothing about ordinary delays. The deeper, everyday cost (Attiya–Welch) is that **linearizable reads and writes are inherently slow**: their latency is proportional to network delay uncertainty, *all the time*, not just during failures. Even RAM on a multicore CPU isn't linearizable by default — for performance, not fault tolerance. So you reserve linearizability for the data that truly needs it (balances, leadership) and use weaker, faster models elsewhere.
+
+</Callout>
+
+## Logical Clocks
+
+We need to order events across machines — "did the account go private before or after the photo upload?" Last chapter killed the obvious idea: **wall-clock timestamps lie** (drift, skew, jumps), so a causally-later event can get an earlier timestamp. The fix is a clock made of *counting*, not quartz.
+
+<Define term="Logical clock (Lamport timestamp)" since="Consistency & Consensus (Part 2)">
+A **logical clock** is an algorithm that **counts events** rather than measuring time. A **Lamport timestamp** is a pair `(counter, nodeID)`: each node increments its counter on every event, and **whenever it sees a higher counter from another node, it jumps its own up to match** before continuing. Why it matters: this guarantees that if event A *happened-before* B (A influenced B), then A's timestamp is less than B's — a **total order consistent with causality**, with no reliance on synchronized hardware clocks. Ties (same counter) break by nodeID, so every timestamp is unique.
+</Define>
+
+Watch causality survive without any real clock — Bryce's reply must out-number the message it answers:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// A Lamport clock: a per-node counter producing timestamps consistent with
+// causality (if A happened-before B, then A's timestamp < B's). No quartz, no NTP.
+type Lamport struct {
+	id      string
+	counter int
+}
+
+// tick: a local event happens; bump the counter and stamp it.
+func (l *Lamport) tick() (int, string) {
+	l.counter++
+	return l.counter, l.id
+}
+
+// receive: we saw a message stamped remoteCounter; catch our counter up past
+// anything we've observed, then tick for the receive event itself.
+func (l *Lamport) receive(remoteCounter int) (int, string) {
+	if remoteCounter > l.counter {
+		l.counter = remoteCounter
+	}
+	l.counter++
+	return l.counter, l.id
+}
+
+func main() {
+	aaliyah := &Lamport{id: "aaliyah"}
+	bryce := &Lamport{id: "bryce"}
+
+	ac, aid := aaliyah.tick() // Aaliyah posts a question -> (1, aaliyah)
+	fmt.Printf("Aaliyah posts at (%d, %s)\n", ac, aid)
+
+	bc, bid := bryce.receive(ac) // Bryce reads it, then replies -> (2, bryce)
+	fmt.Printf("Bryce replies at (%d, %s)\n", bc, bid)
+
+	fmt.Println("reply out-numbers the post, so causal order holds:", bc > ac) // true
+}
+```
+
+</GoPlayground>
+
+Lamport clocks give a total order but **not** linearizability — they order events that already happened, but can't guarantee a value is *currently* up to date. They also can't tell *concurrency* apart from ordering (for that you need **vector clocks**, one counter per node — the version vectors from the replication chapter). A **hybrid logical clock** (used by CockroachDB) bolts a Lamport counter onto a physical timestamp, so you get causal ordering *and* a value that still roughly means "wall-clock time."
+
+<UnderTheHood title="The single-machine analog: Go atomics, and why etcd is written in Go">
+
+Everything here has a familiar shadow on one machine. A linearizable compare-and-set across a cluster is the distributed cousin of `sync/atomic.CompareAndSwap` on one process — and the Go memory model (the *happens-before* relation from the Advanced Concurrency chapter) is the single-machine version of a Lamport clock's causal order. On one box, `atomic.CompareAndSwapInt64` *is* linearizable: the hardware and Go's memory model guarantee a single, agreed, instantaneous flip. The whole difficulty of this chapter is recovering that one guarantee once "one machine" becomes "five machines and an unreliable network."
+
+The bridge is real and it's Go: **etcd** — the consensus store behind Kubernetes, holding exactly the shard maps and leader leases from the last two chapters — is written in Go and implements **Raft**. As of Go 1.26, prefer the typed atomics (`atomic.Int64`, `atomic.Pointer[T]`, Go 1.19+) over the bare functions; and know that no amount of `sync/atomic` crosses a network — for that you need consensus, which is the rest of this chapter.
+
+</UnderTheHood>
+
+## Consensus
+
+Now the summit. Look back at the hard problems: electing one leader, a fault-tolerant atomic CAS, a fault-tolerant ID counter, agreeing to commit a multi-shard transaction. They look different. They are *the same problem*.
+
+<Define term="Consensus" since="Consistency & Consensus (Part 2)">
+**Consensus** is getting multiple nodes to **agree on a single value**, with four properties: **agreement** (no two nodes decide differently), **integrity** (no node changes its decision), **validity** (the decided value was actually proposed), and **termination** (every non-crashed node eventually decides). Why it matters: the first three are *safety* (always hold, even in a total outage); **termination** is *liveness* and requires a **majority** of nodes alive. Get consensus and you get leader election, locks, uniqueness, atomic commit, and a replicated log — all of them — because they're provably **equivalent**.
+</Define>
+
+The most useful packaging of consensus is a **shared, append-only log** — also called **total order broadcast**: every node sees the same entries in the same order. That single primitive gives you *state machine replication* (apply the same writes in the same order → identical replicas), which is how leader-based replication, event sourcing, and serializable transactions are all built. And the equivalences are exact:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="All the same problem">Single-value agreement, atomic **compare-and-set**, a **shared log** (total order broadcast), and **atomic commit** of a distributed transaction are interchangeable — a solution to any one solves all the others. CAS and shared logs have "consensus number ∞" (work for any number of proposers).</ConceptCard>
+  <ConceptCard label="Why it's hard = fault tolerance">On one node, agreement is trivial — a single "dictator" decides. The instant you demand it *survive that node dying*, you need a majority and careful protocols. That's the entire difficulty, and where Paxos, Raft, Zab, and Viewstamped Replication live.</ConceptCard>
+</ConceptGrid>
+
+Termination is why you always run an **odd** number of nodes (3 or 5, never 2 or 4): a decision needs a strict majority, and only one majority can exist (so two conflicting decisions can't both win). With 3 nodes you survive 1 failure; with 5, two:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// A consensus algorithm can only DECIDE (terminate) while a MAJORITY of nodes are
+// reachable. Safety (agreement) holds always; liveness (progress) needs a quorum.
+func canDecide(reachable, total int) bool { return reachable > total/2 }
+
+func main() {
+	fmt.Println("3 nodes, 2 reachable ->", canDecide(2, 3)) // true  (survives 1 failure)
+	fmt.Println("3 nodes, 1 reachable ->", canDecide(1, 3)) // false (lost majority -> pause)
+	fmt.Println("5 nodes, 3 reachable ->", canDecide(3, 5)) // true  (survives 2 failures)
+	// 2 nodes can survive 0 failures, and 4 nodes survive the same as 3 (1) — so
+	// odd counts give the best failure tolerance per machine.
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="FLP, and why consensus works anyway">
+
+You may hear that consensus is *impossible* (the famous FLP result). The fine print: FLP only proves you can't *guarantee termination* in a purely asynchronous model with **no clocks or timeouts**. Real systems *do* have timeouts — they use them to *suspect* a node has crashed (sometimes wrongly) and elect around it. That's enough to make consensus solvable in practice. Raft, for instance, uses randomized election timeouts so that when a leader goes silent, one follower times out first, becomes a candidate, and wins a majority vote. Impossible in theory's strictest model; routine in production.
+
+</Callout>
+
+## Coordination in Practice
+
+You will almost never implement Raft yourself. Instead you'll use a **coordination service** — ZooKeeper or **etcd** — a small, linearizable, consensus-backed store built for exactly the high-stakes, low-volume metadata that must never disagree.
+
+<ExecTimeline
+  title="etcd (Raft) electing a leader and fencing the old one"
+  lanes={[
+    { id: "n1", label: "Node 1 (old leader)" },
+    { id: "etcd", label: "etcd / Raft" },
+    { id: "n2", label: "Node 2" },
+    { id: "n3", label: "Node 3" }
+  ]}
+  steps={[
+    { lane: "n1", kind: "run", label: "holds leader lease", note: "Node 1 is the ledger's write-leader, holding a lease in etcd with term (fencing token) 7." },
+    { lane: "n1", kind: "block", label: "GC pause / partition", note: "Node 1 freezes or gets cut off. It stops renewing its lease." },
+    { lane: "etcd", kind: "run", label: "lease expires", note: "etcd's Raft cluster (a majority agreeing) sees the lease lapse and opens an election." },
+    { lane: "n2", kind: "send", label: "wins majority vote", note: "Node 2 requests votes; nodes 2 and 3 are a majority and elect it leader with term 8 (the token always increases)." },
+    { lane: "n3", kind: "done", label: "follows new leader", note: "The cluster agrees: leader is node 2, term 8. The shard map / lease is updated linearizably." },
+    { lane: "n1", kind: "bad", label: "wakes, term 7 fenced", note: "Node 1 revives thinking it's still leader, but its writes carry term 7 < 8 and are rejected — fenced off (last chapter's mechanism), no split-brain." }
+  ]}
+  caption="This ties the whole track together: consensus (Raft) safely elects one leader, the term number IS the fencing token, and the result is a linearizable map of who-owns-what — the exact thing request routing (sharding) and leases (trouble) needed."
+/>
+
+<Callout kind="pro" title="The senior instinct: don't roll your own; isolate what needs agreement">
+
+Two hard-won rules. First, **never implement consensus yourself** — it is infamous for looking correct and silently corrupting data on the unlucky fault ordering. Use etcd, ZooKeeper, or a database that embeds Raft (CockroachDB, TiDB, YugabyteDB). Second, **consensus is expensive, so keep it small**: don't run every write through Raft. Put only the *metadata that must agree* — who's the leader, the shard→node map, distributed locks, config — in the coordination service, and let it hand out leases and fencing tokens to the fast path. Meridian runs its high-volume ledger writes on a single-leader Postgres, and uses etcd only to elect that leader and guard the lease. Agreement where you must; speed everywhere else.
+
+</Callout>
+
+## Exercises
+
+Each exercise is a real piece of the consistency-and-consensus toolkit.
+
+<Exercise n={1} title="Detect a recency violation" level="easy">
+
+Write `violatesRecency(a, b Read) bool` where a `Read` has a `value`, `start`, and `end` time. Return whether `b` (which started after `a` ended) saw an older value than `a` — a linearizability violation. Why is this the formal version of "Ada and support disagree"?
+
+<Solution>
+
+```go
+type Read struct{ value, start, end int }
+
+func violatesRecency(a, b Read) bool {
+	return b.start > a.end && b.value < a.value
+}
+```
+
+Linearizability's recency rule says: if `b` began *after* `a` finished (no overlap, `b.start > a.end`), then `b` must see a value at least as fresh as `a` did. If `b` instead returns an older value (`b.value < a.value`), time has effectively run backward — exactly Ada's app seeing ₦9,000 while support's *later* read sees ₦0. It's a violation precisely because the two reads don't overlap, so there's a real-time ordering that the system broke.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Lamport clock tick & receive" level="medium">
+
+Implement `tick()` and `receive(remoteCounter int)` for a Lamport clock so timestamps respect causality. Show that a reply's timestamp always exceeds the message it responds to, even with no synchronized physical clock.
+
+<Solution>
+
+```go
+func (l *Lamport) tick() int { l.counter++; return l.counter }
+
+func (l *Lamport) receive(remoteCounter int) int {
+	if remoteCounter > l.counter {
+		l.counter = remoteCounter // catch up past anything we've seen
+	}
+	l.counter++ // then count the receive event itself
+	return l.counter
+}
+```
+
+The `receive` step is the magic: by jumping the local counter up to any larger value it observes *before* ticking, a node guarantees its post-receive timestamp exceeds the sender's. So if event A causally precedes B (B's node saw A), then `A.counter < B.counter`. It captures causality with pure counting — no quartz, no NTP, immune to the clock skew that wrecks wall-clock ordering.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="No-negative-balance via CAS" level="medium">
+
+Model "a balance must never go negative" as a compare-and-set. Write `withdraw(bal *int, expected, amount int) bool` that succeeds only if `*bal == expected` and `expected >= amount`, updating atomically. Show two concurrent withdrawals of the full balance can't both win.
+
+<Solution>
+
+```go
+func withdraw(bal *int, expected, amount int) bool {
+	if *bal != expected { // CAS: someone changed it since we read -> retry/fail
+		return false
+	}
+	if expected < amount { // would overdraw
+		return false
+	}
+	*bal -= amount
+	return true
+}
+// bal = 5000. Two withdrawals both read expected=5000, amount=5000.
+// The FIRST CAS sees *bal==5000 -> succeeds, *bal becomes 0.
+// The SECOND CAS now sees *bal==0 != expected 5000 -> fails. No double-spend.
+```
+
+The compare-and-set is the linearizable heart of a uniqueness/constraint guarantee. Both requests read ₦5,000, but only one CAS can match-and-update before the value changes; the loser's expected value is now stale, so it's rejected. That's why "balance never negative" needs linearizability — and why, made fault-tolerant across machines, this exact CAS *is* consensus.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="CP vs AP under partition" level="medium">
+
+Write `handleWrite(canReachMajority bool) (string, bool)` for a **CP** system: it serves the write only if it can reach a majority, else returns unavailable. Contrast with what an AP system would do, and say why Meridian's ledger picks CP.
+
+<Solution>
+
+```go
+func handleWrite(canReachMajority bool) (string, bool) {
+	if !canReachMajority {
+		return "unavailable: cannot reach majority", false // CP: refuse rather than risk split-brain
+	}
+	return "committed", true
+}
+// AP alternative: always return ("committed", true) — stays up during a partition,
+// but a minority side accepting writes diverges and can double-spend.
+```
+
+A CP system sacrifices availability on the minority side of a partition to preserve correctness: a replica that can't confirm it's on the majority side refuses writes, so two halves can never both accept conflicting updates. Meridian picks CP for the ledger because "the app is briefly down" is recoverable, while "we let a partitioned replica approve a withdrawal and invented money" is not. Down beats wrong when the data is money.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Why a majority, not a dictator" level="hard">
+
+Write `decides(reachable, total int) bool` (strict majority). Then explain: (a) why a single hardcoded "dictator" node satisfies agreement/integrity/validity but fails termination, and (b) why two majorities can never conflict.
+
+<Solution>
+
+```go
+func decides(reachable, total int) bool { return reachable > total/2 }
+
+// 3 nodes: decides(2,3)=true, decides(1,3)=false.
+// 5 nodes: decides(3,5)=true (survives 2 failures).
+```
+
+(a) A dictator trivially agrees (one decider, so no disagreement), never changes its mind, and only decides proposed values — safety holds. But it has *no fault tolerance*: if the dictator crashes, **termination** fails forever — nobody can decide. Termination is the whole reason consensus is hard, and it's why you need a majority that can carry on without any single node. (b) Two majorities can't conflict because any two subsets each containing more than half of N must **overlap** in at least one node — and that shared node can't have voted for two different decisions. The single overlap is the same pigeonhole that made quorums work in the replication chapter; here it's what makes consensus *safe*.
+
+</Solution>
+
+</Exercise>
+
+<Lab
+  title="Compare-and-set IS consensus"
+  archetype="build-it"
+  difficulty="scaffolded"
+  points={90}
+  hintCost={14}
+  objective="Prove the deepest equivalence in the chapter: a linearizable compare-and-set solves single-value consensus. Implement Register.propose(v) so the register decides the FIRST proposed value (CAS from the empty/null state) and every later proposer learns that one decided value. The provided main has three nodes propose A, B, C in order, then checks the four consensus properties: agreement (all three calls return the same value), integrity (the decision never changes), validity (the decided value was proposed), and a sane decided value of A. It prints PASS only when all hold."
+  verify="self-check"
+  starter={`package main
+
+import "fmt"
+
+// Register is a single shared value. "" means undecided (the null state).
+// propose performs a compare-and-set: if still null, adopt the proposal; then
+// return whatever value is now decided, so every node learns the SAME outcome.
+type Register struct {
+	value string
+}
+
+// TODO: if value is still "" (null), set it to v. Always return the decided value.
+func (r *Register) propose(v string) string {
+	// TODO
+	return ""
+}
+
+func main() {
+	r := &Register{}
+
+	a := r.propose("A") // first proposer
+	b := r.propose("B") // learns A won
+	c := r.propose("C") // learns A won
+
+	agreement := a == b && b == c                 // no two decide differently
+	validity := a == "A" || a == "B" || a == "C"  // decided value was proposed
+	integrity := r.value == a                     // decision is stable, no take-backs
+	decided := a == "A"                            // first proposer's value won
+
+	if agreement && validity && integrity && decided {
+		fmt.Printf("all decided %q (agreement+validity+integrity hold)\\nPASS\\n", a)
+	} else {
+		fmt.Printf("FAIL: a=%q b=%q c=%q value=%q\\n", a, b, c, r.value)
+	}
+}
+`}
+  verifier="Self-check: main prints PASS only when propose implements a correct CAS-from-null — the first proposal (A) is adopted and decided, and every subsequent proposal returns that same decided value A, satisfying agreement, validity, integrity, and a decided value of A. Codapi runs go run, so the PASS print is your gate."
+  hints={[
+    "One CAS: if r.value == \"\" { r.value = v }. Then, always, return r.value.",
+    "Do NOT overwrite an already-decided value — the check is == \"\" (still null), not unconditional assignment. Integrity (no take-backs) depends on this.",
+    "Trace it: propose(\"A\") sees \"\" -> sets A, returns A. propose(\"B\") sees \"A\" (not empty) -> returns A. propose(\"C\") -> returns A. All three return A; r.value stays A."
+  ]}
+  flag="GO{cas_is_consensus_one_value_wins}"
+>
+
+This is the theoretical heart of the chapter made executable. A compare-and-set from the null state decides exactly one value and tells everyone the same answer — which is precisely single-value consensus. Make it pass and you've shown, in one tiny function, why locks, leader election, uniqueness, and atomic commit are all the same problem wearing different masks. (The hard part real systems solve is making this CAS survive the node holding it crashing — that's what Raft adds.)
+
+</Lab>
+
+---
+
+<Recap>
+
+You've reached the summit — how unreliable machines agree on one truth:
+
+- **Linearizability** makes many replicas behave like **one always-fresh copy** — a **recency** guarantee: once any read sees a new value, every later read must too. It's *not* serializability (single-object recency vs multi-object transaction ordering).
+- You **need** it for **leader election** (one leader, no split-brain), **uniqueness constraints** (unique email, **no negative balance / double-spend**), and **cross-channel races** — each needs a single agreed value checked atomically (compare-and-set).
+- It **costs**: during a **partition** you choose **CP** (refuse requests, stay correct) or **AP** (stay up, lose consistency) — the CAP trade-off. Money picks **CP**. And linearizable reads/writes are inherently **slow all the time**, so spend the guarantee only where it's needed.
+- **Logical clocks** order events by **counting**, not quartz: a **Lamport timestamp** `(counter, nodeID)` gives a total order **consistent with causality**, immune to clock skew. **Hybrid logical clocks** add back a physical-time feel; **vector clocks** also detect concurrency.
+- **Consensus** — agree on **one value** with **agreement / integrity / validity** (safety) and **termination** (liveness, needs a **majority**). Leader election, CAS, a **shared log / total order broadcast**, and atomic commit are all **equivalent**. **Raft/Paxos/Zab** implement it; **FLP** only forbids guaranteed termination without timeouts.
+- In practice: **never roll your own** — use **etcd/ZooKeeper** (Raft-backed, written in Go). Keep consensus **small** (leader, shard map, locks); the term number doubles as the **fencing token**. Agreement where you must; speed everywhere else.
+
+</Recap>
+
+<Scoreboard
+  streak={10}
+  items={[
+    { label: "Quick check — the double-spend & linearizability", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — detect a recency violation", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Lamport clock tick & receive", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — no-negative-balance via CAS", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — CP vs AP under partition", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — why a majority, not a dictator", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — CAS-is-consensus prints PASS", captured: false, points: 90 }}
+/>
+
+Consistency and consensus — the illusion of one perfect copy, the price it charges, the clocks that order events without trusting time, and the majority vote that lets paranoid machines agree on a single truth. You now understand why money picks "down" over "wrong," why etcd exists, and why leader election, locks, uniqueness, and atomic commit are secretly one problem. That closes the distributed-data track: from **copies** (replication), to **splits** (sharding), to the **engine** (storage), through the **chaos** (the trouble with distributed systems), and up to **agreement** (here). You can now reason about real distributed systems from first principles — the rarest, most valuable skill a backend engineer can have. Next we put it to work on money itself, in Part 3. Let's go.

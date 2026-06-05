@@ -1,0 +1,950 @@
+---
+title: "Docker & Containerization"
+part: 1
+order: 25
+type: "course"
+description: "Images, layers and the build cache, multi-stage builds down to scratch/distroless, and docker compose for local multi-service development."
+prerequisites: ["microservices"]
+---
+
+<HeroCard label="Part 1 · Chapter 25" title="Docker & Containerization">
+
+Let me be very clear about something. Shipping a Go service without a container is like showing up to a black-tie event in sweatpants — technically present, but deeply embarrassing. Docker isn't ops magic; it's *engineering*. And because Go compiles to a single static binary with the runtime baked in, you have an unfair advantage every other language envies. We are going to exploit that advantage mercilessly.
+
+By the end of this chapter you will understand what a container actually *is* at the Linux kernel level, how image layers and the build cache work (and how to exploit both), how to produce a Go binary in a scratch image that's smaller than your average podcast MP3, and how to wire your entire local dev environment together with a single `docker compose up`. The containerization fundamentals live here. The next chapter — **Building & Shipping Go Binaries** — goes deep on cross-compilation, `CGO_ENABLED=0`, and the static-binary trap behind scratch images. After that, production rollout — CI/CD pipelines, Kubernetes, rolling deployments — is Deployment & Infra: CI/CD + Kubernetes. I'll link you forward when we get there.
+
+You're working on **Meridian's ledger service** from the last several chapters. We're going to containerize it. Properly.
+
+</HeroCard>
+
+<Scene
+  title="Single-stage vs multi-stage: the image size problem"
+  actors={[
+    { id: "builder", label: "Builder image (Go toolchain + source)" },
+    { id: "final", label: "Final image (scratch)" }
+  ]}
+  cells={[
+    { id: "A1", label: "go compiler" },
+    { id: "A2", label: "stdlib src" },
+    { id: "A3", label: "mod cache" },
+    { id: "A4", label: "source" },
+    { id: "A5", label: "binary" },
+    { id: "B1", label: "musl libc" },
+    { id: "B2", label: "shell" },
+    { id: "B3", label: "pkg mgr" },
+    { id: "B4", label: "certs" },
+    { id: "B5", label: "binary" }
+  ]}
+  rows={2}
+  cols={5}
+  frames={[
+    {
+      caption: "Single-stage: the full Go toolchain, source tree, and module cache all end up in the production image. ~800MB ships to every node.",
+      beat: "problem",
+      actors: [{ id: "builder", state: "warn" }, { id: "final", state: "idle" }],
+      cells: [
+        { id: "A1", state: "bad", label: "go compiler" },
+        { id: "A2", state: "bad", label: "stdlib src" },
+        { id: "A3", state: "bad", label: "mod cache" },
+        { id: "A4", state: "bad", label: "source" },
+        { id: "A5", state: "warn", label: "binary" },
+        { id: "B1", state: "bad", label: "musl libc" },
+        { id: "B2", state: "bad", label: "shell" },
+        { id: "B3", state: "bad", label: "pkg mgr" },
+        { id: "B4", state: "bad", label: "certs" },
+        { id: "B5", state: "bad", label: "(same)" }
+      ]
+    },
+    {
+      caption: "Multi-stage: the builder stage compiles the binary, then only the binary (and CA certs) cross into the scratch final stage. ~12MB.",
+      beat: "solution",
+      actors: [{ id: "builder", state: "active" }, { id: "final", state: "ok" }],
+      cells: [
+        { id: "A1", state: "idle", label: "go compiler" },
+        { id: "A2", state: "idle", label: "stdlib src" },
+        { id: "A3", state: "idle", label: "mod cache" },
+        { id: "A4", state: "idle", label: "source" },
+        { id: "A5", state: "done", label: "binary ✓" },
+        { id: "B1", state: "idle", label: "(empty)" },
+        { id: "B2", state: "idle", label: "(empty)" },
+        { id: "B3", state: "idle", label: "(empty)" },
+        { id: "B4", state: "done", label: "certs ✓" },
+        { id: "B5", state: "done", label: "binary ✓" }
+      ]
+    }
+  ]}
+  caption="The builder stage is a throwaway workspace — only its output crosses the stage boundary. Everything the Go toolchain needs to compile stays out of the final image."
+/>
+
+<ChapterTabs tabs={["What a Container Actually Is", "Images, Layers & the Build Cache", "Multi-Stage Builds", "Docker Compose"]} />
+
+## What a Container Actually Is
+
+Here is the thing that 80% of engineers get wrong, because they were taught it wrong: **a container is not a virtual machine.** A virtual machine emulates hardware and runs an entire guest OS. A container is just a regular Linux process — the same kind as the one running your shell — that the kernel has been told to *isolate and constrain*.
+
+<Define term="Container" since="Docker & Containerization (this chapter)">
+A **container** is an ordinary Linux process (or process tree) that the kernel has been told to *isolate* with **namespaces** (each container gets its own view of the PID table, network stack, filesystem, etc.) and *constrain* with **cgroups** (hard limits on CPU, memory, and I/O). No hypervisor, no guest OS — the container shares the host kernel directly. That is why containers start in milliseconds and add negligible runtime overhead compared to a virtual machine.
+</Define>
+
+That isolation comes from two Linux kernel features working together.
+
+### Namespaces: the illusion of a private world
+
+A **namespace** is a kernel-level wrapper that gives a process (or group of processes) its own private view of a resource that would otherwise be global. Docker uses six of them:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="PID namespace">The container process sees itself as PID 1 and can't see host processes. Your Go service thinks it owns the machine.</ConceptCard>
+  <ConceptCard label="Network namespace">A private network stack: its own interfaces, routing table, and port space. Port 8080 inside the container is not host port 8080 until you publish it.</ConceptCard>
+  <ConceptCard label="Mount namespace">A private filesystem tree. The container's `/` is not the host's `/` — it's a layered union filesystem (more on this shortly).</ConceptCard>
+  <ConceptCard label="UTS namespace">A private hostname. Your container can call itself `ledger-service` without the host knowing or caring.</ConceptCard>
+  <ConceptCard label="IPC namespace">Isolated System V IPC objects and POSIX message queues — processes in different containers can't signal each other accidentally.</ConceptCard>
+  <ConceptCard label="User namespace">Map container UIDs to host UIDs. Run as root inside the container, mapped to an unprivileged UID on the host.</ConceptCard>
+  <Gotcha>Namespaces create isolation, not security boundaries. A poorly configured container running as root can still escape to the host through kernel exploits or volume misuse. Never run production containers as root if you can avoid it — use a non-root `USER` in your Dockerfile.</Gotcha>
+</ConceptGrid>
+
+### cgroups: the resource accountant
+
+**Control groups** (cgroups) are the kernel's mechanism for *limiting and accounting* for resource usage by a group of processes. Namespaces say "this process has its own view of things." cgroups say "this process is only allowed to use X% of CPU and Y MB of memory."
+
+When Docker says `--memory=256m --cpus=0.5`, it's writing limits into a cgroup hierarchy in `/sys/fs/cgroup`. The kernel's scheduler and OOM killer read those limits. When a container blows past its memory budget, the OOM killer terminates it — the same mechanism that kills any runaway Linux process.
+
+**On the job:** When Meridian's ledger service gets OOM-killed in production, the first question is always "what cgroup limit did we set?" — not "is there a memory leak?" Set both a request and a limit in your deploy config, and monitor container restarts as a first-class signal.
+
+This is the entire secret. A container is a process tree under namespaces (for isolation) and cgroups (for resource limits), running against a union-mount filesystem. No hypervisor. No hardware emulation. Kernel overhead is negligible; startup is measured in milliseconds, not seconds.
+
+<ExecTimeline
+  title="A container starts — what the kernel actually does"
+  lanes={[{ id: "docker", label: "docker run" }, { id: "kernel", label: "Linux kernel" }]}
+  steps={[
+    { lane: "docker", kind: "run", label: "docker run ledger", note: "The Docker daemon receives the run command and begins the container lifecycle." },
+    { lane: "kernel", kind: "run", label: "clone() with NS flags", note: "The kernel clones a new process with new PID, net, mount, UTS, IPC namespaces set. This is one syscall." },
+    { lane: "kernel", kind: "run", label: "cgroup limits applied", note: "The process is placed into cgroup slices with CPU and memory limits. The kernel will enforce these from now on." },
+    { lane: "kernel", kind: "run", label: "union FS mounted", note: "The container's layered filesystem is assembled at the mount namespace root via OverlayFS. The container sees its / but it shares read-only image layers with other containers." },
+    { lane: "docker", kind: "run", label: "exec /ledger binary", note: "The Docker daemon execs the entrypoint inside the new namespace. Your Go process is PID 1 from its own perspective." },
+    { lane: "docker", kind: "done", label: "container running", note: "From this point on, the kernel enforces isolation and limits. No hypervisor involved." }
+  ]}
+  caption="Total wall-clock time: typically under 200ms. This is why containers start faster than VMs by orders of magnitude — it's just a fork/exec with kernel bookkeeping."
+/>
+
+### Images vs. containers
+
+<Define term="Image vs. Container">
+An **image** is a read-only, content-addressed snapshot of a filesystem plus metadata (entrypoint, env vars, exposed ports). It's the artifact you build and push to a registry. It does not run. A **container** is a running (or stopped) instance of an image: Docker adds a thin writable layer on top of the image's read-only layers and starts the process inside a fresh set of namespaces. Many containers can share one image simultaneously — zero duplication of the image bytes.
+</Define>
+
+The terms get conflated. Here is the exact distinction:
+
+An **image** is a read-only, layered snapshot of a filesystem plus metadata (the entrypoint command, environment variables, exposed ports). It's an artifact you build, tag, and push to a registry. It doesn't run.
+
+A **container** is a running (or stopped) instance of an image. Docker adds a thin, writable **container layer** on top of the read-only image layers when it starts a container. Writes inside a running container land in that ephemeral top layer — when the container is removed, those writes are gone.
+
+Multiple containers can run from the same image simultaneously, each with its own writable layer, all sharing the same underlying read-only layers. Zero redundancy; excellent density.
+
+<UnderTheHood title="OverlayFS: how the union filesystem works">
+
+The layered filesystem Docker uses on modern Linux is **OverlayFS** (the `overlay` kernel module). It presents a unified directory view by stacking a **lower dir** (the read-only image layers) under an **upper dir** (the container's writable layer) and a **work dir** for atomic operations.
+
+When a process inside the container reads a file, the kernel checks the upper dir first; if not there, falls through to the lower layers in order (latest image layer first, all the way down to the base). This is a **copy-on-write** read — the underlying file is never copied until you write to it.
+
+When a process writes to a file that lives in a lower (read-only) layer, OverlayFS **copies the file up** into the upper dir first, then allows the write. The lower layer is untouched; the container sees the modified version. This "copy-up" is why the first write to a large file inside a container has a brief latency spike.
+
+When the container is removed, the upper dir is deleted. All writes are gone. This is intentional: containers are ephemeral. Data that must survive container restarts lives in a **volume** (a host directory bind-mounted into the container, bypassing OverlayFS entirely).
+
+As of Go 1.26, the Go binary is statically linked with the runtime (when `CGO_ENABLED=0`) — it doesn't open any shared libraries at runtime. This means the container image doesn't need a glibc or musl layer at all, which is exactly why a Go binary in a `scratch` image (literally nothing but the binary) works perfectly. More on this in the multi-stage section; the full mechanics of `CGO_ENABLED=0` and cross-compilation are covered in the next chapter, **Building & Shipping Go Binaries**.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="What is the fundamental difference between a Docker container and a virtual machine?"
+  options={[
+    "A container emulates hardware; a VM does not",
+    "A container is an isolated Linux process using kernel namespaces and cgroups; a VM emulates hardware and runs a guest OS",
+    "A container uses a hypervisor; a VM uses OverlayFS",
+    "There is no meaningful difference — both are equally heavyweight"
+  ]}
+  answer={1}
+  explain="A container is a regular Linux process with namespace isolation and cgroup resource limits. No hardware emulation, no guest OS, no hypervisor. Startup is milliseconds; overhead is negligible."
+/>
+
+## Images, Layers & the Build Cache
+
+<Define term="Layer &amp; Build Cache">
+Every `Dockerfile` instruction produces one **layer** — an immutable, content-addressed snapshot of the filesystem delta from the previous instruction. Docker caches each layer keyed on the instruction text plus the state of the filesystem at that point. When you rebuild, Docker replays cached layers until it hits a change, then rebuilds from that point down. Getting the layer order right is the single biggest lever on incremental build speed: a poorly ordered Dockerfile re-downloads all your Go modules on every source change; a correctly ordered one serves them from cache and rebuilds in seconds.
+</Define>
+
+Every instruction in a `Dockerfile` produces exactly one **layer** — an immutable, content-addressed snapshot of the filesystem delta from the instruction before it. Layers are the unit of caching. Get the order wrong and you bust the cache on every build. Get it right and incremental rebuilds take seconds.
+
+### The anatomy of a Dockerfile
+
+Here is a naive Dockerfile for the Meridian ledger service — the kind a developer writes at 11pm when they just want it to work:
+
+```dockerfile
+# DON'T DO THIS — cache is busted on every source change
+FROM golang:1.26-alpine
+
+WORKDIR /app
+
+# Copy everything at once — any source change invalidates all layers below
+COPY . .
+
+RUN go mod download
+RUN go build -o ledger ./cmd/ledger
+
+EXPOSE 8080
+CMD ["/app/ledger"]
+```
+
+This builds. It runs. And it rebuilds from scratch on every single code change, downloading all your modules every time. For a service with 50 dependencies, that's painful.
+
+The fix is instruction ordering. Docker's layer cache is keyed on **the instruction itself plus the state of the filesystem at that point**. The moment a `COPY` instruction finds that the files being copied have changed, that layer and every layer below it is invalidated. The trick is to copy *only what each step needs*, starting with the most stable things.
+
+```dockerfile
+# GOOD — cache is preserved across code changes
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+
+# Step 1: copy ONLY the module manifests. These change rarely.
+COPY go.mod go.sum ./
+
+# Step 2: download dependencies. This layer is cached as long as go.mod/go.sum
+# haven't changed — even if source code has changed completely.
+RUN go mod download
+
+# Step 3: NOW copy the source code. Any source change only busts from here.
+COPY . .
+
+RUN go build -o ledger ./cmd/ledger
+```
+
+The invariant: **copy things that change slowly before things that change fast.** Dependency manifests change maybe once a week. Source code changes every hour. Putting `COPY go.mod go.sum` + `go mod download` before `COPY . .` means the entire module download step is served from the local layer cache on every incremental rebuild.
+
+**On the job:** Every extra second of CI build time compounds across dozens of engineers pushing dozens of times a day. At Meridian's team size, a 45-second rebuild vs. an 8-second one is the difference between a fast feedback loop and a coffee habit.
+
+<ExecTimeline
+  title="① First build: every layer runs cold (~45s)"
+  lanes={[{ id: "first", label: "first build" }, { id: "second", label: "rebuild (src changed)" }]}
+  steps={[
+    { lane: "first", kind: "run", label: "FROM golang:1.26", note: "Base image pulled from registry (once; then cached locally)." },
+    { lane: "first", kind: "run", label: "COPY go.mod go.sum", note: "Module manifests copied. Layer fingerprint computed and stored." },
+    { lane: "first", kind: "run", label: "RUN go mod download", note: "All dependencies downloaded. This is the slow step — can be 30s+ on first run." },
+    { lane: "first", kind: "run", label: "COPY . .", note: "Source code copied. New layer." },
+    { lane: "first", kind: "done", label: "RUN go build", note: "Binary compiled. Full build: ~45 seconds." }
+  ]}
+  caption="First build pays for everything — base image, module download, compile. Every layer fingerprint is now stored for next time."
+/>
+
+Now edit one source file and rebuild. The unchanged layers above `COPY . .` are served straight from cache; only the steps below the bust re-run:
+
+<ExecTimeline
+  title="② Rebuild (src changed): cache hits until COPY . . busts (~8s)"
+  lanes={[{ id: "first", label: "first build" }, { id: "second", label: "rebuild (src changed)" }]}
+  steps={[
+    { lane: "second", kind: "run", label: "FROM golang:1.26 ✓", note: "Cache hit — base image layer already present." },
+    { lane: "second", kind: "run", label: "COPY go.mod go.sum ✓", note: "go.mod and go.sum unchanged — cache hit. Layer reused instantly." },
+    { lane: "second", kind: "run", label: "go mod download ✓", note: "Cache hit — modules not re-downloaded. Saved ~30 seconds." },
+    { lane: "second", kind: "run", label: "COPY . . — MISS", note: "Source changed — cache busted here. New layer written." },
+    { lane: "second", kind: "done", label: "RUN go build", note: "Only the compile step re-runs. Rebuild: ~8 seconds." }
+  ]}
+  caption="Correct instruction ordering turns a 45-second full rebuild into an 8-second incremental one. The difference is just layer order."
+/>
+
+### Build arguments and cache invalidation
+
+One footgun: if you use `ARG` to inject a build-time value (say, a version string), and the `ARG` instruction appears before a `RUN go build`, that `ARG` is part of the layer key — changing the version string will bust the cache for everything below it. Place `ARG` instructions as late as possible, after expensive cached steps.
+
+```dockerfile
+# Version arg placed AFTER the expensive compile step — cache preserved
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN go build -ldflags="-X main.version=${VERSION}" -o ledger ./cmd/ledger
+```
+
+<Callout kind="pro" title="Use BuildKit">
+
+Docker BuildKit (enabled by default since Docker 23) adds parallel stage execution, inline cache hints, SSH agent forwarding, and secrets that don't land in image layers. Always build with `DOCKER_BUILDKIT=1` (or use `docker buildx build`) and add `# syntax=docker/dockerfile:1` as the first line of your Dockerfile to unlock the full feature set.
+
+</Callout>
+
+<QuickCheck
+  question="Why does copying go.mod and go.sum before copying source code improve build cache utilization?"
+  options={[
+    "It makes the Docker daemon use less memory",
+    "Because a COPY instruction's cache key includes the file contents — slow dependency downloads are cached until the manifests change, even when source code changes",
+    "go mod download only works when go.sum is the most recent layer",
+    "It has no effect — Docker caches the entire build or nothing"
+  ]}
+  answer={1}
+  explain="Each COPY instruction's layer is invalidated only when the copied files change. By copying just go.mod and go.sum first, the go mod download layer is cached indefinitely unless your dependency manifests change — even if you edit source code every minute."
+/>
+
+## Multi-Stage Builds
+
+<Define term="Multi-Stage Build" since="Building &amp; Shipping Go Binaries (Part 1, Chapter 24)">
+A **multi-stage build** uses multiple `FROM` instructions in a single `Dockerfile`. Each stage is an independent filesystem. You compile in a heavy builder stage (full Go toolchain, source, module cache), then `COPY --from=builder` only the compiled binary into a tiny final stage. Docker discards the intermediate stages entirely — they never enter the final image. The result: a production image that contains exactly what the binary needs to *run*, not what it took to *build*.
+</Define>
+
+Here is where Go's static binary becomes your superpower. The builder stage needs the full Go toolchain — compiler, linker, stdlib sources, module cache. The final container running in production needs *none of that*. It needs exactly one thing: the compiled binary.
+
+Multi-stage builds solve this with multiple `FROM` instructions in a single Dockerfile. Each stage is independent. You compile in a fat build stage, then `COPY --from=builder` just the binary into a tiny final stage that ships to production.
+
+### From fat to scratch
+
+**On the job:** At Meridian, the difference between a 12MB scratch image and an 800MB fat image is the difference between a 3-second rolling deploy and a 3-minute one. Slow image pulls mean longer rollouts, more overlap between old and new instances, and more pressure on the container registry. Keep images small.
+
+Let's look at the full multi-stage Dockerfile for the Meridian ledger service:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+
+# Dependency cache layer (see previous section)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Source code
+COPY . .
+
+# Build a statically-linked binary with no CGO dependencies.
+# CGO_ENABLED=0 is the key flag — it tells the Go linker to avoid cgo
+# and produce a binary that links nothing at runtime.
+# -ldflags="-s -w" strips the symbol table and DWARF debug info,
+# shrinking the binary by ~30%.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build \
+    -ldflags="-s -w" \
+    -o /ledger \
+    ./cmd/ledger
+
+# ── Stage 2: final image ──────────────────────────────────────────────────────
+# "scratch" is a special Docker keyword — an empty image with nothing in it.
+# No shell, no libc, no package manager, no attack surface.
+FROM scratch
+
+# Copy in a TLS certificate bundle so our service can make HTTPS calls.
+# (scratch has no /etc/ssl — we need to bring our own.)
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy in the compiled binary. Nothing else.
+COPY --from=builder /ledger /ledger
+
+# The binary runs as PID 1.
+ENTRYPOINT ["/ledger"]
+```
+
+That final image contains exactly two files: the CA bundle and the binary. Nothing else. No shell. No package manager. No `curl` an attacker could use. No old OpenSSL. No Python interpreter left by a careless base image maintainer.
+
+<BeforeAfter
+  badLabel="Naïve — 800MB"
+  goodLabel="Multi-stage scratch — ~12MB"
+  badFile="Dockerfile.naive"
+  goodFile="Dockerfile.multistage"
+  bad={`FROM golang:1.26-alpine
+WORKDIR /app
+COPY . .
+RUN go mod download
+RUN go build -o ledger .
+EXPOSE 8080
+CMD ["/app/ledger"]
+# Final image: ~800MB
+# Contains: Go toolchain, stdlib
+# sources, module cache, musl,
+# your binary, and more.`}
+  good={`FROM golang:1.26-alpine AS builder
+# ... build steps ...
+RUN CGO_ENABLED=0 go build \
+  -ldflags="-s -w" \
+  -o /ledger ./cmd/ledger
+
+FROM scratch
+COPY --from=builder \
+  /etc/ssl/certs/ca-certificates.crt \
+  /etc/ssl/certs/
+COPY --from=builder /ledger /ledger
+ENTRYPOINT ["/ledger"]
+# Final image: ~12MB
+# Contains: CA bundle + binary.`}
+/>
+
+<ExecTimeline
+  title="Multi-stage build: builder compiles → binary copied to scratch"
+  lanes={[{ id: "builder", label: "builder stage" }, { id: "final", label: "final stage" }]}
+  steps={[
+    { lane: "builder", kind: "run", label: "FROM golang:1.26-alpine", note: "Builder stage starts with the full Go toolchain — ~300MB. This stage never ships to production." },
+    { lane: "builder", kind: "run", label: "go mod download, then COPY source", note: "All dependencies downloaded into the module cache inside this stage, then source copied in. Source can change without busting the dependency cache layer." },
+    { lane: "builder", kind: "run", label: "CGO_ENABLED=0 go build", note: "Static binary compiled. No cgo, no shared lib deps. The Go runtime is linked directly into the binary." },
+    { lane: "builder", kind: "done", label: "/ledger binary ready", note: "~10MB binary sitting in /ledger inside the builder. The rest of the stage is 790MB of tools we don't need." },
+    { lane: "final", kind: "run", label: "FROM scratch", note: "Final stage starts from absolute emptiness — no base OS, no shell, nothing." },
+    { lane: "final", kind: "recv", label: "COPY --from=builder /ledger", note: "Only the compiled binary is copied from the builder stage into the empty final image." },
+    { lane: "final", kind: "done", label: "Final image ~12MB", note: "Done. The 790MB of Go toolchain never enters the final image. This is what ships to production." }
+  ]}
+  caption="The builder stage is a throwaway workspace. Only its output crosses the stage boundary."
+/>
+
+<Define term="scratch / distroless">
+`FROM scratch` is Docker's special empty base image — literally nothing: no shell, no libc, no package manager, no attack surface. It works for a Go binary built with `CGO_ENABLED=0` because that binary links nothing at runtime. **Distroless** images (`gcr.io/distroless/static-debian12`) are a middle ground: a stripped-down Debian with timezone data and CA certificates, but still no shell. ~2–3MB larger than scratch; easier to debug; required when your binary links against C libraries via CGO.
+</Define>
+
+### `scratch` vs. `distroless`
+
+`scratch` is the purest option — nothing. But nothing means *no shell for debugging*. If your service panics at 3am, you can't `docker exec` in and poke around. Google's **distroless** images (`gcr.io/distroless/static-debian12`) are a middle ground: they add a minimal glibc, timezone data, and a few other OS fundamentals, but still no shell and no package manager. They're 2–3MB larger than scratch but easier to debug.
+
+```dockerfile
+# distroless variant — better for services that need timezone data
+# or glibc (if your binary uses CGO)
+FROM gcr.io/distroless/static-debian12
+
+COPY --from=builder /ledger /ledger
+ENTRYPOINT ["/ledger"]
+```
+
+For a pure Go binary with `CGO_ENABLED=0`, scratch is the right default. For a binary that links against C libraries (CGO), use `distroless/base-debian12` which includes glibc.
+
+### Why `CGO_ENABLED=0` matters — the short version
+
+When you set `CGO_ENABLED=0`, the Go linker produces a **fully static binary** — no calls to the dynamic linker (`ld.so`), no `dlopen`, no shared library dependencies whatsoever. The Go runtime, standard library, and all imported packages are compiled into the binary at link time. That's why the binary works in a `scratch` image with no libc present.
+
+This is possible because Go's standard library reimplements most OS interfaces in pure Go (the network stack, DNS resolver, crypto). The `CGO_ENABLED=1` default exists for packages that wrap C libraries (like database drivers using libpq, or packages using OpenSSL). For a service that uses pure Go drivers and the stdlib, `CGO_ENABLED=0` is always the right choice for containers.
+
+<Callout kind="note" title="The full CGO_ENABLED=0 story is in the next chapter">
+
+The mechanics of static vs. dynamic linking, the ELF `PT_INTERP` flag, `ldd` output, cross-compilation gotchas with CGO, and the `-ldflags="-s -w"` strip flags are all covered in depth in the next chapter — **Building & Shipping Go Binaries** (`/part-1/building-shipping-binaries`). This chapter gives you enough to write a correct Dockerfile; the next one explains exactly why it works.
+
+</Callout>
+
+<UnderTheHood title="The static binary and the scratch image (Go 1.26 baseline)">
+
+*This is a conceptual model — a simplification of the actual linker and loader behaviour.*
+
+When `CGO_ENABLED=1` (the default), the Go linker emits a dynamically linked binary that depends on the host's libc (glibc or musl). When this binary runs inside a container, the container image must include that libc. That's why a single-stage `golang:1.26-alpine` image works — Alpine ships musl libc — but `FROM scratch` would not.
+
+With `CGO_ENABLED=0`, all OS-interface calls go through Go's own internal syscall wrappers in the `syscall` package, which invoke the kernel directly without a libc intermediary. The binary `ldd` reports as "not a dynamic executable." You can copy it to any Linux system with a compatible kernel ABI and it runs — no `GLIBC_2.34 not found`, no missing `.so` files.
+
+As of Go 1.26, the race detector still requires CGO. Never ship a `-race` binary to production — the overhead is roughly 5–10× slower. Run the race detector in CI on a non-scratch base image.
+
+See **Building & Shipping Go Binaries** for the full treatment.
+
+</UnderTheHood>
+
+A tiny self-contained Go HTTP server to tie this together — you'd containerize exactly this:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+)
+
+func main() {
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok"}`)
+	})
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "ledger service — build: %s\n", buildVersion)
+	})
+
+	slog.Info("ledger listening", "addr", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		slog.Error("server failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+// injected at build time: go build -ldflags="-X main.buildVersion=v1.2.3"
+var buildVersion = "dev"
+```
+
+</GoPlayground>
+
+This is the binary that would sit inside the scratch image. 12MB. No shell. No attack surface. Starts in under 10ms.
+
+## Docker Compose
+
+Containers in isolation are useful. Containers *talking to each other* are where the real work happens. The ledger service needs PostgreSQL for its double-entry ledger and Redis for its distributed rate limiter (from Part 2). Running three separate `docker run` commands with the right flags, networks, and volume mounts, in the right order, by hand, every time — is not engineering. It's suffering.
+
+<Define term="Docker Compose">
+**Docker Compose** is a declarative YAML format for defining and running multi-container applications on a single host. You describe every service (its image or build context), the environment variables it needs, how the services depend on each other, what ports to expose, and which named volumes to mount — then `docker compose up` wires it all together and starts the stack. Service names become DNS hostnames on the private Compose network, so the ledger service reaches Postgres at `postgres:5432` without any IP configuration. This is your local dev environment — not production (production is Kubernetes, covered in **Deployment & Infra: CI/CD + Kubernetes**).
+</Define>
+
+**Docker Compose** is a declarative format for defining and running multi-container applications. One `docker-compose.yml` file describes the entire local dev environment. One command — `docker compose up` — starts everything.
+
+### The ledger service compose file
+
+```yaml
+# docker-compose.yml
+# Local development stack for the Meridian ledger service.
+# This is NOT a production deployment config —
+# see Deployment & Infra: CI/CD + Kubernetes for Kubernetes.
+
+services:
+  ledger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_URL=postgres://ledger:secret@postgres:5432/ledger?sslmode=disable
+      - REDIS_ADDR=redis:6379
+      - ADDR=:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"    # exposed to host for psql / TablePlus
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pg_data:
+  redis_data:
+```
+
+Let's walk through the key concepts, one by one.
+
+### Networks: container DNS for free
+
+By default, Compose creates a private Docker network for every `docker-compose.yml` and attaches all services to it. On that network, **service names are DNS hostnames**. The `ledger` service connects to Postgres at `postgres:5432` — not `localhost:5432` (that's the host machine) and not an IP address (those change). The Docker daemon runs an embedded DNS resolver that resolves `postgres` to the container's internal IP.
+
+This is why the DB_URL is `postgres://ledger:secret@postgres:5432/ledger` — `postgres` is the service name, which is the DNS name on the Compose network.
+
+### depends_on with healthchecks
+
+**On the job:** Without a real healthcheck, Meridian's ledger service races against Postgres on every `docker compose up` in dev, fails to connect, and crashes — then the engineer adds `sleep 5` to their startup script, and six months later that sleep is in production. Don't do this.
+
+`depends_on` alone only waits for the container to *start*. It does not wait for the service inside to be *ready*. Starting a Postgres container takes a few seconds for the database to initialize; if the ledger service connects immediately, it gets a connection refused and crashes.
+
+The `condition: service_healthy` form waits until the `healthcheck` passes before starting the dependent service. The healthcheck for Postgres runs `pg_isready` — the official Postgres "is the server accepting connections?" probe. For Redis, `redis-cli ping` returns `PONG` when the server is ready.
+
+This is the correct pattern. Never use `sleep 5` as a substitute for a real healthcheck.
+
+### Volumes: data that survives restarts
+
+Named volumes (`pg_data`, `redis_data`) are managed by Docker and persist across `docker compose down` / `docker compose up` cycles. They mount into the container at the paths where each service stores its data.
+
+Without named volumes, every `docker compose down` would wipe your local Postgres data. With them, the data survives service restarts and even container image upgrades.
+
+```
+# The day-to-day development workflow:
+docker compose up            # start everything, follow logs
+docker compose up -d         # start in background
+docker compose logs -f       # tail all logs
+docker compose down          # stop and remove containers (data volumes preserved)
+docker compose down -v       # stop, remove containers AND volumes (wipes data)
+docker compose build ledger  # rebuild just the ledger image after a code change
+```
+
+<ExecTimeline
+  title="docker compose up — startup sequence with healthchecks"
+  lanes={[{ id: "compose", label: "compose" }, { id: "pg", label: "postgres" }, { id: "redis", label: "redis" }, { id: "ledger", label: "ledger" }]}
+  steps={[
+    { lane: "compose", kind: "spawn", label: "compose up", note: "Compose reads the YAML, creates the shared network, and begins starting services in dependency order." },
+    { lane: "pg", kind: "run", label: "container starts", note: "Postgres container starts. initdb runs, then the server begins listening. This takes a few seconds." },
+    { lane: "redis", kind: "run", label: "container starts", note: "Redis container starts in parallel with Postgres — no dependency between them." },
+    { lane: "pg", kind: "run", label: "healthcheck: pg_isready", note: "Compose polls pg_isready every 5s. First few attempts may fail while Postgres initializes." },
+    { lane: "redis", kind: "run", label: "healthcheck: redis-cli ping", note: "Redis starts faster — healthcheck passes on the first or second attempt." },
+    { lane: "pg", kind: "done", label: "healthy ✓", note: "pg_isready returns 0. Postgres is accepting connections." },
+    { lane: "ledger", kind: "spawn", label: "ledger starts", note: "Both dependencies are healthy. Compose starts the ledger container. It connects to postgres:5432 successfully on the first attempt." }
+  ]}
+  caption="depends_on with condition: service_healthy prevents the ledger from racing against Postgres startup. No sleep required."
+/>
+
+<UnderTheHood title="Container networking: how the embedded DNS resolver works">
+
+When Docker Compose creates a network, it spawns an embedded DNS server at a fixed address (typically `127.0.0.11`) and injects that address into each container's `/etc/resolv.conf` as the nameserver. When your Go process calls `net.LookupHost("postgres")`, the Go resolver reads `/etc/resolv.conf`, finds `127.0.0.11`, and sends a DNS query to the Docker daemon's resolver.
+
+The Docker daemon maintains a mapping of service name → container IP, updated as containers start and stop. If you scale a service (`docker compose up --scale worker=3`), round-robin DNS returns all three IPs. This is a primitive form of client-side load balancing — production services use a proper load balancer (see Deployment & Infra: CI/CD + Kubernetes), but for local dev it's perfectly sufficient.
+
+One sharp edge: Go's `net` package has two DNS resolver implementations — the pure-Go resolver and a CGO-based resolver that delegates to the OS libc. With `CGO_ENABLED=0` (our static binary), Go always uses its pure-Go resolver, which reads `/etc/resolv.conf` directly. With `CGO_ENABLED=1`, it might use `nsswitch.conf` and the libc resolver. Both work with Docker's embedded DNS; the pure-Go path is slightly faster (no cgo bridge) and fully predictable.
+
+</UnderTheHood>
+
+<Callout kind="note" title="This is local dev — production is Deployment & Infra: CI/CD + Kubernetes">
+
+The `docker-compose.yml` above is a local development tool. It exposes Postgres on port 5432 to your host machine (so you can use TablePlus or psql), uses a hardcoded password, and has no TLS between services. None of that is acceptable in production.
+
+Production means Kubernetes, TLS everywhere, secrets from a secrets manager, no hard-coded credentials, resource limits per container, liveness and readiness probes wired to your service's `/health` endpoint, rolling deployments, and a CI/CD pipeline that builds and pushes the image before Kubernetes pulls it. All of that is **Deployment & Infra: CI/CD + Kubernetes**. We'll get there.
+
+</Callout>
+
+---
+
+## Exercises
+
+You don't containerize by reading. You containerize by writing the Dockerfile wrong twice, then right once. Let's get the wrong ones out of the way efficiently.
+
+<Exercise n={1} title="Spot the cache-busting Dockerfile" level="easy">
+
+The following Dockerfile rebuilds every dependency on every source change. Identify exactly which line causes the cache bust and rewrite the relevant section to preserve the module download cache.
+
+```dockerfile
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go mod download
+RUN CGO_ENABLED=0 go build -o /api ./cmd/api
+FROM scratch
+COPY --from=builder /api /api
+ENTRYPOINT ["/api"]
+```
+
+<Solution>
+
+The offending line is `COPY . .` which copies the entire source tree before `go mod download`. Any change to any source file invalidates this layer, which invalidates the `go mod download` layer below it.
+
+Fix: copy only the module manifests first, download, then copy source:
+
+```dockerfile
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+
+# Stable: module manifests change rarely
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Variable: source changes frequently — only busts from here
+COPY . .
+RUN CGO_ENABLED=0 go build -o /api ./cmd/api
+
+FROM scratch
+COPY --from=builder /api /api
+ENTRYPOINT ["/api"]
+```
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add the CA bundle to a scratch image" level="easy">
+
+A Go service containerized in `FROM scratch` fails with `x509: certificate signed by unknown authority` when making HTTPS calls to the Stripe API. Explain why and fix the Dockerfile to include TLS certificate verification.
+
+<Solution>
+
+`scratch` contains nothing — no filesystem, no OS. The Go TLS client reads CA certificates from `/etc/ssl/certs/ca-certificates.crt` (on Debian/Alpine) to verify server certificates. That file doesn't exist in a scratch image, so all TLS verification fails.
+
+Fix: copy the CA bundle from the builder stage:
+
+```dockerfile
+FROM golang:1.26-alpine AS builder
+# ... build steps ...
+
+FROM scratch
+# Copy the Alpine CA bundle from the builder image
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/api /api
+ENTRYPOINT ["/api"]
+```
+
+Alternatively, you can use `gcr.io/distroless/static-debian12` as the final stage — it includes CA certificates, timezone data, and `/etc/passwd` out of the box.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Write a healthcheck for a Go HTTP service" level="medium">
+
+Add a `HEALTHCHECK` instruction to the following Dockerfile so that Docker marks the container unhealthy if the `/health` endpoint returns a non-200 status or doesn't respond within 5 seconds. Use only tools available in a scratch-based image.
+
+```dockerfile
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /ledger ./cmd/ledger
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /ledger /ledger
+ENTRYPOINT ["/ledger"]
+```
+
+<Solution>
+
+The problem: `scratch` has no shell, no `curl`, no `wget`. A `HEALTHCHECK` with `CMD curl -f http://localhost:8080/health` won't work.
+
+The idiomatic Go solution: compile a tiny healthcheck binary and include it alongside the main binary. But the simplest approach for a minimal image is to use a `distroless` base (which includes `/bin/sh` and basic tools) or to use Docker's built-in HTTP check via a dedicated healthcheck binary you build in the builder stage:
+
+```dockerfile
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /ledger ./cmd/ledger
+
+# Build a tiny healthcheck binary that exits 0 on 200, 1 otherwise
+RUN CGO_ENABLED=0 go build -o /healthcheck ./cmd/healthcheck
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /ledger /ledger
+COPY --from=builder /healthcheck /healthcheck
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/healthcheck", "http://localhost:8080/health"]
+
+ENTRYPOINT ["/ledger"]
+```
+
+The `cmd/healthcheck/main.go` is a small program that makes an HTTP GET to the given URL and exits non-zero on failure. Alternatively, switching the final stage to `gcr.io/distroless/static-debian12` lets you use the `wget`-style healthcheck included in that image.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Add a depends_on healthcheck to Compose" level="medium">
+
+The following Compose file starts the worker service before Postgres is ready, causing connection refused errors on startup. Fix it so the worker only starts after Postgres is confirmed healthy.
+
+```yaml
+services:
+  worker:
+    build: .
+    environment:
+      - DB_URL=postgres://app:secret@postgres:5432/app
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+```
+
+<Solution>
+
+```yaml
+services:
+  worker:
+    build: .
+    environment:
+      - DB_URL=postgres://app:secret@postgres:5432/app
+    depends_on:
+      postgres:
+        condition: service_healthy   # wait for the healthcheck to pass
+    restart: on-failure              # restart if Postgres isn't ready yet anyway
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+```
+
+Two changes: add `healthcheck` to Postgres (without it, `condition: service_healthy` has nothing to check against), and change `depends_on: postgres` to use `condition: service_healthy`. The `restart: on-failure` on the worker is a belt-and-suspenders measure for race conditions during first boot.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Build a version-stamped image" level="hard">
+
+Modify the ledger Dockerfile and a companion `Makefile` target so that `make docker-build VERSION=v1.4.0` produces an image tagged `ledger:v1.4.0` where the `/version` HTTP endpoint returns `{"version":"v1.4.0","commit":"<git-sha>"}`. The build must not bust the dependency download cache when only the version string changes.
+
+<Solution>
+
+The key insight: `ARG` instructions invalidate the cache for all layers *below* them. Place the version `ARG` after the expensive `go mod download` and source `COPY` — inject it only at the final `go build` step.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# ARG declared AFTER COPY to avoid busting the module cache
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+    -o /ledger \
+    ./cmd/ledger
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /ledger /ledger
+ENTRYPOINT ["/ledger"]
+```
+
+```makefile
+# Makefile
+VERSION ?= dev
+COMMIT  := $(shell git rev-parse --short HEAD)
+
+docker-build:
+	docker build \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg COMMIT=$(COMMIT) \
+	  -t ledger:$(VERSION) \
+	  .
+```
+
+In `cmd/ledger/main.go`, declare the variables at package scope:
+
+```go
+// injected at link time via -ldflags
+var (
+    version = "dev"
+    commit  = "unknown"
+)
+```
+
+And handle the `/version` route:
+
+```go
+mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    fmt.Fprintf(w, `{"version":%q,"commit":%q}`, version, commit)
+})
+```
+
+The module download cache layer is untouched by version changes because `ARG VERSION` appears only after `COPY . .`.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Exercises are for warming up, sport. The lab is the part where I find out if you actually understood it. I set it personally — and I assure you, I am *very* particular about my images being minimal.
+
+<Lab
+  title="Containerize the Meridian ledger service correctly"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="reference"
+  objective="Write a production-grade multi-stage Dockerfile for the Meridian ledger service. Check your own solution against all four criteria: (1) the final stage is FROM scratch or FROM gcr.io/distroless/static-debian12 — no golang, no alpine, no ubuntu in the final stage; (2) the builder uses CGO_ENABLED=0; (3) the final image contains no Go toolchain binaries (go, gofmt, etc.) — confirm with docker history; (4) a docker-compose.yml starts ledger + postgres + redis with correct healthchecks and depends_on so the ledger only starts after both dependencies are healthy. Compare your Dockerfile and compose file against the reference solution in the hints. Award yourself the flag when all four checks pass."
+  starter={`# starter Dockerfile — builds but is wrong in multiple ways.
+# Fix it so all four self-check criteria pass.
+
+FROM golang:1.26-alpine
+
+WORKDIR /app
+COPY . .
+RUN go mod tidy && go build -o ledger ./cmd/ledger
+
+EXPOSE 8080
+CMD ["/app/ledger"]
+
+# ---
+# starter docker-compose.yml (separate file)
+#
+# services:
+#   ledger:
+#     build: .
+#     ports:
+#       - "8080:8080"
+#   postgres:
+#     image: postgres:16-alpine
+#     environment:
+#       POSTGRES_USER: ledger
+#       POSTGRES_PASSWORD: secret
+#       POSTGRES_DB: ledger
+#   redis:
+#     image: redis:7-alpine`}
+  hints={[
+    "Add a second FROM instruction for the final stage. Use 'FROM scratch' or 'FROM gcr.io/distroless/static-debian12'. Only COPY the compiled binary and the CA certs from the builder.",
+    "Set CGO_ENABLED=0 in the RUN go build command: RUN CGO_ENABLED=0 go build -o /ledger ./cmd/ledger. This is required for scratch — no libc available.",
+    "For depends_on, the service_healthy condition requires a healthcheck block on the dependency. Add healthcheck to both postgres (pg_isready) and redis (redis-cli ping), then use depends_on with condition: service_healthy on the ledger service.",
+    "The module download cache fix: add 'COPY go.mod go.sum ./' and 'RUN go mod download' BEFORE 'COPY . .' in the builder stage. This is not required to pass the self-check but is expected for full marks."
+  ]}
+  flag="GO{scratch_not_bloat_cgo_disabled_compose_healthy}"
+>
+
+The starter is a single-stage monstrosity that ships the entire Go toolchain to production. Run `docker history <image>` after your build and you will see the Go compiler sitting right there in the final image layers. You know what to do.
+
+</Lab>
+
+<Recap>
+
+You now understand containers from the kernel up:
+
+- A **container is not a VM**. It's a Linux process isolated with **namespaces** (private PID, network, mount, UTS, IPC, user) and constrained with **cgroups** (CPU, memory limits). Startup is milliseconds; overhead is negligible.
+- **OverlayFS** assembles the layered union filesystem — read-only image layers stacked under a thin writable container layer. Writes trigger copy-up; the underlying image is never modified.
+- **Images** are read-only layered artifacts. **Containers** are running instances of an image with a writable layer on top. Multiple containers share the same image layers.
+- Every `Dockerfile` instruction creates a **layer**. Layer caching is keyed on instruction content + filesystem state. Order matters: **copy stable files first** (`go.mod`, `go.sum` + `go mod download`) before volatile files (`COPY . .`) to maximize cache hits on incremental rebuilds.
+- **Multi-stage builds** use multiple `FROM` instructions. The builder stage compiles using the full toolchain; the final stage contains only the compiled binary. With `CGO_ENABLED=0`, a Go binary is fully static — perfect for `FROM scratch`.
+- `FROM scratch` produces images of ~10–15MB with zero attack surface (no shell, no libc, no package manager). For services needing TLS verification, copy `/etc/ssl/certs/ca-certificates.crt` from the builder.
+- **Docker Compose** defines multi-service dev environments declaratively. Service names are DNS hostnames on the Compose network. Use `depends_on` with `condition: service_healthy` and real `healthcheck` blocks — not `sleep`.
+- The next chapter — **Building & Shipping Go Binaries** — covers `CGO_ENABLED=0` and static linking in full depth, cross-compilation, `-ldflags`, and releasing with GoReleaser.
+- Production deployment (Kubernetes, CI/CD, rolling updates) is **Deployment & Infra: CI/CD + Kubernetes**. Everything here is the foundation that chapter builds on.
+
+</Recap>
+
+<Scoreboard
+  streak={22}
+  items={[
+    { label: "Quick check — container vs. VM", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — layer cache and go.mod ordering", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Spot the cache-busting Dockerfile", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Add the CA bundle to scratch", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Healthcheck in a scratch image", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — depends_on healthcheck in Compose", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Build a version-stamped image", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Containerize the ledger service correctly", captured: false, points: 80 }}
+/>
+
+Not bad. Meridian's ledger service is containerized correctly — small image, no toolchain in production, Compose doesn't race. It's no *me* — but honestly, it's close. Next chapter: **Building & Shipping Go Binaries** — the full static-binary story, cross-compilation, and how to cut a proper release. Then Deployment & Infra: CI/CD + Kubernetes is when `docker run` stops being enough: Kubernetes, CI/CD, rolling deploys, the whole beautiful machine. Brace yourself.

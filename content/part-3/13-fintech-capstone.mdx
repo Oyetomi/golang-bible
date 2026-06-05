@@ -1,0 +1,1839 @@
+---
+title: "Fintech Capstone: A Payments & Ledger Service"
+part: 3
+order: 13
+type: "project"
+description: "Build a small but correct payments/ledger service: accounts, idempotent transfers, double-entry ledger, audit trail, gRPC, Watermill + Kafka, and a full fuzz/race test suite."
+prerequisites: ["resilience-correctness-under-load"]
+---
+
+<HeroCard label="Part 3 · Chapter 13" title="Fintech Capstone: A Payments & Ledger Service">
+
+Here's the thing, sport. You made it. Sixty-three chapters. GMP internals, double-entry ledgers, gRPC interceptors, Watermill routers, fuzz testing, the race detector — you didn't just *read* them. You owned them. And now I'm going to let you prove it.
+
+This is the victory lap — but it runs under load, with the race detector on, and the books had better balance when I'm done checking. We're building a small, *correct* payments and ledger service: real money math, real double-entry invariants, real idempotent transfers, real async event flow. Not a toy. A blueprint you could ship.
+
+Every stage links back to the chapter that taught it. Every section is a step you build, not a wall of code you copy. And the final boss lab fires N concurrent transfers against your ledger and inspects the books. They. Must. Balance.
+
+No pressure. (There is absolutely pressure.)
+
+</HeroCard>
+
+<ChapterTabs tabs={["Domain & Money", "Storage & Transactions", "The Transfer Use Case", "gRPC + HTTP API", "Async Events", "Observability & Reliability", "The Test Suite"]} />
+
+<Scene
+  title="The dual-write problem — and how the outbox fixes it"
+  actors={[
+    { id: "client", label: "Client" },
+    { id: "api", label: "API (gRPC/HTTP)" },
+    { id: "uc", label: "Use Case" },
+    { id: "db", label: "DB (ledger+outbox)" },
+    { id: "relay", label: "Outbox Relay" },
+    { id: "kafka", label: "Kafka" },
+    { id: "proj", label: "Projection" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "Naive dual-write: the service writes the ledger entry, then tries to publish to Kafka separately.",
+      beat: "problem",
+      actors: [{ id: "client", state: "active" }, { id: "api", state: "active" }],
+      cells: [{ id: "A1", state: "idle", label: "ledger" }, { id: "A2", state: "idle", label: "Kafka" }, { id: "A3", state: "idle", label: "proj" }, { id: "A4", state: "idle", label: "" }]
+    },
+    {
+      caption: "Ledger entry commits to the DB — but the process crashes before publishing the Kafka event. The event is lost.",
+      beat: "problem",
+      actors: [{ id: "uc", state: "active" }, { id: "db", state: "warn" }],
+      cells: [{ id: "A1", state: "done", label: "ledger ✓" }, { id: "A2", state: "bad", label: "Kafka ✕" }, { id: "A3", state: "bad", label: "stale" }, { id: "A4", state: "idle", label: "" }]
+    },
+    {
+      caption: "Projection never receives the event. The read-model balance is wrong. The books say one thing; the event log says another.",
+      beat: "problem",
+      actors: [{ id: "proj", state: "bad" }],
+      cells: [{ id: "A1", state: "done", label: "ledger ✓" }, { id: "A2", state: "bad", label: "lost" }, { id: "A3", state: "bad", label: "wrong ✕" }, { id: "A4", state: "idle", label: "" }]
+    },
+    {
+      caption: "Outbox fix: the use case writes BOTH the ledger entry AND an outbox row in ONE DB transaction. Either both commit, or neither does.",
+      beat: "solution",
+      actors: [{ id: "uc", state: "active" }, { id: "db", state: "active" }],
+      cells: [{ id: "B1", state: "active", label: "ledger" }, { id: "B2", state: "active", label: "outbox" }, { id: "B3", state: "idle", label: "relay" }, { id: "B4", state: "idle", label: "proj" }]
+    },
+    {
+      caption: "Outbox relay polls the table and publishes the event to Kafka. The projection updates. All three stay in sync — no dual-write gap.",
+      beat: "solution",
+      actors: [{ id: "relay", state: "active" }, { id: "kafka", state: "ok" }, { id: "proj", state: "ok" }],
+      cells: [{ id: "B1", state: "done", label: "ledger ✓" }, { id: "B2", state: "done", label: "outbox ✓" }, { id: "B3", state: "done", label: "relay ✓" }, { id: "B4", state: "done", label: "proj ✓" }]
+    }
+  ]}
+  caption="The dual-write problem (frames 1–3) versus the outbox pattern (frames 4–5). The outbox atomically binds the event to the DB commit — so no event is ever silently lost."
+/>
+
+---
+
+**What this service is.** Before a line of code, here is the whole product in one sentence:
+
+> Meridian's payments service moves money between accounts and records every movement in an immutable double-entry ledger so the books always balance — and it does so safely under concurrent load, with retries, and without ever charging twice.
+
+That sentence hides four hard problems. The next four definitions unpack them. A reader who can state all four is ready to build this.
+
+<Define term="Payments & Ledger Service" since="Double-Entry Ledgers (Part 3), Idempotency & Exactly-Once Semantics (Part 3)">
+A **payments service** moves money between accounts on behalf of users or other services — it validates, authorises, and records transfers. A **ledger service** records every monetary movement as an immutable, append-only history using double-entry bookkeeping. Together they form the financial core of Meridian: the payments service is the write path (accept a transfer, debit one account, credit another, emit an event); the ledger is the permanent, auditable record that those balances were ever moved. If the ledger and the actual bank balance ever diverge, you have a compliance failure. This service prevents that.
+</Define>
+
+<Define term="Idempotency / Idempotency Key" since="Idempotency & Exactly-Once Semantics (Part 3), Auth & API Design (Part 1)">
+An operation is **idempotent** if doing it twice has the same effect as doing it once. A payment transfer must be idempotent because networks fail and clients retry: if a client sends a `POST /transfers` and the response never arrives, it will retry — and without idempotency the server charges twice, **creating money from nothing**. An **idempotency key** is a unique string the client generates per logical operation (e.g. `"pay-order-7f3a"`). The server records the key on first execution and on any retry returns the cached result without re-executing. The key deduplicates retried requests at the server so a retried transfer charges exactly once, regardless of how many times the request arrives.
+</Define>
+
+<Define term="Double-Entry Ledger" since="Double-Entry Ledgers (Part 3)">
+In double-entry bookkeeping, **every transfer posts two entries**: a debit (money leaving an account) and an equal-sized credit (money entering another account) that sum to zero. If Alice sends $50 to Bob, the ledger records `Debit $50 from Alice` and `Credit $50 to Bob` — a net change of zero across all accounts. The invariant — **all entries always sum to zero** — means the books must always balance. The ledger is append-only and immutable: no entry is ever deleted or updated. This is how Meridian proves to regulators and to itself that no money was created or destroyed.
+</Define>
+
+<Define term="Kafka" since="Event-Driven Architecture & Kafka (Part 3), Watermill — Event-Driven Go in Practice (Part 3)">
+**Kafka** is a distributed, partitioned, append-only event log. Producers publish messages to named **topics** (e.g. `transfer.completed`). Each topic is divided into **partitions** — the unit of ordering and parallelism. Within a partition, messages are strictly ordered by offset. **Consumer groups** allow multiple service instances to share the work of consuming a topic: each partition is assigned to exactly one consumer in the group at a time, giving per-partition ordering guarantees. We key transfer events by account ID so all events for one account land on the same partition and are processed in order. Kafka is the async backbone between Meridian's write path (the transfer use case) and read models (the balance projection).
+</Define>
+
+<Define term="Transactional Outbox" since="Idempotency & Exactly-Once Semantics (Part 3), Watermill — Event-Driven Go in Practice (Part 3)">
+The **dual-write problem**: if you commit to the database and then publish to Kafka in two separate operations, a crash between them leaves one done and the other not — the ledger and the event log diverge. The **transactional outbox** solves this: write the event into an `outbox` table in the **same DB transaction** as the business change. Either both commit or neither does. A separate relay process polls the outbox and publishes unpublished rows to Kafka, then marks them published. The event is guaranteed to be published **at least once** — and idempotent consumers handle the rare duplicate. No distributed transaction required.
+</Define>
+
+<Define term="gRPC" since="gRPC & Service-to-Service Communication (Part 2)">
+**gRPC** is a schema-first, high-performance RPC framework that runs over HTTP/2 and uses Protocol Buffers (protobuf) for serialisation. You define the service contract in a `.proto` file; code generation produces type-safe client and server stubs. Service-to-service calls use gRPC because it is faster than JSON/REST, gives you generated types on both sides, and carries deadlines and cancellation automatically over the wire. Meridian's internal services call the payments service over gRPC; the public edge uses HTTP/JSON.
+</Define>
+
+<Define term="Watermill" since="Watermill — Event-Driven Go in Practice (Part 3)">
+**Watermill** is a Go messaging library that decouples your application logic from the broker. You write `Publisher` and `Subscriber` interfaces; Watermill supplies implementations for Kafka, RabbitMQ, in-memory channels, and others. You swap the backend by changing one line of wiring — the router, middleware, and handler code stay the same. In this service, Watermill's Kafka publisher is what the outbox relay calls to push events; the `GoChannel` publisher is used in tests, giving identical logic without a real broker.
+</Define>
+
+---
+
+## Domain & Money
+
+Before a single byte hits a database, we model the domain. Get this wrong and every layer built on top is lies. Get it right and the compiler enforces the invariants that keep your users from losing money. *(Representing Money — Never Use Floats; Double-Entry Ledgers — Part 3)*
+
+**On the job:** a domain model with floating-point money or mutable `Transaction` values will produce balance discrepancies that appear only at scale — intermittent, hard to reproduce, and career-limiting to explain to a regulator.
+
+**The project layout.** Here is what we're building toward:
+
+```
+cmd/
+  server/         main.go — wires everything, starts gRPC + HTTP
+internal/
+  domain/         Money, Account, Transaction, Entry (pure domain, zero deps)
+  repository/     Postgres-backed store (interface + pgx impl)
+  usecase/        TransferUseCase — the idempotent transfer orchestrator
+  grpcapi/        gRPC server implementation + proto
+  httpapi/        HTTP/JSON edge + middleware
+  messaging/      Watermill router, outbox relay, ledger-projection consumer
+  observability/  slog setup, Prometheus metrics
+  ratelimit/      per-account token-bucket limiter
+migrations/       .sql files managed by golang-migrate
+```
+
+**Why `internal/domain` has zero deps.** The domain package imports nothing outside the standard library. No database drivers. No gRPC. No Kafka. Pure Go types and pure invariants. The outside world adapts to the domain — not the other way around. That's ports-and-adapters (Software Design & Architecture — Part 1) enforced at the package boundary by the Go toolchain itself.
+
+### Money: integer cents, never float
+
+<Define term="Money as Integer Cents" since="Representing Money — Never Use Floats (Part 3)">
+A `float64` cannot exactly represent most decimal fractions. `0.1 + 0.2` in floating-point is `0.30000000000000004` — not `0.30`. In a ledger, rounding errors **accumulate across millions of transactions** and your books no longer balance. The fix is simple: store money as an **integer count of the smallest currency unit** (`int64` cents for USD, pence for GBP, etc.). `$10.50` is stored as `1050`. There is no rounding; there is no approximation. Integer arithmetic is exact. Every monetary value in Meridian is an `int64` count of cents. Not once, not ever, a float.
+</Define>
+
+The rule from Representing Money — Never Use Floats (Part 3), enforced forever:
+
+```go
+// internal/domain/money.go
+
+// Money is an immutable value type representing an amount in the smallest
+// unit of a currency (e.g. USD cents, EUR cents, GBP pence).
+// It is ALWAYS stored as an integer. Never a float. Not once. Never.
+type Money struct {
+	Amount   int64  // e.g. 1050 for $10.50
+	Currency string // ISO 4217, e.g. "USD"
+}
+
+// Add returns a new Money summing m and other.
+// Panics on currency mismatch — callers must enforce homogeneity upstream.
+func (m Money) Add(other Money) Money {
+	if m.Currency != other.Currency {
+		panic("currency mismatch: " + m.Currency + " vs " + other.Currency)
+	}
+	return Money{Amount: m.Amount + other.Amount, Currency: m.Currency}
+}
+
+// Negate returns the additive inverse (for double-entry credit/debit pairs).
+func (m Money) Negate() Money {
+	return Money{Amount: -m.Amount, Currency: m.Currency}
+}
+
+// IsZero reports whether the amount is exactly zero.
+func (m Money) IsZero() bool { return m.Amount == 0 }
+
+// String formats for display only — never parse this back to Money.
+func (m Money) String() string {
+	abs := m.Amount
+	if abs < 0 {
+		abs = -abs
+	}
+	sign := ""
+	if m.Amount < 0 {
+		sign = "-"
+	}
+	return fmt.Sprintf("%s%s %d.%02d", sign, m.Currency, abs/100, abs%100)
+}
+```
+
+<Callout kind="warn" title="Money.String() is display only">
+Never parse `Money.String()` back to a `Money` value. That path runs through string formatting and loses precision. Persist `Amount int64` and `Currency string` in the database directly. Display the formatted string only in logs and UI.
+</Callout>
+
+### Account
+
+```go
+// internal/domain/account.go
+
+// AccountID is a typed string so "account-123" can never be passed
+// where a TransactionID is expected. Phantom types are free in Go.
+type AccountID string
+
+// Account holds balances across currencies.
+// The authoritative balance always comes from summing ledger entries —
+// this struct is a read-model for display, never the source of truth.
+type Account struct {
+	ID       AccountID
+	Name     string
+	Balances map[string]Money // currency → balance
+}
+```
+
+### Transaction and Entry: the double-entry invariant
+
+This is the heart. A `Transaction` contains two or more `Entry` values. The invariant: **every transaction must sum to zero**. A debit of $100 from account A creates an equal and opposite credit of $100 to account B. The books always balance. (Double-Entry Ledgers — Part 3)
+
+```go
+// internal/domain/ledger.go
+
+type EntryID      string
+type TransactionID string
+
+// EntryType distinguishes debits from credits.
+type EntryType string
+
+const (
+	Debit  EntryType = "debit"
+	Credit EntryType = "credit"
+)
+
+// Entry is one side of a double-entry posting.
+type Entry struct {
+	ID            EntryID
+	TransactionID TransactionID
+	AccountID     AccountID
+	Type          EntryType
+	Amount        Money
+	CreatedAt     time.Time
+}
+
+// Transaction is an atomic, balanced double-entry posting.
+// Construct only via NewTransaction to enforce the balance invariant.
+type Transaction struct {
+	ID        TransactionID
+	Entries   []Entry
+	Memo      string
+	CreatedAt time.Time
+}
+
+// ErrUnbalanced is returned when a transaction does not sum to zero.
+var ErrUnbalanced = errors.New("transaction entries do not sum to zero")
+
+// NewTransaction validates and creates a Transaction.
+// It enforces the double-entry invariant: all entries must sum to zero
+// when debits are positive and credits are negative.
+func NewTransaction(id TransactionID, memo string, entries []Entry) (Transaction, error) {
+	if len(entries) < 2 {
+		return Transaction{}, errors.New("a transaction requires at least two entries")
+	}
+	byCurrency := make(map[string]int64)
+	for _, e := range entries {
+		switch e.Type {
+		case Debit:
+			byCurrency[e.Amount.Currency] += e.Amount.Amount
+		case Credit:
+			byCurrency[e.Amount.Currency] -= e.Amount.Amount
+		default:
+			return Transaction{}, fmt.Errorf("unknown entry type: %s", e.Type)
+		}
+	}
+	for cur, sum := range byCurrency {
+		if sum != 0 {
+			return Transaction{}, fmt.Errorf("%w: %s imbalance %d", ErrUnbalanced, cur, sum)
+		}
+	}
+	return Transaction{
+		ID:        id,
+		Entries:   entries,
+		Memo:      memo,
+		CreatedAt: time.Now().UTC(),
+	}, nil
+}
+```
+
+Now animate a transfer posting — two entries, two accounts, the invariant holding:
+
+<ExecTimeline
+  title="A $50.00 transfer posting as a balanced Transaction"
+  lanes={[
+    { id: "tx", label: "NewTransaction()" },
+    { id: "acc_a", label: "Account A (sender)" },
+    { id: "acc_b", label: "Account B (receiver)" }
+  ]}
+  steps={[
+    { lane: "tx", kind: "run", label: "build entries slice", note: "Two entries prepared: a Debit of 5000 cents from Account A, and a Credit of 5000 cents to Account B." },
+    { lane: "acc_a", kind: "send", label: "Debit 5000 cents", note: "Entry 1: Debit $50.00 from Account A. Amount is positive in the sum-to-zero check." },
+    { lane: "acc_b", kind: "recv", label: "Credit 5000 cents", note: "Entry 2: Credit $50.00 to Account B. Amount is negative in the sum-to-zero check." },
+    { lane: "tx", kind: "run", label: "sum check: 5000 - 5000 = 0", note: "NewTransaction iterates entries, accumulates signed amounts per currency. USD sum is zero." },
+    { lane: "tx", kind: "done", label: "Transaction sealed", note: "Invariant satisfied. The Transaction is returned. No path exists to create an unbalanced posting." }
+  ]}
+  caption="The invariant is enforced at construction time — an unbalanced Transaction value literally cannot be created."
+/>
+
+<UnderTheHood title="Why enforce at construction, not at persistence?">
+
+You could check the balance invariant in the repository layer — right before the `INSERT`. Many systems do. But that means every layer *above* the repository can hold an unbalanced `Transaction` in memory and believe it's valid. A function returns it; another function passes it; a bug upstream creates an imbalance that isn't caught until the database call, buried under a stack trace.
+
+Enforcing in `NewTransaction` makes an unbalanced transaction **unrepresentable as a Go value**. You cannot have one. The type system closes the hole. This is the "make illegal states unrepresentable" principle from functional programming, and Go's value types make it cheap. The repository's job shrinks to *persisting* the invariant, not *discovering* its violation.
+
+As of Go 1.26, there's no compiler-level dependent typing, so `NewTransaction` returning `error` is the idiomatic gate. The key is that the public `Transaction` type has no exported constructor other than `NewTransaction` — outside the `domain` package, there's no way to build one without passing the check.
+
+</UnderTheHood>
+
+Here is the self-contained, runnable core — `Money`, balanced `Transaction`, and an in-memory idempotent transfer. This is the heart of the whole system, stdlib only, runnable right now:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// ── Money ──────────────────────────────────────────────────────────────────
+
+type Money struct {
+	Amount   int64
+	Currency string
+}
+
+func USD(cents int64) Money { return Money{Amount: cents, Currency: "USD"} }
+
+func (m Money) Add(other Money) Money {
+	if m.Currency != other.Currency {
+		panic("currency mismatch")
+	}
+	return Money{Amount: m.Amount + other.Amount, Currency: m.Currency}
+}
+
+func (m Money) Negate() Money { return Money{Amount: -m.Amount, Currency: m.Currency} }
+func (m Money) IsZero() bool  { return m.Amount == 0 }
+
+func (m Money) String() string {
+	abs := m.Amount
+	if abs < 0 {
+		abs = -abs
+	}
+	sign := ""
+	if m.Amount < 0 {
+		sign = "-"
+	}
+	return fmt.Sprintf("%sUSD %d.%02d", sign, abs/100, abs%100)
+}
+
+// ── Domain types ──────────────────────────────────────────────────────────
+
+type AccountID      string
+type TransactionID  string
+type EntryType      string
+
+const (
+	Debit  EntryType = "debit"
+	Credit EntryType = "credit"
+)
+
+type Entry struct {
+	AccountID AccountID
+	Type      EntryType
+	Amount    Money
+}
+
+type Transaction struct {
+	ID      TransactionID
+	Entries []Entry
+	Memo    string
+	At      time.Time
+}
+
+var ErrUnbalanced = errors.New("transaction does not sum to zero")
+
+func NewTransaction(id TransactionID, memo string, entries []Entry) (Transaction, error) {
+	if len(entries) < 2 {
+		return Transaction{}, errors.New("need at least two entries")
+	}
+	var sum int64
+	cur := entries[0].Amount.Currency
+	for _, e := range entries {
+		if e.Amount.Currency != cur {
+			return Transaction{}, errors.New("mixed currencies in one transaction")
+		}
+		switch e.Type {
+		case Debit:
+			sum += e.Amount.Amount
+		case Credit:
+			sum -= e.Amount.Amount
+		}
+	}
+	if sum != 0 {
+		return Transaction{}, fmt.Errorf("%w: residual %d", ErrUnbalanced, sum)
+	}
+	return Transaction{ID: id, Entries: entries, Memo: memo, At: time.Now().UTC()}, nil
+}
+
+// ── In-memory idempotent ledger ───────────────────────────────────────────
+
+type Ledger struct {
+	mu       sync.Mutex
+	balances map[AccountID]int64
+	seen     map[string]struct{} // idempotency keys
+	txns     []Transaction
+}
+
+func NewLedger(accounts map[AccountID]int64) *Ledger {
+	bal := make(map[AccountID]int64, len(accounts))
+	for id, v := range accounts {
+		bal[id] = v
+	}
+	return &Ledger{balances: bal, seen: make(map[string]struct{})}
+}
+
+// Transfer posts a balanced double-entry transaction.
+// idempotencyKey makes repeat calls a no-op.
+func (l *Ledger) Transfer(ikey string, from, to AccountID, amount Money) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if _, dup := l.seen[ikey]; dup {
+		return nil // already applied — idempotent
+	}
+	entries := []Entry{
+		{AccountID: from, Type: Debit, Amount: amount},
+		{AccountID: to, Type: Credit, Amount: amount},
+	}
+	tx, err := NewTransaction(TransactionID(ikey), "transfer", entries)
+	if err != nil {
+		return err
+	}
+	// Apply atomically: debit sender, credit receiver.
+	if l.balances[from] < amount.Amount {
+		return fmt.Errorf("insufficient funds: %s has %d cents", from, l.balances[from])
+	}
+	l.balances[from] -= amount.Amount
+	l.balances[to] += amount.Amount
+	l.txns = append(l.txns, tx)
+	l.seen[ikey] = struct{}{}
+	return nil
+}
+
+// TotalAssets sums all balances — must equal the initial total always.
+func (l *Ledger) TotalAssets() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var total int64
+	for _, b := range l.balances {
+		total += b
+	}
+	return total
+}
+
+// ── Race test: N concurrent transfers, books must balance ─────────────────
+
+func main() {
+	const (
+		initialAlice = int64(100_000) // $1,000.00
+		initialBob   = int64(100_000)
+		transfers    = 200
+		amountCents  = int64(100) // $1.00
+	)
+
+	ledger := NewLedger(map[AccountID]int64{
+		"alice": initialAlice,
+		"bob":   initialBob,
+	})
+	startTotal := ledger.TotalAssets()
+
+	// wg.Go is new in Go 1.25: spawns a goroutine and calls wg.Add(1) atomically.
+	// The loop variable capture is safe since Go 1.22 (each iteration gets its own i).
+	var wg sync.WaitGroup
+	for i := range transfers {
+		wg.Go(func() {
+			key := fmt.Sprintf("alice-to-bob-%d", i)
+			if err := ledger.Transfer(key, "alice", "bob", USD(amountCents)); err != nil {
+				// Insufficient funds is expected when racing — not a bug.
+				_ = err
+			}
+		})
+		wg.Go(func() {
+			key := fmt.Sprintf("bob-to-alice-%d", i)
+			if err := ledger.Transfer(key, "bob", "alice", USD(amountCents)); err != nil {
+				_ = err
+			}
+		})
+	}
+	wg.Wait()
+
+	endTotal := ledger.TotalAssets()
+	if endTotal != startTotal {
+		fmt.Printf("INVARIANT VIOLATED: started %d cents, ended %d cents\n",
+			startTotal, endTotal)
+		return
+	}
+	fmt.Printf("All %d concurrent transfers completed.\n", transfers*2)
+	fmt.Printf("Total assets: %d cents (unchanged from %d). Books balance.\n",
+		endTotal, startTotal)
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question="Why does NewTransaction return an error rather than panic on an unbalanced input?"
+  options={[
+    "Panics are forbidden in Go",
+    "An unbalanced posting is a caller error that can happen legitimately (e.g. bad input from an API) — it should surface as a handled error, not crash the process",
+    "The error is cheaper to allocate than a panic",
+    "The Go spec requires error returns on all constructor functions"
+  ]}
+  answer={1}
+  explain="A panic is appropriate for programming errors that should never happen. An unbalanced transaction from untrusted input (a malformed API request, a bug in a caller) is an expected failure path. Returning error keeps the caller in control and keeps the service running."
+/>
+
+## Storage & Transactions
+
+The domain is pure. Now we wire it to Postgres — with the concurrency safety that real money requires. *(SQL & Databases in Go — Part 1; Transactions, Consistency & Sagas — Part 3)*
+
+### The repository interface
+
+The domain drives the interface. The database adapts to it.
+
+```go
+// internal/repository/repository.go
+
+// LedgerRepository is the port the domain talks to.
+// The pgx implementation is one adapter; a fake is another — for tests.
+type LedgerRepository interface {
+	// CreateAccount opens a new account with a given starting balance.
+	CreateAccount(ctx context.Context, id AccountID, name string, opening Money) error
+
+	// GetAccount returns the account, locking the row for update if forUpdate is true.
+	// Use forUpdate=true inside a transfer transaction to prevent lost updates.
+	GetAccount(ctx context.Context, tx pgx.Tx, id AccountID, forUpdate bool) (Account, error)
+
+	// PostTransaction persists a balanced Transaction and all its Entries atomically.
+	// The pgx.Tx must be passed in — the use case owns the transaction boundary.
+	PostTransaction(ctx context.Context, tx pgx.Tx, t Transaction) error
+
+	// BeginTx starts a serializable transaction.
+	BeginTx(ctx context.Context) (pgx.Tx, error)
+
+	// MarkIdempotencyKey records that the key has been processed.
+	// Returns ErrDuplicate if the key was already recorded.
+	MarkIdempotencyKey(ctx context.Context, tx pgx.Tx, key string) error
+
+	// GetBalance returns the current balance for an account by summing entries.
+	// This is the authoritative balance — never trust a cached column alone.
+	GetBalance(ctx context.Context, id AccountID) (Money, error)
+}
+
+// ErrDuplicate is returned by MarkIdempotencyKey for known keys.
+var ErrDuplicate = errors.New("duplicate idempotency key")
+```
+
+### SELECT FOR UPDATE: the concurrent-transfer safety net
+
+<Define term="Pessimistic Locking / SELECT FOR UPDATE" since="Transactions, Consistency & Sagas (Part 3)">
+**Pessimistic locking** assumes conflict is likely and acquires a lock *before* reading the data. In Postgres, `SELECT ... FOR UPDATE` locks the selected rows for the duration of the enclosing transaction: any other transaction that tries to `SELECT ... FOR UPDATE` the same rows must wait. The alternative — **optimistic locking** — reads without a lock and checks at write time whether a concurrent writer changed the data (via a version counter), retrying on conflict. For Meridian's transfers we use pessimistic locking: two transfers on the same account are a guaranteed conflict, and the retry cost of optimistic locking is higher than the wait cost of a short row lock.
+
+**On the job:** a missing lock here causes a **lost update** — two goroutines read the same stale balance, both decide the sender has enough funds, and both debit. The account goes negative. Real money is lost.
+</Define>
+
+Two transfers hitting the same account simultaneously is the classic fintech race. Thread A reads the balance, Thread B reads the balance, both compute the new balance from the stale read, and one transfer disappears. `SELECT ... FOR UPDATE` prevents it: the first transaction locks the row; the second blocks until the first commits or rolls back. (Transactions, Consistency & Sagas — Part 3)
+
+```go
+// internal/repository/postgres.go (excerpt)
+
+func (r *pgxRepo) GetAccount(
+	ctx context.Context,
+	tx pgx.Tx,
+	id AccountID,
+	forUpdate bool,
+) (Account, error) {
+	q := `SELECT id, name FROM accounts WHERE id = $1`
+	if forUpdate {
+		q += ` FOR UPDATE` // locks this row for the duration of tx
+	}
+	var acc Account
+	row := tx.QueryRow(ctx, q, string(id))
+	if err := row.Scan(&acc.ID, &acc.Name); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Account{}, fmt.Errorf("account %s: %w", id, ErrNotFound)
+		}
+		return Account{}, fmt.Errorf("GetAccount: %w", err)
+	}
+	return acc, nil
+}
+```
+
+<ExecTimeline
+  title="Two concurrent transfers on Account A — SELECT FOR UPDATE serializes them"
+  lanes={[
+    { id: "tx1", label: "Transfer 1 (goroutine)" },
+    { id: "tx2", label: "Transfer 2 (goroutine)" },
+    { id: "db",  label: "Postgres row lock" }
+  ]}
+  steps={[
+    { lane: "tx1", kind: "run",   label: "BEGIN + SELECT FOR UPDATE", note: "Transfer 1 opens a transaction and immediately locks Account A's row. Postgres grants it." },
+    { lane: "tx2", kind: "spawn", label: "BEGIN (concurrent)",        note: "Transfer 2 starts in a separate goroutine at the same time." },
+    { lane: "tx2", kind: "block", label: "SELECT FOR UPDATE — blocks", note: "Transfer 2 requests the same row lock. Postgres blocks it — it must wait for tx1 to finish." },
+    { lane: "tx1", kind: "run",   label: "check balance + UPDATE",   note: "Transfer 1 reads a fresh, locked balance, validates funds, and updates the row. No stale read." },
+    { lane: "tx1", kind: "done",  label: "COMMIT → lock released",   note: "Transfer 1 commits. The row lock is released atomically with the commit." },
+    { lane: "tx2", kind: "run",   label: "lock acquired, re-reads",  note: "Transfer 2 now holds the lock and reads the post-commit balance — guaranteed fresh." },
+    { lane: "tx2", kind: "done",  label: "COMMIT",                   note: "Transfer 2 commits against the already-updated balance. No lost update possible." }
+  ]}
+  caption="SELECT FOR UPDATE turns a concurrent race into a serialized queue. Slower, but never wrong."
+/>
+
+### Migrations
+
+Schema lives in `migrations/`. Use `golang-migrate` or `goose` to apply them:
+
+```go
+// migrations/000001_create_accounts.up.sql
+CREATE TABLE accounts (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    currency    TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- migrations/000002_create_entries.up.sql
+CREATE TABLE transactions (
+    id          TEXT PRIMARY KEY,
+    memo        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE entries (
+    id              TEXT PRIMARY KEY,
+    transaction_id  TEXT NOT NULL REFERENCES transactions(id),
+    account_id      TEXT NOT NULL REFERENCES accounts(id),
+    type            TEXT NOT NULL CHECK (type IN ('debit','credit')),
+    amount_cents    BIGINT NOT NULL,
+    currency        TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- migrations/000003_create_idempotency_keys.up.sql
+CREATE TABLE idempotency_keys (
+    key         TEXT PRIMARY KEY,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+<QuickCheck
+  question="Why does the transfer use case pass pgx.Tx into GetAccount rather than having the repository manage its own connection?"
+  options={[
+    "pgx.Tx is faster than a bare connection",
+    "The use case owns the transaction boundary — it must ensure the lock, balance check, and entry insert happen in ONE atomic transaction",
+    "It avoids connection pool exhaustion",
+    "The repository interface requires it by convention"
+  ]}
+  answer={1}
+  explain="If the repository managed its own connection, each call would get a different connection — the SELECT FOR UPDATE lock and the UPDATE would not be in the same transaction, so the lock would be useless. The use case passes the transaction in precisely so all operations are atomic."
+/>
+
+## The Transfer Use Case
+
+The use case is where business rules live. It owns the transaction boundary and orchestrates: idempotency check → lock accounts → validate funds → post double-entry → write outbox event. All in one DB transaction. If anything fails, Postgres rolls back — nothing is partially applied. *(Idempotency & Exactly-Once Semantics, Auditability & Compliance — Part 3)*
+
+<Define term="Saga / Compensating Action" since="Transactions, Consistency & Sagas (Part 3)">
+A **saga** is a sequence of local transactions where each step is individually committed. If a later step fails, you undo the earlier steps by running **compensating actions** — inverse operations (e.g. if step 2 of a cross-border payment fails after step 1 debited the sender, a compensating action re-credits the sender). Sagas are used when a single atomic DB transaction cannot span the whole operation (e.g. when two services each own their own database). Meridian's single-service transfer fits inside one Postgres transaction and does not need a saga — but if the transfer involved an external payment rail, each leg would be a separate saga step with a compensating action ready to fire on failure.
+</Define>
+
+```go
+// internal/usecase/transfer.go
+
+type TransferRequest struct {
+	IdempotencyKey string
+	FromAccount    AccountID
+	ToAccount      AccountID
+	Amount         Money
+	Memo           string
+}
+
+type TransferResult struct {
+	TransactionID TransactionID
+	Duplicate     bool // true if the key was already processed
+}
+
+type TransferUseCase struct {
+	repo   LedgerRepository
+	outbox OutboxWriter
+	log    *slog.Logger
+}
+
+func NewTransferUseCase(repo LedgerRepository, outbox OutboxWriter, log *slog.Logger) *TransferUseCase {
+	return &TransferUseCase{repo: repo, outbox: outbox, log: log}
+}
+
+// Execute runs a single idempotent transfer.
+// It is safe to call concurrently and safe to retry with the same IdempotencyKey.
+func (uc *TransferUseCase) Execute(ctx context.Context, req TransferRequest) (TransferResult, error) {
+	dbTx, err := uc.repo.BeginTx(ctx)
+	if err != nil {
+		return TransferResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		// Rollback is a no-op after commit. Always safe to defer.
+		if rb := dbTx.Rollback(ctx); rb != nil && !errors.Is(rb, pgx.ErrTxClosed) {
+			uc.log.ErrorContext(ctx, "rollback failed", "err", rb)
+		}
+	}()
+
+	// 1. Idempotency: record the key atomically. Returns ErrDuplicate if seen before.
+	if err := uc.repo.MarkIdempotencyKey(ctx, dbTx, req.IdempotencyKey); err != nil {
+		if errors.Is(err, ErrDuplicate) {
+			if err2 := dbTx.Commit(ctx); err2 != nil {
+				return TransferResult{}, fmt.Errorf("commit (dup): %w", err2)
+			}
+			return TransferResult{Duplicate: true}, nil
+		}
+		return TransferResult{}, fmt.Errorf("idempotency key: %w", err)
+	}
+
+	// 2. Lock both accounts (always in a deterministic order to avoid deadlocks).
+	ids := []AccountID{req.FromAccount, req.ToAccount}
+	if req.FromAccount > req.ToAccount {
+		ids[0], ids[1] = ids[1], ids[0]
+	}
+	for _, id := range ids {
+		if _, err := uc.repo.GetAccount(ctx, dbTx, id, true /*forUpdate*/); err != nil {
+			return TransferResult{}, fmt.Errorf("lock account %s: %w", id, err)
+		}
+	}
+
+	// 3. Validate funds (by summing entries — authoritative balance).
+	senderBal, err := uc.repo.GetBalance(ctx, req.FromAccount)
+	if err != nil {
+		return TransferResult{}, fmt.Errorf("get balance: %w", err)
+	}
+	if senderBal.Amount < req.Amount.Amount {
+		return TransferResult{}, fmt.Errorf("insufficient funds: have %s, need %s",
+			senderBal, req.Amount)
+	}
+
+	// 4. Build and validate the double-entry transaction.
+	txID := TransactionID("txn-" + req.IdempotencyKey)
+	entries := []Entry{
+		{AccountID: req.FromAccount, Type: Debit, Amount: req.Amount},
+		{AccountID: req.ToAccount, Type: Credit, Amount: req.Amount},
+	}
+	tx, err := NewTransaction(txID, req.Memo, entries)
+	if err != nil {
+		return TransferResult{}, fmt.Errorf("build transaction: %w", err)
+	}
+
+	// 5. Persist the transaction and entries.
+	if err := uc.repo.PostTransaction(ctx, dbTx, tx); err != nil {
+		return TransferResult{}, fmt.Errorf("post transaction: %w", err)
+	}
+
+	// 6. Write the outbox event (same DB transaction — guaranteed at-least-once delivery).
+	if err := uc.outbox.Write(ctx, dbTx, OutboxEvent{
+		Topic:   "transfer.completed",
+		Payload: req, // serialized to JSON by the OutboxWriter
+	}); err != nil {
+		return TransferResult{}, fmt.Errorf("outbox: %w", err)
+	}
+
+	// 7. Commit. If this fails, the client retries with the same idempotency key — safe.
+	if err := dbTx.Commit(ctx); err != nil {
+		return TransferResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	uc.log.InfoContext(ctx, "transfer committed",
+		"transaction_id", txID,
+		"from", req.FromAccount,
+		"to", req.ToAccount,
+		"amount", req.Amount,
+	)
+	return TransferResult{TransactionID: txID}, nil
+}
+```
+
+<Callout kind="pro" title="Always acquire locks in a deterministic order">
+When two goroutines each try to lock accounts A then B, they can deadlock: goroutine 1 holds A, waits for B; goroutine 2 holds B, waits for A. Fix it by always acquiring in the same canonical order (e.g. alphabetical by account ID). Then two goroutines with the same pair always reach for the same first lock — one gets it, the other blocks cleanly. This is the classic "philosopher's fork" fix.
+</Callout>
+
+Animate the full transfer flowing through all six steps inside one DB transaction:
+
+<ExecTimeline
+  title="Execute(): one idempotent transfer through the use case"
+  lanes={[
+    { id: "uc",  label: "TransferUseCase" },
+    { id: "db",  label: "Postgres Tx" }
+  ]}
+  steps={[
+    { lane: "uc", kind: "run",  label: "BeginTx",              note: "Open a serializable Postgres transaction. All steps share this connection." },
+    { lane: "db", kind: "recv", label: "MarkIdempotencyKey",   note: "INSERT into idempotency_keys. Unique constraint catches duplicates and returns ErrDuplicate." },
+    { lane: "db", kind: "recv", label: "SELECT … FOR UPDATE",  note: "Lock both account rows in deterministic order. Concurrent transfers block here." },
+    { lane: "uc", kind: "run",  label: "validate funds",       note: "Sum entries to compute the authoritative sender balance. Reject if insufficient." },
+    { lane: "db", kind: "send", label: "PostTransaction",      note: "INSERT transaction row + two entry rows. NewTransaction already validated the balance invariant." },
+    { lane: "db", kind: "send", label: "outbox.Write",         note: "INSERT outbox row with transfer.completed payload — same transaction, guaranteed at-least-once." },
+    { lane: "db", kind: "done", label: "COMMIT",               note: "All six operations commit atomically. On failure anywhere, Postgres rolls back everything." }
+  ]}
+  caption="One DB transaction wraps all six steps. The outbox row commits with the transfer — or neither does."
+/>
+
+## gRPC + HTTP API
+
+The transfer use case is a pure Go function. Now we expose it: gRPC for service-to-service, HTTP/JSON for the edge. *(gRPC & Service-to-Service Communication — Part 2; Auth & API Design — Part 1; Context in Production — Part 2)*
+
+**On the job:** every service-to-service call in a payments system must carry a deadline. Without one, a slow downstream (a locked DB row, a network partition) blocks the caller's goroutine indefinitely — under a load spike, goroutines pile up, memory climbs, and the service falls over. The 5-second context deadline in `handleTransfer` is not a detail; it is structural safety.
+
+### The gRPC layer
+
+```go
+// internal/grpcapi/server.go (illustrative — non-runnable without proto gen)
+
+// TransferServiceServer implements the gRPC TransferService.
+// Protobuf definition lives in proto/transfer.proto; code generated by buf.
+type TransferServiceServer struct {
+	uc  *usecase.TransferUseCase
+	log *slog.Logger
+	pb.UnimplementedTransferServiceServer
+}
+
+func (s *TransferServiceServer) Transfer(
+	ctx context.Context,
+	req *pb.TransferRequest,
+) (*pb.TransferResponse, error) {
+	result, err := s.uc.Execute(ctx, usecase.TransferRequest{
+		IdempotencyKey: req.IdempotencyKey,
+		FromAccount:    domain.AccountID(req.FromAccountId),
+		ToAccount:      domain.AccountID(req.ToAccountId),
+		Amount:         domain.Money{Amount: req.AmountCents, Currency: req.Currency},
+		Memo:           req.Memo,
+	})
+	if err != nil {
+		s.log.ErrorContext(ctx, "transfer failed", "err", err, "key", req.IdempotencyKey)
+		// Map domain errors to gRPC status codes.
+		if errors.Is(err, domain.ErrInsufficientFunds) {
+			return nil, status.Errorf(codes.FailedPrecondition, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	return &pb.TransferResponse{
+		TransactionId: string(result.TransactionID),
+		Duplicate:     result.Duplicate,
+	}, nil
+}
+
+// authInterceptor validates a Bearer token on every RPC.
+// In production, verify a JWT signed by your auth service (Auth & API Design — Part 1).
+func authInterceptor(
+	ctx context.Context,
+	req any,
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (any, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok || len(md["authorization"]) == 0 {
+		return nil, status.Error(codes.Unauthenticated, "missing authorization")
+	}
+	// Verify token here in production.
+	return handler(ctx, req)
+}
+```
+
+### The HTTP/JSON edge
+
+```go
+// internal/httpapi/handler.go (illustrative — non-runnable)
+
+type transferRequest struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	FromAccount    string `json:"from_account"`
+	ToAccount      string `json:"to_account"`
+	AmountCents    int64  `json:"amount_cents"`
+	Currency       string `json:"currency"`
+	Memo           string `json:"memo"`
+}
+
+func (h *Handler) handleTransfer(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Enforce a per-request deadline so a slow DB never holds the connection forever.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var req transferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.IdempotencyKey == "" || req.AmountCents <= 0 {
+		http.Error(w, "idempotency_key and positive amount_cents required",
+			http.StatusBadRequest)
+		return
+	}
+
+	result, err := h.uc.Execute(ctx, usecase.TransferRequest{
+		IdempotencyKey: req.IdempotencyKey,
+		FromAccount:    domain.AccountID(req.FromAccount),
+		ToAccount:      domain.AccountID(req.ToAccount),
+		Amount:         domain.Money{Amount: req.AmountCents, Currency: req.Currency},
+		Memo:           req.Memo,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrInsufficientFunds) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if result.Duplicate {
+		w.WriteHeader(http.StatusOK) // idempotent repeat — 200, not 201
+	} else {
+		w.WriteHeader(http.StatusCreated)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"transaction_id": result.TransactionID,
+		"duplicate":      result.Duplicate,
+	})
+}
+```
+
+<UnderTheHood title="How context deadlines propagate across layers">
+
+When `handleTransfer` calls `context.WithTimeout(ctx, 5s)`, it derives a child context with a deadline. That child context flows into `uc.Execute`, then into `repo.BeginTx`, then into every `pgx` call inside the transaction. The pgx driver passes the context's deadline to Postgres as a query timeout. If the 5 seconds expires while the DB is waiting on a lock, Postgres cancels the query, pgx returns a context error, the use case returns, the HTTP handler writes a 503, and the goroutine is freed.
+
+Without that deadline: the handler goroutine can block indefinitely on the DB lock. Under a thundering herd or a slow Postgres, that is a goroutine leak and connection-pool drain — the exact failure mode covered in The context Package, In Depth (Part 1). Context deadlines are not nice-to-have. They are structural safety. `pgx/v5` propagates context cancellation to PostgreSQL's query cancellation path; exact termination latency depends on the driver, network, and server state.
+
+</UnderTheHood>
+
+## Async Events
+
+The transfer committed. Now the rest of the system needs to know. The outbox row we wrote in step 6 is the starting gun. A relay goroutine polls that table, publishes to Kafka via Watermill, and a ledger-projection consumer updates a read-model balance table. *(Watermill — Event-Driven Go in Practice; Event-Driven Architecture & Kafka; Messaging & Pub/Sub Foundations — Part 3)*
+
+**On the job:** the outbox relay's `SELECT ... FOR UPDATE SKIP LOCKED` is critical in a multi-replica deployment — without `SKIP LOCKED`, every relay instance tries to claim the same rows and they serialise on the lock, defeating horizontal scale. With `SKIP LOCKED`, each replica claims a non-overlapping set of rows and they publish in parallel.
+
+```go
+// internal/messaging/outbox_relay.go (illustrative — non-runnable)
+
+// OutboxRelay polls the outbox table and publishes pending events.
+// It runs as a background goroutine and shuts down cleanly on context cancellation.
+type OutboxRelay struct {
+	db        *pgxpool.Pool
+	publisher message.Publisher // Watermill Publisher (Kafka in prod, GoChannel in tests)
+	log       *slog.Logger
+}
+
+func (r *OutboxRelay) Run(ctx context.Context) error {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := r.flush(ctx); err != nil {
+				r.log.ErrorContext(ctx, "outbox flush failed", "err", err)
+				// Don't return — keep retrying. The event stays in the outbox.
+			}
+		}
+	}
+}
+
+func (r *OutboxRelay) flush(ctx context.Context) error {
+	rows, err := r.db.Query(ctx,
+		`SELECT id, topic, payload FROM outbox WHERE published_at IS NULL
+		 ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, topic string
+		var payload []byte
+		if err := rows.Scan(&id, &topic, &payload); err != nil {
+			return err
+		}
+		msg := message.NewMessage(id, payload)
+		if err := r.publisher.Publish(topic, msg); err != nil {
+			return fmt.Errorf("publish %s: %w", id, err)
+		}
+		if _, err := r.db.Exec(ctx,
+			`UPDATE outbox SET published_at = now() WHERE id = $1`, id); err != nil {
+			return fmt.Errorf("mark published %s: %w", id, err)
+		}
+	}
+	return rows.Err()
+}
+```
+
+```go
+// internal/messaging/ledger_projection.go (illustrative — non-runnable)
+
+// LedgerProjectionHandler consumes "transfer.completed" events and updates
+// a denormalized balance table for fast reads (CQRS read model).
+func LedgerProjectionHandler(
+	db *pgxpool.Pool,
+	log *slog.Logger,
+) message.HandlerFunc {
+	return func(msg *message.Message) ([]*message.Message, error) {
+		var evt struct {
+			FromAccount string `json:"FromAccount"`
+			ToAccount   string `json:"ToAccount"`
+			AmountCents int64  `json:"AmountCents"`
+			Currency    string `json:"Currency"`
+		}
+		if err := json.Unmarshal(msg.Payload, &evt); err != nil {
+			return nil, fmt.Errorf("unmarshal projection event: %w", err)
+		}
+		_, err := db.Exec(msg.Context(),
+			`INSERT INTO account_balances (account_id, currency, balance_cents)
+			 VALUES ($1, $3, -$2), ($4, $3, $2)
+			 ON CONFLICT (account_id, currency)
+			 DO UPDATE SET balance_cents = account_balances.balance_cents + EXCLUDED.balance_cents`,
+			evt.FromAccount, evt.AmountCents, evt.Currency, evt.ToAccount)
+		if err != nil {
+			return nil, fmt.Errorf("update projection: %w", err)
+		}
+		log.InfoContext(msg.Context(), "projection updated",
+			"from", evt.FromAccount, "to", evt.ToAccount, "cents", evt.AmountCents)
+		msg.Ack()
+		return nil, nil
+	}
+}
+```
+
+Animate the full end-to-end flow — from HTTP request to Kafka projection — so you can see all seven layers working together:
+
+<ExecTimeline
+  title="A transfer request traveling end to end through the system"
+  lanes={[
+    { id: "http",  label: "HTTP handler" },
+    { id: "uc",    label: "TransferUseCase" },
+    { id: "db",    label: "Postgres Tx" },
+    { id: "relay", label: "Outbox Relay" },
+    { id: "kafka", label: "Kafka / Watermill" }
+  ]}
+  steps={[
+    { lane: "http",  kind: "recv",  label: "POST /transfers",          note: "HTTP handler decodes the JSON body, validates idempotency_key and amount_cents, derives a 5s deadline context." },
+    { lane: "uc",    kind: "run",   label: "Execute(ctx, req)",         note: "Use case opens a Postgres transaction, marks the idempotency key, acquires account locks." },
+    { lane: "db",    kind: "recv",  label: "PostTransaction + outbox",  note: "Ledger entries and the outbox row are inserted in one atomic Postgres commit." },
+    { lane: "http",  kind: "send",  label: "201 Created",               note: "HTTP handler returns the transaction ID. The caller's request is done. Events are still in flight." },
+    { lane: "relay", kind: "run",   label: "flush() polls outbox",      note: "Outbox relay picks up the unpublished row within 200ms (SELECT FOR UPDATE SKIP LOCKED)." },
+    { lane: "kafka", kind: "recv",  label: "transfer.completed event",  note: "Watermill publishes to Kafka. The ledger-projection consumer picks it up from its partition." },
+    { lane: "kafka", kind: "done",  label: "projection updated",        note: "Consumer applies the balance delta to account_balances. Read model is eventually consistent." }
+  ]}
+  caption="HTTP response is synchronous and fast. The async event tail (steps 5–7) is decoupled and retryable."
+/>
+
+## Observability & Reliability
+
+A payment service nobody can debug is a liability. Observability and reliability hooks are not optional extras — they are the difference between a system you can operate and one you can only hope doesn't break. *(Observability: Telemetry & Acting On It — Part 2; Reliability Patterns — Part 2; Resilience & Correctness Under Load — Part 3)*
+
+### Structured logging with slog
+
+```go
+// internal/observability/logger.go
+
+func NewLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+		// ReplaceAttr strips the time key in tests so output is deterministic.
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{} // omit in structured mode; inject at the collector
+			}
+			return a
+		},
+	}))
+}
+```
+
+Every log line in the transfer path carries `transaction_id`, `from_account`, `to_account`, and `amount` as structured fields — never interpolated into the message string. That makes them filterable in Grafana Loki or any log aggregator without regex torture.
+
+### A Prometheus transfer counter
+
+```go
+// internal/observability/metrics.go
+
+var (
+	TransfersTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ledger_transfers_total",
+		Help: "Total number of transfer attempts by result.",
+	}, []string{"result"}) // labels: "ok", "duplicate", "insufficient_funds", "error"
+)
+```
+
+In the use case, after `Execute` returns:
+
+```go
+switch {
+case err != nil && errors.Is(err, domain.ErrInsufficientFunds):
+	observability.TransfersTotal.WithLabelValues("insufficient_funds").Inc()
+case err != nil:
+	observability.TransfersTotal.WithLabelValues("error").Inc()
+case result.Duplicate:
+	observability.TransfersTotal.WithLabelValues("duplicate").Inc()
+default:
+	observability.TransfersTotal.WithLabelValues("ok").Inc()
+}
+```
+
+### Per-account rate limiting
+
+```go
+// internal/ratelimit/limiter.go
+
+// AccountLimiter enforces a per-account token-bucket rate limit.
+// (Reliability Patterns — Part 2: token bucket, per-key limiting)
+type AccountLimiter struct {
+	mu      sync.Mutex
+	buckets map[AccountID]*rate.Limiter
+	r       rate.Limit // refill rate per second
+	burst   int        // max burst
+}
+
+func NewAccountLimiter(r rate.Limit, burst int) *AccountLimiter {
+	return &AccountLimiter{
+		buckets: make(map[AccountID]*rate.Limiter),
+		r:       r,
+		burst:   burst,
+	}
+}
+
+// Allow returns false if the account has exceeded its rate limit.
+func (l *AccountLimiter) Allow(id AccountID) bool {
+	l.mu.Lock()
+	lim, ok := l.buckets[id]
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.burst)
+		l.buckets[id] = lim
+	}
+	l.mu.Unlock()
+	return lim.Allow()
+}
+```
+
+### Graceful shutdown
+
+```go
+// cmd/server/main.go (excerpt)
+
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+// Start the gRPC server.
+go func() {
+	if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+		log.ErrorContext(ctx, "gRPC server error", "err", err)
+	}
+}()
+
+// Start the HTTP server.
+httpServer := &http.Server{Addr: ":8080", Handler: mux}
+go func() {
+	if err := httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.ErrorContext(ctx, "HTTP server error", "err", err)
+	}
+}()
+
+// Start the outbox relay.
+go func() {
+	if err := relay.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.ErrorContext(ctx, "outbox relay error", "err", err)
+	}
+}()
+
+// Block until signal.
+<-ctx.Done()
+log.InfoContext(context.Background(), "shutting down")
+
+// Drain in-flight requests (30s grace window).
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+grpcServer.GracefulStop()
+if err := httpServer.Shutdown(shutdownCtx); err != nil {
+	log.ErrorContext(shutdownCtx, "HTTP shutdown error", "err", err)
+}
+```
+
+## The Test Suite
+
+And now — *this* is what it was all building toward. Everything else in the service exists so that this test suite can be run and pass, under `-race`, every time. *(Testing in Go — Part 1; Test-Driven Development in Go — Part 1)*
+
+<Define term="Fuzz Test" since="Testing in Go (Part 1)">
+A **fuzz test** generates random inputs automatically to find cases that break your invariants — inputs you would never think to write by hand. You supply a seed corpus (a handful of representative values) and invariants (properties that must always hold). The fuzzer mutates the corpus, exercises your code under thousands of random variants, and reports any input that violates an invariant or causes a panic. In Meridian, fuzzing the `Money` type finds overflow conditions and sign-confusion bugs that a hand-written table test misses. Run with `go test -fuzz=FuzzName ./path/to/pkg`.
+</Define>
+
+<Define term="Race Detector" since="Testing in Go (Part 1), Advanced Concurrency & Correctness (Part 2)">
+The **race detector** (`go test -race`) instruments every memory load and store with shadow memory that records the last write (goroutine + logical clock). On a concurrent read, it checks whether the last write happened-before this read in Go's memory model. If not — the read and write are unsynchronised — it fires and prints both goroutine stacks. The detector catches real data races with negligible false-positive rate. Cost: 5–10x slower execution and 5–10x more memory — run it in CI, not production. It catches *races on memory*; the balance-invariant assertion catches *logical correctness bugs*. Both checks matter.
+</Define>
+
+### Table-driven unit tests for Money math
+
+```go
+// internal/domain/money_test.go
+
+func TestMoney_Add(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		a, b    Money
+		want    Money
+		wantPan bool
+	}{
+		{
+			name: "same currency adds",
+			a:    Money{Amount: 1000, Currency: "USD"},
+			b:    Money{Amount: 500, Currency: "USD"},
+			want: Money{Amount: 1500, Currency: "USD"},
+		},
+		{
+			name: "negative amounts (credit)",
+			a:    Money{Amount: -500, Currency: "USD"},
+			b:    Money{Amount: 1000, Currency: "USD"},
+			want: Money{Amount: 500, Currency: "USD"},
+		},
+		{
+			name:    "currency mismatch panics",
+			a:       Money{Amount: 100, Currency: "USD"},
+			b:       Money{Amount: 100, Currency: "EUR"},
+			wantPan: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.wantPan {
+				defer func() {
+					if r := recover(); r == nil {
+						t.Fatal("expected panic on currency mismatch")
+					}
+				}()
+			}
+			got := tc.a.Add(tc.b)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewTransaction_BalanceInvariant(t *testing.T) {
+	t.Parallel()
+	t.Run("balanced passes", func(t *testing.T) {
+		t.Parallel()
+		entries := []Entry{
+			{AccountID: "alice", Type: Debit, Amount: Money{Amount: 5000, Currency: "USD"}},
+			{AccountID: "bob", Type: Credit, Amount: Money{Amount: 5000, Currency: "USD"}},
+		}
+		if _, err := NewTransaction("txn-1", "test", entries); err != nil {
+			t.Fatalf("balanced transaction rejected: %v", err)
+		}
+	})
+	t.Run("unbalanced rejected", func(t *testing.T) {
+		t.Parallel()
+		entries := []Entry{
+			{AccountID: "alice", Type: Debit, Amount: Money{Amount: 5000, Currency: "USD"}},
+			{AccountID: "bob", Type: Credit, Amount: Money{Amount: 4999, Currency: "USD"}},
+		}
+		_, err := NewTransaction("txn-2", "oops", entries)
+		if !errors.Is(err, ErrUnbalanced) {
+			t.Fatalf("expected ErrUnbalanced, got %v", err)
+		}
+	})
+}
+```
+
+### Fuzz test for money math
+
+The fuzz test finds edge cases you'd never think to write — overflow on very large amounts, sign confusion, and the invariant that `Negate(Negate(m)) == m`.
+
+```go
+// internal/domain/money_fuzz_test.go
+
+// FuzzMoneyAddNegate verifies two core Money invariants under arbitrary inputs.
+// Run with: go test -fuzz=FuzzMoneyAddNegate ./internal/domain/
+func FuzzMoneyAddNegate(f *testing.F) {
+	// Seed corpus: typical amounts, edge cases.
+	f.Add(int64(0), int64(0))
+	f.Add(int64(100), int64(-100))
+	f.Add(int64(1_000_000_00), int64(-1_000_000_00))
+	f.Add(int64(math.MaxInt64/2), int64(-(math.MaxInt64/2)))
+
+	f.Fuzz(func(t *testing.T, a, b int64) {
+		m := Money{Amount: a, Currency: "USD"}
+		n := Money{Amount: b, Currency: "USD"}
+
+		// Invariant 1: addition is commutative.
+		if m.Add(n) != n.Add(m) {
+			t.Fatalf("add not commutative: %d + %d", a, b)
+		}
+
+		// Invariant 2: m.Add(m.Negate()) == zero.
+		if got := m.Add(m.Negate()); !got.IsZero() {
+			t.Fatalf("m + Negate(m) != 0: got %d", got.Amount)
+		}
+
+		// Invariant 3: double negation is identity.
+		if m.Negate().Negate() != m {
+			t.Fatalf("Negate(Negate(m)) != m for %d", a)
+		}
+
+		// Invariant 4: a balanced transaction with arbitrary amounts
+		// should always be accepted when amounts are equal.
+		entries := []Entry{
+			{AccountID: "a", Type: Debit, Amount: Money{Amount: a, Currency: "USD"}},
+			{AccountID: "b", Type: Credit, Amount: Money{Amount: a, Currency: "USD"}},
+		}
+		if _, err := NewTransaction("fuzz", "fuzz", entries); err != nil {
+			t.Fatalf("balanced transaction with amount %d rejected: %v", a, err)
+		}
+	})
+}
+```
+
+### The Race Test: N concurrent transfers, books must balance
+
+This is the one that matters. Fire N goroutines at the in-memory ledger simultaneously with `-race` on. When it finishes, assert:
+
+1. Total assets equal the initial total — no money created or destroyed.
+2. The race detector is silent — no data races.
+3. Every idempotency key is honored — duplicate calls are absorbed.
+
+```go
+// internal/domain/ledger_race_test.go
+
+func TestLedger_ConcurrentTransfers_BooksBalance(t *testing.T) {
+	t.Parallel()
+
+	const (
+		goroutines  = 100
+		perG        = 10
+		startAlice  = int64(500_000)
+		startBob    = int64(500_000)
+		amountCents = int64(100)
+	)
+
+	ledger := NewLedger(map[AccountID]int64{
+		"alice": startAlice,
+		"bob":   startBob,
+	})
+	startTotal := ledger.TotalAssets()
+
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perG {
+				// Half goroutines send alice→bob, half send bob→alice.
+				from, to := AccountID("alice"), AccountID("bob")
+				if g%2 == 0 {
+					from, to = "bob", "alice"
+				}
+				key := fmt.Sprintf("g%d-i%d", g, i)
+				// Retry on error (e.g. insufficient funds) with a fresh key is
+				// intentionally NOT done here — we want to observe that the
+				// books balance regardless of which transfers succeed or fail.
+				_ = ledger.Transfer(key, from, to, USD(amountCents))
+
+				// Fire the same key twice to verify idempotency.
+				_ = ledger.Transfer(key, from, to, USD(amountCents))
+			}
+		}()
+	}
+	wg.Wait()
+
+	endTotal := ledger.TotalAssets()
+	if endTotal != startTotal {
+		t.Fatalf(
+			"money created or destroyed: started %d cents, ended %d cents (delta %d)",
+			startTotal, endTotal, endTotal-startTotal,
+		)
+	}
+	t.Logf("concurrent race test passed: %d goroutines x %d transfers each, total assets stable at %d cents",
+		goroutines, perG, endTotal)
+}
+```
+
+Run it with `go test -race ./internal/domain/ -run TestLedger_ConcurrentTransfers_BooksBalance`. If the race detector fires, you have a real data race in your ledger. If total assets shift, you have money appearing from nowhere or vanishing — both are production-ending bugs.
+
+### httptest for the HTTP edge
+
+```go
+// internal/httpapi/handler_test.go
+
+func TestHandleTransfer_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	// Wire a real use case backed by an in-memory ledger — no DB needed.
+	ledger := domain.NewLedger(map[domain.AccountID]int64{"alice": 100_000, "bob": 0})
+	uc := &inMemoryTransferUseCase{ledger: ledger}
+	h := NewHandler(uc, slog.Default())
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /transfers", h.handleTransfer)
+
+	body := `{"idempotency_key":"key-1","from_account":"alice","to_account":"bob","amount_cents":1000,"currency":"USD"}`
+
+	// First request: 201 Created.
+	req1 := httptest.NewRequest(http.MethodPost, "/transfers", strings.NewReader(body))
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	mux.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("first request: want 201, got %d", rec1.Code)
+	}
+
+	// Second request — same idempotency key: 200 OK (duplicate absorbed).
+	req2 := httptest.NewRequest(http.MethodPost, "/transfers", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("duplicate request: want 200, got %d", rec2.Code)
+	}
+
+	// Balance check: alice should be down 1000 cents exactly once.
+	if got := ledger.TotalAssets(); got != 100_000 {
+		t.Fatalf("money created or destroyed: total %d != 100000", got)
+	}
+}
+```
+
+### Integration test sketch (testcontainers)
+
+For the DB layer, spin a real Postgres — not a mock — so the `SELECT ... FOR UPDATE` logic is actually tested:
+
+```go
+// internal/repository/integration_test.go
+//go:build integration
+
+func TestPostgresRepo_ConcurrentTransfers(t *testing.T) {
+	ctx := context.Background()
+
+	// Spin up Postgres via testcontainers-go.
+	container, err := testcontainers.GenericContainer(ctx,
+		testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Image:        "postgres:16-alpine",
+				Env:          map[string]string{"POSTGRES_PASSWORD": "test"},
+				ExposedPorts: []string{"5432/tcp"},
+				WaitingFor:   wait.ForListeningPort("5432/tcp"),
+			},
+			Started: true,
+		})
+	if err != nil {
+		t.Fatalf("start postgres: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Terminate(ctx) })
+
+	host, _ := container.Host(ctx)
+	port, _ := container.MappedPort(ctx, "5432")
+	dsn := fmt.Sprintf("postgres://postgres:test@%s:%s/postgres?sslmode=disable",
+		host, port.Port())
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Run migrations, seed accounts, fire concurrent transfers, assert balance.
+	// (Abbreviated — full version in the repo.)
+}
+```
+
+<UnderTheHood title="How the race detector actually works (Go 1.26)">
+
+`go test -race` instruments every memory load and store with shadow memory recording the last write (goroutine + logical clock). On a read, it checks whether the last write happened-before this read in the happens-before partial order defined by Go's memory model. If not — both the read and the write are concurrent and unsynchronized — the detector fires and prints both goroutine stacks.
+
+The detector uses ThreadSanitizer (TSan) under the hood, compiled into the binary. As of Go 1.26 it has negligible false-positive rate and catches real races reliably. The cost: 5–10x slower execution and 5–10x more memory. Run it in CI. Don't run it in production. The Ledger in our runnable example is protected by `sync.Mutex` — the race detector should be silent.
+
+One subtlety: the race detector catches *races on memory*, not *logical correctness bugs*. Two goroutines can serialize perfectly through a mutex and still produce a wrong result if the invariant logic is flawed. That's why the balance-invariant assertion in `TestLedger_ConcurrentTransfers_BooksBalance` matters independently of the race detector — they catch different classes of bug.
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Add a Split transfer" level="medium">
+
+Extend `NewTransaction` to accept a "split" — one debit from a sender, split across *N* credit entries (e.g. a $100 payment split to three vendors: $40, $35, $25). Ensure the invariant still holds. Write a table-driven test covering balanced splits, an unbalanced split (returns `ErrUnbalanced`), and a single-entry split (rejected — minimum two entries).
+
+<Solution>
+
+The invariant check in `NewTransaction` already handles N entries. No change to the function is needed — it sums all debits and credits by currency and requires zero. The only addition needed is making sure callers construct entries correctly:
+
+```go
+// A $100 split: one debit, three credits.
+entries := []Entry{
+    {AccountID: "payer",   Type: Debit,  Amount: USD(10000)},
+    {AccountID: "vendor1", Type: Credit, Amount: USD(4000)},
+    {AccountID: "vendor2", Type: Credit, Amount: USD(3500)},
+    {AccountID: "vendor3", Type: Credit, Amount: USD(2500)},
+}
+tx, err := NewTransaction("split-1", "three-way split", entries)
+// err == nil; 10000 - 4000 - 3500 - 2500 == 0.
+```
+
+For the test, add a case where credits sum to 9999 (off by one) and verify `errors.Is(err, ErrUnbalanced)`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Fuzz the idempotency key store" level="medium">
+
+Write a fuzz test for the in-memory `Ledger.Transfer` idempotency logic. The fuzz input is the idempotency key (a string). Invariant: calling `Transfer` with the same key twice and then checking total assets should always equal calling it once — regardless of how weird the key string is (empty, all whitespace, Unicode, very long).
+
+<Solution>
+
+```go
+func FuzzLedger_IdempotencyKey(f *testing.F) {
+	f.Add("normal-key-123")
+	f.Add("")
+	f.Add("   ")
+	f.Add("key\x00with\x00nulls")
+
+	f.Fuzz(func(t *testing.T, key string) {
+		ledger := NewLedger(map[AccountID]int64{"alice": 100_000, "bob": 0})
+		before := ledger.TotalAssets()
+
+		_ = ledger.Transfer(key, "alice", "bob", USD(100))
+		after1 := ledger.TotalAssets()
+
+		_ = ledger.Transfer(key, "alice", "bob", USD(100)) // duplicate
+		after2 := ledger.TotalAssets()
+
+		// Second call with same key must be a no-op.
+		if after1 != after2 {
+			t.Fatalf("idempotency violated: key=%q, after1=%d after2=%d",
+				key, after1, after2)
+		}
+		// Total assets never change.
+		if after2 != before {
+			t.Fatalf("money created or destroyed: key=%q, before=%d after=%d",
+				key, before, after2)
+		}
+	})
+}
+```
+
+Note: an empty string key is allowed by the ledger — the test verifies it's stable. A production service should reject empty idempotency keys at the HTTP layer.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Add a per-account rate limiter to the HTTP handler" level="medium">
+
+Wire the `AccountLimiter` from the Observability & Reliability section into `handleTransfer`. When the sender account exceeds 10 requests per second (burst 20), return HTTP 429 Too Many Requests. Write an `httptest`-based test that fires 25 rapid requests from the same account and asserts at least some are rate-limited.
+
+<Solution>
+
+```go
+func (h *Handler) handleTransfer(w http.ResponseWriter, r *http.Request) {
+	var req transferRequest
+	// ... decode as before ...
+
+	if !h.limiter.Allow(domain.AccountID(req.FromAccount)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+	// ... rest of handler ...
+}
+```
+
+In the test, create a `NewAccountLimiter(10, 20)` and fire 25 `httptest` requests without sleeping. Assert that at least one response has status 429.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="httptest: verify 422 on insufficient funds" level="easy">
+
+Using `httptest`, write a test for `handleTransfer` where the sender has a zero balance and the amount is positive. Assert the response status is 422 Unprocessable Entity and the body contains "insufficient funds".
+
+<Solution>
+
+```go
+func TestHandleTransfer_InsufficientFunds(t *testing.T) {
+	ledger := domain.NewLedger(map[domain.AccountID]int64{"alice": 0, "bob": 50000})
+	uc := &inMemoryTransferUseCase{ledger: ledger}
+	h := NewHandler(uc, slog.Default())
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /transfers", h.handleTransfer)
+
+	body := `{"idempotency_key":"broke","from_account":"alice","to_account":"bob","amount_cents":100,"currency":"USD"}`
+	req := httptest.NewRequest(http.MethodPost, "/transfers", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "insufficient") {
+		t.Fatalf("body should mention insufficient funds: %s", rec.Body.String())
+	}
+}
+```
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Reconciliation invariant (hard)" level="hard">
+
+Write a `Reconcile` function that takes the full slice of `Transaction` values from the ledger and returns an error if the sum of all `Debit` entries does not equal the sum of all `Credit` entries across the entire ledger history. Write a property-based test (table or fuzz) that constructs random sequences of balanced transactions and asserts `Reconcile` returns nil, then introduces one unbalanced entry and asserts it returns an error.
+
+<Solution>
+
+```go
+// Reconcile checks the entire ledger history for global balance.
+// Global invariant: sum(all debits) == sum(all credits).
+func Reconcile(txns []Transaction) error {
+	byCurrency := make(map[string]int64)
+	for _, tx := range txns {
+		for _, e := range tx.Entries {
+			switch e.Type {
+			case Debit:
+				byCurrency[e.Amount.Currency] += e.Amount.Amount
+			case Credit:
+				byCurrency[e.Amount.Currency] -= e.Amount.Amount
+			}
+		}
+	}
+	for cur, sum := range byCurrency {
+		if sum != 0 {
+			return fmt.Errorf("reconciliation failed: %s ledger imbalance %d cents", cur, sum)
+		}
+	}
+	return nil
+}
+```
+
+The trick: since `NewTransaction` enforces balance at creation, any `[]Transaction` built through the constructor will always reconcile. The test for the error path must *manually* build a `Transaction` with a tampered entry — bypassing `NewTransaction` — to simulate ledger corruption, which is the exact scenario reconciliation guards against.
+
+</Solution>
+
+</Exercise>
+
+---
+
+<Recap>
+
+You just built a production-quality payments and ledger service. Not a toy. Let me tell you what you actually did:
+
+- **Domain first.** `Money` as `int64` cents — never a float. `NewTransaction` enforcing the double-entry invariant at construction time, making an unbalanced posting unrepresentable.
+- **Ports-and-adapters.** `internal/domain` imports nothing outside stdlib. The outside world adapts to the domain.
+- **SELECT FOR UPDATE.** Concurrent transfers serialized by Postgres row locks, acquired in a deterministic order to prevent deadlock.
+- **One atomic DB transaction.** Idempotency key + account locks + entry posting + outbox event — all committed or all rolled back.
+- **The outbox pattern.** Guaranteed at-least-once event delivery without distributed transactions. The relay polls and publishes; Watermill routes to Kafka; the projection consumer updates the read model.
+- **gRPC + HTTP.** Service-to-service gRPC with auth interceptor and deadline propagation. HTTP/JSON edge with 5s per-request context timeout.
+- **slog + Prometheus + per-account rate limiting + graceful shutdown.** Every layer observable and resilient.
+- **The test suite.** Table-driven unit tests, a fuzz test finding invariant violations across arbitrary inputs, a concurrent race test asserting the books balance under 100 simultaneous goroutines with `-race` on, `httptest` for the HTTP edge, and a testcontainers integration sketch for the real DB.
+
+Sixty-three chapters. This is what they were for.
+
+</Recap>
+
+---
+
+## The Lab — Final Boss
+
+I've been waiting for this. You've been waiting for this. And I am going to enjoy watching you either *prove* you've earned it, or watch you scramble while the verifier fires every scenario I can think of — concurrently, under `-race`, with duplicate keys and edge-case amounts flying at your ledger like it's game day and I'm the visiting team.
+
+<Lab
+  title="The Ledger Gauntlet"
+  archetype="load"
+  difficulty="unscaffolded"
+  points={150}
+  hintCost={15}
+  verify="self-check"
+  objective="Complete the in-memory Ledger implementation so the self-check main prints PASS for all four conditions: (1) 500 concurrent goroutines fire transfers between 5 accounts and total assets are identical before and after — no money created, none destroyed; (2) every transfer fired twice with the same idempotency key is a no-op on the second call; (3) a transfer exceeding the sender's balance returns an error and leaves total assets unchanged; (4) the code runs clean under go run (no data races detectable via the mutex invariants the self-check exercises). To verify the race detector is truly silent, run your solution locally with: go run -race solution.go"
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+// Money is always integer cents. Never a float. Not negotiable.
+type Money struct {
+	Amount   int64
+	Currency string
+}
+
+func USD(cents int64) Money { return Money{cents, "USD"} }
+
+type AccountID string
+
+// Ledger is an in-memory double-entry ledger.
+// TODO: implement Transfer so all four self-check conditions pass.
+type Ledger struct {
+	mu       sync.Mutex
+	balances map[AccountID]int64
+	seen     map[string]struct{} // idempotency keys
+}
+
+func NewLedger(initial map[AccountID]int64) *Ledger {
+	bal := make(map[AccountID]int64, len(initial))
+	for k, v := range initial {
+		bal[k] = v
+	}
+	return &Ledger{balances: bal, seen: make(map[string]struct{})}
+}
+
+var ErrInsufficientFunds = errors.New("insufficient funds")
+
+// Transfer atomically moves amount from src to dst.
+// If key was already seen, it is a no-op (idempotent).
+// Must be safe for concurrent use.
+func (l *Ledger) Transfer(key string, src, dst AccountID, amount Money) error {
+	// TODO: implement me
+	return fmt.Errorf("not implemented")
+}
+
+// TotalAssets returns the sum of all balances (must never change across transfers).
+func (l *Ledger) TotalAssets() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var total int64
+	for _, b := range l.balances {
+		total += b
+	}
+	return total
+}
+
+// ── Self-check: do not modify below this line ─────────────────────────────
+
+func main() {
+	pass := true
+
+	// Check 1: concurrent transfers, books must balance.
+	ledger := NewLedger(map[AccountID]int64{
+		"a": 100_000, "b": 100_000, "c": 100_000, "d": 100_000, "e": 100_000,
+	})
+	startTotal := ledger.TotalAssets()
+	accounts := []AccountID{"a", "b", "c", "d", "e"}
+	var wg sync.WaitGroup
+	for g := range 500 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			src := accounts[g%5]
+			dst := accounts[(g+1)%5]
+			key := fmt.Sprintf("g%d", g)
+			_ = ledger.Transfer(key, src, dst, USD(100))
+			_ = ledger.Transfer(key, src, dst, USD(100)) // duplicate — must be no-op
+		}()
+	}
+	wg.Wait()
+	endTotal := ledger.TotalAssets()
+	if endTotal != startTotal {
+		fmt.Printf("FAIL check 1: money created or destroyed: started %d, ended %d\n", startTotal, endTotal)
+		pass = false
+	} else {
+		fmt.Println("PASS check 1: concurrent transfers — books balance")
+	}
+
+	// Check 2: idempotency — same key twice changes balance exactly once.
+	l2 := NewLedger(map[AccountID]int64{"alice": 10_000, "bob": 0})
+	before := l2.TotalAssets()
+	_ = l2.Transfer("idem-1", "alice", "bob", USD(500))
+	after1 := l2.TotalAssets()
+	_ = l2.Transfer("idem-1", "alice", "bob", USD(500))
+	after2 := l2.TotalAssets()
+	if after1 != before || after2 != before {
+		fmt.Println("FAIL check 2: idempotency violated")
+		pass = false
+	} else {
+		fmt.Println("PASS check 2: idempotency — second call is a no-op")
+	}
+
+	// Check 3: insufficient funds returns error, ledger unchanged.
+	l3 := NewLedger(map[AccountID]int64{"broke": 0, "rich": 50_000})
+	t3 := l3.TotalAssets()
+	err := l3.Transfer("nofunds", "broke", "rich", USD(100))
+	if err == nil {
+		fmt.Println("FAIL check 3: expected error on insufficient funds, got nil")
+		pass = false
+	} else if l3.TotalAssets() != t3 {
+		fmt.Println("FAIL check 3: ledger corrupted after insufficient-funds rejection")
+		pass = false
+	} else {
+		fmt.Println("PASS check 3: insufficient funds rejected, ledger intact")
+	}
+
+	if pass {
+		fmt.Println("ALL PASS — books balance, idempotency holds, rejections are clean.")
+		fmt.Println("Run with: go run -race solution.go  to confirm the race detector is silent.")
+	} else {
+		fmt.Println("FAIL — fix Transfer and run again.")
+	}
+}`}
+  verifier="Self-check: the starter's main() exercises all four conditions and prints PASS/FAIL for each. Correctness is visible without a hidden server-side test. For the race detector, run your finished file locally with go run -race solution.go — the mutex in your Transfer implementation must make it silent."
+  hints={[
+    "The entire Transfer body must run under l.mu.Lock(). Read the idempotency map, check balance, and update balance — all while holding the lock.",
+    "Check l.seen[key] first. If found, return nil immediately (idempotent no-op) — do NOT touch balances.",
+    "Check l.balances[src] >= amount.Amount before modifying anything. Return ErrInsufficientFunds immediately if not.",
+    "After passing both checks: subtract from src, add to dst, mark the key in l.seen. In that order. Under the lock the whole time."
+  ]}
+  flag="GO{books_balance_race_silent_money_never_lost}"
+>
+
+I've seen engineers with five years of fintech experience get this wrong — a stray unlock, a race on the idempotency map, an insufficient-funds check that still corrupts the balance. This is not a trick. It is the whole point of everything we built. The mutex, the idempotency check, the balance guard — three ideas, ten lines of code, the correctness of a payment system.
+
+500 goroutines. `-race`. Books must balance. Come find me when you've got the flag.
+
+</Lab>
+
+<Scoreboard
+  streak={12}
+  items={[
+    { label: "Quick check — NewTransaction error vs panic", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — why use case owns the pgx.Tx", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Split transfer + tests", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 2 — Fuzz idempotency key store", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3 — Per-account rate limiter in handler", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 4 — httptest: 422 on insufficient funds", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Reconciliation invariant (hard)", kind: "exercise", points: 30, done: false }
+  ]}
+  flag={{ label: "Lab — The Ledger Gauntlet (load, unscaffolded)", captured: false, points: 150 }}
+/>
+
+---
+
+Sixty-three chapters. Three parts. One language. You went from `fmt.Println("hello")` to a concurrent, idempotent, double-entry payment service with a fuzz test, a race test, and a Watermill-Kafka event pipeline — and the books balance. I taught you, which means it's flawless. You're welcome, sport. Now go build something the world actually needs.

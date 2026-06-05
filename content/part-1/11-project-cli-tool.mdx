@@ -1,0 +1,1636 @@
+---
+title: "Project: A Real CLI Tool"
+part: 1
+order: 11
+type: "project"
+description: "Build a CLI that exercises everything so far — flags, I/O, errors, concurrency — shipped with a real, runnable test suite."
+prerequisites: ["testing"]
+---
+
+<HeroCard label="Part 1 · Chapter 11" title="Project: A Real CLI Tool">
+
+You've absorbed eight chapters of Go. Syntax, structs, interfaces, error wrapping, goroutines, channels, testing. Impressive. For a student. Now it's time to stop learning *about* building things and actually *build* one — something that runs, something that handles real data, something that ships with a test suite that I am personally comfortable putting my name next to. Which is a higher bar than you realize.
+
+We're going to build `txstat`: a concurrent transaction-file analyzer. Feed it newline-delimited records, get per-account totals, minimums, maximums, and counts back. It will parse, aggregate concurrently with a worker pool, and print a report — or emit JSON if you ask nicely. The whole thing ships with table-driven tests, a fuzz test for the money parser, and a `-race`-clean concurrency test. By the end of this chapter, the compiler won't be the only thing that can vouch for your code.
+
+All code targets Go 1.26.
+
+Let's go.
+
+</HeroCard>
+
+<Scene
+  title="One file, millions of records — serial vs worker pool"
+  actors={[
+    { id: "file", label: "tx.log (50 GB)" },
+    { id: "w1",   label: "Worker 1" },
+    { id: "w2",   label: "Worker 2" },
+    { id: "w3",   label: "Worker 3" },
+    { id: "w4",   label: "Worker 4" },
+  ]}
+  rows={2}
+  cols={5}
+  frames={[
+    {
+      caption: "One goroutine reads and aggregates each record in turn. The CPU sits idle waiting for the next read.",
+      beat: "problem",
+      actors: [{ id: "file", state: "active" }, { id: "w1", state: "idle" }, { id: "w2", state: "idle" }, { id: "w3", state: "idle" }, { id: "w4", state: "idle" }],
+      cells: [
+        { id: "A1", state: "active", label: "rec" },
+        { id: "A2", state: "idle" }, { id: "A3", state: "idle" }, { id: "A4", state: "idle" }, { id: "A5", state: "idle" },
+        { id: "B1", state: "idle" }, { id: "B2", state: "idle" }, { id: "B3", state: "idle" }, { id: "B4", state: "idle" }, { id: "B5", state: "idle" },
+      ],
+    },
+    {
+      caption: "Serial processing: millions of records, one at a time. Four minutes. The Python script ops uses today.",
+      beat: "problem",
+      actors: [{ id: "file", state: "warn" }, { id: "w1", state: "active" }, { id: "w2", state: "idle" }, { id: "w3", state: "idle" }, { id: "w4", state: "idle" }],
+      cells: [
+        { id: "A1", state: "done", label: "✓" }, { id: "A2", state: "active", label: "rec" },
+        { id: "A3", state: "idle" }, { id: "A4", state: "idle" }, { id: "A5", state: "idle" },
+        { id: "B1", state: "idle" }, { id: "B2", state: "idle" }, { id: "B3", state: "idle" }, { id: "B4", state: "idle" }, { id: "B5", state: "idle" },
+      ],
+    },
+    {
+      caption: "Worker pool: the file streams into a shared channel; four workers fan out, each claiming a record and aggregating in parallel.",
+      beat: "solution",
+      actors: [{ id: "file", state: "active" }, { id: "w1", state: "active" }, { id: "w2", state: "active" }, { id: "w3", state: "active" }, { id: "w4", state: "active" }],
+      cells: [
+        { id: "A1", state: "done", label: "W1" }, { id: "A2", state: "done", label: "W2" },
+        { id: "A3", state: "done", label: "W3" }, { id: "A4", state: "done", label: "W4" },
+        { id: "A5", state: "active", label: "W1" },
+        { id: "B1", state: "active", label: "W2" }, { id: "B2", state: "active", label: "W3" },
+        { id: "B3", state: "idle" }, { id: "B4", state: "idle" }, { id: "B5", state: "idle" },
+      ],
+    },
+    {
+      caption: "All records processed. Workers merge their private tallies once at the end — no lock contention on the hot path. Seconds, not minutes.",
+      beat: "solution",
+      actors: [{ id: "file", state: "done" }, { id: "w1", state: "ok" }, { id: "w2", state: "ok" }, { id: "w3", state: "ok" }, { id: "w4", state: "ok" }],
+      cells: [
+        { id: "A1", state: "done", label: "✓" }, { id: "A2", state: "done", label: "✓" },
+        { id: "A3", state: "done", label: "✓" }, { id: "A4", state: "done", label: "✓" },
+        { id: "A5", state: "done", label: "✓" },
+        { id: "B1", state: "done", label: "✓" }, { id: "B2", state: "done", label: "✓" },
+        { id: "B3", state: "done", label: "✓" }, { id: "B4", state: "done", label: "✓" },
+        { id: "B5", state: "done", label: "✓" },
+      ],
+    },
+  ]}
+  caption="The cells are transaction records. Serial processing (problem) chains them one at a time through a single goroutine; the worker pool (solution) fans them across four goroutines simultaneously."
+/>
+
+<ChapterTabs tabs={["Scaffold", "Parse", "Concurrency", "Output", "Tests"]} />
+
+## Scaffold
+
+Every production CLI has the same skeleton problem: how do you wire flags, I/O, and program structure before you've written any real logic? Do it wrong and you're trapped — a global `os.Stdin` call buried inside your parser makes testing a nightmare. Do it right and every piece is independently testable.
+
+Here's the scenario. A fintech startup processes millions of transactions per day. Each is written as one JSON line to a log file:
+
+```
+{"account":"acct_001","amount_cents":1499,"type":"debit"}
+{"account":"acct_002","amount_cents":5000,"type":"credit"}
+{"account":"acct_001","amount_cents":200,"type":"debit"}
+```
+
+The ops team needs daily summaries — per account, total debits/credits, min/max amounts. They need it fast, they need it scriptable, and right now they have a Python script that takes four minutes on a large file. You're going to replace it with a Go binary that takes seconds, reads from a file or stdin, and is testable without touching the filesystem.
+
+### Module and layout
+
+```
+txstat/
+├── go.mod
+├── main.go
+├── parse/
+│   ├── parse.go
+│   └── parse_test.go
+├── aggregate/
+│   ├── aggregate.go
+│   └── aggregate_test.go
+└── report/
+    ├── report.go
+    └── report_test.go
+```
+
+Three packages. Each one does exactly one thing. `parse` reads records; `aggregate` computes stats; `report` formats output. `main.go` wires them together with flags and I/O.
+
+```
+go mod init github.com/you/txstat
+```
+
+<Define term="CLI / flag parsing" since="Go Fundamentals: Syntax, Types & Control Flow (Part 1)">
+A **CLI (command-line interface)** is a program you invoke from the shell by name, optionally followed by **flags** — named options like `-workers 4` or `-json`. Go's standard `flag` package reads those flags from `os.Args` and stores the parsed values in typed pointers you dereference after `flag.Parse()`. Why it matters: a well-designed flag surface is the difference between a tool that's trivially testable (pass any reader, any writer) and one that's hard-wired to `os.Stdin` and impossible to test without spawning a subprocess.
+</Define>
+
+### Flags first
+
+```go
+// main.go — the wiring layer. No logic lives here; only flag parsing and plumbing.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/you/txstat/aggregate"
+	"github.com/you/txstat/parse"
+	"github.com/you/txstat/report"
+)
+
+func main() {
+	// Define flags before parsing. Keep defaults sensible so the tool
+	// works out of the box with no arguments.
+	workers := flag.Int("workers", 4, "number of concurrent aggregation workers")
+	jsonOut := flag.Bool("json", false, "emit JSON instead of a human-readable table")
+	top := flag.Int("top", 0, "show only the top N accounts by total (0 = all)")
+	file := flag.String("file", "", "input file (default: read from stdin)")
+	flag.Parse()
+
+	// Wire up cancellation so Ctrl-C flushes and exits cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Open the input — file or stdin. The rest of the program only sees
+	// an io.Reader, which means tests can pass any reader they like.
+	var r io.Reader = os.Stdin
+	if *file != "" {
+		f, err := os.Open(*file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "txstat: open: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		r = f
+	}
+
+	// Parse, aggregate, report — three clearly separated stages.
+	records, errs := parse.Stream(ctx, r) // channel of parsed records
+	stats, err := aggregate.Run(ctx, records, *workers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "txstat: aggregate: %v\n", err)
+		// Drain parse errors too before we exit.
+		for e := range errs {
+			fmt.Fprintf(os.Stderr, "txstat: parse: %v\n", e)
+		}
+		os.Exit(1)
+	}
+	// Surface any parse errors that didn't kill the run.
+	for e := range errs {
+		fmt.Fprintf(os.Stderr, "txstat: parse warning: %v\n", e)
+	}
+
+	if err := report.Write(os.Stdout, stats, *top, *jsonOut); err != nil {
+		fmt.Fprintf(os.Stderr, "txstat: report: %v\n", err)
+		os.Exit(1)
+	}
+}
+```
+
+<GoPlayground>
+
+```go
+// This is main.go's shape — the full build is multi-package, so this
+// playground shows just the flag-parsing skeleton. The real binary is in
+// the chapter's project repo.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+)
+
+func main() {
+	workers := flag.Int("workers", 4, "number of concurrent aggregation workers")
+	jsonOut := flag.Bool("json", false, "emit JSON output")
+	top := flag.Int("top", 0, "show top N accounts (0 = all)")
+	file := flag.String("file", "", "input file (default: stdin)")
+	flag.Parse()
+
+	fmt.Printf("workers=%d  json=%v  top=%d  file=%q  extra-args=%v\n",
+		*workers, *jsonOut, *top, *file, flag.Args())
+	_ = os.Stdout // placeholder — the real program writes here
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="How flag.Parse() and os.Args work">
+
+When you call `flag.Parse()`, Go's `flag` package reads `os.Args[1:]` — everything after the binary name. Each element is either a flag (`-workers 4` or `-workers=4`) or a positional argument.
+
+**How flag values are stored.** `flag.Int("workers", 4, "…")` allocates an `int`, registers it by name in the default `FlagSet`, and returns a pointer to that int. When `Parse()` sees `-workers 8`, it writes `8` through that pointer. You dereference it after `Parse()` returns with `*workers`. This is why you must call `flag.Parse()` before using any flag value — the pointer's target is still the default until then.
+
+**`FlagSet` is the real type.** `flag.Parse()` is just a method call on the package-level `flag.CommandLine` — a `*flag.FlagSet` pre-initialized with the binary name. In tests you create your own `FlagSet` so you can parse flags without touching `os.Args` and without exiting the test process when a required flag is missing (the default `ExitOnError` would call `os.Exit(2)` — fatal for a test). Use `flag.NewFlagSet("test", flag.ContinueOnError)` in tests.
+
+**`os.Args` is a plain slice.** `os.Args[0]` is the executable path; `os.Args[1:]` is everything the shell passed. On Linux the kernel fills the `argv` array; the Go runtime copies it into the slice. There's nothing magic here — `flag` just iterates it.
+
+**POSIX vs. GNU style.** Go's `flag` package is intentionally minimal and non-POSIX: it accepts `-flag value`, `-flag=value`, and `--flag value` (double-dash works), but it does *not* support combined single-letter flags like `-abc` meaning `-a -b -c`. That's a deliberate trade-off for simplicity. If you need subcommands and GNU-style parsing, reach for `github.com/spf13/cobra` — but for most CLIs, `flag` is exactly enough.
+
+</UnderTheHood>
+
+<ExecTimeline
+  title="flag.Parse() walking os.Args"
+  lanes={[{ id: "parser", label: "flag.Parse()" }]}
+  steps={[
+    { lane: "parser", kind: "run", label: "os.Args = [txstat -workers 8 -json -file tx.log]", note: "The OS passes the command line as a slice of strings. os.Args[0] is the binary path." },
+    { lane: "parser", kind: "run", label: "iterate os.Args[1:]", note: "Parse begins at index 1, skipping the binary name." },
+    { lane: "parser", kind: "run", label: "see -workers, peek next: 8", note: "Finds registered flag 'workers'. The next token is the value. Writes 8 through the *int pointer." },
+    { lane: "parser", kind: "run", label: "see -json (bool, no value needed)", note: "Bool flags are special: -json alone sets the value to true. No following token consumed." },
+    { lane: "parser", kind: "run", label: "see -file tx.log", note: "Writes 'tx.log' through the *string pointer for 'file'." },
+    { lane: "parser", kind: "done", label: "flag.Args() == []", note: "No remaining positional args. flag.Parse() returns. All pointers now hold the parsed values." }
+  ]}
+  caption="flag.Parse reads left to right, consuming flag-value pairs. Positional arguments (non-flags) are collected in flag.Args()."
+/>
+
+## Parse
+
+<Define term="stdin / stdout / bufio">
+**`stdin`** is the default source of bytes a program reads from (the terminal, or a pipe from another command). **`stdout`** is where it writes results. In Go, both are `*os.File` values (`os.Stdin`, `os.Stdout`) that implement `io.Reader` and `io.Writer` — meaning any function that accepts those interfaces works equally well with a file, a pipe, or a test's `strings.NewReader`. **`bufio`** wraps an `io.Reader` with a buffer and a line scanner: instead of issuing one read syscall per byte, it reads a large chunk, then hands your code one line at a time. Without buffering, reading a 50 GB file line-by-line would drown the kernel in syscalls. Why it matters: accepting `io.Reader` instead of `*os.File` is the single change that makes every I/O function in this project independently testable without touching the filesystem.
+</Define>
+
+The parser lives in its own package so it's testable without running the full program. Its job: read an `io.Reader` line by line, parse each JSON record, and emit a channel of results. Errors go on a separate channel so the caller can decide whether a bad line is fatal.
+
+```go
+// parse/parse.go
+package parse
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+)
+
+// Record is a single transaction as parsed from one input line.
+// Amount is in integer cents — never float. A $14.99 charge is 1499.
+type Record struct {
+	Account     string `json:"account"`
+	AmountCents int64  `json:"amount_cents"` // integer cents, always
+	Type        string `json:"type"`         // "debit" or "credit"
+}
+
+// Stream reads r line by line, parses each line as a Record, and sends the
+// result on the returned channel. Parse errors go on the error channel.
+// Both channels are closed when r is exhausted or ctx is cancelled.
+// Callers must drain both channels to avoid goroutine leaks.
+func Stream(ctx context.Context, r io.Reader) (<-chan Record, <-chan error) {
+	out := make(chan Record, 64)  // buffered — don't block the scanner
+	errc := make(chan error, 16) // errors are infrequent; small buffer is fine
+
+	go func() {
+		defer close(out)   // always close; callers range over this
+		defer close(errc)
+
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			// Respect cancellation between lines — a large file should
+			// be interruptible without waiting for EOF.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			var rec Record
+			if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+				// Wrap the error with context so the caller knows which line.
+				errc <- fmt.Errorf("parse: %w", err)
+				continue // skip the bad line, keep going
+			}
+			if rec.Account == "" {
+				errc <- fmt.Errorf("parse: missing account field")
+				continue
+			}
+			out <- rec
+		}
+		if err := sc.Err(); err != nil {
+			errc <- fmt.Errorf("scan: %w", err)
+		}
+	}()
+
+	return out, errc
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+type Record struct {
+	Account     string `json:"account"`
+	AmountCents int64  `json:"amount_cents"`
+	Type        string `json:"type"`
+}
+
+func stream(ctx context.Context, input string) (<-chan Record, <-chan error) {
+	out := make(chan Record, 8)
+	errc := make(chan error, 4)
+	go func() {
+		defer close(out)
+		defer close(errc)
+		sc := bufio.NewScanner(strings.NewReader(input))
+		for sc.Scan() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			var rec Record
+			if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+				errc <- fmt.Errorf("parse: %w", err)
+				continue
+			}
+			out <- rec
+		}
+	}()
+	return out, errc
+}
+
+func main() {
+	input := `{"account":"acct_001","amount_cents":1499,"type":"debit"}
+{"account":"acct_002","amount_cents":5000,"type":"credit"}
+{"account":"acct_001","amount_cents":200,"type":"debit"}
+not-json`
+
+	ctx := context.Background()
+	records, errs := stream(ctx, input)
+	for rec := range records {
+		fmt.Printf("parsed: account=%s amount=%d type=%s\n", rec.Account, rec.AmountCents, rec.Type)
+	}
+	for e := range errs {
+		fmt.Println("error:", e)
+	}
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question="Why does Stream return two channels instead of one channel of a (Record, error) struct?"
+  options={[
+    "Two channels is always faster than one",
+    "Errors are infrequent — a separate buffered error channel lets the hot path avoid an interface allocation per record and lets the caller treat errors as advisory",
+    "Go channels cannot carry interface values",
+    "It makes the code easier to read"
+  ]}
+  answer={1}
+  explain={'Errors are rare and advisory here — a bad line shouldn\'t block the good ones. A separate error channel lets the main data channel run at full speed with a concrete type (no interface{} boxing), and gives the caller the flexibility to treat errors as warnings rather than hard stops.'}
+/>
+
+### The cents rule
+
+Notice `AmountCents int64` — not `float64`. This isn't a style choice. It's correctness. Financial systems that use float arithmetic have a long, storied history of inventing or destroying fractions of cents at scale. An `int64` holding cents can represent every amount up to about $92 trillion without losing a single cent. A `float64` can't reliably represent `0.1`. We enforce this at the type level in the parser so the rest of the program never has to think about it.
+
+<Callout kind="warn" title="Amount fields from external APIs are often strings">
+
+Some payment APIs send `"amount": "14.99"` — a decimal string to avoid the float problem on the wire. If your input uses that format, parse it as a string and convert: multiply by 100 and round, or use `strconv.ParseFloat` then `math.Round`. Never store the float; convert to `int64` cents immediately in the parser. The fuzz test below will make sure your conversion is correct under adversarial input.
+
+</Callout>
+
+## Concurrency
+
+<Define term="Worker pool" since="Concurrency Patterns (Part 2)">
+A **worker pool** is a fixed set of goroutines that all read from the same shared channel. You control concurrency by controlling the pool size, not by spawning one goroutine per record (which would launch millions and exhaust memory). Each worker loops: receive a record, process it, loop back. When the channel closes, workers exit. Why it matters: unbounded goroutine spawning crashes under large workloads; a bounded pool gives you parallel throughput with predictable resource usage. The pattern goes deep in Concurrency Patterns (Part 2).
+</Define>
+
+Now the reason ops is going to love this tool. A 50 GB transaction file has millions of records. Parsing them sequentially is fine — the bottleneck is disk I/O, not CPU. But *aggregating* them — computing per-account stats — can be done in parallel if we shard work by account. We'll use a classic bounded worker pool: a fixed number of goroutines draining a shared jobs channel.
+
+```go
+// aggregate/aggregate.go
+package aggregate
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/you/txstat/parse"
+)
+
+// Stats holds per-account aggregated data.
+type Stats struct {
+	Account    string
+	TotalCents int64 // algebraic sum: credits add, debits subtract
+	MinCents   int64 // smallest single amount seen (by absolute value)
+	MaxCents   int64 // largest single amount seen
+	Count      int
+}
+
+// Run consumes records from the channel, aggregates them with `workers`
+// goroutines, and returns a map keyed by account ID.
+// It is safe to call with a cancelled context — it drains the channel
+// and returns whatever was aggregated before cancellation.
+func Run(ctx context.Context, records <-chan parse.Record, workers int) (map[string]*Stats, error) {
+	if workers < 1 {
+		workers = 1
+	}
+
+	// Each worker gets its own local map — no locks on the hot path.
+	// We merge the local maps at the end under a single lock pass.
+	type result struct {
+		local map[string]*Stats
+		err   error
+	}
+
+	resultc := make(chan result, workers)
+	var wg sync.WaitGroup
+
+	for range workers {
+		// wg.Go (new in Go 1.25) spawns a goroutine and calls Add(1)/Done()
+		// for you — no more manual bookkeeping, no risk of mismatched pairs.
+		wg.Go(func() {
+			local := make(map[string]*Stats)
+			for {
+				select {
+				case rec, ok := <-records:
+					if !ok {
+						// Channel closed — all records consumed.
+						resultc <- result{local: local}
+						return
+					}
+					apply(local, rec)
+				case <-ctx.Done():
+					// Cancelled — ship what we have.
+					resultc <- result{local: local, err: ctx.Err()}
+					return
+				}
+			}
+		})
+	}
+
+	// Close resultc after all workers finish so we can range over it safely.
+	go func() {
+		wg.Wait()
+		close(resultc)
+	}()
+
+	// Merge all local maps into one global map.
+	global := make(map[string]*Stats)
+	var firstErr error
+	for r := range resultc {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		merge(global, r.local)
+	}
+	return global, firstErr
+}
+
+// apply updates account stats for one record.
+// Called only from within one goroutine's local map — no synchronization needed.
+func apply(m map[string]*Stats, rec parse.Record) {
+	s, ok := m[rec.Account]
+	if !ok {
+		s = &Stats{
+			Account:  rec.Account,
+			MinCents: rec.AmountCents,
+			MaxCents: rec.AmountCents,
+		}
+		m[rec.Account] = s
+	}
+	s.Count++
+	switch rec.Type {
+	case "credit":
+		s.TotalCents += rec.AmountCents
+	case "debit":
+		s.TotalCents -= rec.AmountCents
+	}
+	if rec.AmountCents < s.MinCents {
+		s.MinCents = rec.AmountCents
+	}
+	if rec.AmountCents > s.MaxCents {
+		s.MaxCents = rec.AmountCents
+	}
+}
+
+// merge folds src into dst.
+func merge(dst, src map[string]*Stats) {
+	for acct, s := range src {
+		if d, ok := dst[acct]; ok {
+			d.TotalCents += s.TotalCents
+			d.Count += s.Count
+			if s.MinCents < d.MinCents {
+				d.MinCents = s.MinCents
+			}
+			if s.MaxCents > d.MaxCents {
+				d.MaxCents = s.MaxCents
+			}
+		} else {
+			dst[acct] = s
+		}
+	}
+}
+
+// CentsToDisplay formats integer cents as a human-readable dollar string.
+// $-14.99 for a net debit of 1499 cents. Never uses float arithmetic.
+func CentsToDisplay(cents int64) string {
+	sign := ""
+	if cents < 0 {
+		sign = "-"
+		cents = -cents
+	}
+	return fmt.Sprintf("%s$%d.%02d", sign, cents/100, cents%100)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+)
+
+// Minimal self-contained demo of the worker pool pattern.
+// Each worker holds its own local map; we merge at the end.
+
+type record struct {
+	account string
+	cents   int64
+}
+
+type stats struct {
+	total int64
+	count int
+}
+
+func run(ctx context.Context, records <-chan record, workers int) map[string]*stats {
+	type result struct{ local map[string]*stats }
+	resultc := make(chan result, workers)
+	var wg sync.WaitGroup
+
+	for range workers {
+		// wg.Go (Go 1.25) handles Add(1)/Done() automatically.
+		wg.Go(func() {
+			local := make(map[string]*stats)
+			for {
+				select {
+				case r, ok := <-records:
+					if !ok {
+						resultc <- result{local}
+						return
+					}
+					s := local[r.account]
+					if s == nil {
+						s = &stats{}
+						local[r.account] = s
+					}
+					s.total += r.cents
+					s.count++
+				case <-ctx.Done():
+					resultc <- result{local}
+					return
+				}
+			}
+		})
+	}
+	go func() { wg.Wait(); close(resultc) }()
+
+	global := make(map[string]*stats)
+	for r := range resultc {
+		for acct, s := range r.local {
+			if g, ok := global[acct]; ok {
+				g.total += s.total
+				g.count += s.count
+			} else {
+				global[acct] = s
+			}
+		}
+	}
+	return global
+}
+
+func main() {
+	data := []record{
+		{"acct_001", 1499},
+		{"acct_002", 5000},
+		{"acct_001", 200},
+		{"acct_003", 7500},
+	}
+	ch := make(chan record, len(data))
+	for _, r := range data {
+		ch <- r
+	}
+	close(ch)
+
+	result := run(context.Background(), ch, 3)
+	for acct, s := range result {
+		fmt.Printf("%s: total=%d count=%d\n", acct, s.total, s.count)
+	}
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="① Drain: three workers pull records in parallel"
+  lanes={[
+    { id: "chan",    label: "records channel" },
+    { id: "w1",     label: "Worker 1" },
+    { id: "w2",     label: "Worker 2" },
+    { id: "w3",     label: "Worker 3" },
+    { id: "merge",  label: "merge()" }
+  ]}
+  steps={[
+    { lane: "chan",  kind: "send",  label: "4 records buffered",        note: "The parse goroutine fills the channel. Workers are already waiting to receive." },
+    { lane: "w1",   kind: "recv",  label: "recv acct_001 / 1499",      note: "Worker 1 pulls the first record. It updates its private local map — no mutex needed." },
+    { lane: "w2",   kind: "recv",  label: "recv acct_002 / 5000",      note: "Worker 2 grabs the second record simultaneously. Three goroutines run in parallel." },
+    { lane: "w3",   kind: "recv",  label: "recv acct_003 / 7500",      note: "Worker 3 takes the third record. The channel is now down to one record." },
+    { lane: "w1",   kind: "recv",  label: "recv acct_001 / 200",       note: "Worker 1 loops back, takes the last record. Channel is now empty." }
+  ]}
+  caption="Three workers drain the shared records channel in parallel, each with a private local map — no mutex on the hot path."
+/>
+
+Once the channel is empty and closed, each worker ships its private map to the result channel and the merge pass folds them into one:
+
+<ExecTimeline
+  title="② Close + merge: each local map folds into the global result"
+  lanes={[
+    { id: "chan",    label: "records channel" },
+    { id: "w1",     label: "Worker 1" },
+    { id: "w2",     label: "Worker 2" },
+    { id: "w3",     label: "Worker 3" },
+    { id: "merge",  label: "merge()" }
+  ]}
+  steps={[
+    { lane: "chan",  kind: "done",  label: "channel closed",            note: "Parser is done. The ok==false from receive tells workers to exit." },
+    { lane: "w1",   kind: "done",  label: "send local map → resultc",  note: "Worker 1 sends its local map {acct_001: {total:1699}} to the result channel." },
+    { lane: "w2",   kind: "done",  label: "send local map → resultc",  note: "Worker 2 sends {acct_002: {total:5000}}." },
+    { lane: "w3",   kind: "done",  label: "send local map → resultc",  note: "Worker 3 sends {acct_003: {total:7500}}." },
+    { lane: "merge", kind: "run",  label: "merge all local maps",      note: "The main goroutine ranges over resultc, folding each local map into the global result." },
+    { lane: "merge", kind: "done", label: "global map ready",          note: "All accounts aggregated. No mutex was ever held on the hot path — each worker owned its own data." }
+  ]}
+  caption="Merging happens once at the end — one lock-free pass over every worker's private map."
+/>
+
+<UnderTheHood title="Why local maps beat a shared mutex map">
+
+The naive approach to a concurrent aggregator is one `sync.Mutex`-protected global map. Workers lock, update, unlock. This *works*, but under a high record rate the mutex becomes a bottleneck: every goroutine serializes at exactly the one place where they could run in parallel.
+
+**The local-map pattern** sidesteps this entirely. Each goroutine owns data that no other goroutine touches — this is called *confinement*. The Go memory model guarantees that writes done by a goroutine before it sends on a channel happen-before the receive of that value. So when a worker sends its local map on `resultc`, the merge goroutine is guaranteed to see all its writes — no mutex needed, zero contention.
+
+**Why not `sync.Map`?** `sync.Map` is designed for append-heavy workloads where the set of keys stabilizes after a warm-up (think HTTP handler route tables). For our workload — many updates to a small set of keys — a plain map behind a mutex, or the local-map-then-merge pattern, is almost always faster. Profile first; reach for `sync.Map` when you have profiler evidence.
+
+**Channel overhead.** A channel is not free: each send/receive involves the Go runtime scheduler. Buffering the records channel (we use 64 here) amortizes the scheduler cost by letting the parser run ahead of the workers. The buffer size is a tuning parameter — measure under your real workload.
+
+**GOMAXPROCS.** As of Go 1.25, Go's default `GOMAXPROCS` is container-aware: it considers logical CPUs, CPU affinity, and Linux cgroup CPU quota. Four workers on a four-core machine with no tighter quota can genuinely run in parallel on different OS threads. On a single-core or one-CPU-quota environment, the workers still run concurrently (interleaved by the scheduler) but not in parallel. The code is correct either way.
+
+**`wg.Go` (new in Go 1.25).** The worker-pool code uses `wg.Go(func(){...})` instead of the older `wg.Add(1)` / `defer wg.Done()` pair. `wg.Go` calls `Add(1)` before launching the goroutine and `Done()` when it returns — eliminating the risk of a mismatched pair (e.g., calling `Add` after the goroutine has already exited). It's a small API but it removes a whole class of WaitGroup misuse.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="In the worker pool design above, why does each worker use its own local map instead of a shared map protected by a mutex?"
+  options={[
+    "Go maps crash when accessed from multiple goroutines even with a mutex",
+    "Confinement eliminates contention on the hot path — workers never block on each other; merging happens once at the end",
+    "sync.Mutex prevents concurrent access so it cannot be used with maps",
+    "Local maps use less memory than a shared map"
+  ]}
+  answer={1}
+  explain="Each worker owns its local map exclusively — no other goroutine touches it, so no synchronization is needed during aggregation. Merging happens once at the end when all workers are done. This eliminates lock contention entirely on the hot path."
+/>
+
+<Define term="Graceful shutdown (SIGINT / context)" since="The context Package, In Depth (Part 1)">
+**SIGINT** is the Unix signal sent when you press Ctrl-C. A program that ignores it exits immediately, possibly mid-write, leaving partial output. **Graceful shutdown** means the program catches the signal, cancels a `context.Context`, and waits for every goroutine to finish its current unit of work and clean up before exiting. In Go, `signal.NotifyContext` wires an OS signal to a context's cancel function in one call. Why it matters: a tool that can't be safely interrupted is not production-ready — ops will Ctrl-C it the moment a run goes wrong, and you need to guarantee you never leave half-written output or leaked goroutines behind.
+</Define>
+
+### Graceful cancellation on SIGINT
+
+The `signal.NotifyContext` call in `main.go` wires up SIGINT (Ctrl-C) to the context. When the signal fires, `ctx.Done()` closes. Both the parser's goroutine and every worker goroutine check `ctx.Done()` in their select loops. They ship what they have and exit cleanly — no abandoned goroutines, no half-written output.
+
+<ExecTimeline
+  title="SIGINT cancellation propagating through the pipeline"
+  lanes={[
+    { id: "signal", label: "signal.NotifyContext" },
+    { id: "parse",  label: "parse.Stream goroutine" },
+    { id: "w1",     label: "Worker 1" },
+    { id: "w2",     label: "Worker 2" }
+  ]}
+  steps={[
+    { lane: "signal", kind: "run",   label: "SIGINT received",           note: "User presses Ctrl-C. signal.NotifyContext cancels the context by closing ctx.Done()." },
+    { lane: "parse",  kind: "block", label: "select: ctx.Done() fires",  note: "The parse goroutine's select hits the ctx.Done() case. It returns without reading more lines." },
+    { lane: "parse",  kind: "done",  label: "close(records channel)",    note: "The parse goroutine's deferred close(out) fires. Workers will see the channel close next." },
+    { lane: "w1",     kind: "recv",  label: "recv: ok==false → exit",    note: "Worker 1 sees the records channel closed. It sends its local map and returns." },
+    { lane: "w2",     kind: "recv",  label: "select: ctx.Done() fires",  note: "Worker 2 was blocked on select. ctx.Done() wins. It sends its partial local map and returns." },
+    { lane: "w1",     kind: "done",  label: "partial result shipped",    note: "Whatever Worker 1 aggregated before the signal is merged into the global result." },
+    { lane: "w2",     kind: "done",  label: "partial result shipped",    note: "Whatever Worker 2 had is merged too. No goroutines remain. No data is abandoned." }
+  ]}
+  caption="Context cancellation flows down: signal → context → parse goroutine → channel close → workers. Every goroutine exits cleanly."
+/>
+
+<UnderTheHood title="signal.NotifyContext and os/signal under the hood">
+
+`signal.NotifyContext(ctx, sig...)` is a thin wrapper introduced in Go 1.16. It creates a child context and registers a channel with the OS signal machinery via `signal.Notify`. When one of the listed signals arrives, the runtime's signal handler (a dedicated goroutine that sits on a `sigqueue`) writes to the registered channel. The wrapper reads that channel and calls the context's cancel function — which closes `ctx.Done()`. All goroutines blocking on `ctx.Done()` in a select statement are unblocked immediately.
+
+The `defer stop()` call is important: it tells the runtime to stop forwarding those signals to this context's channel, releasing the channel and preventing a goroutine leak inside the signal package itself. Miss it and the signal package holds a reference to your channel forever.
+
+On Linux, signals arrive as POSIX signals delivered to the process. Go's runtime catches them in a signal handler written in assembly (`sigtramp`), marshals them into the internal `sigqueue`, and unblocks the signal-receiving goroutine. On Windows, `os/signal` maps to `SetConsoleCtrlHandler` for SIGINT.
+
+</UnderTheHood>
+
+## Output
+
+Two output formats: a human-readable table for the terminal, and JSON for piping into other tools. Both write to an `io.Writer` — the real binary passes `os.Stdout`, the tests pass a `bytes.Buffer`.
+
+```go
+// report/report.go
+package report
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"sort"
+	"text/tabwriter"
+
+	"github.com/you/txstat/aggregate"
+)
+
+// Write formats stats and writes to w. top limits output to the N
+// accounts with the highest absolute total (0 = all).
+func Write(w io.Writer, stats map[string]*aggregate.Stats, top int, asJSON bool) error {
+	// Sort by absolute total descending for a consistent, useful ordering.
+	sorted := make([]*aggregate.Stats, 0, len(stats))
+	for _, s := range stats {
+		sorted = append(sorted, s)
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		ai, aj := sorted[i].TotalCents, sorted[j].TotalCents
+		if ai < 0 { ai = -ai }
+		if aj < 0 { aj = -aj }
+		if ai != aj { return ai > aj }
+		return sorted[i].Account < sorted[j].Account // stable tie-break
+	})
+	if top > 0 && top < len(sorted) {
+		sorted = sorted[:top]
+	}
+
+	if asJSON {
+		return writeJSON(w, sorted)
+	}
+	return writeTable(w, sorted)
+}
+
+func writeTable(w io.Writer, rows []*aggregate.Stats) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ACCOUNT\tNET TOTAL\tMIN\tMAX\tCOUNT")
+	fmt.Fprintln(tw, "-------\t---------\t---\t---\t-----")
+	for _, s := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\n",
+			s.Account,
+			aggregate.CentsToDisplay(s.TotalCents),
+			aggregate.CentsToDisplay(s.MinCents),
+			aggregate.CentsToDisplay(s.MaxCents),
+			s.Count,
+		)
+	}
+	return tw.Flush()
+}
+
+type jsonRow struct {
+	Account       string `json:"account"`
+	NetTotalCents int64  `json:"net_total_cents"`
+	MinCents      int64  `json:"min_cents"`
+	MaxCents      int64  `json:"max_cents"`
+	Count         int    `json:"count"`
+}
+
+func writeJSON(w io.Writer, rows []*aggregate.Stats) error {
+	out := make([]jsonRow, len(rows))
+	for i, s := range rows {
+		out[i] = jsonRow{
+			Account:       s.Account,
+			NetTotalCents: s.TotalCents,
+			MinCents:      s.MinCents,
+			MaxCents:      s.MaxCents,
+			Count:         s.Count,
+		}
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"text/tabwriter"
+)
+
+type stats struct {
+	Account    string
+	TotalCents int64
+	MinCents   int64
+	MaxCents   int64
+	Count      int
+}
+
+func centsToDisplay(c int64) string {
+	sign := ""
+	if c < 0 {
+		sign = "-"
+		c = -c
+	}
+	return fmt.Sprintf("%s$%d.%02d", sign, c/100, c%100)
+}
+
+func main() {
+	rows := []*stats{
+		{"acct_001", -1699, 200, 1499, 2},
+		{"acct_002", 5000, 5000, 5000, 1},
+		{"acct_003", 7500, 7500, 7500, 1},
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		ai, aj := rows[i].TotalCents, rows[j].TotalCents
+		if ai < 0 {
+			ai = -ai
+		}
+		if aj < 0 {
+			aj = -aj
+		}
+		return ai > aj
+	})
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ACCOUNT\tNET TOTAL\tMIN\tMAX\tCOUNT")
+	fmt.Fprintln(tw, "-------\t---------\t---\t---\t-----")
+	for _, s := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\n",
+			s.Account,
+			centsToDisplay(s.TotalCents),
+			centsToDisplay(s.MinCents),
+			centsToDisplay(s.MaxCents),
+			s.Count,
+		)
+	}
+	tw.Flush()
+}
+```
+
+</GoPlayground>
+
+<BeforeAfter
+  badLabel="String formatting floats"
+  goodLabel="Integer cents, display only"
+  bad={`// BUG: float arithmetic before display
+total := 0.0
+for _, r := range records {
+    total += float64(r.AmountCents) / 100.0
+}
+// Binary floating-point cannot represent 0.1 exactly.
+// Summing thousands of these silently accumulates error.
+fmt.Printf("$%.2f", total)`}
+  good={`// Correct: stay in integer cents throughout.
+// Only convert to a display string at the very last moment.
+var totalCents int64
+for _, r := range records {
+    totalCents += r.AmountCents
+}
+// No float ever enters the math. The display is lossless.
+sign := ""
+if totalCents < 0 { sign = "-"; totalCents = -totalCents }
+fmt.Sprintf("%s$%d.%02d", sign, totalCents/100, totalCents%100)`}
+/>
+
+## Tests
+
+This is the part that separates the people who *say* they write Go from the people who actually write Go. We're going to write four kinds of tests, all in the same project, and they're all going to pass with `-race`. I've accepted nothing less from myself for years. Now it's your turn.
+
+### Table-driven parser tests
+
+```go
+// parse/parse_test.go
+package parse_test
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/you/txstat/parse"
+)
+
+func TestStream(t *testing.T) {
+	t.Parallel() // safe — no shared state
+
+	cases := []struct{
+		name    string
+		input   string
+		wantRec int   // expected good records
+		wantErr int   // expected parse errors
+	}{
+		{
+			name: "two valid records",
+			input: `{"account":"acct_001","amount_cents":1499,"type":"debit"}` + "\n" +
+				`{"account":"acct_002","amount_cents":5000,"type":"credit"}`,
+			wantRec: 2,
+			wantErr: 0,
+		},
+		{
+			name: "one valid one invalid",
+			input: `{"account":"acct_001","amount_cents":1499,"type":"debit"}` + "\n" +
+				`not-json`,
+			wantRec: 1,
+			wantErr: 1,
+		},
+		{
+			name:    "missing account field",
+			input:   `{"amount_cents":1499,"type":"debit"}`,
+			wantRec: 0,
+			wantErr: 1,
+		},
+		{
+			name:    "empty input",
+			input:   "",
+			wantRec: 0,
+			wantErr: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel() // loop-variable capture is safe since Go 1.22
+
+			ctx := context.Background()
+			records, errs := parse.Stream(ctx, strings.NewReader(tc.input))
+
+			var gotRec int
+			for range records {
+				gotRec++
+			}
+			var gotErr int
+			for range errs {
+				gotErr++
+			}
+
+			if gotRec != tc.wantRec {
+				t.Errorf("records: got %d want %d", gotRec, tc.wantRec)
+			}
+			if gotErr != tc.wantErr {
+				t.Errorf("errors: got %d want %d", gotErr, tc.wantErr)
+			}
+		})
+	}
+}
+```
+
+### Race test for concurrent aggregation
+
+```go
+// aggregate/aggregate_test.go
+package aggregate_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/you/txstat/aggregate"
+	"github.com/you/txstat/parse"
+)
+
+// TestRunRace verifies that concurrent aggregation produces the correct totals
+// AND is data-race-free. Run with: go test -race ./aggregate/...
+func TestRunRace(t *testing.T) {
+	// 1000 records, 10 accounts, 4 workers — enough to stress the scheduler.
+	const numRecords = 1000
+	const numAccounts = 10
+	const workers = 4
+
+	// Each account receives 100 debit records of 100 cents each.
+	// Expected: Count == 100, TotalCents == -100 * 100 == -10000 per account.
+	records := make(chan parse.Record, numRecords)
+	for i := range numRecords {
+		records <- parse.Record{
+			Account:     fmt.Sprintf("acct_%03d", i%numAccounts),
+			AmountCents: 100,
+			Type:        "debit",
+		}
+	}
+	close(records)
+
+	stats, err := aggregate.Run(context.Background(), records, workers)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for acct, s := range stats {
+		if s.Count != 100 {
+			t.Errorf("%s: count = %d, want 100", acct, s.Count)
+		}
+		if s.TotalCents != -10000 {
+			t.Errorf("%s: total = %d cents, want -10000", acct, s.TotalCents)
+		}
+	}
+}
+```
+
+<Callout kind="note" title="testing/synctest makes concurrency tests deterministic (Go 1.25)">
+
+`TestRunRace` above relies on the race detector and a large-enough record count to expose any latent races. As of Go 1.25, the new `testing/synctest` package lets you run goroutines inside a fake clock where time advances only when all goroutines are blocked — making concurrency tests deterministic without `time.Sleep` or large iteration counts. If you find yourself writing timing-sensitive tests for the worker pool or the streaming parser, `synctest.Test(t, ...)` is worth reaching for. The Testing chapter (Part 1, Chapter 8) covers `testing/synctest` in depth.
+
+</Callout>
+
+<Define term="Golden-file test" since="Testing in Go (Part 1)">
+A **golden file** is a file on disk holding the known-correct output of a function — the "gold standard" the output must match. The test calls the function, captures its output into a buffer, then diffs the buffer against the file. If the output changes unexpectedly, the test fails. To update intentionally, run with an environment variable (e.g. `UPDATE_GOLDEN=1`) and the test overwrites the file. Why it matters: for formatting-heavy output like a tabular report, manually asserting every field is brittle and verbose. The golden file captures the whole output in one shot and makes any regression immediately visible as a diff.
+</Define>
+
+### Golden-file test for report output
+
+A golden file is the saved, known-good output of a function. The test runs the function and diffs against the file. If the output changes, the test fails — and you update the golden file deliberately, not accidentally.
+
+```go
+// report/report_test.go
+package report_test
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/you/txstat/aggregate"
+	"github.com/you/txstat/report"
+)
+
+func TestWriteTable_golden(t *testing.T) {
+	stats := map[string]*aggregate.Stats{
+		"acct_001": {Account: "acct_001", TotalCents: -1699, MinCents: 200, MaxCents: 1499, Count: 2},
+		"acct_002": {Account: "acct_002", TotalCents:  5000, MinCents: 5000, MaxCents: 5000, Count: 1},
+	}
+
+	var buf bytes.Buffer
+	if err := report.Write(&buf, stats, 0, false); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got := buf.Bytes()
+
+	// Path to the golden file: testdata/table.golden
+	golden := filepath.Join("testdata", "table.golden")
+
+	// Run with -update to regenerate golden files when output changes intentionally.
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(golden, got, 0644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return
+	}
+
+	want, err := os.ReadFile(golden)
+	if err != nil {
+		t.Fatalf("read golden (run with UPDATE_GOLDEN=1 to create): %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("report output differs from golden\\ngot:\\n%s\\nwant:\\n%s", got, want)
+	}
+}
+```
+
+The golden file at `report/testdata/table.golden` looks like:
+
+```
+ACCOUNT   NET TOTAL  MIN     MAX     COUNT
+-------   ---------  ---     ---     -----
+acct_002  $50.00     $50.00  $50.00  1
+acct_001  -$16.99    $2.00   $14.99  2
+```
+
+### Fuzz test for the cents parser
+
+This is the test I care about most. Money parsing under adversarial input is exactly where bugs hide.
+
+```go
+// parse/parse_fuzz_test.go
+package parse_test
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/you/txstat/parse"
+)
+
+// FuzzParseCents sends arbitrary byte sequences to the parser and asserts
+// it never panics and always produces a non-negative amount for valid records.
+// Run with: go test -fuzz=FuzzParseCents ./parse/...
+func FuzzParseCents(f *testing.F) {
+	// Seed corpus — known good and known bad inputs.
+	f.Add(`{"account":"acct_001","amount_cents":1499,"type":"debit"}`)
+	f.Add(`{"account":"a","amount_cents":0,"type":"credit"}`)
+	f.Add(`{"account":"a","amount_cents":-1,"type":"debit"}`)
+	f.Add(`not json at all`)
+	f.Add(`{}`)
+	f.Add(`{"account":"","amount_cents":9999999999999,"type":"credit"}`)
+
+	f.Fuzz(func(t *testing.T, line string) {
+		// The parser must never panic on any input.
+		// Valid records must have non-negative AmountCents
+		// (the sender is responsible for the sign; negative amounts are a design smell).
+		ctx := context.Background()
+		records, errs := parse.Stream(ctx, strings.NewReader(line))
+
+		for rec := range records {
+			// If parsing succeeded, the amount must fit in int64 and be >= 0.
+			// (Negative amounts would come from malformed data, not our schema.)
+			if rec.AmountCents < 0 {
+				t.Errorf("parser produced negative amount %d for input %q", rec.AmountCents, line)
+			}
+		}
+		// Drain errors — we don't care if they error, only that they don't panic.
+		for range errs {
+		}
+	})
+}
+```
+
+Run the full suite under the race detector:
+
+```
+go test -race -count=1 ./...
+```
+
+Run the fuzz test for 30 seconds:
+
+```
+go test -fuzz=FuzzParseCents -fuzztime=30s ./parse/...
+```
+
+<GoPlayground>
+
+```go
+package main
+
+// This snippet shows the test patterns in a self-contained form.
+// The real tests are in separate _test.go files; this illustrates
+// the table-driven subtest pattern that drives all of them.
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+type Record struct {
+	Account     string `json:"account"`
+	AmountCents int64  `json:"amount_cents"`
+	Type        string `json:"type"`
+}
+
+func stream(ctx context.Context, input string) ([]Record, []error) {
+	sc := bufio.NewScanner(strings.NewReader(input))
+	var recs []Record
+	var errs []error
+	for sc.Scan() {
+		var r Record
+		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if r.Account == "" {
+			errs = append(errs, fmt.Errorf("missing account"))
+			continue
+		}
+		recs = append(recs, r)
+	}
+	return recs, errs
+}
+
+func main() {
+	cases := []struct {
+		name    string
+		input   string
+		wantRec int
+		wantErr int
+	}{
+		{"two valid", `{"account":"a","amount_cents":100,"type":"debit"}` + "\n" +
+			`{"account":"b","amount_cents":200,"type":"credit"}`, 2, 0},
+		{"one bad", `{"account":"a","amount_cents":100,"type":"debit"}` + "\nnot-json", 1, 1},
+		{"empty", "", 0, 0},
+	}
+
+	for _, tc := range cases {
+		recs, errs := stream(context.Background(), tc.input)
+		ok := len(recs) == tc.wantRec && len(errs) == tc.wantErr
+		fmt.Printf("%-12s recs=%d errs=%d  pass=%v\n", tc.name, len(recs), len(errs), ok)
+	}
+}
+```
+
+</GoPlayground>
+
+---
+
+## Exercises
+
+You've seen the whole tool. Now extend it — because knowing how something works and being able to *modify* it under pressure are very different skills.
+
+<Exercise n={1} title="Add a -min-amount flag" level="easy">
+
+Add a `-min-amount` flag (integer cents) to `main.go` that filters out any record whose `AmountCents` is below the threshold before it reaches the aggregator. Wire it into `parse.Stream` or as a filtering stage between parse and aggregate. Write one test that verifies records below the threshold are excluded.
+
+<Solution>
+
+The cleanest approach is a filtering goroutine between the parse and aggregate stages — this keeps each stage's responsibilities clear.
+
+```go
+// In main.go, after calling parse.Stream:
+minAmount := flag.Int("min-amount", 0, "skip records below this amount in cents")
+flag.Parse()
+// ... existing code ...
+records, errs := parse.Stream(ctx, r)
+if *minAmount > 0 {
+    records = filterByMinAmount(ctx, records, int64(*minAmount))
+}
+stats, err := aggregate.Run(ctx, records, *workers)
+
+// The filter stage — a goroutine that gates records.
+func filterByMinAmount(ctx context.Context, in <-chan parse.Record, min int64) <-chan parse.Record {
+    out := make(chan parse.Record, 64)
+    go func() {
+        defer close(out)
+        for {
+            select {
+            case rec, ok := <-in:
+                if !ok {
+                    return
+                }
+                if rec.AmountCents >= min {
+                    out <- rec
+                }
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    return out
+}
+```
+
+Test:
+
+```go
+func TestFilterByMinAmount(t *testing.T) {
+    in := make(chan parse.Record, 3)
+    in <- parse.Record{Account: "a", AmountCents: 50, Type: "debit"}
+    in <- parse.Record{Account: "b", AmountCents: 200, Type: "credit"}
+    in <- parse.Record{Account: "c", AmountCents: 99, Type: "debit"}
+    close(in)
+
+    out := filterByMinAmount(context.Background(), in, 100)
+    var got []parse.Record
+    for r := range out {
+        got = append(got, r)
+    }
+    if len(got) != 1 || got[0].Account != "b" {
+        t.Errorf("expected only acct b, got %v", got)
+    }
+}
+```
+
+The filter stage is a pipeline stage — it reads from one channel, applies a predicate, and writes to another. The ctx plumbing ensures SIGINT still works.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Add a -type flag" level="easy">
+
+Add a `-type` flag that accepts `"debit"`, `"credit"`, or `""` (all). Filter records by type after parsing. Add a table-driven test that verifies the filter works for each value.
+
+<Solution>
+
+```go
+// In main.go:
+txType := flag.String("type", "", "filter by transaction type: debit, credit, or empty for all")
+
+// Filter function:
+func filterByType(ctx context.Context, in <-chan parse.Record, txType string) <-chan parse.Record {
+    if txType == "" {
+        return in // fast path: no filtering needed
+    }
+    out := make(chan parse.Record, 64)
+    go func() {
+        defer close(out)
+        for {
+            select {
+            case rec, ok := <-in:
+                if !ok { return }
+                if rec.Type == txType { out <- rec }
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    return out
+}
+```
+
+Table-driven test:
+
+```go
+func TestFilterByType(t *testing.T) {
+    cases := []struct{
+        txType   string
+        wantAcct string
+    }{
+        {"debit",  "acct_001"},
+        {"credit", "acct_002"},
+        {"",       ""},        // both pass through
+    }
+    for _, tc := range cases {
+        ch := make(chan parse.Record, 2)
+        ch <- parse.Record{Account: "acct_001", AmountCents: 100, Type: "debit"}
+        ch <- parse.Record{Account: "acct_002", AmountCents: 200, Type: "credit"}
+        close(ch)
+        out := filterByType(context.Background(), ch, tc.txType)
+        var got []parse.Record
+        for r := range out { got = append(got, r) }
+        if tc.txType != "" && (len(got) != 1 || got[0].Account != tc.wantAcct) {
+            t.Errorf("type=%q: got %v, want %s", tc.txType, got, tc.wantAcct)
+        }
+        if tc.txType == "" && len(got) != 2 {
+            t.Errorf("type=all: got %d records, want 2", len(got))
+        }
+    }
+}
+```
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="CSV output format" level="medium">
+
+Add a `-csv` flag. When set, `report.Write` should emit a CSV header row followed by one data row per account (comma-separated, amounts as raw cents integers — not display strings). Write a test using `encoding/csv` to verify the output is valid CSV with the correct values.
+
+<Solution>
+
+```go
+// In report/report.go, add a writeCSV function:
+import "encoding/csv"
+import "strconv"
+
+func writeCSV(w io.Writer, rows []*aggregate.Stats) error {
+    cw := csv.NewWriter(w)
+    if err := cw.Write([]string{"account","net_total_cents","min_cents","max_cents","count"}); err != nil {
+        return err
+    }
+    for _, s := range rows {
+        if err := cw.Write([]string{
+            s.Account,
+            strconv.FormatInt(s.TotalCents, 10),
+            strconv.FormatInt(s.MinCents, 10),
+            strconv.FormatInt(s.MaxCents, 10),
+            strconv.Itoa(s.Count),
+        }); err != nil {
+            return err
+        }
+    }
+    cw.Flush()
+    return cw.Error()
+}
+```
+
+Test:
+
+```go
+func TestWriteCSV(t *testing.T) {
+    stats := map[string]*aggregate.Stats{
+        "acct_001": {Account: "acct_001", TotalCents: -1699, MinCents: 200, MaxCents: 1499, Count: 2},
+    }
+    var buf bytes.Buffer
+    if err := report.Write(&buf, stats, 0, false, true /*csv*/); err != nil {
+        t.Fatal(err)
+    }
+    r := csv.NewReader(&buf)
+    records, err := r.ReadAll()
+    if err != nil {
+        t.Fatalf("invalid CSV: %v", err)
+    }
+    if records[0][0] != "account" {
+        t.Errorf("header[0] = %q, want 'account'", records[0][0])
+    }
+    if records[1][1] != "-1699" {
+        t.Errorf("total = %q, want '-1699'", records[1][1])
+    }
+}
+```
+
+Note: amounts in CSV stay as raw `int64` cents — no display formatting. The downstream consumer can format them however it needs. Raw data out; formatting is the consumer's job.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Context timeout on slow input" level="medium">
+
+Modify `parse.Stream` to accept a per-record timeout: if the scanner hasn't produced a new line within `N` milliseconds, cancel the context. Write a test using a slow `io.Reader` (a reader that sleeps between reads) to verify that the timeout fires and `ctx.Err()` is returned by the aggregator.
+
+<Solution>
+
+```go
+// A slow reader for testing:
+type slowReader struct {
+    data  []byte
+    pos   int
+    delay time.Duration
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+    if s.pos >= len(s.data) {
+        return 0, io.EOF
+    }
+    time.Sleep(s.delay)
+    n := copy(p, s.data[s.pos:s.pos+1]) // one byte at a time
+    s.pos += n
+    return n, nil
+}
+
+func TestStreamTimeout(t *testing.T) {
+    ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+    defer cancel()
+
+    // The slow reader will take much longer than 50ms to emit a full line.
+    r := &slowReader{
+        data:  []byte(`{"account":"a","amount_cents":100,"type":"debit"}`),
+        delay: 10 * time.Millisecond, // 10ms per byte × 48 bytes = 480ms total
+    }
+
+    records, errs := parse.Stream(ctx, r)
+    for range records {} // drain
+    for range errs {}    // drain
+
+    if ctx.Err() == nil {
+        t.Error("expected context to be cancelled by timeout")
+    }
+}
+```
+
+The `select { case <-ctx.Done(): return }` inside `Stream`'s scan loop is what makes this test meaningful — without it, the goroutine would ignore the timeout and leak.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Per-account report as a histogram" level="hard">
+
+Add a `-histogram` flag. When set, after the stats table, print an ASCII bar chart showing each account's absolute net total as a horizontal bar, scaled so the largest value fills 40 characters. Use only stdlib. Write a golden-file test for the histogram output.
+
+<Solution>
+
+```go
+// In report/report.go:
+func writeHistogram(w io.Writer, rows []*aggregate.Stats) error {
+    if len(rows) == 0 { return nil }
+    // Find the maximum absolute total for scaling.
+    var maxAbs int64
+    for _, s := range rows {
+        abs := s.TotalCents
+        if abs < 0 { abs = -abs }
+        if abs > maxAbs { maxAbs = abs }
+    }
+    const width = 40
+    fmt.Fprintln(w, "\nHistogram (absolute net total):")
+    for _, s := range rows {
+        abs := s.TotalCents
+        if abs < 0 { abs = -abs }
+        barLen := int(float64(abs) / float64(maxAbs) * width)
+        bar := strings.Repeat("█", barLen)
+        fmt.Fprintf(w, "%-12s |%s| %s\n", s.Account, bar, CentsToDisplay(s.TotalCents))
+    }
+    return nil
+}
+```
+
+The golden-file test pattern is identical to the table golden test — run with `UPDATE_GOLDEN=1` to seed, then lock it in by removing the env variable. The histogram uses integer scaling throughout: `int64(abs)` over `int64(maxAbs)`, multiplied by `width` — no float math ever touches the financial data.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Stop. Right there. You think you're done because the tests pass locally? I run this tool on 50 GB files in production. It needs to produce **exactly correct totals** under a concurrent load with the race detector watching every memory access. No exceptions. I set this test personally, and I will know if you cheated.
+
+<Lab
+  title="Make txstat correct under concurrent load"
+  archetype="load"
+  difficulty="guided"
+  points={100}
+  hintCost={15}
+  objective="The starter aggregator below has a data race: workers share a single map without synchronization. Fix it so the race detector is silent AND the totals are mathematically correct after 10,000 records across 5 accounts with 8 workers. The verifier runs go test -race and checks that every account's total equals exactly (records_per_account * amount_per_record) and count == records_per_account."
+  starter={`package aggregate
+
+import (
+	"context"
+	"sync"
+	"github.com/you/txstat/parse"
+)
+
+type Stats struct {
+	Account    string
+	TotalCents int64
+	Count      int
+}
+
+// BUG: workers share globalMap without any synchronization.
+// The race detector will fire. Fix it without using sync.Mutex on the hot path.
+var globalMap = make(map[string]*Stats)
+
+func Run(ctx context.Context, records <-chan parse.Record, workers int) (map[string]*Stats, error) {
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for rec := range records {
+				s := globalMap[rec.Account] // DATA RACE: concurrent read + write
+				if s == nil {
+					s = &Stats{Account: rec.Account}
+					globalMap[rec.Account] = s // DATA RACE
+				}
+				s.TotalCents += rec.AmountCents // DATA RACE
+				s.Count++                       // DATA RACE
+			}
+		}()
+	}
+	wg.Wait()
+	return globalMap, nil
+}`}
+  verifier="go test -race -run TestRunCorrectUnderLoad ./aggregate/... — must exit 0. The test checks: for each of 5 accounts, Count == 2000 and TotalCents == 2000 * 100 == 200000."
+  hints={[
+    "The global map is the problem. Give each worker its own local map — it owns it exclusively, so no synchronization is needed on the hot path.",
+    "After all workers finish (wg.Wait()), merge the local maps in the main goroutine. The Go memory model guarantees you see all writes once wg.Wait() returns.",
+    "The merge is a simple nested map iteration: for acct, s := range local { if d, ok := global[acct]; ok { d.TotalCents += s.TotalCents; d.Count += s.Count } else { global[acct] = s } }",
+    "Remove the package-level globalMap variable entirely. Each call to Run should create a fresh map. Package-level mutable state is a race waiting to happen."
+  ]}
+  flag="GO{local_maps_no_mutex_merge_at_the_end}"
+>
+
+The global mutable map is a crime. Crimes have consequences. Fix it using the local-map-then-merge pattern from the chapter — no mutex on the hot path, merge under a single pass at the end. When the race detector goes silent and the totals are exact, the flag is yours.
+
+I'll be watching the race detector output personally. Don't disappoint me.
+
+</Lab>
+
+<Recap>
+
+You just built a real tool. Let's make sure you know what you actually did:
+
+- **Module layout:** three packages, each with one job. `parse` reads; `aggregate` computes; `report` formats. `main` wires them together with flags and I/O. No logic in `main`.
+- **`flag` parsing:** `flag.Int/Bool/String` allocate pointers, `flag.Parse()` fills them from `os.Args[1:]`. In tests, use `flag.NewFlagSet` to avoid touching `os.Args` and to avoid `os.Exit`.
+- **`io.Reader` for testability:** the whole program only touches `os.Stdin` and `os.Stdout` in `main`. Every function accepts `io.Reader` and `io.Writer` so tests pass `strings.NewReader` and `bytes.Buffer`.
+- **Bounded worker pool:** N goroutines drain a shared channel, each with a private local map. Merge at the end — zero lock contention on the hot path.
+- **Graceful cancellation:** `signal.NotifyContext` wires SIGINT to a context; every goroutine checks `ctx.Done()` in a select. Cancel once, everything tears down cleanly.
+- **Integer cents, always:** `int64` throughout; `CentsToDisplay` only at the moment of output. No float ever touched the math.
+- **The test suite:** table-driven parser tests, a `-race` correctness test for the aggregator, golden-file tests for report output, and a fuzz test for the parser — all passing under `go test -race ./...`.
+
+</Recap>
+
+<Scoreboard
+  streak={9}
+  items={[
+    { label: "Quick check — why two channels", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — local maps vs mutex", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — -min-amount flag", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — -type flag", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — CSV output", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — context timeout", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 5 — ASCII histogram", kind: "exercise", points: 30, done: false }
+  ]}
+  flag={{ label: "Lab — Correct under concurrent load", captured: false, points: 100 }}
+/>
+
+You built it. You tested it. You made the race detector go quiet. Not bad, sport — genuinely not bad. It's no *me*, but I've seen worse ship to production. Onward: next we talk about design patterns — the vocabulary that separates engineers who solve the same problem five times from engineers who name it once and reach for the right tool.

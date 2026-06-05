@@ -1,0 +1,1751 @@
+---
+title: "Advanced Concurrency & Correctness"
+part: 2
+order: 7
+type: "course"
+description: "Correctness under load: backpressure, the race detector in practice, designing for zero data races, the Go memory model and happens-before, and the bugs that survive review — lost wakeups, goroutine leaks, deadlocks."
+prerequisites: ["concurrency-patterns"]
+---
+
+<HeroCard label="Part 2 · Chapter 7" title="Advanced Concurrency & Correctness">
+
+Listen carefully, because I'm only going to say this once. The Concurrency Patterns chapter taught you the *vocabulary* — pipelines, fan-out, worker pools, all of it. Gorgeous. But vocabulary without correctness is just noise that compiles. The engineers who break production at 3 a.m.? They knew the patterns. What they didn't know was *why* their code was a ticking clock.
+
+That changes today. We're going to talk about backpressure, races, the memory model, and the bugs that slip past every code review — the ones that only show up when a million users hit the same endpoint at the same time. You'll use the race detector. You'll understand what happens-before actually *guarantees*. You'll know exactly how a goroutine leak unfolds and how to stop it cold.
+
+By the end of this chapter you won't just write concurrent code. You'll write *correct* concurrent code. And that, sport, is a very different thing.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Backpressure under load", "The race detector", "Designing for zero races", "The Go memory model", "Bugs that survive review"]} />
+
+## Backpressure under load
+
+**On the job:** Every `POST /transfers` endpoint at Meridian runs behind a bounded worker pool. When a settlement batch hits at midnight, requests arrive faster than workers can process them. Without an explicit shed policy, the queue grows without bound — gigabytes of goroutine stacks and channel items accumulate until OOM kills the process. You define the policy, or the OS defines it for you.
+
+Let me set the scene. You're running Meridian's payment-processing service. A flash sale hits — 50 000 checkout requests per second instead of the usual 5 000. Your worker pool is configured for 100 goroutines. What happens to the other 49 900 requests that can't be served right now?
+
+If you didn't answer that question deliberately in your architecture, the runtime answered it for you. And it probably answered it badly.
+
+**Backpressure** is the mechanism by which a system *signals to its caller that it's full* rather than silently accepting unlimited work. In Go, the primary tool is the **bounded channel** — a channel with a capacity. It applies backpressure the moment it's full.
+
+The three options when you're full:
+
+1. **Block** — the sender blocks until a slot opens. Simple, but can cascade a stall upstream.
+2. **Drop** — the sender discards the work item and moves on. Fast; you lose some work intentionally.
+3. **Shed** — return an explicit error or HTTP 503 so the *client* knows to back off. The most honest signal.
+
+Here's the pattern in code — a bounded job queue with a non-blocking try-send and explicit shedding:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+const workers = 3
+
+// processPayments spins up a bounded worker pool.
+// The channel IS the queue; capacity IS the backpressure knob.
+func processPayments(jobs <-chan int, maxQueue int) {
+	queue := make(chan int, maxQueue) // bounded buffer
+	var wg sync.WaitGroup
+
+	// Start fixed pool of workers.
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range queue {
+				// Simulate processing time (e.g. card network call).
+				time.Sleep(20 * time.Millisecond)
+				fmt.Printf("processed payment %d\n", job)
+			}
+		}()
+	}
+
+	// Forward from inbound stream; shed if full.
+	for job := range jobs {
+		select {
+		case queue <- job:
+			// Slot available — accepted.
+		default:
+			// Buffer full — shed with an explicit signal.
+			fmt.Printf("shed payment %d (queue full)\n", job)
+		}
+	}
+	close(queue) // signal workers to drain and exit
+	wg.Wait()
+}
+
+func main() {
+	jobs := make(chan int, 20)
+	for i := 1; i <= 10; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	processPayments(jobs, 4) // only 4 slots behind 3 workers
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+const workers = 3
+
+func processPayments(jobs <-chan int, maxQueue int) {
+	queue := make(chan int, maxQueue)
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range queue {
+				time.Sleep(20 * time.Millisecond)
+				fmt.Printf("processed payment %d\n", job)
+			}
+		}()
+	}
+
+	for job := range jobs {
+		select {
+		case queue <- job:
+		default:
+			fmt.Printf("shed payment %d (queue full)\n", job)
+		}
+	}
+	close(queue)
+	wg.Wait()
+}
+
+func main() {
+	jobs := make(chan int, 20)
+	for i := 1; i <= 10; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	processPayments(jobs, 4)
+}
+```
+
+</GoPlayground>
+
+Now watch what happens as the bounded buffer fills and the system starts shedding:
+
+<ExecTimeline
+  title="Bounded buffer filling — backpressure in action"
+  lanes={[
+    { id: "sender", label: "Sender" },
+    { id: "queue", label: "Queue (cap 4)" },
+    { id: "worker", label: "Workers (3)" }
+  ]}
+  steps={[
+    { lane: "sender", kind: "send", label: "send job 1–3", note: "First three jobs go directly to workers — the pool is idle, no queuing needed." },
+    { lane: "worker", kind: "run", label: "workers busy", note: "All three workers are now processing. Queue has 0 items." },
+    { lane: "sender", kind: "send", label: "send job 4–7", note: "Workers still busy. Jobs 4–7 fill the bounded queue (cap 4). Queue is now full." },
+    { lane: "queue", kind: "block", label: "queue at capacity", note: "The buffer holds exactly 4 items. One more and we're over the limit." },
+    { lane: "sender", kind: "run", label: "shed job 8–10", note: "select default fires: sender cannot enqueue, so it sheds jobs 8–10 immediately." },
+    { lane: "worker", kind: "done", label: "workers drain", note: "Workers finish processing; they pull from the queue until it's empty." },
+    { lane: "queue", kind: "done", label: "queue drained", note: "close(queue) signals workers to exit cleanly. WaitGroup completes." }
+  ]}
+  caption="A bounded channel IS the backpressure mechanism. When it's full, the non-blocking select fires the default branch — explicit shedding, never silent loss."
+/>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Block (blocking send)">Sender waits until a slot opens. No work is lost, but a slow downstream stalls the entire pipeline upstream. Use when every item must be processed.</ConceptCard>
+  <ConceptCard label="Drop (default branch)">Sender discards the item silently and moves on. Fast, but loss is invisible unless you instrument it. Good for metric samples or non-critical events.</ConceptCard>
+  <ConceptCard label="Shed (return 503)">Return an error to the caller immediately. The most honest signal: the client knows, can retry with backoff, and you haven't burned resources. Prefer this at service boundaries.</ConceptCard>
+  <Gotcha>An unbounded channel (`make(chan T)` with no cap, used as a queue) is not "no backpressure" — it's "unlimited memory." Under a sustained burst, you'll allocate gigabytes of goroutine stacks and channel items before OOM kills the process. Always size your queues and know what happens when they're full.</Gotcha>
+</ConceptGrid>
+
+<UnderTheHood title="How the Go runtime implements channel sends (hchan internals)">
+
+A channel is a `runtime.hchan` struct containing a **circular ring buffer** (the internal queue), a mutex (`lock`), two goroutine queues (`sendq` and `recvq`), and the current buffer fill count (`qcount`). As of Go 1.26, this struct lives on the heap — `make(chan T, n)` allocates the `hchan` and its backing array together. The description below is a simplified model; the actual runtime source is in `runtime/chan.go`.
+
+When you `select { case ch <- v: default: }`, the runtime:
+1. Acquires the `hchan` lock.
+2. Checks `qcount < dataqsiz` (is there room in the ring buffer?).
+3. If yes → copies `v` into the ring buffer, increments `qcount`, releases the lock. O(1).
+4. If no → and there's a blocked receiver in `recvq` → hands off directly (the "direct send" fast path). Otherwise, with the `default` branch present, releases the lock and jumps to `default`. No goroutine is parked, no context switch — that's why the `select/default` pattern is the idiomatic shedding mechanism rather than a length check followed by a separate send.
+
+The ring buffer is cache-friendly for small element types. For large structs, the copy cost matters — consider channel-of-pointer instead. This tradeoff is covered in the performance chapter (Part 2, Ch 8).
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Your payment queue has cap 100 and 200 jobs arrive at once. Workers are busy. What happens to jobs 101–200 if you use a non-blocking select with a default branch?"
+  options={["They block until a slot opens", "They are shed immediately via the default branch", "They overflow the channel and panic", "They are silently queued on the heap"]}
+  answer={1}
+  explain="With a non-blocking select (default branch), any send that would block fires the default case instead. Jobs 101–200 are shed immediately — no blocking, no panic, no silent queuing."
+/>
+
+## The race detector
+
+**On the job:** Meridian's `POST /transfers` handler spawns a goroutine per request. Two transfers hitting the same account concurrently — both reading the balance, both computing the new value, both writing back — corrupt the ledger silently. No panic, no error. The books are wrong and the race detector is the only tool that catches it before it ships.
+
+<Scene
+  title="Two transfers racing on one Meridian balance"
+  actors={[
+    { id: "ta", label: "Transfer A" },
+    { id: "tb", label: "Transfer B" }
+  ]}
+  rows={1}
+  cols={3}
+  cells={[
+    { id: "A1", label: "bal" },
+    { id: "A2", label: "→" },
+    { id: "A3", label: "ledger" }
+  ]}
+  frames={[
+    {
+      caption: "Account balance is 5000 cents. Both transfers are about to start.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "idle", label: "5000" },
+        { id: "A2", state: "idle", label: "→" },
+        { id: "A3", state: "idle", label: "ledger" }
+      ]
+    },
+    {
+      caption: "Transfer A reads balance = 5000. Transfer B also reads balance = 5000. Neither has written yet.",
+      beat: "problem",
+      actors: [{ id: "ta", state: "active" }, { id: "tb", state: "active" }],
+      cells: [
+        { id: "A1", state: "warn", label: "5000" },
+        { id: "A2", state: "warn", label: "read×2" },
+        { id: "A3", state: "idle", label: "ledger" }
+      ]
+    },
+    {
+      caption: "Transfer A computes 5000 − 1000 = 4000. Transfer B computes 5000 − 500 = 4500. Both based on the stale read.",
+      beat: "problem",
+      actors: [{ id: "ta", state: "active" }, { id: "tb", state: "active" }],
+      cells: [
+        { id: "A1", state: "warn", label: "5000" },
+        { id: "A2", state: "bad", label: "compute" },
+        { id: "A3", state: "idle", label: "ledger" }
+      ]
+    },
+    {
+      caption: "Transfer A writes 4000. Transfer B writes 4500, overwriting A. One debit is silently lost — balance is wrong.",
+      beat: "problem",
+      actors: [{ id: "ta", state: "idle" }, { id: "tb", state: "bad" }],
+      cells: [
+        { id: "A1", state: "bad", label: "4500" },
+        { id: "A2", state: "bad", label: "lost!" },
+        { id: "A3", state: "bad", label: "corrupt" }
+      ]
+    },
+    {
+      caption: "With a mutex: Transfer A locks, reads, computes, writes 4000, unlocks. Transfer B then locks and sees 4000 — correct.",
+      beat: "solution",
+      actors: [{ id: "ta", state: "ok" }, { id: "tb", state: "ok" }],
+      cells: [
+        { id: "A1", state: "done", label: "3500" },
+        { id: "A2", state: "done", label: "serial" },
+        { id: "A3", state: "done", label: "correct" }
+      ]
+    }
+  ]}
+  caption="The canonical Meridian race: two concurrent transfers on one balance. The mutex forces serial execution and the books stay correct."
+/>
+
+Here's the scene in code: two goroutines update the same account balance at the same time. Both read it, both add their transfer amount, both write back. One write silently overwrites the other. Money appears from thin air — or disappears into it. That's a **data race**, and Go ships a tool that catches it before it ever sees production.
+
+Run any Go command with `-race` and the runtime wraps every memory access in **shadow memory tracking**. When two goroutines touch the same address without any synchronization between them, it fires an alarm.
+
+First, let's see the race — and what `-race` reports:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// balance is shared state — the bug is that nothing protects it.
+var balance int
+
+func deposit(amount int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	// BUG: read-modify-write is not atomic.
+	// Two goroutines can both read 1000, both add, both write —
+	// and one write silently wins, losing a deposit.
+	balance = balance + amount
+}
+
+func main() {
+	var wg sync.WaitGroup
+	balance = 1000
+
+	for range 5 {
+		wg.Add(1)
+		go deposit(100, &wg) // five concurrent deposits of $1.00 each
+	}
+	wg.Wait()
+	// Expected: 1500. Actual: unpredictable (and wrong).
+	fmt.Println("final balance:", balance)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+var balance int
+
+func deposit(amount int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	balance = balance + amount
+}
+
+func main() {
+	var wg sync.WaitGroup
+	balance = 1000
+
+	for range 5 {
+		wg.Add(1)
+		go deposit(100, &wg)
+	}
+	wg.Wait()
+	fmt.Println("final balance:", balance)
+}
+```
+
+</GoPlayground>
+
+Run this with `go run -race main.go` locally and you'll see a report like:
+
+```
+==================
+WARNING: DATA RACE
+Read at 0x... by goroutine 8:
+  main.deposit()
+      main.go:16
+
+Previous write at 0x... by goroutine 7:
+  main.deposit()
+      main.go:16
+
+Goroutine 8 (running) created at:
+  main.main()
+      main.go:24
+==================
+```
+
+The report tells you: the *address* that raced, the *line* of each conflicting access, the *goroutines* involved, and where those goroutines were spawned. That's everything you need to find and fix the bug.
+
+Now watch the two goroutines racing — and the fix:
+
+<ExecTimeline
+  title="Two goroutines racing on balance — then the fix"
+  lanes={[
+    { id: "g1", label: "goroutine 1" },
+    { id: "g2", label: "goroutine 2" }
+  ]}
+  steps={[
+    { lane: "g1", kind: "run", label: "read balance=1000", note: "Goroutine 1 reads the current balance: 1000." },
+    { lane: "g2", kind: "run", label: "read balance=1000", note: "Goroutine 2 ALSO reads balance: still 1000 — the write hasn't happened yet. This is the race." },
+    { lane: "g1", kind: "run", label: "compute 1000+100", note: "Goroutine 1 computes the new value: 1100." },
+    { lane: "g2", kind: "run", label: "compute 1000+100", note: "Goroutine 2 independently computes: also 1100." },
+    { lane: "g1", kind: "send", label: "write balance=1100", note: "Goroutine 1 writes 1100. Correct so far." },
+    { lane: "g2", kind: "send", label: "write balance=1100", note: "Goroutine 2 ALSO writes 1100 — it overwrites G1's write. One deposit is lost." },
+    { lane: "g1", kind: "done", label: "wg.Done()", note: "Both goroutines finish. Balance is 1100, not 1200. $1.00 vanished." }
+  ]}
+  caption="The read-modify-write is three separate operations. The scheduler can interleave goroutines between any two of them. That gap is the race."
+/>
+
+Here's the fix — with a mutex:
+
+<BeforeAfter
+  badLabel="DATA RACE"
+  goodLabel="Race-free"
+  bad={`var balance int
+
+func deposit(amt int) {
+  balance = balance + amt
+}`}
+  good={`var (
+  mu      sync.Mutex
+  balance int
+)
+
+func deposit(amt int) {
+  mu.Lock()
+  defer mu.Unlock()
+  balance += amt
+}`}
+/>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+var (
+	mu      sync.Mutex
+	balance int
+)
+
+func deposit(amount int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	mu.Lock()
+	defer mu.Unlock()
+	balance += amount
+}
+
+func main() {
+	var wg sync.WaitGroup
+	balance = 1000
+
+	for range 5 {
+		wg.Add(1)
+		go deposit(100, &wg)
+	}
+	wg.Wait()
+	// Always 1500 — guaranteed.
+	fmt.Println("final balance:", balance)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warn" title="-race doesn't run in the public Go Playground">
+
+The Go Playground sandbox disables `-race` for security reasons. To reproduce the race report: clone the racy version above, run `go run -race main.go` locally, and watch it fire. In CI, always include a `-race` job — it's a single flag in your `go test` command and it catches things that months of review miss.
+
+</Callout>
+
+<UnderTheHood title="How -race works: shadow memory and vector clocks">
+
+The race detector is implemented in the Go runtime using **ThreadSanitizer v2** (TSan), compiled in when you pass `-race`. As of Go 1.26, the instrumentation works at two levels. This is a simplified model of the mechanism; the full implementation is in `runtime/race.go` and the upstream TSan library.
+
+**Shadow memory.** Every 8 bytes of your program's memory gets a corresponding 32-byte "shadow" cell in a parallel region. Each shadow cell stores the last 4 access records: goroutine ID, logical time (a vector-clock epoch), read/write flag, and whether synchronization happened around it. This is why `-race` uses 5–10× more memory — the shadow map is proportional to your heap+stack.
+
+**Vector clocks.** Every synchronization event (channel send/receive, mutex lock/unlock, `sync.Once.Do`, etc.) advances a logical clock for each goroutine. When goroutine G2 receives from a channel that G1 sent on, G2's clock is updated to reflect everything G1 had done before the send. This is the happens-before relation encoded numerically.
+
+**The detection.** On each memory access, the compiler-inserted instrumentation checks: does the shadow cell record a conflicting access (opposite read/write, or both writes) by a *different* goroutine whose clock epoch is *not* happens-before this access? If yes → race detected. The check is O(1) per access — it's fast enough to run in staging, though the 2–20× slowdown makes it unsuitable for production hot paths.
+
+The source lives in `runtime/race.go` (the Go shim) and the upstream TSan library. If you want to go deeper: Serebryany & Iskhodzhanov, "ThreadSanitizer: Data Race Detection in Practice," Proceedings of the Workshop on Binary Instrumentation and Applications, 2009.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="You run go test -race ./... and see a DATA RACE report. What are the two things the report always tells you?"
+  options={[
+    "The goroutine IDs and the race detector version",
+    "The memory address that raced and the line numbers of the conflicting accesses",
+    "The CPU core and the OS thread number",
+    "The package name and the test function name"
+  ]}
+  answer={1}
+  explain="A race report always names the exact memory address that was raced on, the file:line of each conflicting access (read vs. write), the goroutines involved, and where those goroutines were created — everything you need to locate and fix the bug."
+/>
+
+## Designing for zero races
+
+**On the job:** The race detector only fires on paths that actually execute during a test run. A transfer path that requires a specific timing window may never trigger it in CI but will in production under load. Design the data structures to make races impossible, not just hard to trigger.
+
+The race detector finds races *after* they exist. The real goal is to design code so races *cannot* exist. There are four techniques, and I'll tell you exactly when to reach for each one.
+
+### Confinement
+
+The cleanest solution: don't share at all. If only one goroutine ever touches a value, no synchronization is needed — the risk surface is zero.
+
+```go
+package main
+
+import "fmt"
+
+// processTransfer runs entirely within a single goroutine.
+// Each invocation gets its own local copy of the ledger state.
+// No sharing, no synchronization needed.
+func processTransfer(fromBalance, amount int) (int, error) {
+	if fromBalance < amount {
+		return fromBalance, fmt.Errorf("insufficient funds: have %d, need %d",
+			fromBalance, amount)
+	}
+	return fromBalance - amount, nil // local variable, not shared
+}
+
+func main() {
+	bal, err := processTransfer(5000, 1500)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("remaining balance:", bal)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+func processTransfer(fromBalance, amount int) (int, error) {
+	if fromBalance < amount {
+		return fromBalance, fmt.Errorf("insufficient funds: have %d, need %d",
+			fromBalance, amount)
+	}
+	return fromBalance - amount, nil
+}
+
+func main() {
+	bal, err := processTransfer(5000, 1500)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("remaining balance:", bal)
+}
+```
+
+</GoPlayground>
+
+The Go proverb here: **"Don't communicate by sharing memory; share memory by communicating."** Confinement is the purest form — nothing to communicate, nothing to share.
+
+### Immutability
+
+If data can never change after creation, any number of goroutines can read it simultaneously — reads never race with reads. In Go, you implement immutability by returning values (not pointers) and never exposing mutation methods.
+
+### Atomics for counters and flags
+
+For simple numeric values — counters, flags, version stamps — `sync/atomic` is faster than a mutex and race-free by construction. Use `atomic.Int64` (Go 1.19+), not the old `atomic.AddInt64` function form.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+func main() {
+	var requestCount atomic.Int64 // zero value is 0 — ready to use
+	var wg sync.WaitGroup
+
+	// 1000 concurrent requests, each incrementing the counter.
+	// wg.Go (Go 1.25) calls wg.Add(1) and launches the goroutine atomically.
+	for range 1000 {
+		wg.Go(func() {
+			requestCount.Add(1)
+		})
+	}
+	wg.Wait()
+	fmt.Println("total requests:", requestCount.Load()) // always 1000
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+func main() {
+	var requestCount atomic.Int64
+	var wg sync.WaitGroup
+
+	// wg.Go is available as of Go 1.25.
+	for range 1000 {
+		wg.Go(func() {
+			requestCount.Add(1)
+		})
+	}
+	wg.Wait()
+	fmt.Println("total requests:", requestCount.Load())
+}
+```
+
+</GoPlayground>
+
+### Mutex discipline
+
+When the shared state is complex (a struct, a map, a slice), a mutex is the right tool. The rules for getting it right:
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Lock the data, not the code">The mutex protects a specific piece of data, not a vague "critical section." Embed the mutex with the data it guards so the relationship is obvious.</ConceptCard>
+  <ConceptCard label="defer mu.Unlock()">Always defer the unlock on the line after the lock. It fires even when the function panics. Forgetting it causes a deadlock that won't show until your first burst of real traffic.</ConceptCard>
+  <ConceptCard label="Don't hold locks across I/O">Calling a database, HTTP endpoint, or anything that blocks while holding a lock means all other goroutines that need that lock are parked for the duration of the network call. Release the lock; use local variables.</ConceptCard>
+  <Gotcha>Never copy a mutex. A `sync.Mutex` contains internal state; copying it copies that state and the copy won't unlock the original. Embed it by value in a struct, and pass the struct by pointer. `go vet` catches this — run it.</Gotcha>
+</ConceptGrid>
+
+Here's an account struct that puts these rules together:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Account embeds its mutex with the data it guards.
+// The zero value is safe to use — both mu and balance start at zero.
+type Account struct {
+	mu      sync.Mutex
+	balance int // cents; protected by mu
+}
+
+// Deposit adds amount to the balance. Safe for concurrent use.
+func (a *Account) Deposit(amount int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.balance += amount
+}
+
+// Balance returns the current balance. Safe for concurrent use.
+func (a *Account) Balance() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.balance
+}
+
+func main() {
+	acc := &Account{balance: 10000} // $100.00 in cents
+	var wg sync.WaitGroup
+
+	// Ten concurrent deposits of $10.00 each.
+	// wg.Go (Go 1.25) adds 1 and spawns the goroutine in one call.
+	for range 10 {
+		wg.Go(func() {
+			acc.Deposit(1000)
+		})
+	}
+	wg.Wait()
+	fmt.Printf("final: $%d.%02d\n", acc.Balance()/100, acc.Balance()%100)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Account struct {
+	mu      sync.Mutex
+	balance int
+}
+
+func (a *Account) Deposit(amount int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.balance += amount
+}
+
+func (a *Account) Balance() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.balance
+}
+
+func main() {
+	acc := &Account{balance: 10000}
+	var wg sync.WaitGroup
+
+	for range 10 {
+		wg.Go(func() {
+			acc.Deposit(1000)
+		})
+	}
+	wg.Wait()
+	fmt.Printf("final: $%d.%02d\n", acc.Balance()/100, acc.Balance()%100)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="What atomics compile to: LOCK-prefixed instructions and barriers">
+
+`atomic.Int64.Add` compiles to a single `LOCK XADDQ` instruction on amd64 (or equivalent on arm64). The `LOCK` prefix tells the CPU to hold the memory bus for the duration of the read-modify-write, making it *hardware-atomic* — no other core can interleave between the read and the write.
+
+This is substantially cheaper than a `sync.Mutex`, which involves a futex syscall when there's contention (a full OS round-trip). For a simple counter touched by hundreds of goroutines, the difference between `atomic.Int64` and `sync.Mutex` can be 5–10× in throughput.
+
+However, atomics don't compose. If you need to atomically update *two* related values (e.g. a balance *and* a transaction count together, consistently), you need a mutex — there's no hardware instruction for multi-field atomicity. The moment the invariant spans more than one word, reach for a mutex.
+
+On arm64, the compiler emits `STLXR`/`LDAXR` (load-acquire / store-release) sequences. These carry **memory ordering barriers**: the CPU guarantees that all prior memory operations are visible to other cores before the store completes. This is what makes atomics safe across cores — not just hardware-atomic, but *sequentially consistent* for the operations they protect.
+
+</UnderTheHood>
+
+<UnderTheHood title="How a mutex is actually built: spinlock → futex → starvation mode">
+
+A `sync.Mutex` looks like a black box, but it's three layers, each solving the failure of the one below. Knowing them explains why a mutex is cheap when uncontended and expensive when hot.
+
+**Layer 1 — the spinlock.** The simplest lock is a single integer and an atomic compare-and-swap: "if the lock is 0, set it to 1." If the CAS fails (someone holds it), you *spin* — loop and retry. A **spinlock** is correct and, for a lock held for a handful of nanoseconds, fast: the waiter stays hot on its CPU core and grabs the lock the instant it's free, with no trip into the kernel. The catch: a spinning goroutine **burns a whole CPU doing nothing**. Spin for a lock held across a slow operation and you waste millions of cycles. Spinning only pays when the wait is shorter than the cost of parking.
+
+**Layer 2 — the futex.** So you can't *only* spin. The kernel offers a **futex** ("fast userspace mutex"): in the uncontended case the lock is taken and released entirely in userspace with one atomic op — *zero* syscalls, which is why an uncontended `Lock()`/`Unlock()` is nearly free. Only when a goroutine actually has to *wait* does it make a syscall to **park** (sleep) until the holder's `Unlock` issues a wake. No CPU burned while parked. The cost is that syscall round-trip — the "futex syscall" the atomics note above referred to — which is why contention, not locking itself, is what makes a mutex slow.
+
+**Go's blend.** `sync.Mutex` combines both: on contention it **spins a few times** (cheap, in case the lock frees immediately), and only then **parks** the goroutine via the runtime (Go parks the *goroutine*, not the OS thread, so the M stays free to run others — a futex-like park one level up from the kernel). Two pieces of real internal state make this robust: a **spin count** bounding the busy-wait, and, since Go 1.9, a **starvation mode** — if a goroutine waits more than **1ms** for the lock, the mutex flips to handing the lock *directly* to the front of the wait queue instead of letting a freshly-arriving goroutine barge in. That barging is great for throughput but can leave an unlucky waiter starved forever; starvation mode trades a little throughput for the guarantee that no waiter waits unboundedly. As of Go 1.26 this lives in `sync/mutex.go` (`lockSlow`/`unlockSlow`). The takeaway: a mutex is fast precisely *because* it avoids the kernel until it must, and fair precisely *because* it gives up that speed under sustained contention.
+
+</UnderTheHood>
+
+## The Go memory model
+
+**On the job:** Meridian's ledger workers cache an account's balance in a local variable before processing a batch. Without a synchronization event between the writer goroutine and the reader goroutine, the cached value may be stale — even on a single machine. This is not a theoretical concern: the compiler and CPU both reorder memory operations for performance, and they do so aggressively.
+
+The Go memory model (last revised 2022) is the authoritative answer to the question: "If goroutine A writes to a variable, is goroutine B guaranteed to see that write?" The answer — and this surprises a lot of people — is **not necessarily, unless there's a synchronization event between them.**
+
+Here's the foundational rule:
+
+> **A write to a variable by one goroutine is guaranteed to be observed by a read of that variable in a different goroutine only if the write happens-before the read.**
+
+**Happens-before** is a strict partial order. It's not about wall-clock time. It's about *logical ordering enforced by synchronization*. Without synchronization, the compiler and CPU are free to reorder memory operations for performance — and they do.
+
+The events that establish happens-before in Go (as of the 2022 memory model):
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Channel send / receive">A send on a channel happens-before the corresponding receive completes. For buffered channels, the k-th receive happens-before completion of the (k + cap)-th send; that is what makes buffered-channel semaphores work.</ConceptCard>
+  <ConceptCard label="Mutex Unlock → Lock">An `mu.Unlock()` call happens-before any subsequent `mu.Lock()` call returns. This is why mutex-guarded data is visible to the next locker.</ConceptCard>
+  <ConceptCard label="sync.Once.Do">The completion of `f` inside `once.Do(f)` happens-before the return of any call to `once.Do(f)`. The initialization is guaranteed visible to all callers.</ConceptCard>
+  <ConceptCard label="Goroutine creation">The `go` statement that creates goroutine G happens-before G's execution begins. Arguments evaluated before the `go` are visible inside the goroutine.</ConceptCard>
+</ConceptGrid>
+
+Here's the classic trap — unsynchronized access looks fine in testing but is still a data race:
+
+```go
+package main
+
+import "fmt"
+
+// WARNING: this code has a data race.
+// Do not use this pattern. Shown for educational purposes.
+var ready bool   // no synchronization
+var data int
+
+func setup() {
+	data = 42    // write 1
+	ready = true // write 2
+}
+
+func observe() {
+	if ready {        // read 2 — may see true...
+		fmt.Println(data) // read 1 — ...but may NOT see 42!
+	}
+}
+
+func main() {
+	// This program has a data race. The result is not synchronized.
+	// The compiler or CPU may reorder writes in setup(),
+	// and the goroutine running observe() has no happens-before
+	// guarantee from setup()'s writes.
+	go setup()
+	go observe()
+	// Without synchronization, we cannot reason about the output.
+	fmt.Println("(race — unsynchronized behavior)")
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Fixed version: channel establishes happens-before.
+var data int
+
+func setup(done chan<- struct{}) {
+	data = 42         // write happens before...
+	close(done)       // ...the channel close, which happens-before...
+}
+
+func observe(done <-chan struct{}) {
+	<-done            // ...this receive completes. So data=42 is visible.
+	fmt.Println("data:", data)
+}
+
+func main() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); setup(done) }()
+	go func() { defer wg.Done(); observe(done) }()
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Happens-before via channel: data is guaranteed visible"
+  lanes={[
+    { id: "setup", label: "setup goroutine" },
+    { id: "obs", label: "observe goroutine" }
+  ]}
+  steps={[
+    { lane: "setup", kind: "run", label: "data = 42", note: "Write to data. Not yet visible to other goroutines — no sync event yet." },
+    { lane: "setup", kind: "send", label: "close(done)", note: "Closing a channel is a send. The memory model guarantees: all writes before close happen-before..." },
+    { lane: "obs", kind: "recv", label: "<-done unblocks", note: "...the receive on done completing. The observe goroutine now has happens-before on setup's writes." },
+    { lane: "obs", kind: "run", label: "read data → 42", note: "Guaranteed to see 42. The happens-before chain makes this correct, not luck." }
+  ]}
+  caption="The channel close establishes the happens-before edge. Without it, reading data from observe is a race — even if it 'usually works' in testing."
+/>
+
+<Callout kind="pro" title="The 2022 memory model revision">
+
+The Go memory model was substantially revised in 2022 to align with how the language actually behaves and to match the C++ memory model's formalism. The key addition: **package-level `sync` primitives** (`sync.Mutex`, `sync.WaitGroup`, `sync.Once`, `sync.Map`, `sync.Pool`, `sync.Cond`) all now have formally documented happens-before guarantees in the spec. Read it at `go.dev/ref/mem`. If you're writing lock-free code or using `unsafe`, cite it chapter and verse. If you're not, the rule is simple: always synchronize access to shared mutable state, and you're fine.
+
+</Callout>
+
+## Bugs that survive review
+
+**On the job:** Lost wakeups, goroutine leaks, and deadlocks survive code review because they require specific interleavings that tests almost never reproduce. At Meridian, a goroutine leak in the settlement job accumulated 400 MB of orphaned goroutine stacks over six hours before an OOM killed the process. The code looked fine in review.
+
+These are the four bugs that your code reviewer will miss, your unit tests won't catch, and `-race` may not trigger deterministically. I've seen each one take down a service. You will recognize all of them today.
+
+### Lost wakeup
+
+A goroutine waits on a condition — but the signal fires *before* the wait begins. The goroutine waits forever for a signal that already happened.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// BUG: processOrder signals before the monitor goroutine is ready to wait.
+// The cond.Signal() fires into the void; cond.Wait() then blocks forever.
+func buggyVersion() {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	orderReady := false
+
+	// "Producer": marks order ready and signals.
+	go func() {
+		mu.Lock()
+		orderReady = true
+		cond.Signal() // fires before the consumer calls Wait — lost!
+		mu.Unlock()
+	}()
+
+	// "Consumer": supposed to wait until order is ready.
+	// But if the goroutine above runs first, Signal() is lost.
+	mu.Lock()
+	// FIX: always check the condition in a loop.
+	for !orderReady {
+		cond.Wait() // blocks here forever if Signal() already fired
+	}
+	mu.Unlock()
+	fmt.Println("order processed") // may never print in the buggy version
+}
+
+func main() {
+	// The fixed version: check the condition in a loop.
+	// cond.Wait() atomically releases mu and parks the goroutine.
+	// If the signal already fired, orderReady is true and we skip Wait entirely.
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	orderReady := false
+
+	go func() {
+		mu.Lock()
+		orderReady = true
+		cond.Signal()
+		mu.Unlock()
+	}()
+
+	mu.Lock()
+	for !orderReady { // loop: re-check after every wakeup (also handles spurious wakeups)
+		cond.Wait()
+	}
+	mu.Unlock()
+	fmt.Println("order processed — guaranteed")
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	orderReady := false
+
+	go func() {
+		mu.Lock()
+		orderReady = true
+		cond.Signal()
+		mu.Unlock()
+	}()
+
+	mu.Lock()
+	for !orderReady {
+		cond.Wait()
+	}
+	mu.Unlock()
+	fmt.Println("order processed — guaranteed")
+}
+```
+
+</GoPlayground>
+
+<Gotcha>Never call `cond.Wait()` once. Always wrap it in a `for !condition` loop. This handles both the lost-wakeup case (the loop body is skipped if the condition is already true) and spurious wakeups (wakeups that happen without a Signal, allowed by POSIX and therefore by Go's implementation).</Gotcha>
+
+### Goroutine leak
+
+A goroutine that's launched but can never exit. It stays alive, consuming memory (goroutine stacks start small and grow dynamically), until the process dies. At 1 000 leaking goroutines per minute, you have 30 minutes before OOM.
+
+The canonical leak: a goroutine blocked on a channel send with no receiver.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// leaked: worker sends on results but the caller only reads one value
+// and then returns. The goroutine is permanently blocked on the send.
+func leaked(ctx context.Context) <-chan string {
+	results := make(chan string) // unbuffered — blocks until read
+	go func() {
+		// Simulate two results found.
+		results <- "transfer-001" // first read consumed by caller
+		results <- "transfer-002" // NOBODY READS THIS — goroutine leaks here
+	}()
+	return results
+}
+
+// fixed: worker respects context cancellation.
+func fixed(ctx context.Context) <-chan string {
+	results := make(chan string)
+	go func() {
+		defer close(results) // always close to signal completion
+		items := []string{"transfer-001", "transfer-002"}
+		for _, item := range items {
+			select {
+			case results <- item:
+			case <-ctx.Done():
+				return // context cancelled — exit cleanly, no leak
+			}
+		}
+	}()
+	return results
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	ch := fixed(ctx)
+	// Read only the first result; context timeout covers the rest.
+	if v, ok := <-ch; ok {
+		fmt.Println("got:", v)
+	}
+	// cancel() fires; worker goroutine sees ctx.Done() and exits cleanly.
+	time.Sleep(10 * time.Millisecond) // let the goroutine exit
+	fmt.Println("no leak — goroutine exited via context")
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func fixed(ctx context.Context) <-chan string {
+	results := make(chan string)
+	go func() {
+		defer close(results)
+		items := []string{"transfer-001", "transfer-002"}
+		for _, item := range items {
+			select {
+			case results <- item:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return results
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	ch := fixed(ctx)
+	if v, ok := <-ch; ok {
+		fmt.Println("got:", v)
+	}
+	time.Sleep(10 * time.Millisecond)
+	fmt.Println("no leak")
+}
+```
+
+</GoPlayground>
+
+**The rule:** every goroutine you launch must have a path to exit. The standard signal is `context.Done()`. If you're not passing a `context.Context` into your goroutines, you don't have a clean shutdown story.
+
+<Callout kind="note" title="Detecting leaks in production — Go 1.26 goroutineleak profile">
+
+Go 1.26 adds an experimental `goroutineleak` pprof profile alongside the existing `goroutine` profile. Enable it with `GOEXPERIMENT=goroutineleakprofile`; that also exposes `/debug/pprof/goroutineleak` via `net/http/pprof`. The profile reports goroutines blocked on concurrency primitives that the runtime can prove cannot become unblocked, using GC reachability. It will not catch every leak, but it catches a large class without drowning you in the full goroutine dump.
+
+</Callout>
+
+<Callout kind="note" title="Testing time-sensitive concurrency — testing/synctest (Go 1.25)">
+
+`testing/synctest` (added in Go 1.25, package path `testing/synctest`) lets you write deterministic tests for code that uses timers or `time.After`. Call `synctest.Test(t, func(t *testing.T) { ... })` to execute the body in a fake-time environment where `time.Sleep` and `time.After` don't block real wall time — they advance a synthetic clock. This is the canonical way to test the lost-wakeup scenario and timeout-driven goroutine exits without `time.Sleep` in tests. It does not replace `-race`; use both.
+
+</Callout>
+
+### Deadlock
+
+Two goroutines each hold a lock the other needs. Both wait forever. Go's runtime detects the total-deadlock case (all goroutines blocked) and panics with "all goroutines are asleep — deadlock!" but partial deadlocks — where a subset of goroutines are stuck and the rest keep running — go undetected.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Transfer between two accounts — classic lock ordering bug.
+// Always lock in the same order to prevent deadlock.
+type SafeAccount struct {
+	id      int
+	mu      sync.Mutex
+	balance int
+}
+
+// transferFixed always locks the lower-ID account first.
+// Consistent ordering prevents the circular wait that causes deadlock.
+func transferFixed(from, to *SafeAccount, amount int) error {
+	// Establish a canonical lock order by account ID.
+	first, second := from, to
+	if from.id > to.id {
+		first, second = to, from
+	}
+
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+
+	if from.balance < amount {
+		return fmt.Errorf("insufficient funds")
+	}
+	from.balance -= amount
+	to.balance += amount
+	return nil
+}
+
+func main() {
+	a := &SafeAccount{id: 1, balance: 5000}
+	b := &SafeAccount{id: 2, balance: 3000}
+
+	var wg sync.WaitGroup
+
+	// wg.Go (Go 1.25) — no wg.Add(1) / defer wg.Done() boilerplate.
+	wg.Go(func() {
+		if err := transferFixed(a, b, 1000); err != nil {
+			fmt.Println("a→b error:", err)
+		}
+	})
+	wg.Go(func() {
+		if err := transferFixed(b, a, 500); err != nil {
+			fmt.Println("b→a error:", err)
+		}
+	})
+
+	wg.Wait()
+	fmt.Printf("a: %d  b: %d  total: %d\n", a.balance, b.balance, a.balance+b.balance)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type SafeAccount struct {
+	id      int
+	mu      sync.Mutex
+	balance int
+}
+
+func transferFixed(from, to *SafeAccount, amount int) error {
+	first, second := from, to
+	if from.id > to.id {
+		first, second = to, from
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+
+	if from.balance < amount {
+		return fmt.Errorf("insufficient funds")
+	}
+	from.balance -= amount
+	to.balance += amount
+	return nil
+}
+
+func main() {
+	a := &SafeAccount{id: 1, balance: 5000}
+	b := &SafeAccount{id: 2, balance: 3000}
+	var wg sync.WaitGroup
+
+	wg.Go(func() { transferFixed(a, b, 1000) })
+	wg.Go(func() { transferFixed(b, a, 500) })
+
+	wg.Wait()
+	fmt.Printf("a: %d  b: %d  total: %d\n", a.balance, b.balance, a.balance+b.balance)
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="Deadlock (buggy) vs. lock-ordering fix"
+  lanes={[
+    { id: "g1", label: "goroutine A→B" },
+    { id: "g2", label: "goroutine B→A" }
+  ]}
+  steps={[
+    { lane: "g1", kind: "run", label: "lock account A", note: "Goroutine 1 acquires account A's mutex successfully." },
+    { lane: "g2", kind: "run", label: "lock account B", note: "Goroutine 2 acquires account B's mutex successfully." },
+    { lane: "g1", kind: "block", label: "wait for B — blocked", note: "Goroutine 1 tries to lock B. Goroutine 2 holds it. G1 parks." },
+    { lane: "g2", kind: "block", label: "wait for A — blocked", note: "Goroutine 2 tries to lock A. Goroutine 1 holds it. DEADLOCK." },
+    { lane: "g1", kind: "done", label: "FIX: lock low-ID first", note: "With canonical ordering: both goroutines lock account 1 first, then account 2. One wins, the other waits — no cycle." },
+    { lane: "g2", kind: "done", label: "winner proceeds", note: "The goroutine that got account 1 first completes; the other proceeds after. No deadlock possible." }
+  ]}
+  caption="Deadlock requires a cycle in the lock-acquisition graph. Destroy the cycle by always acquiring locks in the same canonical order across all code paths."
+/>
+
+### Livelock and starvation
+
+Deadlock is the *quiet* failure — everyone's asleep. Its two cousins are the *loud* ones, and they're nastier precisely because the goroutines look healthy. CPU's pegged, the trace shows goroutines running, your dashboards are green-ish. And yet nothing actually finishes. Charming, isn't it?
+
+<Define term="Livelock" since="Advanced Concurrency (Part 2)">Goroutines aren't blocked — they're actively running and *reacting to each other* — but make zero forward progress. The classic image: two people in a corridor, each politely stepping aside, both stepping the same way, forever. Fix: break the symmetry.</Define>
+
+**On the job:** Meridian's transfer code was "clever." To avoid the deadlock you just learned about, each transfer would *try* to grab both account locks, and if it couldn't get the second one, it would release the first and retry. Sounds defensive. But when two opposite transfers (`A→B` and `B→A`) collide, both detect the conflict on the same beat, both back off on the same beat, both retry on the same beat — and collide again. No one is blocked. Everyone is busy. The books never move. That's a **livelock**.
+
+The cure is to **destroy the symmetry**. Two ways: a single canonical lock order (the deadlock fix from above — no retry needed at all, which is why it's the better answer), or, if you must retry, **randomized backoff (jitter)** so the two goroutines stop landing on the same beat:
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand/v2"
+)
+
+// Two transfers that, on detecting contention, both back off and retry.
+// With NO jitter they retry in perfect lockstep — a livelock: always busy,
+// never progressing. With jitter, one waits a different amount, breaks the
+// symmetry, and progress is made. We model each "attempt" as a round.
+func tryWithBackoff(name string, jitter bool) int {
+	rounds := 0
+	for {
+		rounds++
+		collide := true // both land on the same beat → they conflict
+		if jitter {
+			// Random backoff desynchronizes the two retriers.
+			collide = rand.IntN(2) == 0
+		}
+		if !collide {
+			fmt.Printf("%s: acquired after %d round(s)\n", name, rounds)
+			return rounds
+		}
+		fmt.Printf("%s: collision on round %d — backing off\n", name, rounds)
+		if rounds >= 6 {
+			fmt.Printf("%s: LIVELOCK — gave up after %d lockstep retries\n", name, rounds)
+			return rounds
+		}
+	}
+}
+
+func main() {
+	fmt.Println("=== No jitter: lockstep retries → livelock ===")
+	tryWithBackoff("transfer-A", false)
+
+	fmt.Println("\n=== Randomized backoff: jitter breaks the symmetry ===")
+	tryWithBackoff("transfer-B", true)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand/v2"
+)
+
+func tryWithBackoff(name string, jitter bool) int {
+	rounds := 0
+	for {
+		rounds++
+		collide := true
+		if jitter {
+			collide = rand.IntN(2) == 0
+		}
+		if !collide {
+			fmt.Printf("%s: acquired after %d round(s)\n", name, rounds)
+			return rounds
+		}
+		fmt.Printf("%s: collision on round %d — backing off\n", name, rounds)
+		if rounds >= 6 {
+			fmt.Printf("%s: LIVELOCK — gave up after %d lockstep retries\n", name, rounds)
+			return rounds
+		}
+	}
+}
+
+func main() {
+	fmt.Println("=== No jitter: lockstep retries → livelock ===")
+	tryWithBackoff("transfer-A", false)
+
+	fmt.Println("\n=== Randomized backoff: jitter breaks the symmetry ===")
+	tryWithBackoff("transfer-B", true)
+}
+```
+
+</GoPlayground>
+
+<Gotcha>"Retry on conflict" without jitter is a livelock generator. If two actors react to the same signal identically, they'll stay synchronized. Add randomized backoff, *or* eliminate the retry entirely with a canonical lock order — the latter is strictly better because there's no wasted work at all.</Gotcha>
+
+Now the other cousin.
+
+<Define term="Starvation" since="Advanced Concurrency (Part 2)">A goroutine never gets a resource because other goroutines keep winning it. No deadlock, no livelock — just one perpetually-unlucky goroutine waiting while the queue jumps it indefinitely.</Define>
+
+Starvation is why `sync.Mutex` has the **starvation mode** from the under-the-hood note above. A plain mutex lets a freshly-arriving goroutine *barge* in and grab a just-freed lock ahead of a goroutine that's been waiting — great for throughput, but under sustained contention the barging newcomers can starve the patient waiter forever. So since Go 1.9, if a waiter has been queued for more than **1ms**, the mutex flips to handing the lock *directly* to the front of the wait queue. That single rule is the difference between "fast on average" and "fast on average *and* no waiter waits unboundedly."
+
+`sync.RWMutex` faces the mirror image: **reader-starvation vs. writer-starvation.** A naive read-write lock that always admits readers will starve any writer the moment readers arrive continuously — the writer never sees a gap. Go's `RWMutex` defends the writer: once a writer is waiting, **new readers are blocked** behind it even if the lock is currently held by other readers. That guarantees the writer eventually runs, at the cost of making some readers wait. Fairness, like everything in concurrency, is a trade.
+
+<Callout kind="note" title="Deadlock vs. livelock vs. starvation — the one-line test">
+
+All three mean "no useful progress," but they fail differently. **Deadlock:** everyone is *blocked* (asleep), waiting on each other — the runtime can sometimes detect the total case and panic. **Livelock:** everyone is *running* and reacting to each other, but no state advances — undetectable by the runtime, looks like 100% CPU doing nothing. **Starvation:** *most* goroutines progress fine, but one (or a class) never gets its turn — looks like a latency outlier, not an outage. Ask: "is the stuck goroutine asleep, spinning, or just always last?"
+
+</Callout>
+
+<ConceptGrid cols={4}>
+  <ConceptCard label="Lost wakeup">Signal fires before Wait — goroutine sleeps forever. Fix: always check condition in a `for !condition` loop before calling `cond.Wait()`.</ConceptCard>
+  <ConceptCard label="Goroutine leak">Goroutine blocked on channel with no consumer, or no exit signal. Fix: pass `context.Context`, select on `ctx.Done()`, always `close()` channels you own.</ConceptCard>
+  <ConceptCard label="Deadlock">Circular lock acquisition. Fix: canonical lock ordering by a stable key (ID, pointer address), or a single mutex over both resources.</ConceptCard>
+  <ConceptCard label="Livelock / starvation">Livelock: actors retry in lockstep, never progressing — fix with jitter or canonical ordering. Starvation: one goroutine never wins the resource — Go's mutex (1ms) starvation mode and `RWMutex` writer-priority exist to prevent it.</ConceptCard>
+</ConceptGrid>
+
+<Callout kind="tip" title="Coming up next">
+
+You'll apply everything from this chapter in the **Concurrent Cinema Booking** project (Part 2, Chapter 8). The seat double-booking race is the same two-writers-on-one-resource problem as the Meridian balance race — the domain changes, the mechanics don't. You'll solve it three ways: an in-memory store that fails under `-race`, a `sync.RWMutex` pessimistic-lock store that fixes it, and a Redis store for distributed holds.
+
+</Callout>
+
+---
+
+## Exercises
+
+No more watching. Time to fix things yourself, sport. I'll be watching.
+
+<Exercise n={1} title="Bounded queue with metrics" level="easy">
+
+Extend the `processPayments` example to count how many jobs were accepted and how many were shed. Use `atomic.Int64` for both counters (not a mutex). Print the final counts after all jobs are processed.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+func main() {
+	var accepted, shed atomic.Int64
+	queue := make(chan int, 4)
+	var wg sync.WaitGroup
+
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range queue {
+				time.Sleep(5 * time.Millisecond)
+				_ = job
+			}
+		}()
+	}
+
+	for i := 1; i <= 10; i++ {
+		select {
+		case queue <- i:
+			accepted.Add(1)
+		default:
+			shed.Add(1)
+		}
+	}
+	close(queue)
+	wg.Wait()
+
+	fmt.Printf("accepted: %d  shed: %d\n", accepted.Load(), shed.Load())
+}
+```
+
+`atomic.Int64` is the idiomatic counter type since Go 1.19. Its `Add` and `Load` methods are race-free without a mutex, and the zero value is ready to use. No `var accepted int64` + `atomic.AddInt64(&accepted, 1)` — that older API form is still valid but the typed wrapper is cleaner.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Find the race" level="medium">
+
+The following function is supposed to build a list of processed order IDs from 10 concurrent goroutines. It has a data race. Identify it and fix it with a mutex. Verify your fix by reasoning about what `-race` would report.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func collectOrders() []int {
+	var results []int
+	var wg sync.WaitGroup
+
+	for i := range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results = append(results, i) // BUG
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func main() {
+	fmt.Println(collectOrders())
+}
+```
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func collectOrders() []int {
+	var (
+		mu      sync.Mutex
+		results []int
+	)
+	var wg sync.WaitGroup
+
+	for i := range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			results = append(results, i)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func main() {
+	fmt.Println(collectOrders())
+}
+```
+
+The race: `append` reads the slice header (pointer, len, cap), may reallocate, and writes the new header back. Multiple goroutines doing this concurrently on the same `results` variable race on the slice header. `-race` would report conflicting reads and writes at the `append` line. The fix: protect with a mutex. Alternatively, pre-allocate a fixed-size slice and write to pre-assigned indices — but the mutex approach is simpler and correct here.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Happens-before with WaitGroup" level="medium">
+
+Write a program that spawns 5 goroutines, each computing the square of its index and storing it in a pre-allocated `[]int`. The main goroutine prints all results after all goroutines complete. Explain in a comment why the reads in `main` are guaranteed to see the correct values (cite the happens-before rule that makes it safe).
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	results := make([]int, 5) // each goroutine owns one index — no sharing
+	var wg sync.WaitGroup
+
+	// wg.Go (Go 1.25): no wg.Add/defer wg.Done boilerplate.
+	// Loop variables are per-iteration since Go 1.22, so i is captured correctly.
+	for i := range 5 {
+		wg.Go(func() {
+			results[i] = i * i // each goroutine writes a distinct slot
+		})
+	}
+
+	// wg.Wait() returns only after all goroutines launched via wg.Go complete.
+	// The memory model guarantees: with wg.Go, each function return synchronizes before
+	// any wg.Wait() return that it unblocks.
+	// Therefore: all writes to results happen-before the reads below.
+	// No mutex needed because each goroutine writes a distinct index (no sharing).
+	wg.Wait()
+
+	fmt.Println(results) // guaranteed to see [0 1 4 9 16]
+}
+```
+
+Key happens-before chain: each goroutine launched via `wg.Go` completes before `wg.Wait()` returns. Since the writes to `results[i]` happen inside those goroutines, and `wg.Wait()` returns after all of them, the reads in `main` are guaranteed to see the written values. No data sharing occurs because each goroutine touches a unique index.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Fix the goroutine leak" level="hard">
+
+The function below leaks a goroutine. Identify the leak, then rewrite the function so it is context-aware and the goroutine always exits. Add a comment explaining the fix.
+
+```go
+func fetchAccountStatus(accountID string) <-chan string {
+	out := make(chan string)
+	go func() {
+		// Simulate slow external API call.
+		time.Sleep(2 * time.Second)
+		out <- "active"
+		out <- "verified" // second send — who reads this?
+	}()
+	return out
+}
+```
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// fetchAccountStatus returns account status strings on the channel.
+// The goroutine exits when ctx is cancelled or all values are sent.
+func fetchAccountStatus(ctx context.Context, accountID string) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out) // always signal completion to callers
+
+		statuses := []string{"active", "verified"}
+		for _, s := range statuses {
+			// Simulate work per status.
+			select {
+			case <-time.After(100 * time.Millisecond):
+				// work done — try to send
+			case <-ctx.Done():
+				return // caller cancelled — exit without leaking
+			}
+
+			select {
+			case out <- s:
+			case <-ctx.Done():
+				return // nobody reading and caller cancelled — exit
+			}
+		}
+	}()
+	return out
+}
+
+func main() {
+	// Caller only wants the first result; cancels after getting it.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	ch := fetchAccountStatus(ctx, "acct-42")
+	if v, ok := <-ch; ok {
+		fmt.Println("status:", v)
+	}
+	cancel() // goroutine sees ctx.Done() and exits cleanly
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("done — no leak")
+}
+```
+
+The original leak: the goroutine sends two values but the caller only reads one. The second `out <- "verified"` blocks forever because nobody receives it. Fix: (1) select on `ctx.Done()` at every blocking point so the goroutine exits when the caller is done; (2) `defer close(out)` to signal completion and unblock any ranging callers. The golden rule: every goroutine must have a path to exit.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Total-balance invariant under concurrent transfers" level="hard">
+
+Write a function `transferAll` that performs 500 random transfers between 4 accounts concurrently. Each transfer picks two random accounts and moves a random amount between 1 and 100 cents. After all transfers complete, verify that the sum of all balances equals the initial total. Use proper mutex discipline. Your solution must be silent under `go test -race`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand/v2"
+	"sync"
+)
+
+type Account struct {
+	id      int
+	mu      sync.Mutex
+	balance int
+}
+
+func transfer(from, to *Account, amount int) {
+	// Canonical lock order prevents deadlock.
+	first, second := from, to
+	if from.id > to.id {
+		first, second = to, from
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+
+	if from.balance < amount {
+		return // insufficient funds — skip, no partial update
+	}
+	from.balance -= amount
+	to.balance += amount
+}
+
+func main() {
+	accounts := []*Account{
+		{id: 1, balance: 1000},
+		{id: 2, balance: 2000},
+		{id: 3, balance: 3000},
+		{id: 4, balance: 4000},
+	}
+	initial := 0
+	for _, a := range accounts {
+		initial += a.balance
+	}
+
+	var wg sync.WaitGroup
+	for range 500 {
+		wg.Go(func() {
+			i := rand.IntN(len(accounts))
+			j := rand.IntN(len(accounts))
+			if i == j {
+				return
+			}
+			transfer(accounts[i], accounts[j], rand.IntN(100)+1)
+		})
+	}
+	wg.Wait()
+
+	total := 0
+	for _, a := range accounts {
+		total += a.balance
+	}
+	if total != initial {
+		fmt.Printf("INVARIANT VIOLATED: initial %d, final %d\n", initial, total)
+	} else {
+		fmt.Printf("Invariant holds: total = %d cents\n", total)
+	}
+}
+```
+
+Two correctness properties: (1) mutex discipline — each transfer acquires both account locks in a canonical order (by ID) to prevent deadlock; (2) balance invariant — no money is created or destroyed because we only perform `from -= amount; to += amount` as an atomic unit under both locks. Under `-race`, this is clean because all reads and writes to `balance` fields are protected by the respective mutex.
+
+</Solution>
+
+</Exercise>
+
+## The Lab
+
+You've fixed my examples. Now fix my challenge. I set this one personally, and I have extremely strong feelings about whether the books balance.
+
+<Lab
+  title="Fix the Concurrent Transfer Service"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={15}
+  objective="The starter code processes 200 concurrent transfers across 4 accounts but has a data race on account balances AND a goroutine leak in the result collector. Fix both so: (1) go test -race is completely silent, (2) the total balance after all transfers equals the initial total (10 000 cents), and (3) no goroutine is left running after the function returns."
+  starter={`package main
+
+import (
+	"context"
+	"fmt"
+	"math/rand/v2"
+	"sync"
+)
+
+// BUG 1: Account has no synchronization — balance is raced on.
+type Account struct {
+	id      int
+	balance int // UNPROTECTED
+}
+
+// BUG 2: transfer locks only one account at a time — still a race.
+func transfer(from, to *Account, amount int) {
+	if from.balance < amount {
+		return
+	}
+	from.balance -= amount
+	to.balance += amount
+}
+
+// BUG 3: collectResults leaks — goroutine blocks forever if ctx is cancelled
+// before all results are read.
+func collectResults(ctx context.Context, n int) <-chan int {
+	out := make(chan int, n)
+	go func() {
+		for i := range n {
+			out <- i // blocks if nobody reads — leaks on ctx cancellation
+		}
+	}()
+	return out
+}
+
+func main() {
+	accounts := []*Account{
+		{id: 1, balance: 2500},
+		{id: 2, balance: 2500},
+		{id: 3, balance: 2500},
+		{id: 4, balance: 2500},
+	}
+
+	var wg sync.WaitGroup
+	for range 200 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			i := rand.IntN(4)
+			j := rand.IntN(4)
+			if i != j {
+				transfer(accounts[i], accounts[j], rand.IntN(50)+1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	total := 0
+	for _, a := range accounts {
+		total += a.balance
+	}
+	fmt.Println("total:", total) // should always be 10000
+}`}
+  verify="self-check"
+  verifier="Run go run main.go locally with -race. Your solution is correct when: (1) the race detector is silent (no DATA RACE output), (2) the printed total is always 10000, and (3) the process exits cleanly. Codapi runs plain go run — use it to check the logic; run -race locally to verify race-freedom."
+  hints={[
+    "Bug 1 & 2: add a sync.Mutex field to Account. In transfer(), lock both accounts — but always in canonical order (by id) to prevent deadlock.",
+    "Bug 3: the goroutine in collectResults must select on ctx.Done() at every blocking point and close(out) via defer when it exits. The caller must also cancel the context when it is done reading.",
+    "For the lock ordering: if from.id > to.id, swap first/second before locking. Then lock first, defer unlock, lock second, defer unlock — then do the transfer logic."
+  ]}
+  flag="GO{race_free_balanced_books_no_leak}"
+>
+
+Ten thousand cents. Four accounts. Two hundred transfers. The books had better balance when you're done — and I'll be running the race detector personally. Show me something worth my time.
+
+</Lab>
+
+<Recap>
+
+- **Backpressure** is a bounded channel + a `select/default` shed path. An unbounded channel is unlimited memory. Size your queues; own your shed policy.
+- **The race detector** (`-race`) uses shadow memory and vector clocks to catch data races at runtime. Always run it in CI. Read the report: it gives you the exact address, lines, and goroutines involved.
+- **Zero races by design**: confinement (don't share), immutability (don't mutate), `atomic.Int64` for counters, `sync.Mutex` for complex state. Embed the mutex with the data it guards.
+- **The Go memory model** (revised 2022): a write is only guaranteed visible to another goroutine if a happens-before event connects them — channel send/receive, mutex unlock/lock, `sync.Once.Do`, goroutine creation. Without synchronization, the program has a data race; reads can observe surprising values, and compiler/runtime reordering is allowed within the memory model's constraints.
+- **Lost wakeups**: always `for !condition { cond.Wait() }` — never bare `cond.Wait()`.
+- **Goroutine leaks**: every goroutine must have a path to exit. Pass `context.Context`, select on `ctx.Done()`, close channels you own.
+- **Deadlocks**: canonical lock ordering (by stable key) breaks the circular-wait cycle. Two goroutines, two locks, opposite order = guaranteed deadlock.
+
+</Recap>
+
+<Scoreboard
+  streak={6}
+  items={[
+    { label: "Quick check — backpressure shed behavior", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — race detector report contents", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Bounded queue with metrics", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Find the race", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Happens-before with WaitGroup", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Fix the goroutine leak", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Balance invariant under load", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the Concurrent Transfer Service", captured: false, points: 100 }}
+/>
+
+Correct concurrent code. That's what separates the engineers I'd trust with a production system from everyone else. You've got the tools now — the race detector, the memory model, the patterns for zero-race design. Use them, or I'll be very disappointed. And trust me, sport, you don't want that.

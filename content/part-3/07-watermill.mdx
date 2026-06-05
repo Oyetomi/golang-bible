@@ -1,0 +1,1229 @@
+---
+title: "Watermill — Event-Driven Go in Practice"
+part: 3
+order: 7
+type: "course"
+description: "The Publisher/Subscriber abstraction, messages and the Router, middleware, and implementing CQRS, event sourcing and the outbox with Watermill."
+prerequisites: ["event-driven-kafka"]
+---
+
+<HeroCard label="Part 3 · Chapter 7" title="Watermill — Event-Driven Go in Practice">
+
+Listen up, sport, because I'm only going to say this once: the single stupidest thing a payments engineer can do is couple their business logic directly to a message broker. Today you change Kafka's config and everything rebuilds. Tomorrow your compliance team mandates a different broker and you're rewriting *handlers* — as if handlers have anything to do with brokers. That is not a problem I have. Ever.
+
+Watermill fixes this. It gives you a clean, broker-agnostic Publisher/Subscriber layer so the same handler code runs on Kafka in production and on an in-memory channel during your test suite. Swap brokers by swapping one constructor call. Your logic stays pristine. That's not convenience — that's correctness by design.
+
+By the end of this chapter you will have: the Publisher/Subscriber abstraction wired into your brain, the Router (the heart of the whole thing) animated step by step, middleware layered the right way, and a complete CQRS/event-sourcing/outbox flow. We're building Meridian's payments service. Let's go.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Why Watermill", "Publisher and Subscriber", "The Router", "Middleware", "CQRS, Event Sourcing and the Outbox"]} />
+
+## Why Watermill
+
+<Define term="Watermill" since="Event-Driven Architecture & Kafka (Part 3)">
+**Watermill** (`github.com/ThreeDotsLabs/watermill`) is a third-party Go library for building event-driven services. It defines a thin `Publisher` / `Subscriber` interface that any message broker can implement, then provides a **Router** that dispatches messages to handler functions with composable middleware. The payoff: swap Kafka for NATS or an in-memory channel by changing one constructor call — your handlers never notice.
+</Define>
+
+Here's the problem we're solving, and it's embarrassingly common.
+
+Meridian's payments service publishes a `payment.completed` event to Kafka. The ledger-projection handler, the notification handler, and the fraud-check handler all subscribe to it. Beautiful. Then someone decides that for the settlement flow you need NATS Streaming, and for the test suite you absolutely cannot be spinning up a real Kafka cluster in CI. Now you have three message-broker SDKs, three sets of connection boilerplate, three subtly different delivery semantics to manage, and a handler that reads Kafka-specific `kafka.Message` types instead of a clean domain event. You have built infrastructure coupling into your business logic.
+
+**On the job:** Broker migrations are more common than they sound — compliance mandates, cost changes, cloud provider switches. If your handlers import broker-specific types, every migration is a handler rewrite. That is months of risk for zero business value.
+
+Watermill's answer is the same answer Go always gives: **define an interface and hide the broker behind it.**
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Broker-agnostic">The same handler code runs on Kafka, NATS, RabbitMQ, Google Cloud Pub/Sub, or the in-memory `GoChannel` — determined by a constructor argument, not by the handler itself.</ConceptCard>
+  <ConceptCard label="Testable by default">The `GoChannel` pub/sub is fully in-process. No Docker, no network, no flaky CI. Write a test, publish a message, assert the handler ran — all in milliseconds.</ConceptCard>
+  <ConceptCard label="Router + middleware">The Router wires publishers to subscribers with a middleware chain (retry, DLQ, correlation ID, recovery) that works identically regardless of broker. Middleware composes cleanly because it's just function wrapping.</ConceptCard>
+  <ConceptCard label="CQRS + Outbox built-in">Watermill ships first-class CQRS components (command bus, event bus) and the Forwarder component for the transactional outbox pattern — so the patterns from the last two chapters have idiomatic Go implementations.</ConceptCard>
+  <ConceptCard label="Observability hooks">The Router emits structured log events you can wire to `slog` or OpenTelemetry. Correlation IDs propagate automatically through the middleware chain.</ConceptCard>
+  <Gotcha>Watermill is a third-party import (`github.com/ThreeDotsLabs/watermill`). It is NOT in the stdlib sandbox, so Watermill snippets in this chapter are plain fenced code blocks — NOT wrapped in `GoPlayground`. We reserve `GoPlayground` for stdlib-only illustrations. The patterns are real and runnable in your own module; `go get github.com/ThreeDotsLabs/watermill`.</Gotcha>
+</ConceptGrid>
+
+**The real scenario spine for this chapter:** Meridian's `PaymentsService` publishes `payment.completed` via Watermill. A Router with `retry + DLQ + correlationID` middleware dispatches to a `LedgerProjection` handler. In tests, the broker is an in-memory `GoChannel`. In production, it's Kafka. The handler doesn't know and doesn't care.
+
+Let's build it from the ground up.
+
+---
+
+## Publisher and Subscriber
+
+<Define term="Publisher / Subscriber abstraction" since="Messaging & Pub/Sub Foundations (Part 3)">
+The **Publisher/Subscriber abstraction** is Watermill's core. Two small interfaces — `Publisher` (send messages to a topic) and `Subscriber` (receive messages from a topic) — hide every broker behind the same contract. Kafka, NATS, RabbitMQ, and the in-process `GoChannel` all satisfy the same two interfaces. Your handlers, Router, and middleware operate exclusively against these interfaces and are therefore broker-agnostic.
+</Define>
+
+Everything in Watermill descends from two interfaces. If you understand these, you understand everything that follows.
+
+```go
+// Publisher publishes messages to a named topic.
+// Close releases broker resources.
+type Publisher interface {
+    Publish(topic string, messages ...*message.Message) error
+    Close() error
+}
+
+// Subscriber subscribes to a named topic and returns a read-only
+// channel of messages. The channel closes when ctx is cancelled or
+// Close is called.
+type Subscriber interface {
+    Subscribe(ctx context.Context, topic string) (<-chan *message.Message, error)
+    Close() error
+}
+```
+
+Two interfaces. That's the whole broker abstraction. Any broker that can publish and consume messages can satisfy these two interfaces, and Watermill ships adapters for the most common ones. But let's look at what travels over those channels.
+
+### The `message.Message`
+
+<Define term="message.Message (Ack/Nack)">
+A `message.Message` is Watermill's universal message envelope. It carries a **UUID** (the idempotency key), **Metadata** (a `map[string]string` for trace IDs and headers), and a **Payload** (`[]byte` — usually JSON or Protobuf). Critically, it owns the delivery acknowledgement: calling `msg.Ack()` tells the broker the message was processed successfully; calling `msg.Nack()` asks for redelivery. The Router calls Ack or Nack on your behalf — handlers just return `nil` or an error.
+</Define>
+
+A Watermill `message.Message` is a tiny struct with four fields:
+
+```go
+// From github.com/ThreeDotsLabs/watermill/message
+type Message struct {
+    UUID     string          // unique ID for deduplication (idempotency key — see Idempotency & Exactly-Once Semantics, Part 3)
+    Metadata Metadata        // map[string]string — correlation IDs, tracing headers, etc.
+    Payload  []byte          // the actual body — usually JSON, Protobuf, or Avro
+    // unexported: Ack/Nack channels
+}
+
+// Ack tells the broker: "I processed this successfully, advance the offset."
+func (m *Message) Ack() bool { ... }
+
+// Nack tells the broker: "I failed, redeliver this message."
+func (m *Message) Nack() bool { ... }
+```
+
+The `Ack()` and `Nack()` calls are the hooks that drive Watermill's at-least-once delivery. We'll animate exactly how the Router uses them in the next section — but the key point right now is that **Ack/Nack are on the message, not the consumer**. Your handler doesn't call any broker-specific API; it just returns `nil` (which the Router translates to Ack) or an error (which the Router translates to Nack and optionally retries).
+
+**On the job:** A handler that swallows errors and returns `nil` always Acks — even on failures. You will silently lose `payment.completed` events and the ledger will be wrong. Return errors honestly; let the Router and middleware decide what to do with them.
+
+<ExecTimeline
+  title="The life of a message.Message — publish to ack"
+  lanes={[{ id: "pub", label: "Publisher" }, { id: "msg", label: "Message" }, { id: "handler", label: "Handler" }]}
+  steps={[
+    { lane: "pub", kind: "send", label: "Publish(topic, msg)", note: "Publisher sends the message to the broker topic. msg.UUID is the idempotency key from the producer side." },
+    { lane: "msg", kind: "recv", label: "arrives on chan", note: "Subscriber delivers the message on the channel returned by Subscribe(). The message is in flight — not yet acknowledged." },
+    { lane: "handler", kind: "run", label: "handler(msg)", note: "The Router calls your HandlerFunc with the message. You read msg.Payload and msg.Metadata. You must not call Ack/Nack yourself — return nil or an error." },
+    { lane: "handler", kind: "run", label: "return nil", note: "Returning nil means success. The Router will call msg.Ack() on your behalf, signalling to the broker that the offset can be committed." },
+    { lane: "msg", kind: "send", label: "Ack() → broker", note: "Ack travels back to the broker. On Kafka this commits the consumer-group offset; on GoChannel it pops the message from the in-memory queue." },
+    { lane: "pub", kind: "done", label: "delivery complete", note: "At-least-once delivery: the broker won't redeliver this message to this consumer group. If Nack() had fired instead, it would be redelivered." }
+  ]}
+  caption="The Router owns the Ack/Nack lifecycle. Your handler just returns nil or an error."
+/>
+
+### The `GoChannel` — your test double
+
+Watermill ships `github.com/ThreeDotsLabs/watermill/pubsub/gochannel`. It is a fully in-process Publisher/Subscriber backed by Go channels. No network, no broker, no Docker. It implements *exactly* the same `Publisher` and `Subscriber` interfaces as the Kafka adapter, which means:
+
+```go
+// In your test:
+broker := gochannel.NewGoChannel(
+    gochannel.Config{
+        OutputChannelBuffer:            0,     // synchronous delivery for tests
+        Persistent:                     false, // in-memory only
+        BlockPublishUntilSubscriberAck: false,
+    },
+    watermill.NewStdLogger(false, false),
+)
+
+// In production, same interface, different constructor:
+broker, err := kafka.NewPublisher(
+    kafka.PublisherConfig{
+        Brokers: []string{"kafka:9092"},
+        // ...
+    },
+    watermill.NewSlogLogger(slog.Default()),
+)
+```
+
+The handler doesn't change. The Router doesn't change. The middleware doesn't change. Only the constructor changes. This is the entire value proposition — don't let anyone tell you it's more complicated than that.
+
+<QuickCheck
+  question="A Watermill handler returns an error. What does the Router do next?"
+  options={[
+    "Calls msg.Ack() and moves on",
+    "Calls msg.Nack() — the broker will redeliver the message",
+    "Panics and crashes the process",
+    "Logs a warning and swallows the error"
+  ]}
+  answer={1}
+  explain="Returning an error from a handler causes the Router to call msg.Nack(). The broker redelivers the message — that's at-least-once delivery. With the retry middleware in the chain, the Router also retries locally before Nacking to the broker."
+/>
+
+---
+
+## The Router
+
+<Define term="the Router">
+The **Router** is Watermill's central dispatcher. You register handlers with it (`AddHandler`), add middleware globally (`AddMiddleware`), then call `router.Run(ctx)`. The Router spawns one goroutine per handler, feeds it messages from the subscribed topic, runs the composed middleware chain, and calls `msg.Ack()` or `msg.Nack()` based on the handler's return value. You do not manage goroutines, channels, or Ack/Nack directly — the Router owns all of that.
+</Define>
+
+<Scene
+  title="Router dispatching payment.completed through the middleware chain"
+  actors={[
+    { id: "msg", label: "payment.completed msg" },
+    { id: "corr", label: "CorrelationID mw" },
+    { id: "retry", label: "Retry mw" },
+    { id: "dlq", label: "DLQ mw" },
+    { id: "handler", label: "LedgerProjection" }
+  ]}
+  frames={[
+    {
+      caption: "Without a Router: Meridian's handler imports Kafka types directly. A broker swap means rewriting every handler. One transient DB error drops the message silently — no retry, no DLQ.",
+      beat: "problem",
+      actors: [
+        { id: "msg", state: "bad" },
+        { id: "handler", state: "bad" }
+      ]
+    },
+    {
+      caption: "The Router receives payment.completed from the Subscriber channel. The message enters the middleware chain outermost-first.",
+      beat: "neutral",
+      actors: [
+        { id: "msg", state: "active" },
+        { id: "corr", state: "idle" },
+        { id: "retry", state: "idle" },
+        { id: "dlq", state: "idle" },
+        { id: "handler", state: "idle" }
+      ]
+    },
+    {
+      caption: "CorrelationID middleware stamps corr-abc-123 into msg.Metadata before anything else runs — every log line and span downstream carries this ID.",
+      beat: "neutral",
+      actors: [
+        { id: "msg", state: "active" },
+        { id: "corr", state: "active" }
+      ]
+    },
+    {
+      caption: "Retry middleware wraps the inner call. It will re-invoke the handler up to N times on error before giving up.",
+      beat: "neutral",
+      actors: [
+        { id: "corr", state: "done" },
+        { id: "retry", state: "active" }
+      ]
+    },
+    {
+      caption: "DLQ middleware wraps the handler. If the retry budget is exhausted, it diverts the message to payment.completed.dlq instead of looping forever.",
+      beat: "neutral",
+      actors: [
+        { id: "retry", state: "active" },
+        { id: "dlq", state: "active" }
+      ]
+    },
+    {
+      caption: "LedgerProjection runs. It applies the double-entry record and returns nil. Success on first attempt.",
+      beat: "solution",
+      actors: [
+        { id: "dlq", state: "active" },
+        { id: "handler", state: "active" }
+      ]
+    },
+    {
+      caption: "nil error unwinds through DLQ (no action) and Retry (no action). Router calls msg.Ack() and publishes output to ledger.events. Delivery complete.",
+      beat: "solution",
+      actors: [
+        { id: "msg", state: "done" },
+        { id: "corr", state: "done" },
+        { id: "retry", state: "done" },
+        { id: "dlq", state: "done" },
+        { id: "handler", state: "done" }
+      ]
+    },
+    {
+      caption: "On failure: Retry re-invokes the handler. After N attempts the DLQ catches the final error and parks the message — no lost events, no infinite loop.",
+      beat: "solution",
+      actors: [
+        { id: "msg", state: "warn" },
+        { id: "retry", state: "warn" },
+        { id: "dlq", state: "ok" },
+        { id: "handler", state: "bad" }
+      ]
+    }
+  ]}
+  caption="beat: problem — raw broker coupling with no safety net. beat: solution — Router + middleware chain: retry absorbs transient failures, DLQ catches poison messages, CorrelationID makes every hop traceable."
+/>
+
+The `Router` is the heart of Watermill. It's the component that watches subscriber channels, dispatches incoming messages to the right handler, manages the Ack/Nack lifecycle, and runs your middleware chain. Every production Watermill service has exactly one Router.
+
+### Handler registration
+
+```go
+router, err := message.NewRouter(
+    message.RouterConfig{
+        // How long to wait for handlers to finish on graceful shutdown.
+        CloseTimeout: 30 * time.Second,
+    },
+    logger,
+)
+if err != nil {
+    return fmt.Errorf("creating router: %w", err)
+}
+
+// AddHandler wires: subscriber → topic → handler → publisher → topic.
+// The handler's return value is re-published to the output topic (optional).
+router.AddHandler(
+    "ledger-projection",       // handler name (used in logs and metrics)
+    "payment.completed",       // input topic — subscribed via sub
+    sub,                       // the Subscriber (Kafka, GoChannel, etc.)
+    "ledger.events",           // output topic — the handler's return is published here
+    pub,                       // the Publisher (can be nil if no output)
+    handlePaymentCompleted,    // your HandlerFunc
+)
+
+// Run blocks until ctx is cancelled (graceful shutdown).
+if err := router.Run(ctx); err != nil {
+    return fmt.Errorf("router: %w", err)
+}
+```
+
+The handler signature is one of the cleanest things in Go:
+
+```go
+// HandlerFunc is the function signature for a Watermill handler.
+// Receive *message.Message, return []*message.Message (or nil), error.
+// The returned messages are published to the output topic.
+// Return nil, nil for a "consume-only" handler (no output to publish).
+type HandlerFunc func(msg *message.Message) ([]*message.Message, error)
+
+func handlePaymentCompleted(msg *message.Message) ([]*message.Message, error) {
+    var event PaymentCompletedEvent
+    if err := json.Unmarshal(msg.Payload, &event); err != nil {
+        // Bad payload — we don't want to retry this forever.
+        // Return nil, nil to Ack and discard (or let the poison-queue middleware catch it).
+        return nil, err
+    }
+
+    // Apply the event to the ledger projection.
+    if err := applyToLedger(msg.Context(), event); err != nil {
+        return nil, err // Nack → retry (broker redelivers or middleware retries locally)
+    }
+
+    // Emit a downstream event to the output topic.
+    out := message.NewMessage(watermill.NewUUID(), marshalLedgerEntry(event))
+    return message.Messages{out}, nil
+}
+```
+
+Notice: no broker types, no Kafka offsets, no NATS subjects. Just a function. This is what broker-agnostic looks like in practice.
+
+### The Router dispatching a message through middleware to a handler
+
+<ExecTimeline
+  title="Router dispatches payment.completed through the middleware chain"
+  lanes={[{ id: "router", label: "Router" }, { id: "mw", label: "Middleware chain" }, { id: "handler", label: "Handler" }]}
+  steps={[
+    { lane: "router", kind: "recv", label: "msg arrives on chan", note: "The Router's goroutine receives a new *message.Message from the Subscriber channel for 'payment.completed'." },
+    { lane: "router", kind: "run", label: "inject correlationID", note: "The correlation-ID middleware runs first (outermost wrapper): it stamps msg.Metadata with a trace ID so the whole chain is observable." },
+    { lane: "mw", kind: "run", label: "retry wrapper enters", note: "The retry middleware wraps the inner call. It will catch errors on exit and re-invoke the handler up to N times with backoff before giving up." },
+    { lane: "mw", kind: "run", label: "poison-queue wrapper", note: "The poison-queue middleware wraps the call. If the handler keeps failing past the retry budget, it diverts the message to the DLQ topic instead of blocking forever." },
+    { lane: "handler", kind: "run", label: "handlePaymentCompleted", note: "Your handler runs. It unmarshals the payload, applies the ledger entry, returns (messages, nil) on success." },
+    { lane: "mw", kind: "send", label: "nil error → unwinds", note: "nil error bubbles back out through the middleware chain. retry sees no error and does nothing. poison-queue sees no error and does nothing." },
+    { lane: "router", kind: "done", label: "Ack + publish output", note: "The Router calls msg.Ack() and publishes the handler's output messages to 'ledger.events'. Delivery complete." }
+  ]}
+  caption="Middleware wraps inward; the error unwinds outward. The Router owns Ack/Nack — handlers just return."
+/>
+
+<UnderTheHood title="How the Router runs: one goroutine per handler registration">
+
+When `router.Run(ctx)` is called, the Router spawns **one goroutine per registered handler**. Each goroutine sits in a loop: `for msg := range subscriberChannel`. When a message arrives, it calls the composed middleware chain (which wraps your HandlerFunc). On success it Acks; on final failure it Nacks.
+
+The key implementation detail: **middleware composition is just function wrapping**. The Router's internal type is:
+
+```go
+type HandlerFunc func(msg *message.Message) ([]*message.Message, error)
+
+type HandlerMiddleware func(h HandlerFunc) HandlerFunc
+```
+
+When you call `router.AddMiddleware(m1, m2, m3)`, the Router builds a composed handler:
+
+```go
+composed := m1(m2(m3(yourHandler)))
+```
+
+This is the exact same pattern as Go's `http.Handler` middleware — a decorator chain of functions, each wrapping the next. The outermost middleware runs first on the way in, last on the way out. This is why **middleware order matters**: correlation-ID must be outermost (so it stamps the ID before anything else logs), retry must wrap the inner logic (so it can re-invoke it), and poison-queue must be the innermost wrapper around the handler (so it catches *final* failures after retry gives up).
+
+As of Go 1.26, the goroutine-per-handler model is efficient: goroutines are cheap (a few KB of initial stack, grown dynamically), and the GMP scheduler multiplexes them onto OS threads without you thinking about it. The Router's `CloseTimeout` gives in-flight handlers time to finish their current message before the process exits — this is how you drain gracefully without dropping messages. (This is a simplification of the Router's internal loop; the real source handles more edge cases around subscriber closure and context cancellation.)
+
+</UnderTheHood>
+
+---
+
+## Middleware
+
+<Define term="middleware (in messaging)" since="Design Patterns, the Go Way (Part 1)">
+In Watermill, **middleware** is a function of type `func(HandlerFunc) HandlerFunc` — it wraps a handler with additional behaviour (retry, recovery, tracing) without the handler knowing. Middleware composes by wrapping: `m1(m2(m3(handler)))`. The outermost middleware runs first on the way in and last on the way out, so **order determines behaviour**. This is the same decorator pattern as Go's `http.Handler` middleware chain.
+</Define>
+
+**On the job:** Middleware is the correct place for cross-cutting concerns (retry, DLQ, trace IDs). A handler that implements its own retry loop is not testable, not reusable, and silently breaks when you add a second handler that needs the same logic.
+
+Middleware is where Watermill goes from "nice abstraction" to "production-grade infrastructure." The four middlewares you'll use in every payments service:
+
+### 1. Retry
+
+```go
+// middleware.Retry retries failed handlers with exponential backoff.
+// If the handler still fails after MaxRetries, it returns the last error
+// (which the poison-queue middleware or the Router will then Nack).
+retryMiddleware := middleware.Retry{
+    MaxRetries:      5,
+    InitialInterval: 100 * time.Millisecond,
+    MaxInterval:     10 * time.Second,
+    Multiplier:      2.0,
+    // Jitter prevents the thundering-herd problem (covered in "Reliability Patterns (Part 2)").
+    MaxElapsedTime:  2 * time.Minute,
+    Logger:          logger,
+}.Middleware
+```
+
+This directly applies the retry-with-backoff-and-jitter pattern from "Reliability Patterns (Part 2)" — but now it's middleware, applied uniformly to every handler in the Router, without each handler needing to implement its own retry loop.
+
+### 2. Poison Queue (Dead-Letter Queue)
+
+```go
+// PoisonQueue catches messages that still fail after retry budget is exhausted.
+// Instead of Nacking them (which would cause infinite redelivery from the broker),
+// it publishes them to a separate "dead letter" topic for human inspection.
+poisonQueue, err := middleware.NewPoisonQueue(
+    publisher,
+    "payment.completed.dlq", // DLQ topic — operators consume this for manual replay
+)
+if err != nil {
+    return fmt.Errorf("poison queue: %w", err)
+}
+```
+
+This implements the DLQ pattern from "Event-Driven Architecture & Kafka (Part 3)." The key insight: a message that fails repeatedly is **not the same problem** as a message that fails transiently. Transient failures get retried. Poison messages (bad payload, schema mismatch, unexpected data) should be parked for investigation — not looped forever. The PoisonQueue middleware makes this automatic.
+
+**On the job:** Without a DLQ, a single malformed `payment.completed` event can stall an entire consumer group. The partition offset never advances, the handler loops forever on the bad message, and every subsequent event — valid ones — piles up behind it. The DLQ breaks the loop and lets the partition drain.
+
+### 3. Correlation ID
+
+```go
+// CorrelationID propagates a trace ID through the message metadata.
+// It reads the ID from msg.Metadata["correlation_id"] if present,
+// or generates a new UUID if this is the originating message.
+// The ID is stored in the context so your handler can attach it to slog/OTEL spans.
+router.AddMiddleware(middleware.CorrelationID)
+```
+
+The `CorrelationID` middleware stamps every message with a `correlation_id` in its metadata. When your handler publishes downstream messages (e.g. the ledger entry event), those messages inherit the same correlation ID. You now have a chain from the original payment event all the way through every downstream effect — observable across services, for free.
+
+### 4. Recovery
+
+```go
+// Recoverer catches panics in handlers and converts them to errors,
+// preventing one bad message from killing the entire Router goroutine.
+router.AddMiddleware(middleware.Recoverer)
+```
+
+Panics in a handler goroutine would crash the goroutine and stall that handler slot forever (messages pile up, offsets never commit). The Recoverer middleware catches panics, logs them as structured errors, and Nacks the message — the Router stays alive and the DLQ catches the bad message.
+
+### Wiring the full middleware stack
+
+Order matters. Here is the correct order, and why:
+
+```go
+// Apply middlewares to the router (affects ALL handlers).
+// Order: outermost to innermost — first listed runs first on entry.
+router.AddMiddleware(
+    // 1. Correlation ID — outermost: stamps the ID before anything else runs.
+    //    Every subsequent log line, metric, and span carries this ID.
+    middleware.CorrelationID,
+
+    // 2. Recoverer — catches panics *after* correlation is stamped,
+    //    so the panic log carries the trace ID.
+    middleware.Recoverer,
+
+    // 3. Retry — re-invokes the handler on transient errors.
+    retryMiddleware,
+
+    // 4. Poison Queue — innermost wrapper around the handler.
+    //    It catches errors that *survived* the retry budget.
+    poisonQueue.Middleware,
+)
+```
+
+<BeforeAfter
+  badLabel="Wrong order"
+  goodLabel="Correct order"
+  bad={`router.AddMiddleware(
+  poisonQueue.Middleware, // WRONG: poison
+  middleware.CorrelationID, // queue fires
+  retryMiddleware,         // before retry
+)`}
+  good={`router.AddMiddleware(
+  middleware.CorrelationID, // stamp ID first
+  middleware.Recoverer,     // catch panics
+  retryMiddleware,          // retry transients
+  poisonQueue.Middleware,   // DLQ on final fail
+)`}
+/>
+
+<QuickCheck
+  question="You have retry and poison-queue middleware. In which order should they be added to the Router?"
+  options={[
+    "Poison queue outermost, retry innermost — so DLQ catches all failures including transient ones",
+    "Retry outermost (listed first), poison queue innermost — retry exhausts its budget, then DLQ catches the final error",
+    "Order doesn't matter; middleware is commutative",
+    "Poison queue should be added per-handler, not globally"
+  ]}
+  answer={1}
+  explain="Retry must be listed before (outermost to) poison queue. The retry middleware re-invokes the inner chain; only after the retry budget is exhausted does the error propagate outward to the poison-queue middleware, which then diverts the message to the DLQ. If you put poison queue first, it catches the first failure before retry ever gets a chance."
+/>
+
+---
+
+## CQRS, Event Sourcing and the Outbox
+
+<Define term="CQRS" since="Event-Driven Architecture & Kafka (Part 3)">
+**CQRS** (Command Query Responsibility Segregation) splits a service's write path from its read path. A **command** mutates state and has exactly one handler (point-to-point). An **event** announces that state changed and has zero or more handlers (fan-out). In Watermill, the `CommandBus` routes commands to one handler; the `EventBus` fans out events to all subscribers. The result: `ProcessPayment` is a command owned by one service; `PaymentCompleted` is an event that the ledger, notification, and fraud services each handle independently.
+</Define>
+
+<Define term="the Forwarder / outbox" since="Idempotency & Exactly-Once Semantics (Part 3)">
+The **transactional outbox** pattern solves the dual-write problem: you must write to the DB *and* publish an event, but you cannot do both atomically with a single broker call. The solution: write the event to an **outbox table** in the same DB transaction as your domain write, then have a background process (Watermill's **Forwarder**) poll the outbox and deliver to the broker. If the process crashes before delivery, the outbox record survives and the Forwarder retries. You get atomicity without a distributed transaction.
+</Define>
+
+**On the job:** The dual-write problem is the source of "ghost payments" — a payment debited from the account but never reflected in the ledger because the event publish failed after the DB commit. The outbox + Forwarder is the standard fix. If you see a discrepancy between your DB state and your event log, this pattern is missing.
+
+Now we assemble the full pattern stack. This is what the last four chapters have been building toward.
+
+### Watermill's CQRS Component
+
+Watermill ships a `cqrs` package that gives you typed command buses and event buses on top of the raw Publisher/Subscriber layer. Think of it as thin, opinionated wiring:
+
+```go
+import "github.com/ThreeDotsLabs/watermill/components/cqrs"
+
+// CommandBus: sends a command to exactly one handler (point-to-point).
+// EventBus: publishes an event to all subscribers (fan-out).
+
+cqrsFacade, err := cqrs.NewFacade(cqrs.FacadeConfig{
+    GenerateCommandsTopic: func(commandName string) string {
+        // "payments.ProcessPayment" → "commands.payments.ProcessPayment"
+        return "commands." + commandName
+    },
+    GenerateEventsTopic: func(eventName string) string {
+        // "payments.PaymentCompleted" → "events.payments.PaymentCompleted"
+        return "events." + eventName
+    },
+    CommandHandlers: func(cb *cqrs.CommandBus, eb *cqrs.EventBus) []cqrs.CommandHandler {
+        return []cqrs.CommandHandler{
+            ProcessPaymentHandler{eventBus: eb},
+        }
+    },
+    EventHandlers: func(cb *cqrs.CommandBus, eb *cqrs.EventBus) []cqrs.EventHandler {
+        return []cqrs.EventHandler{
+            LedgerProjectionHandler{},
+            NotificationHandler{},
+            FraudCheckHandler{},
+        }
+    },
+    Router:                router,
+    CommandsPublisher:     publisher,
+    CommandsSubscriber:    subscriber,
+    EventsPublisher:       publisher,
+    EventsSubscriber:      subscriber,
+    CommandEventMarshaler: cqrs.JSONMarshaler{},
+    Logger:                logger,
+})
+```
+
+**Command handler** — processes one command, emits events:
+
+```go
+type ProcessPaymentHandler struct {
+    eventBus *cqrs.EventBus
+}
+
+// HandlerName is used as the subscriber name (important for Kafka consumer groups).
+func (h ProcessPaymentHandler) HandlerName() string {
+    return "ProcessPaymentHandler"
+}
+
+// NewCommand returns the zero value of the command struct.
+// Watermill uses this for type-safe deserialization.
+func (h ProcessPaymentHandler) NewCommand() interface{} {
+    return &ProcessPaymentCommand{}
+}
+
+// Handle is where your business logic lives.
+// Money is int64 cents — never a float (see "Representing Money — Never Use Floats (Part 3)").
+func (h ProcessPaymentHandler) Handle(
+    ctx context.Context,
+    cmd interface{},
+) error {
+    c := cmd.(*ProcessPaymentCommand)
+
+    // ... validate, debit account, write to DB in a transaction ...
+
+    // Emit the domain event.
+    return h.eventBus.Publish(ctx, &PaymentCompletedEvent{
+        PaymentID:   c.PaymentID,
+        AccountID:   c.AccountID,
+        AmountCents: c.AmountCents, // int64 cents — see "Representing Money — Never Use Floats (Part 3)"
+        CompletedAt: time.Now().UTC(),
+    })
+}
+```
+
+**Event handler** — reacts to an event, reads-only on the domain:
+
+```go
+type LedgerProjectionHandler struct{}
+
+func (h LedgerProjectionHandler) HandlerName() string { return "LedgerProjectionHandler" }
+func (h LedgerProjectionHandler) NewEvent() interface{} { return &PaymentCompletedEvent{} }
+
+func (h LedgerProjectionHandler) Handle(
+    ctx context.Context,
+    event interface{},
+) error {
+    e := event.(*PaymentCompletedEvent)
+    // Post the double-entry ledger record (see "Double-Entry Ledgers (Part 3)").
+    return postLedgerEntry(ctx, e)
+}
+```
+
+### Wiring an event-sourced flow
+
+Here is the full data flow animated — a `ProcessPayment` command entering the system and rippling through to the ledger, notification, and fraud check:
+
+<ExecTimeline
+  title="CQRS flow: ProcessPayment → PaymentCompleted fan-out"
+  lanes={[
+    { id: "api", label: "API handler" },
+    { id: "cmdbus", label: "CommandBus" },
+    { id: "evtbus", label: "EventBus" },
+    { id: "ledger", label: "LedgerProjection" }
+  ]}
+  steps={[
+    { lane: "api", kind: "run", label: "POST /payments", note: "The HTTP handler validates the request, builds a ProcessPaymentCommand with a UUID idempotency key, and publishes it to the CommandBus." },
+    { lane: "cmdbus", kind: "recv", label: "ProcessPaymentCommand", note: "CommandBus routes to exactly one handler: ProcessPaymentHandler. It's point-to-point — commands have one owner." },
+    { lane: "cmdbus", kind: "run", label: "Handle(): debit + DB", note: "ProcessPaymentHandler debits the account in a DB transaction and calls eventBus.Publish(PaymentCompletedEvent)." },
+    { lane: "evtbus", kind: "send", label: "PaymentCompleted event", note: "EventBus publishes the domain event to 'events.payments.PaymentCompleted'. All subscribers receive it — fan-out." },
+    { lane: "ledger", kind: "recv", label: "PaymentCompleted recv", note: "LedgerProjectionHandler receives the event (as do NotificationHandler and FraudCheckHandler, concurrently). Each handler runs in its own Router goroutine." },
+    { lane: "ledger", kind: "run", label: "postLedgerEntry(ctx, e)", note: "The projection posts the double-entry record (debit + credit pair — see Double-Entry Ledgers, Part 3). Returns nil — the Router Acks the message." },
+    { lane: "api", kind: "done", label: "202 Accepted", note: "The API returned immediately when the command was published. The downstream effects (ledger, notification, fraud) complete asynchronously." }
+  ]}
+  caption="Commands are point-to-point; events are fan-out. The API is async — publish the command, return 202, let the Router handle the rest."
+/>
+
+### The Transactional Outbox with Watermill's Forwarder
+
+The transactional outbox pattern ("Idempotency & Exactly-Once Semantics (Part 3)") ensures that writing to your DB and publishing an event are atomic — you write both in one database transaction, then a background process forwards the event to the broker. Watermill ships the `Forwarder` component for exactly this.
+
+```go
+import "github.com/ThreeDotsLabs/watermill/components/forwarder"
+
+// The Forwarder polls the outbox table (written in the same DB tx as your domain write)
+// and publishes pending messages to the broker, then deletes them.
+// It uses the same Publisher/Subscriber abstraction — swap brokers without touching this code.
+
+fwd, err := forwarder.NewForwarder(
+    outboxSubscriber, // Subscriber reading from the outbox (e.g. a DB-backed sub)
+    publisher,        // Publisher writing to the real broker
+    logger,
+    forwarder.Config{
+        ForwarderTopic: forwarder.TopicPrefix + "payment.completed",
+    },
+)
+if err != nil {
+    return fmt.Errorf("forwarder: %w", err)
+}
+
+// Run the forwarder alongside the router in a goroutine.
+go fwd.Run(ctx)
+```
+
+The write path — the "transactional" part:
+
+```go
+// In your ProcessPaymentHandler:
+func processPayment(
+    ctx context.Context,
+    tx *sql.Tx,      // the DB transaction for your domain write
+    pub message.Publisher, // an outbox publisher that writes INTO the tx
+    cmd *ProcessPaymentCommand,
+) error {
+    // 1. Debit the account — domain write, inside the tx.
+    if err := debitAccount(ctx, tx, cmd.AccountID, cmd.AmountCents); err != nil {
+        return err
+    }
+
+    // 2. Write the event to the outbox — same tx, so it's atomic with step 1.
+    //    If the process crashes between step 1 and the broker publish,
+    //    the outbox record survives and the Forwarder will retry it.
+    outboxMsg := message.NewMessage(cmd.PaymentID, marshalPaymentCompleted(cmd))
+    if err := pub.Publish("_outbox.payment.completed", outboxMsg); err != nil {
+        return err // tx rolls back — atomicity preserved
+    }
+
+    // 3. Commit. Either both changes land, or neither does.
+    return tx.Commit()
+}
+```
+
+This ties together "Idempotency & Exactly-Once Semantics (Part 3)" (idempotency key = `cmd.PaymentID` as `msg.UUID`), "Event-Driven Architecture & Kafka (Part 3)" (the outbox pattern described for Kafka), and now Watermill's `Forwarder` as the Go implementation.
+
+<UnderTheHood title="How the Router's ack/nack drives at-least-once delivery">
+
+Under the hood, the Router's goroutine for each handler runs this loop (simplified from the Watermill source):
+
+```go
+for {
+    select {
+    case msg, ok := <-subscriberChan:
+        if !ok {
+            return // subscriber closed, Router is shutting down
+        }
+        // Run the full middleware chain (correlation → recovery → retry → DLQ → handler).
+        producedMessages, err := composedHandler(msg)
+        if err != nil {
+            msg.Nack() // broker will redeliver
+            continue
+        }
+        // Publish output messages before Acking the input.
+        // If this publish fails, we Nack so the input is redelivered and re-processed.
+        if err := publishOutputs(producedMessages); err != nil {
+            msg.Nack()
+            continue
+        }
+        msg.Ack() // only now do we commit the offset
+
+    case <-ctx.Done():
+        return // graceful shutdown
+    }
+}
+```
+
+The critical ordering: **output messages are published before the input is Acked**. This ensures at-least-once delivery of the *entire pipeline*: if the process crashes after posting the ledger entry but before Acking the input, the input message is redelivered and the handler runs again. This is why your handlers must be **idempotent** (see "Idempotency & Exactly-Once Semantics (Part 3)") — they will run at least once, and possibly more than once.
+
+The `msg.Ack()` and `msg.Nack()` calls on the `GoChannel` use a simple `select` on a `chan struct{}` inside the message — they're non-blocking once delivered. On the Kafka adapter, `Ack()` commits the consumer-group offset via the underlying Kafka client library (Watermill supports multiple: `sarama`, `confluent-kafka-go`, and others). The broker-specific behaviour is hidden inside the adapter, behind the same two methods. That's the interface abstraction paying for itself.
+
+As of Go 1.26: the GMP scheduler handles the Router's goroutines efficiently. With `GOMAXPROCS` cores available, handler goroutines for different topics run truly in parallel. A slow handler on one topic does not block handlers on other topics. (Deep dive on GMP scheduling: "The Go Scheduler (GMP), In Depth (Part 2)".)
+
+</UnderTheHood>
+
+### A stdlib-only middleware chain illustration
+
+To show the wrapping pattern concretely without any Watermill imports, here is the same decorator-chain idea in pure stdlib:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+// HandlerFunc mirrors Watermill's handler signature (simplified to one return).
+type HandlerFunc func(payload string) error
+
+// Middleware wraps a HandlerFunc with additional behaviour.
+type Middleware func(next HandlerFunc) HandlerFunc
+
+// retryMiddleware retries the handler up to maxAttempts times.
+func retryMiddleware(maxAttempts int) Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(payload string) error {
+			var lastErr error
+			for attempt := range maxAttempts {
+				lastErr = next(payload)
+				if lastErr == nil {
+					return nil
+				}
+				fmt.Printf("  [retry] attempt %d failed: %v\n", attempt+1, lastErr)
+				time.Sleep(10 * time.Millisecond) // tiny sleep for demo
+			}
+			return fmt.Errorf("gave up after %d attempts: %w", maxAttempts, lastErr)
+		}
+	}
+}
+
+// correlationIDMiddleware stamps a fake correlation ID.
+func correlationIDMiddleware(next HandlerFunc) HandlerFunc {
+	return func(payload string) error {
+		fmt.Printf("  [correlationID] tracing: corr-abc-123\n")
+		return next(payload)
+	}
+}
+
+// compose builds the chain: first middleware is outermost (runs first).
+func compose(h HandlerFunc, middlewares ...Middleware) HandlerFunc {
+	// Apply in reverse so the first in the slice is the outermost wrapper.
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
+}
+
+func main() {
+	attempts := 0
+
+	// A handler that fails twice, then succeeds.
+	handler := func(payload string) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("transient error")
+		}
+		fmt.Printf("  [handler] processed payload: %q\n", payload)
+		return nil
+	}
+
+	// Wire: correlationID (outermost) → retry → handler (innermost).
+	composed := compose(handler,
+		correlationIDMiddleware,
+		retryMiddleware(5),
+	)
+
+	fmt.Println("--- dispatching message ---")
+	if err := composed("payment.completed: {id:42, cents:9999}"); err != nil {
+		fmt.Println("final error:", err)
+	} else {
+		fmt.Println("--- message processed successfully ---")
+	}
+}
+```
+
+</GoPlayground>
+
+The `compose` function and the `Middleware` type are structurally identical to what Watermill does internally — just without the `*message.Message` type and the broker plumbing. The wrapping pattern is plain Go closures all the way down.
+
+---
+
+## Exercises
+
+I set these personally, and I grade on execution. Not effort — execution.
+
+<Exercise n={1} title="Implement a HandlerFunc that deserializes JSON" level="easy">
+
+Write a function matching Watermill's `HandlerFunc` signature that:
+1. Unmarshals the message payload as `{"amount_cents": 9999}` into a struct with an `int64` field named `AmountCents`.
+2. Returns an error if the amount is zero or negative (money invariant from "Representing Money — Never Use Floats (Part 3)").
+3. Returns `nil, nil` on success.
+
+No broker needed — just the function and a test that calls it with `message.NewMessage(uuid, payload)`.
+
+<Solution>
+
+```go
+// PaymentPayload is the expected message body.
+// AmountCents is int64 — never float64. Non-negotiable.
+type PaymentPayload struct {
+    AmountCents int64 `json:"amount_cents"`
+}
+
+func handlePayment(msg *message.Message) ([]*message.Message, error) {
+    var p PaymentPayload
+    if err := json.Unmarshal(msg.Payload, &p); err != nil {
+        return nil, fmt.Errorf("unmarshal payment: %w", err)
+    }
+    if p.AmountCents <= 0 {
+        return nil, fmt.Errorf("invalid amount_cents %d: must be positive", p.AmountCents)
+    }
+    return nil, nil
+}
+```
+
+The function returns `(nil, nil)` on success — the Router translates that to an Ack. Returning an error triggers a Nack. The amount check guards the double-entry invariant: a zero or negative payment is a data error, not a transient failure.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Build the GoChannel test harness" level="medium">
+
+Write a table-driven test for `handlePayment` that:
+1. Creates a `gochannel.GoChannel` publisher and subscriber.
+2. Subscribes to the `"payments"` topic.
+3. Publishes test messages (valid, zero amount, bad JSON) using the publisher.
+4. Calls the handler directly (do not use the Router — unit test).
+5. Asserts the correct error (or nil) for each case.
+
+<Solution>
+
+```go
+func TestHandlePayment(t *testing.T) {
+    tests := []struct {
+        name    string
+        payload []byte
+        wantErr bool
+    }{
+        {
+            name:    "valid payment",
+            payload: []byte(`{"amount_cents":9999}`),
+            wantErr: false,
+        },
+        {
+            name:    "zero amount",
+            payload: []byte(`{"amount_cents":0}`),
+            wantErr: true,
+        },
+        {
+            name:    "negative amount",
+            payload: []byte(`{"amount_cents":-100}`),
+            wantErr: true,
+        },
+        {
+            name:    "bad JSON",
+            payload: []byte(`not-json`),
+            wantErr: true,
+        },
+    }
+
+    for _, tc := range tests {
+        t.Run(tc.name, func(t *testing.T) {
+            msg := message.NewMessage(watermill.NewUUID(), tc.payload)
+            _, err := handlePayment(msg)
+            if (err != nil) != tc.wantErr {
+                t.Errorf("handlePayment() error = %v, wantErr = %v", err, tc.wantErr)
+            }
+        })
+    }
+}
+```
+
+The handler is a plain function — test it like a plain function. No broker, no Router, no goroutines. This is exactly why Watermill's handler signature is a simple function: it's trivially unit-testable. The Router and broker wiring are integration concerns.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Write a correlation-ID middleware" level="medium">
+
+Implement a Watermill-compatible middleware (`func(HandlerFunc) HandlerFunc`) that:
+1. Reads `"correlation_id"` from `msg.Metadata`. If absent, generates a new UUID and sets it.
+2. Stores the correlation ID in a value on `msg.Context()` under a typed key.
+3. Calls the next handler and returns its result unchanged.
+
+Use only stdlib (`context`, `crypto/rand`) — no Watermill import needed for the logic.
+
+<Solution>
+
+```go
+type ctxKey string
+
+const correlationIDKey ctxKey = "correlation_id"
+
+// CorrelationID middleware stamps a correlation ID on every message.
+func CorrelationID(next HandlerFunc) HandlerFunc {
+    return func(msg *message.Message) ([]*message.Message, error) {
+        id := msg.Metadata.Get("correlation_id")
+        if id == "" {
+            id = newUUID() // your UUID generator, e.g. watermill.NewUUID()
+            msg.Metadata.Set("correlation_id", id)
+        }
+        // Attach to context so handlers can pass it to slog/OTEL.
+        ctx := context.WithValue(msg.Context(), correlationIDKey, id)
+        msg.SetContext(ctx)
+        return next(msg)
+    }
+}
+
+// CorrelationIDFromCtx retrieves the correlation ID from a context.
+func CorrelationIDFromCtx(ctx context.Context) string {
+    if id, ok := ctx.Value(correlationIDKey).(string); ok {
+        return id
+    }
+    return ""
+}
+```
+
+The typed key (`ctxKey`) avoids collisions with other packages storing values in the same context — it's unexported, so nothing outside this package can accidentally read or shadow it. This is the idiomatic context-value pattern from "The context Package, In Depth (Part 1)."
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Wire the full stack: subscriber → router → handler" level="hard">
+
+Using `gochannel.GoChannel` and `message.NewRouter`, write a complete in-process integration test that:
+1. Creates a Router with `CorrelationID` and `Recoverer` middleware.
+2. Registers `handlePayment` as the handler for topic `"payments"`.
+3. Publishes a valid `PaymentPayload` message.
+4. Asserts the handler was called and Ack'd (channel drained).
+5. Tears down cleanly by cancelling the context.
+
+<Solution>
+
+```go
+func TestRouterIntegration(t *testing.T) {
+    logger := watermill.NewStdLogger(false, false)
+    broker := gochannel.NewGoChannel(
+        gochannel.Config{OutputChannelBuffer: 1},
+        logger,
+    )
+
+    router, err := message.NewRouter(message.RouterConfig{}, logger)
+    if err != nil {
+        t.Fatal(err)
+    }
+    router.AddMiddleware(
+        middleware.CorrelationID,
+        middleware.Recoverer,
+    )
+
+    handled := make(chan struct{})
+    router.AddNoPublisherHandler(
+        "test-payment-handler",
+        "payments",
+        broker,
+        func(msg *message.Message) error {
+            close(handled)
+            return nil
+        },
+    )
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    go func() {
+        if err := router.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+            t.Errorf("router error: %v", err)
+        }
+    }()
+
+    // Wait for the router to start before publishing.
+    <-router.Running()
+
+    payload := []byte(`{"amount_cents":1000}`)
+    msg := message.NewMessage(watermill.NewUUID(), payload)
+    if err := broker.Publish("payments", msg); err != nil {
+        t.Fatal(err)
+    }
+
+    select {
+    case <-handled:
+        // success
+    case <-ctx.Done():
+        t.Fatal("timed out waiting for handler")
+    }
+}
+```
+
+`router.Running()` returns a channel that closes once the Router's goroutines are ready. Always wait for it before publishing in tests — otherwise your message may arrive before the subscriber is registered and get dropped. This is the in-process integration test you'd write for every new handler before you ever touch a real broker.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Implement the outbox write path" level="hard">
+
+Write `processPaymentTx` that:
+1. Accepts a `*sql.Tx` and a `message.Publisher` (the outbox publisher).
+2. Executes `INSERT INTO payments VALUES (...)` inside the tx.
+3. Publishes a `message.NewMessage(paymentID, payload)` to `"_outbox.payment.completed"` using the publisher (also inside the tx — assume the publisher writes to the outbox table via the same connection).
+4. Returns an error if either step fails (tx will roll back at the call site).
+5. Does NOT call `tx.Commit()` — that's the caller's responsibility.
+
+<Solution>
+
+```go
+func processPaymentTx(
+    ctx context.Context,
+    tx *sql.Tx,
+    pub message.Publisher,
+    cmd *ProcessPaymentCommand,
+) error {
+    // 1. Domain write — the authoritative record.
+    _, err := tx.ExecContext(ctx,
+        `INSERT INTO payments (id, account_id, amount_cents, created_at)
+         VALUES ($1, $2, $3, NOW())`,
+        cmd.PaymentID, cmd.AccountID, cmd.AmountCents,
+    )
+    if err != nil {
+        return fmt.Errorf("insert payment: %w", err)
+    }
+
+    // 2. Outbox write — same transaction, guaranteed atomic with step 1.
+    //    msg.UUID == cmd.PaymentID: the idempotency key doubles as the
+    //    message UUID for deduplication downstream (see "Idempotency & Exactly-Once Semantics (Part 3)").
+    payload, err := json.Marshal(PaymentCompletedEvent{
+        PaymentID:   cmd.PaymentID,
+        AccountID:   cmd.AccountID,
+        AmountCents: cmd.AmountCents,
+    })
+    if err != nil {
+        return fmt.Errorf("marshal event: %w", err)
+    }
+
+    outboxMsg := message.NewMessage(cmd.PaymentID, payload)
+    if err := pub.Publish("_outbox.payment.completed", outboxMsg); err != nil {
+        return fmt.Errorf("publish to outbox: %w", err)
+    }
+
+    return nil // caller commits — or rolls back if this returned an error
+}
+```
+
+The two writes (domain + outbox) succeed or fail together because they share the same `*sql.Tx`. If the process crashes after `tx.Commit()` but before the Forwarder delivers to the broker, the outbox record is still in the DB and the Forwarder will deliver it on the next poll. At-least-once delivery, guaranteed. The `msg.UUID = cmd.PaymentID` ties idempotency from "Idempotency & Exactly-Once Semantics (Part 3)" directly to Watermill's deduplication hook.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+You've read enough. Now you perform.
+
+I designed this test myself. I'm personally invested in whether you pass, which is to say: I'll be mildly annoyed if you don't, and mildly impressed if you do. Let's see which one it is.
+
+<Lab
+  title="Implement retry + correlationID middleware for a payment handler"
+  archetype="build-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  objective="The payments team shipped a handler with no middleware — it crashes on transient DB errors and has no trace IDs. Your task: implement a RetryMiddleware (max 3 attempts, 10ms fixed delay) and a CorrelationIDMiddleware (stamp 'corr-id' in metadata if absent, store in context), compose them around the provided handler (correlation outermost, retry inner), and make the hidden tests pass. Use only stdlib — no Watermill import. The flag is revealed when your composed handler: (1) retries transient errors up to 3 times and returns nil on the 3rd attempt, (2) stamps a correlation ID on a fresh message, (3) propagates an existing correlation ID unchanged."
+  starter={`package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// ----- minimal message types (stdlib-only stand-in) -----
+
+type Metadata map[string]string
+
+func (m Metadata) Get(k string) string { return m[k] }
+func (m Metadata) Set(k, v string)     { m[k] = v }
+
+type Message struct {
+    UUID     string
+    Payload  []byte
+    Metadata Metadata
+    ctx      context.Context
+}
+
+func NewMessage(uuid string, payload []byte) *Message {
+    return &Message{
+        UUID:     uuid,
+        Payload:  payload,
+        Metadata: make(Metadata),
+        ctx:      context.Background(),
+    }
+}
+
+func (m *Message) Context() context.Context { return m.ctx }
+func (m *Message) SetContext(ctx context.Context) { m.ctx = ctx }
+
+type HandlerFunc func(msg *Message) error
+
+type Middleware func(next HandlerFunc) HandlerFunc
+
+// ----- TODO: implement these -----
+
+// RetryMiddleware retries the handler up to maxAttempts times with a fixed delay.
+// If all attempts fail, return the last error.
+func RetryMiddleware(maxAttempts int, delay time.Duration) Middleware {
+    // TODO
+    return nil
+}
+
+// CorrelationIDMiddleware stamps a correlation ID in msg.Metadata["corr-id"]
+// if not already present, and stores it in the context under a typed key.
+func CorrelationIDMiddleware(next HandlerFunc) HandlerFunc {
+    // TODO
+    return nil
+}
+
+// compose applies middlewares: first in slice is outermost (runs first on entry).
+func compose(h HandlerFunc, middlewares ...Middleware) HandlerFunc {
+    for i := len(middlewares) - 1; i >= 0; i-- {
+        h = middlewares[i](h)
+    }
+    return h
+}
+
+// ----- do not modify below this line -----
+
+type ctxKey string
+const CorrIDKey ctxKey = "corr-id"
+
+func main() {
+    attempts := 0
+    handler := func(msg *Message) error {
+        attempts++
+        if attempts < 3 {
+            return errors.New("transient db error")
+        }
+        fmt.Printf("handled: corr=%s payload=%s\\n",
+            msg.Metadata.Get("corr-id"),
+            msg.Payload,
+        )
+        return nil
+    }
+
+    composed := compose(handler,
+        CorrelationIDMiddleware,
+        RetryMiddleware(3, 10*time.Millisecond),
+    )
+
+    msg := NewMessage("pay-001", []byte("payment data"))
+    if err := composed(msg); err != nil {
+        fmt.Println("FAIL:", err)
+    }
+}`}
+  verify="self-check"
+  verifier="The starter's main() exercises the middleware chain and prints the result. Correct output: the handler prints 'handled: corr=...' and the program exits cleanly. If RetryMiddleware or CorrelationIDMiddleware is wrong, main() will print 'FAIL:' or produce no output. Codapi runs go run — inspect the output yourself."
+  hints={[
+    "RetryMiddleware: the inner loop is `for attempt := range maxAttempts`. Call next(msg), check err. If nil, return nil immediately. After the loop, return the last error.",
+    "CorrelationIDMiddleware: check `msg.Metadata.Get(\"corr-id\")`. If empty, generate an ID (you can use fmt.Sprintf(\"corr-%s\", msg.UUID) for stdlib-only). Set it with msg.Metadata.Set. Then call context.WithValue(msg.Context(), CorrIDKey, id) and msg.SetContext(ctx).",
+    "compose applies in reverse: for i := len(middlewares)-1; i >= 0; i-- { h = middlewares[i](h) }. This makes the first middleware in the slice the outermost wrapper. CorrelationIDMiddleware must be a Middleware-typed value — make sure its type matches."
+  ]}
+  flag="GO{middleware_chain_retry_correlation_wired}"
+>
+
+The starter code gives you the minimal `Message` type and the `compose` function — pure stdlib, no Watermill import, fully runnable in the lab sandbox. Your job is `RetryMiddleware` and `CorrelationIDMiddleware`. When the hidden tests go green, the flag is yours.
+
+Personally, I never needed hints. But you're not me, so they're there if you want them.
+
+</Lab>
+
+---
+
+<Recap>
+
+You now own the full Watermill stack:
+
+- **The abstraction:** `Publisher` and `Subscriber` are two interfaces. Any broker that implements them is interchangeable. The `GoChannel` in-process broker makes your tests fast and deterministic — no Docker required.
+- **`message.Message`:** UUID (idempotency key), payload (bytes), metadata (string map for trace IDs), and `Ack()`/`Nack()` for delivery acknowledgement. Return `nil` from your handler to Ack; return an error to Nack.
+- **The Router:** one goroutine per handler, runs the composed middleware chain, owns the Ack/Nack lifecycle. Output messages are published *before* the input is Acked — at-least-once semantics enforced by design.
+- **Middleware order:** correlation ID outermost (stamps IDs first), then recovery (catch panics), then retry (retry transients), then poison queue innermost (DLQ final failures). The order is not style — it determines behavior.
+- **CQRS wiring:** `CommandBus` for point-to-point commands, `EventBus` for fan-out events. Handlers are plain structs with a `Handle(ctx, cmd/event)` method. The Router and broker are injected — your handlers stay broker-free.
+- **The outbox:** write domain record + outbox message in one DB transaction. The `Forwarder` polls and delivers. If the process crashes before delivery, the outbox record survives. `msg.UUID == idempotencyKey` ties back to "Idempotency & Exactly-Once Semantics (Part 3)" — the same key deduplicates both the payment and the event.
+- **Under the hood:** middleware composition is decorator-chaining of `HandlerFunc` wrappers. The GMP scheduler multiplexes Router goroutines across Ps with no special configuration needed.
+
+</Recap>
+
+<Scoreboard
+  streak={7}
+  items={[
+    { label: "Quick check — handler error → Nack", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — middleware order", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — HandlerFunc with JSON", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — GoChannel test harness", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Correlation ID middleware", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Router integration test", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Outbox write path", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — retry + correlationID middleware chain", captured: false, points: 80 }}
+/>
+
+Not bad. Honestly, for someone who isn't me, you're holding up reasonably well. The Forwarder, the CQRS bus, the middleware chain — that's the full stack. Next we connect this service to the outside world: payment processors, webhook verification, idempotent retries against external APIs, and the async reality of ACH settlement. The real money moves slowly. Make sure your state machine knows that.
