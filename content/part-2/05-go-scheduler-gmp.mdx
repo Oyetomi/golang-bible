@@ -229,7 +229,7 @@ An `m` struct tracks the OS thread: its `g0` (the goroutine that runs scheduler 
 
 A `p` struct is the scheduling context: its `runq` (a circular buffer of `*g`, capacity 256 — the local run queue), a `runnext` field for the one goroutine the P wants to run next (bypasses the queue for freshly-spawned goroutines), and links to the global run queue (`sched.runq`). The set of all Ps is stored in `runtime.allp`, and `runtime.GOMAXPROCS` resizes that slice.
 
-As of Go 1.26, the scheduler is a non-preemptive, work-stealing, M:N scheduler. The "M:N" terminology means M goroutines are multiplexed onto N OS threads. Note that these struct layouts are implementation details of the Go runtime and may change between versions; treat this as a model grounded in Go 1.26 source, not a guaranteed API.
+As of Go 1.26, the scheduler is a work-stealing, M:N scheduler with both cooperative yield points and asynchronous preemption. The "M:N" terminology means M goroutines are multiplexed onto N OS threads. Note that these struct layouts are implementation details of the Go runtime and may change between versions; treat this as a model grounded in Go 1.26 source, not a guaranteed API.
 
 </UnderTheHood>
 
@@ -535,7 +535,7 @@ Go 1.14 introduced **asynchronous preemption**. The runtime can now stop a gorou
 
 ### sysmon: the background monitor
 
-`sysmon` is a goroutine that runs without a P — it runs directly on an M with no P attached. It never stops. Its jobs (as of Go 1.26):
+`sysmon` is a runtime monitor thread that runs without a P — directly on an M with no P attached. It never stops. Its jobs (as of Go 1.26):
 
 <ConceptGrid cols={2}>
   <ConceptCard label="Async preemption">Every ~10ms, finds goroutines that have been running too long and sends SIGURG to their M to trigger preemption.</ConceptCard>
@@ -1300,7 +1300,8 @@ Alright. Exercises are where you showed me you *understand*. This is where you s
   points={80}
   hintCost={15}
   verify="self-check"
-  objective="Meridian's settlement service has a critical bug: a CPU-bound annual settlement goroutine is starving the HTTP request handlers. Fix the two bugs in the starter code — the program prints its own measurements and will show avg handler latency dropping below 5ms and GOMAXPROCS restored from the hardcoded 1 to the runtime default when your fix is correct. Capture the flag when both conditions are met."
+  expect="ALL CHECKS PASS"
+  objective="Meridian's settlement service serialises everything onto one P and runs all four CPU-bound settlement jobs without a concurrency cap, starving the HTTP handlers. Fix the two bugs above main: (1) GOMAXPROCS is hardcoded to 1 — restore the runtime default so multiple Ps are available; (2) the settlement goroutines have no semaphore — cap concurrent settlement jobs to runtime.GOMAXPROCS(0)/2 so handlers always have room to run. main is the self-check verifier — do not edit it."
   starter={`package main
 
 import (
@@ -1308,81 +1309,93 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
-// PROBLEM: Meridian's ledger service runs settlement goroutines and
-// HTTP handler goroutines concurrently. Under load, the CPU-bound
-// settlement jobs starve the handlers.
-//
-// Your tasks:
-//   1. Restore GOMAXPROCS to the runtime default (it is currently hardcoded to 1).
-//   2. Add a semaphore to limit concurrent settlement goroutines to
-//      runtime.GOMAXPROCS(0)/2 (half the Ps for settlement, half for handlers).
-//   3. The program prints avg handler latency — it should be < 5ms.
+// peakActive and nowActive are updated INSIDE runSettlementCapped after the
+// semaphore is acquired, so they measure goroutines actively executing the
+// CPU loop — not goroutines merely waiting for a slot.
+var peakActive atomic.Int64
+var nowActive atomic.Int64
 
-var handlerCount atomic.Int64
-var handlerTotalLatency atomic.Int64 // nanoseconds
-
-func handleRequest(id int) {
-	start := time.Now()
-	// Simulate fast I/O-bound handler work (POST /transfers DB round-trip).
-	time.Sleep(1 * time.Millisecond)
-	latNs := time.Since(start).Nanoseconds()
-	handlerCount.Add(1)
-	handlerTotalLatency.Add(latNs)
+// BUG 1: GOMAXPROCS is hardcoded to 1 — all goroutines serialise on one P.
+// Fix: call runtime.GOMAXPROCS(runtime.NumCPU()) (or any value > 1) to
+// enable true parallelism before spawning goroutines.
+func initParallelism() {
+	runtime.GOMAXPROCS(1) // BUG: change this
 }
 
-func runSettlement(batchID int64) int64 {
-	// CPU-bound: tight loop over ledger rows. No rate limiting applied.
+// BUG 2: runSettlementCapped must use a semaphore to limit concurrent
+// goroutines that are INSIDE this function at the same time.
+// The semaphore acquire (sem <- struct{}{}) must come BEFORE the
+// nowActive.Add(1) call so only goroutines that have their slot are counted.
+// Fix: add sem <- struct{}{} as the first line and defer func(){ <-sem }()
+// as the second line.
+func runSettlementCapped(batchID int64, sem chan struct{}) int64 {
+	// TODO: sem <- struct{}{} here (acquire slot BEFORE counting as active)
+	// TODO: defer func() { <-sem }() here (release slot on return)
+	cur := nowActive.Add(1)
+	defer nowActive.Add(-1)
+	for {
+		old := peakActive.Load()
+		if cur <= old || peakActive.CompareAndSwap(old, cur) {
+			break
+		}
+	}
 	var sum int64
-	for i := range int64(10_000_000) {
+	for i := range int64(500_000) {
 		sum += i * batchID
 	}
 	return sum
 }
 
+// ── checks: do not edit. Run to verify your fix. ──
 func main() {
-	// BUG: GOMAXPROCS is set to 1 — all goroutines serialize on one P.
-	runtime.GOMAXPROCS(1)
+	allOK := true
+
+	initParallelism()
+
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 2 {
+		fmt.Printf("FAIL GOMAXPROCS: got %d, want >= 2 (restore runtime default)\\n", procs)
+		allOK = false
+	}
+
+	maxWorkers := procs / 2
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
+	sem := make(chan struct{}, maxWorkers)
 
 	var wg sync.WaitGroup
-	start := time.Now()
-
-	// Spawn 4 CPU-bound settlement goroutines.
-	for i := range 4 {
+	const nJobs = 8
+	for i := range nJobs {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			// BUG: no semaphore — all 4 run concurrently, starving handlers.
-			result := runSettlement(int64(id + 1))
-			_ = result
+			_ = runSettlementCapped(int64(id+1), sem)
 		}(i)
 	}
-
-	// Spawn 20 handler goroutines.
-	for i := range 20 {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			handleRequest(id)
-		}(i)
-	}
-
 	wg.Wait()
-	elapsed := time.Since(start)
 
-	count := handlerCount.Load()
-	avgLatMs := float64(handlerTotalLatency.Load()) / float64(count) / 1e6
-	fmt.Printf("handlers completed: %d in %v\\n", count, elapsed)
-	fmt.Printf("avg handler latency: %.2fms (target: < 5ms)\\n", avgLatMs)
-	fmt.Printf("GOMAXPROCS: %d (runtime default restored; NumCPU=%d)\\n", runtime.GOMAXPROCS(0), runtime.NumCPU())
+	peakSeen := peakActive.Load()
+	if peakSeen > int64(maxWorkers) {
+		fmt.Printf("FAIL semaphore: peak inside CPU loop=%d, want <= %d\\n", peakSeen, maxWorkers)
+		allOK = false
+	}
+	if peakSeen == 0 {
+		fmt.Println("FAIL: peak=0 — runSettlementCapped was never called properly")
+		allOK = false
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
 }`}
-  verifier="The starter code prints avg handler latency and GOMAXPROCS. Your fix is correct when the output shows GOMAXPROCS is no longer the hardcoded 1 and avg handler latency < 5ms. Both conditions are self-evident from the printed output — no hidden test required."
+  verifier="main calls initParallelism() then verifies GOMAXPROCS >= 2, spawns 8 settlement goroutines through runSettlementCapped, and asserts peak concurrent settlement jobs never exceed procs/2. Codapi runs plain go run — no race flag, no hidden test runner. The flag unlocks when it prints ALL CHECKS PASS."
   hints={[
-    "Fix #1 is one line: change runtime.GOMAXPROCS(1) to runtime.SetDefaultGOMAXPROCS(). This restores the Go 1.25+ runtime default, including container CPU quota awareness.",
-    "Fix #2: create a buffered channel `sem := make(chan struct{}, runtime.GOMAXPROCS(0)/2)` before the settlement loop. In the settlement goroutine, do `sem <- struct{}{}` before calling runSettlement and `<-sem` after (use defer). This limits concurrent settlement jobs to half the Ps.",
-    "If avgLatency is still too high, check that your semaphore is correctly limiting to GOMAXPROCS(0)/2. Remember: GOMAXPROCS(0) queries without changing — call it after restoring the runtime default."
+    "Bug 1: inside initParallelism(), replace runtime.GOMAXPROCS(1) with runtime.GOMAXPROCS(runtime.NumCPU()). The check in main asserts GOMAXPROCS(0) >= 2.",
+    "Bug 2: in runSettlementCapped, add sem <- struct{}{} as the very first statement, then defer func() { <-sem }(). Those two lines are the entire semaphore — they block the goroutine until a slot is free and release it when the function returns.",
+    "The peak concurrency check compares the maximum number of goroutines that were simultaneously inside runSettlementCapped against cap (procs/2). If the semaphore is wired correctly, peak will never exceed cap even with 8 goroutines racing."
   ]}
   flag="GO{gomaxprocs_plus_semaphore_restores_handler_fairness}"
 >
@@ -1397,7 +1410,7 @@ You now understand the engine under every goroutine. Let's lock it in:
 
 - **G (goroutine)** — lightweight, user-space, starts at 2 KB. Millions can exist. **M (OS thread)** — the actual thread; there are few of these. **P (logical processor)** — the scheduling context that glues G to M. `GOMAXPROCS` = number of Ps = maximum true parallelism.
 - Each P has a **local run queue** (ring buffer, capacity 256). There's also a **global run queue** for overflow. When a P empties its local queue, it **steals half** of a random busy P's queue — automatic load balancing, no orchestrator.
-- **Blocking syscalls** trigger a **P handoff**: the M blocks but the P is immediately picked up by another M, keeping goroutines in the queue running. **Network I/O** uses the **netpoller** (epoll/kqueue) — goroutines park without consuming any OS thread. 100,000 goroutines waiting on network I/O still use only `GOMAXPROCS` threads.
+- **Blocking syscalls** trigger a **P handoff**: the M blocks but the P is picked up by another M, keeping goroutines in the queue running. **Network I/O** uses the **netpoller** (epoll/kqueue) — goroutines park without needing one OS thread each. Runnable Go code is still limited by `GOMAXPROCS`, while the runtime may keep extra threads for syscalls and internal work.
 - Before Go 1.14, a tight CPU loop with no function calls could starve everything on its P. **Go 1.14 added async preemption** via `SIGURG`: sysmon sends a signal after ~10ms of continuous running, saving registers and parking the goroutine. **`sysmon`** is a P-less background thread that also polls the netpoller, retakes Ps from long-blocked syscalls, and triggers GC.
 - **Go 1.25: container-aware GOMAXPROCS.** The runtime now reads the cgroup CPU limit directly — no `uber-go/automaxprocs` needed. `runtime.SetDefaultGOMAXPROCS()` reapplies the container-aware runtime default, even after an explicit env var or earlier `runtime.GOMAXPROCS` call disabled automatic updates. Remove `automaxprocs` from new services targeting Go 1.25+.
 - **`runtime/metrics` scheduler metrics.** `/sched/goroutines:goroutines`, `/sched/latencies:seconds`, and the Go 1.26 goroutine-state additions let you feed scheduling health into your Prometheus pipeline. P99 scheduling latency above the service's normal baseline can signal P saturation before it becomes a latency incident.

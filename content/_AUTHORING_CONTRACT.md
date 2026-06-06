@@ -85,6 +85,17 @@ Every `<Lab>` must set `verify="verifier" | "self-check" | "reference"`:
 
 **The Codapi runner only runs plain `go run` — it does NOT run `go test`, `-race`, fuzzing, or benchmarks.** So if your lab's check needs those, it is at best `self-check` (ship a `main` that exercises the code and prints PASS/FAIL) — never label it `verifier`. Prefer verifier → self-check → reference.
 
+### The flag is gated for real (`expect` prop) — REQUIRED for self-check labs
+
+The `<Lab>` starter is a **live, editable, runnable** Codapi Go snippet. The flag unlocks **only** when a run finishes with a clean build (`ok`) AND its stdout contains the `expect` string. There is no hidden harness — gating is honest and entirely client-side. So:
+
+- Ship the starter with a **do-not-edit self-check `main`** (mark it `// ── checks: do not edit. Run to verify your fix. ──`). The buggy/`TODO` code lives in the functions *above* `main`; `main` is the harness.
+- `main` runs the checks and prints the sentinel **`ALL CHECKS PASS`** on the **last line, only if every check passed** (early-`return` or track an `ok` bool on any failure; print a `FAIL …` line so the learner sees what broke). Use that exact phrase — never a bare `PASS` (it collides with per-check `PASS` lines).
+- Set `expect="ALL CHECKS PASS"` and `verify="self-check"`.
+- The check must be **un-cheatable by the shipped starter**: as authored, the starter must either fail to compile (best — make `main` call the *fixed* API so wrong signatures won't build) or print a `FAIL` line. Verify both states: shipped starter does NOT print the sentinel; the intended fix DOES.
+- Must build & run on **Go 1.24 via `go run`** — stdlib only, no external services, no `-race`/`go test`. For HTTP, use in-memory `httptest.NewRecorder()` + `httptest.NewRequest()` (NOT `httptest.NewServer`, which needs a loopback socket). No network, no real DB/redis/kafka/docker — model the logic in-process.
+- If a lab genuinely cannot run in the sandbox (needs real external systems), omit `expect`, set `verify="reference"`, and it falls back to an honest manual "Reveal flag" — never claim `verifier`/hidden tests.
+
 ## Lab (capture-the-flag) — mandatory, in persona
 
 A sandboxed challenge that culminates the chapter (distinct from the exercises). Archetypes: `fix-it`, `find-it`, `build-it`, `optimize-it`, `break-fix` (defensive security only, fully sandboxed), `load` (fintech: concurrent transfers under -race, books must balance). Each lab needs: a single clear **objective**, **starter** code in a broken/incomplete state, a **verifier** (stated win condition a runner checks — tests green, `-race` silent, allocations < N, invariant holds), tiered **hints** (each spends points), and a **flag** `GO{snake_case_token}` derived from solving (never pasteable). Ground it in the chapter's real scenario. Homelander sets the test personally.

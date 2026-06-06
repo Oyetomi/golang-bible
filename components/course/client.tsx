@@ -1,8 +1,10 @@
 "use client";
 
 import {
+  createElement,
   Fragment,
   useEffect,
+  useId,
   useRef,
   useState,
   type CSSProperties,
@@ -437,9 +439,12 @@ const VERIFY_TIP: Record<VerifyTier, string> = {
   reference: "Compare your solution against the provided reference and rubric (honor system).",
 };
 
-/** End-of-chapter capture-the-flag lab. Placeholder runner: the live site
- *  wires this to the Codapi/verifier harness. No storage — captures emit via
- *  the optional onCapture callback. */
+/** End-of-chapter capture-the-flag lab. The starter is a REAL editable + runnable
+ *  Codapi Go snippet (editor="basic"). The flag is gated honestly: when `expect`
+ *  is set, it unlocks only when a run finishes with a clean build (`ok`) AND its
+ *  stdout contains that sentinel — Codapi fires a `result` event with
+ *  `{ok, stdout, stderr}`. Labs without `expect` (e.g. reference/no-starter ones)
+ *  fall back to an honest manual reveal. No storage — captures emit via onCapture. */
 export function Lab({
   title,
   archetype = "build-it",
@@ -451,6 +456,7 @@ export function Lab({
   hints = [],
   verifier,
   verify,
+  expect,
   flag,
   children,
   onCapture,
@@ -465,21 +471,40 @@ export function Lab({
   hints?: string[];
   verifier?: string;
   verify?: VerifyTier;
+  expect?: string; // substring stdout must contain on a clean run to unlock the flag
   flag: string;
   children?: ReactNode;
   onCapture?: (flag: string, hintsUsed: number) => void;
 }) {
   const [revealed, setRevealed] = useState(0);
   const [captured, setCaptured] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [ran, setRan] = useState(false);
+  const snippetRef = useRef<HTMLElement | null>(null);
+  const codeId = "lab-" + useId().replace(/[^a-zA-Z0-9_-]/g, "");
 
-  const run = () => {
-    setRunning(true);
-    setTimeout(() => {
-      setRunning(false);
-      setCaptured(true);
-      onCapture?.(flag, revealed);
-    }, 900);
+  // Watch real Codapi runs. Auto-unlock only on a clean build whose output
+  // contains `expect`; otherwise just record that a run happened.
+  useEffect(() => {
+    const host = snippetRef.current;
+    if (!host) return;
+    const onResult = (e: Event) => {
+      const d = (e as CustomEvent).detail as
+        | { ok?: boolean; stdout?: string }
+        | undefined;
+      setRan(true);
+      if (captured || !expect || !d?.ok) return;
+      if ((d.stdout ?? "").includes(expect)) {
+        setCaptured(true);
+        onCapture?.(flag, revealed);
+      }
+    };
+    host.addEventListener("result", onResult as EventListener);
+    return () => host.removeEventListener("result", onResult as EventListener);
+  }, [captured, expect, flag, revealed, onCapture]);
+
+  const revealManually = () => {
+    setCaptured(true);
+    onCapture?.(flag, revealed);
   };
 
   return (
@@ -509,11 +534,19 @@ export function Lab({
         <div className="lab-starter">
           <div className="lab-starter-bar">
             <span>starter.go</span>
-            <span className="lab-starter-tag">sandbox</span>
+            <span className="lab-starter-tag">editable · runnable</span>
           </div>
-          <pre className="lab-code">
+          <pre className="lab-code" id={codeId} spellCheck={false}>
             <code>{starter.replace(/^\n+|\n+$/g, "")}</code>
           </pre>
+          <div className="lab-snippet">
+            {createElement("codapi-snippet", {
+              ref: snippetRef,
+              sandbox: "go",
+              editor: "basic",
+              selector: `#${codeId}`,
+            })}
+          </div>
         </div>
       )}
 
@@ -547,17 +580,19 @@ export function Lab({
       )}
 
       <div className="lab-run">
-        <button
-          className="lab-run-btn"
-          onClick={run}
-          disabled={running || captured}
-        >
-          {captured
-            ? "✓ Verifier passed"
-            : running
-            ? "Running verifier…"
-            : "▶ Run the verifier"}
-        </button>
+        {captured ? (
+          <span className="lab-run-state">✓ Flag unlocked</span>
+        ) : expect && starter ? (
+          <span className="lab-run-note">
+            {ran
+              ? "Not green yet — fix the code above and Run again."
+              : "Edit the code, hit Run — the flag unlocks when the output checks out."}
+          </span>
+        ) : (
+          <button className="lab-run-btn" onClick={revealManually}>
+            Reveal flag
+          </button>
+        )}
         {revealed > 0 && !captured && (
           <span className="lab-run-note">{revealed} hint(s) used</span>
         )}
@@ -568,9 +603,9 @@ export function Lab({
           <span className="lab-flag-label">⚑ Flag captured</span>
           <code className="lab-flag-code">{flag}</code>
           <p className="lab-flag-note">
-            Genuinely solved — the flag is derived from the verifier passing, not
-            pasted in. (Placeholder runner; the site maps this to the real lab
-            harness.)
+            {expect && starter
+              ? "Earned — your code built clean and produced the expected output. Not pasted in."
+              : "Logged on the honor system. Check your solution against the objective and hints above."}
           </p>
         </div>
       )}

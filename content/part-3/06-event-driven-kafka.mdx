@@ -1379,27 +1379,28 @@ I built you a partition-key function and a consumer-group offset tracker. They'r
   points={100}
   hintCost={15}
   verify="self-check"
-  objective="Two bugs: (1) the partition router uses a broken hash that maps EVERY key to partition 0, destroying per-key ordering. (2) the offset tracker has a concurrency bug — a missing mutex means concurrent consumers corrupt the offset map. Fix both so the self-check passes: same-account events map to one stable non-zero partition, and committed offsets advance correctly under concurrent access. Run with -race locally to confirm the data race is gone."
+  expect="ALL CHECKS PASS"
+  objective="Two bugs: (1) the partition router always returns 0, destroying per-key ordering. (2) OffsetTracker has no mutex — concurrent Commit calls corrupt the offset map. Fix both. main is the self-check harness — do not edit it. It asserts stable non-trivial partitioning and correct offsets after concurrent commits, then prints ALL CHECKS PASS."
   starter={`package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sync"
 )
 
-// BUG 1: This "hash" always returns 0, so every key maps to partition 0.
-// One hot partition; no per-account ordering isolation at all.
+// BUG 1: always returns 0 — every key maps to partition 0.
+// Fix: use hash/fnv to distribute keys across partitions.
 func partitionForKey(key string, numPartitions int) int {
-	var h int
-	for _, c := range key {
-		h += int(c) // summing runes — deterministic but NOT a good hash
-	}
-	// BUG: h is never used for the modulo. Fix this.
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	_ = h.Sum32() // BUG: result computed but never used
 	return 0
 }
 
-// BUG 2: OffsetTracker has no mutex — concurrent Commit calls race on the map.
+// BUG 2: no mutex — concurrent Commit calls race on the map.
 type OffsetTracker struct {
+	// TODO: add a sync.Mutex field
 	offsets map[int]int64
 }
 
@@ -1408,67 +1409,80 @@ func NewOffsetTracker() *OffsetTracker {
 }
 
 func (ot *OffsetTracker) Commit(partition int, offset int64) {
-	// BUG: no mutex — concurrent goroutines race here.
+	// BUG: no lock — concurrent writes race here
 	ot.offsets[partition] = offset
 }
 
 func (ot *OffsetTracker) Position(partition int) int64 {
+	// BUG: no lock — concurrent read races with writes
 	if off, ok := ot.offsets[partition]; ok {
 		return off
 	}
 	return -1
 }
 
+// ── checks: do not edit. Run to verify your fix. ──
 func main() {
-	// Test 1: partition stability
+	allOK := true
+
+	// Check 1: same key always maps to the same partition.
 	p1 := partitionForKey("ACC-001", 6)
 	p2 := partitionForKey("ACC-001", 6)
 	if p1 != p2 {
-		fmt.Println("FAIL: same key mapped to different partitions")
+		fmt.Println("FAIL check 1: same key mapped to different partitions")
+		allOK = false
 	}
-	// All keys MUST NOT map to 0 (the trivial broken case).
+
+	// Check 2: not all keys map to partition 0 (broken hash).
+	keys := []string{"ACC-001", "ACC-002", "ACC-003", "ACC-004", "ACC-005"}
 	allZero := true
-	for _, acc := range []string{"ACC-001","ACC-002","ACC-003","ACC-004","ACC-005"} {
-		if partitionForKey(acc, 6) != 0 {
+	for _, k := range keys {
+		if partitionForKey(k, 6) != 0 {
 			allZero = false
+			break
 		}
 	}
 	if allZero {
-		fmt.Println("FAIL: all keys map to partition 0 — broken hash")
+		fmt.Println("FAIL check 2: all keys map to partition 0 — hash not applied")
+		allOK = false
 	}
 
-	// Test 2: concurrent offset commits (run with -race to catch the bug)
+	// Check 3: concurrent Commit calls do not corrupt the tracker.
 	tracker := NewOffsetTracker()
 	var wg sync.WaitGroup
-	for p := range 6 {
+	for p := 0; p < 6; p++ {
+		p := p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for offset := range int64(100) {
+			for offset := int64(0); offset < 100; offset++ {
 				tracker.Commit(p, offset)
 			}
 		}()
 	}
 	wg.Wait()
-
-	// Verify all partitions reached offset 99.
-	for p := range 6 {
+	for p := 0; p < 6; p++ {
 		if tracker.Position(p) != 99 {
-			fmt.Printf("FAIL: partition %d offset = %d, expected 99\\n", p, tracker.Position(p))
+			fmt.Printf("FAIL check 3: partition %d offset = %d, want 99\\n",
+				p, tracker.Position(p))
+			allOK = false
 		}
 	}
-	fmt.Println("verifier complete")
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
 }`}
-  verifier="Self-check: the program prints no FAIL lines and ends with 'verifier complete'. (1) partitionForKey returns the same value on repeated calls AND not all 5 test keys map to partition 0 (uses fnv.New32a). (2) OffsetTracker.Commit and Position are protected by a sync.Mutex — run locally with -race to confirm the race is gone (Codapi runs plain go run, not -race)."
+  verifier="main runs three in-process checks: (1) same key produces the same partition, (2) not all keys map to 0, (3) 6 goroutines committing 100 offsets each produce offset 99 in every partition. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
   hints={[
-    "Bug 1: replace the rune-sum with hash/fnv. Import hash/fnv, create fnv.New32a(), call h.Write([]byte(key)), and use h.Sum32() % uint32(numPartitions) cast to int. Don't forget to actually USE the result in the return statement.",
-    "Bug 2: add a sync.Mutex field to OffsetTracker. Call mu.Lock() / defer mu.Unlock() at the top of both Commit and Position. The map access is safe once the mutex guards it.",
-    "Double-check: after fixing partitionForKey, verify that 'ACC-001' and 'ACC-002' hash to different partitions (they should with FNV — try it). After fixing OffsetTracker, run go test -race on a test that spawns 6 goroutines committing concurrently — it should be silent."
+    "Bug 1: fnv.New32a() is already imported. Write the key bytes, then use the result: return int(h.Sum32()) % numPartitions. That one change routes different keys to different partitions deterministically.",
+    "Bug 2: add mu sync.Mutex to OffsetTracker. In Commit: ot.mu.Lock(); ot.offsets[partition] = offset; ot.mu.Unlock(). In Position: ot.mu.Lock(); defer ot.mu.Unlock(); then read the map.",
+    "Each goroutine in check 3 writes offsets 0..99 for its own partition. Because each goroutine owns a unique partition key, two goroutines never write the same map key — but the map itself is shared, so any concurrent access without a lock is a data race."
   ]}
   flag="GO{fnv_hash_partition_key_mutex_offset_tracker}"
 >
 
-Two bugs. One destroys per-account ordering — everything goes to partition 0. One is a data race on the offset map that corrupts your consumer's position tracking under concurrent load. Either bug in production means incorrect Meridian ledger projections. Fix them. The self-check prints no FAIL lines when you're done. Run with `-race` locally to confirm the mutex fix — Codapi runs plain `go run` so the race detector check is yours to verify.
+Bug 1 collapses all events onto one partition — per-account ordering gone. Bug 2 is a data race that silently corrupts the consumer's position. Either bug in production means Meridian's ledger projections go wrong without a trace. Fix both. Three checks. No FAIL lines. Get the flag.
 
 </Lab>
 

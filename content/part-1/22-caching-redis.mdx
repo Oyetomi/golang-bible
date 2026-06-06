@@ -1699,19 +1699,46 @@ Don't embarrass me.
   points={80}
   hintCost={15}
   verify="self-check"
-  objective="The starter code has a cache-aside GetProductList that is NOT protected against concurrent misses. Under load, 50 goroutines all miss and all hit the database simultaneously. Add singleflight protection so that exactly ONE database call fires regardless of how many goroutines miss concurrently. The main function fires 50 goroutines with a cold cache and prints FLAG or FAIL based on whether dbCalls == 1."
+  expect="ALL CHECKS PASS"
+  objective="The starter ProductStore has two bugs: (1) it uses real time.Now() for TTL — replace the injected clock so tests are deterministic; (2) GetProductList has no call-deduplication: 50 concurrent misses each hit the fake DB. Fix both: wire the injected clock through the cache, then add a mutex-guarded in-flight map so only one goroutine fetches the DB when many miss simultaneously. The DO-NOT-EDIT main advances the fake clock, fires 50 goroutines, and prints ALL CHECKS PASS only when TTL expiry and deduplication both work."
   starter={`package main
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
-	// TODO: import golang.org/x/sync/singleflight
 )
 
-// --- in-process cache (do not modify) ---
+// ── clock abstraction — inject this instead of calling time.Now() directly ──
+
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+// fakeClock lets tests advance time without sleeping.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// ── in-memory cache ──
 
 type entry struct {
 	value     string
@@ -1721,13 +1748,19 @@ type entry struct {
 type Cache struct {
 	mu    sync.RWMutex
 	items map[string]entry
+	// BUG 1: clock is not wired — Get/Set call time.Now() directly below.
+	// Add a Clock field and use it instead of time.Now().
+	clk Clock
 }
 
-func NewCache() *Cache { return &Cache{items: make(map[string]entry)} }
+func NewCache(clk Clock) *Cache {
+	return &Cache{items: make(map[string]entry), clk: clk}
+}
 
 func (c *Cache) Set(key, val string, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// BUG 1: must use c.clk.Now() not time.Now()
 	c.items[key] = entry{value: val, expiresAt: time.Now().Add(ttl)}
 }
 
@@ -1735,72 +1768,105 @@ func (c *Cache) Get(key string) (string, bool) {
 	c.mu.RLock()
 	e, ok := c.items[key]
 	c.mu.RUnlock()
+	// BUG 1: must use c.clk.Now() not time.Now()
 	if !ok || time.Now().After(e.expiresAt) {
 		return "", false
 	}
 	return e.value, true
 }
 
-// --- ProductStore — THIS IS WHAT YOU FIX ---
+// ── ProductStore — fix both bugs here ──
 
 type ProductStore struct {
 	cache   *Cache
-	DBCalls int64 // increment atomically on every DB fetch
-	// TODO: add a singleflight.Group field here
+	DBCalls int64 // increment atomically on every real DB fetch
+
+	// BUG 2: no deduplication — 50 concurrent misses each call fetchFromDB.
+	// Add a sync.Mutex and an inFlight bool (or a map) to collapse concurrent misses.
+	mu       sync.Mutex
+	inFlight bool
+	waiting  []chan string
 }
 
-func (s *ProductStore) GetProductList(ctx context.Context) (string, error) {
+func (s *ProductStore) GetProductList() (string, error) {
 	const key = "product:list"
-
 	if val, ok := s.cache.Get(key); ok {
 		return val, nil
 	}
-
-	// BUG: no singleflight protection — every concurrent miss hits the DB.
+	// BUG 2: every goroutine that misses calls fetchFromDB independently.
+	// Only one should fetch; the rest should block and share the result.
 	atomic.AddInt64(&s.DBCalls, 1)
-	time.Sleep(20 * time.Millisecond) // simulate DB latency
-	result := \`[{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]\`
-	s.cache.Set(key, result, 5*time.Minute)
+	result := s.fetchFromDB()
+	s.cache.Set(key, result, 30*time.Second)
 	return result, nil
 }
 
-// --- verifier (do not modify) ---
+// fetchFromDB simulates a slow DB query (do not modify).
+func (s *ProductStore) fetchFromDB() string {
+	time.Sleep(5 * time.Millisecond)
+	return \`[{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]\`
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
 
 func main() {
-	store := &ProductStore{cache: NewCache()}
-	ctx := context.Background()
+	allOK := true
+	check := func(label string, ok bool) {
+		if ok {
+			fmt.Printf("PASS %s\\n", label)
+		} else {
+			fmt.Printf("FAIL %s\\n", label)
+			allOK = false
+		}
+	}
 
+	clk := &fakeClock{now: time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)}
+
+	// check 1: item stored then retrieved before TTL expiry
+	c := NewCache(clk)
+	c.Set("k", "v", 10*time.Second)
+	got, ok := c.Get("k")
+	check("cache hit before TTL", ok && got == "v")
+
+	// check 2: item expires after clock advances past TTL
+	clk.Advance(11 * time.Second)
+	_, ok = c.Get("k")
+	check("cache miss after TTL expires", !ok)
+
+	// check 3: 50 concurrent misses must result in exactly 1 DB call
+	clk2 := &fakeClock{now: time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)}
+	store := &ProductStore{cache: NewCache(clk2)}
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := store.GetProductList(ctx); err != nil {
-				fmt.Println("error:", err)
-			}
+			store.GetProductList()
 		}()
 	}
 	wg.Wait()
-
 	calls := atomic.LoadInt64(&store.DBCalls)
-	fmt.Printf("DB calls: %d\\n", calls)
-	if calls == 1 {
-		fmt.Println("FLAG: GO{singleflight_collapses_the_herd}")
-	} else {
-		fmt.Printf("FAIL: expected 1 DB call, got %d\\n", calls)
+	check("exactly 1 DB call for 50 concurrent misses", calls == 1)
+
+	// check 4: result is cached — subsequent call must not hit DB again
+	store.GetProductList()
+	calls2 := atomic.LoadInt64(&store.DBCalls)
+	check("cached result served on next call (no extra DB call)", calls2 == 1)
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
 	}
 }`}
+  verifier="main runs four in-process checks: (1) an item stored with a 10s TTL is retrievable before expiry, (2) it disappears after the injected clock advances 11s, (3) exactly 1 DB call fires for 50 concurrent misses, (4) the cached result is served on the next call without a second DB fetch. No external dependencies — stdlib only. The flag unlocks when it builds clean and prints ALL CHECKS PASS."
   hints={[
-    "Import golang.org/x/sync/singleflight and add a `group singleflight.Group` field to ProductStore. singleflight.Group has a zero value — no constructor needed.",
-    "In GetProductList, after the cache miss, wrap the DB fetch in `s.group.Do(key, func() (interface{}, error) { ... })`. Move the atomic.AddInt64, time.Sleep, and cache.Set inside the func. Return (result, nil) from the inner func and cast v.(string) for the return value.",
-    "The DBCalls counter must move INSIDE the singleflight func — it currently increments before the Do, which means every goroutine increments it on a miss. Inside Do, only one goroutine executes the func, so the counter will be exactly 1."
+    "Bug 1 (clock): replace both time.Now() calls in Cache.Get and Cache.Set with c.clk.Now(). The fakeClock's Advance method lets main fast-forward time without sleeping — that is what makes check 2 pass.",
+    "Bug 2 (dedup): in GetProductList, lock s.mu before checking the cache a second time. If inFlight is already true, create a channel, append it to s.waiting, unlock, block on the channel, and return the received result. If inFlight is false, set it to true, unlock, do the fetch, then lock again — drain s.waiting by sending the result to each channel and reset inFlight to false.",
+    "Move the atomic.AddInt64 call inside the code path that actually calls fetchFromDB (only the goroutine that wins the inFlight gate). Goroutines that block on the channel must not increment DBCalls."
   ]}
   flag="GO{singleflight_collapses_the_herd}"
 >
 
-The stampede is real. The `ProductStore` above is Meridian's dashboard service at 9 a.m. Fifty goroutines, cold cache, no protection. Add `singleflight` to collapse them. The self-check only passes when the DB count is exactly one.
-
-I'll be watching.
+The stampede is real. The `ProductStore` above is Meridian's dashboard service at 9 a.m. Fix the injected clock so TTL expiry is testable, then add call deduplication so 50 concurrent misses fire exactly one DB call. The DO-NOT-EDIT main will tell you exactly which check fails first.
 
 </Lab>
 
