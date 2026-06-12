@@ -829,3 +829,494 @@ export function AlgoGrid({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   MapAnim — a Go map as it actually is: buckets
+   holding key slots, a hashing gopher routing
+   each key to hash(k) % B, collisions landing in
+   the next slot, overflow chaining.
+   ════════════════════════════════════════════ */
+type MapFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** bucket contents: buckets[i] = array of key labels in slots */
+  buckets: string[][];
+  /** key currently being hashed/routed (shown in the gopher's hands) */
+  hashing?: string;
+  /** highlight a landing spot */
+  to?: { bucket: number; slot: number };
+};
+
+export function MapAnim({
+  title = "Inside a Go map",
+  slots = 3,
+  frames,
+  caption,
+}: {
+  title?: string;
+  slots?: number;
+  frames: MapFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="map internals"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="mapa">
+        <div className="mapa-hasher">
+          <Gopher
+            pose={f.hashing ? "carry" : "idle"}
+            state={f.hashing ? "active" : "idle"}
+            payload={f.hashing}
+            size={48}
+            role="librarian"
+            title="hash router"
+          />
+          <span className="mapa-fn">hash(key) % {f.buckets.length}</span>
+        </div>
+        <div className="mapa-buckets">
+          {f.buckets.map((b, bi) => (
+            <div key={bi} className={`mapa-bucket ${f.to?.bucket === bi ? "landing" : ""}`}>
+              <span className="mapa-bn">b{bi}</span>
+              {Array.from({ length: Math.max(slots, b.length) }, (_, si) => (
+                <span
+                  key={si}
+                  className={`mapa-slot ${b[si] ? "full" : ""} ${
+                    f.to?.bucket === bi && f.to?.slot === si ? "hot" : ""
+                  } ${si >= slots ? "overflow" : ""}`}
+                >
+                  {b[si] ?? ""}
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   StackHeapAnim — escape analysis made visible:
+   stack frames on the left, heap on the right,
+   a value visibly ESCAPING from one to the other,
+   and the sweeper gopher who now has to manage it.
+   ════════════════════════════════════════════ */
+type StackHeapFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  stack: { fn: string; vars: string[] }[]; // top of stack = last entry
+  heap: string[];
+  escaping?: string; // var label shown mid-flight to the heap
+};
+
+export function StackHeapAnim({
+  title = "Stack vs heap — escape analysis",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: StackHeapFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="escape analysis"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="shp">
+        <div className="shp-col">
+          <span className="shp-label">stack (free: pop &amp; gone)</span>
+          <div className="shp-stack">
+            {f.stack.length === 0 && <span className="shp-empty">empty</span>}
+            {[...f.stack].reverse().map((fr) => (
+              <div key={fr.fn} className="shp-frame">
+                <span className="shp-fn">{fr.fn}</span>
+                {fr.vars.map((v) => (
+                  <span key={v} className="shp-var">{v}</span>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+        {f.escaping && (
+          <div className="shp-escape">
+            <span className="shp-escaping">{f.escaping}</span>
+            <span className="shp-arrow">⟶</span>
+          </div>
+        )}
+        <div className="shp-col">
+          <span className="shp-label">heap (free: GC must prove it dead)</span>
+          <div className="shp-heap">
+            <span className="shp-gc">
+              <Gopher pose={f.heap.length > 2 ? "blocked" : "idle"} state={f.heap.length > 2 ? "warn" : "idle"} size={36} role="sweeper" title="GC" />
+            </span>
+            {f.heap.map((h) => (
+              <span key={h} className="shp-blob">{h}</span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   GraphAnim — trees ARE graphs: nodes + edges in
+   SVG with per-frame node states and a walking
+   scholar gopher. Powers BFS/DFS/Dijkstra/BST
+   walkthroughs and heap sift paths.
+   ════════════════════════════════════════════ */
+type GraphNode = { id: string; label?: string; x: number; y: number; to?: string[] };
+type GraphState = "idle" | "frontier" | "visit" | "done" | "found" | "reject";
+type GraphFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  nodes: Record<string, GraphState>;
+  /** edges to light up, as "a-b" using node ids */
+  edges?: string[];
+  /** node the gopher currently stands at */
+  at?: string;
+};
+
+export function GraphAnim({
+  title = "Graph walkthrough",
+  nodes,
+  height = 230,
+  frames,
+  caption,
+}: {
+  title?: string;
+  nodes: GraphNode[];
+  height?: number;
+  frames: GraphFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1600);
+  const f = frames[st.cur] ?? frames[0];
+  const pos = Object.fromEntries(nodes.map((n) => [n.id, n]));
+  const lit = new Set(f.edges ?? []);
+  const at = f.at ? pos[f.at] : null;
+  return (
+    <AnimShell
+      title={title}
+      kicker="traversal"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="grf">
+        <svg className="grf-svg" viewBox={`0 0 460 ${height}`}>
+          {nodes.flatMap(
+            (n) =>
+              n.to?.map((t) => (
+                <line
+                  key={`${n.id}-${t}`}
+                  x1={n.x}
+                  y1={n.y}
+                  x2={pos[t]?.x}
+                  y2={pos[t]?.y}
+                  className={`grf-edge ${
+                    lit.has(`${n.id}-${t}`) || lit.has(`${t}-${n.id}`) ? "lit" : ""
+                  }`}
+                />
+              )) ?? []
+          )}
+          {nodes.map((n) => {
+            const s = f.nodes[n.id] ?? "idle";
+            return (
+              <g key={n.id} className={`grf-node grf-${s}`}>
+                <circle cx={n.x} cy={n.y} r="17" />
+                <text x={n.x} y={n.y + 4} textAnchor="middle">
+                  {n.label ?? n.id}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+        {at && (
+          <span
+            className="grf-walker"
+            style={{ left: `${(at.x / 460) * 100}%`, top: `${(at.y / height) * 100}%` } as CSSProperties}
+          >
+            <Gopher pose="run" state="active" size={34} role="scholar" title="walker" />
+          </span>
+        )}
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   CacheAnim — cache-aside, hits, misses, and the
+   9 a.m. stampede: client gophers, a cache box
+   with keyed slots, and the database that pays
+   for every miss.
+   ════════════════════════════════════════════ */
+type CacheFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  clients: number; // how many client gophers are asking right now
+  cache: string[]; // keys currently cached
+  flow?: "hit" | "miss" | "fill" | "stampede" | "locked";
+  dbCalls: number;
+};
+
+export function CacheAnim({
+  title = "Cache-aside",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: CacheFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const overload = f.dbCalls > 3;
+  return (
+    <AnimShell
+      title={title}
+      kicker="caching"
+      note={f.note}
+      beat={f.beat ?? (overload ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="cch">
+        <div className="cch-clients">
+          {Array.from({ length: f.clients }, (_, i) => (
+            <Gopher
+              key={i}
+              pose={f.flow === "hit" ? "happy" : f.flow === "locked" && i > 0 ? "blocked" : "run"}
+              state={f.flow === "hit" ? "ok" : f.flow === "stampede" ? "bad" : "active"}
+              size={34}
+              title={`client ${i + 1}`}
+            />
+          ))}
+          <span className="cch-name">{f.clients} request{f.clients === 1 ? "" : "s"}</span>
+        </div>
+        <div className={`cch-box ${f.flow === "hit" ? "cch-hit" : ""} ${f.flow === "miss" || f.flow === "stampede" ? "cch-miss" : ""}`}>
+          <span className="cch-label">cache</span>
+          <div className="cch-slots">
+            {f.cache.length === 0 && <span className="cch-empty">empty</span>}
+            {f.cache.map((k) => (
+              <span key={k} className="cch-key">{k}</span>
+            ))}
+          </div>
+        </div>
+        <div className={`cch-db ${overload ? "cch-db-hot" : ""}`}>
+          <Gopher
+            pose={overload ? "panic" : f.dbCalls > 0 ? "carry" : "idle"}
+            state={overload ? "bad" : f.dbCalls > 0 ? "active" : "idle"}
+            size={44}
+            role="librarian"
+            title="database"
+          />
+          <span className="cch-name">DB — {f.dbCalls} quer{f.dbCalls === 1 ? "y" : "ies"}</span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   CircuitAnim — a circuit breaker as the gate it
+   is: closed (requests flow), open (gate slams,
+   instant failure), half-open (one probe gopher
+   allowed through).
+   ════════════════════════════════════════════ */
+type CircuitFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  state: "closed" | "open" | "half";
+  failures?: number;
+  probe?: "ok" | "fail";
+};
+
+export function CircuitAnim({
+  title = "Circuit breaker",
+  downstream = "card processor",
+  frames,
+  caption,
+}: {
+  title?: string;
+  downstream?: string;
+  frames: CircuitFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="reliability"
+      note={f.note}
+      beat={f.beat ?? (f.state === "open" ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="cir">
+        <div className="cir-side">
+          <Gopher
+            pose={f.state === "open" ? "blocked" : "run"}
+            state={f.state === "open" ? "warn" : "active"}
+            size={46}
+            role="banker"
+            title="checkout"
+          />
+          <span className="cir-name">checkout</span>
+        </div>
+        <div className={`cir-gate cir-${f.state}`}>
+          <span className="cir-state">
+            {f.state === "closed" ? "CLOSED — flowing" : f.state === "open" ? "OPEN — fail fast" : "HALF-OPEN — probing"}
+          </span>
+          <span className="cir-bar" />
+          {typeof f.failures === "number" && (
+            <span className="cir-fails">{f.failures} consecutive failures</span>
+          )}
+        </div>
+        <div className="cir-side">
+          <Gopher
+            pose={f.state === "open" ? "sleep" : f.probe === "fail" ? "panic" : "idle"}
+            state={f.state === "open" ? "idle" : f.probe === "fail" ? "bad" : f.probe === "ok" ? "ok" : "idle"}
+            size={46}
+            role="operator"
+            title={downstream}
+          />
+          <span className="cir-name">{downstream}</span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   PoolAnim — a connection pool: fixed slots,
+   borrower gophers taking and returning conns,
+   the queue that forms when the pool is dry.
+   ════════════════════════════════════════════ */
+type PoolFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** slot contents: null = free, string = borrower name */
+  pool: (string | null)[];
+  waiting?: string[];
+};
+
+export function PoolAnim({
+  title = "Connection pool",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: PoolFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="database/sql pool"
+      note={f.note}
+      beat={f.beat ?? ((f.waiting?.length ?? 0) > 0 ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="pol">
+        {(f.waiting?.length ?? 0) > 0 && (
+          <div className="pol-queue">
+            {f.waiting!.map((w) => (
+              <span key={w} className="pol-waiter">
+                <Gopher pose="blocked" state="warn" size={34} title={w} />
+                <span className="pol-name">{w}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="pol-slots">
+          {f.pool.map((s, i) => (
+            <div key={i} className={`pol-slot ${s ? "used" : "free"}`}>
+              <span className="pol-conn">conn {i + 1}</span>
+              {s ? (
+                <>
+                  <Gopher pose="run" state="active" size={32} title={s} />
+                  <span className="pol-name">{s}</span>
+                </>
+              ) : (
+                <span className="pol-free">free</span>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="pol-db">
+          <Gopher pose="idle" state="idle" size={40} role="librarian" title="Postgres" />
+          <span className="pol-name">Postgres</span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
