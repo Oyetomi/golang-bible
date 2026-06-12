@@ -1,0 +1,1368 @@
+---
+title: "In-Process Pub/Sub: Building an Event Bus"
+part: 3
+order: 6
+type: "course"
+description: "Before you reach for a broker: an in-process, type-safe pub/sub event bus built from channels, generics and reflection — the actor model, total event ordering, and backpressure — grounded in decoupling Meridian's modules and read against Tailscale's production util/eventbus."
+prerequisites: ["messaging-pubsub-foundations"]
+---
+
+<HeroCard label="Part 3 · Chapter 6" title="In-Process Pub/Sub: Building an Event Bus">
+
+Listen up, sport. Last chapter I handed you the whole broker-agnostic mental model — topics, fan-out, acks, backpressure — and you earned it. But here's the thing nobody tells you before they sell you a Kafka cluster: *you might not need a network at all.*
+
+Meridian isn't six services yet. Right now it's **one binary**: the transfers module, the ledger module, the notifications module, the fraud module — all running in the same process, sharing the same memory. And they're calling each other directly, which means they're welded together. Change one, recompile all. One slow module stalls the request. That's not architecture, that's a single point of seizure.
+
+An **in-process event bus** breaks that weld *without* a broker, *without* a network hop, *without* serialization. Same publish/subscribe model you just learned — but the "wire" is a Go channel and the "message" is a struct that never leaves the heap. Tailscale runs exactly this pattern in production to keep their daemon's subsystems from strangling each other, and by the end of this chapter you'll have built it yourself, from channels up through generics and reflection, and then read theirs and understood every line.
+
+I've decoupled bigger systems than Meridian in my sleep. Pay attention and so will you.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Coupling Problem", "A Naive Channel Bus", "Typed Edges with Generics", "Routing by Type", "Backpressure & the Pump", "The Actor Model", "Why So Many Parts", "Tailscale's Real Bus"]} />
+
+## The Coupling Problem
+
+Let's see the weld before we cut it.
+
+Meridian's monolith settles a transfer. The instant `POST /transfers` commits, four things must happen: the **ledger** posts the double-entry lines, the **notifier** emails a receipt, the **fraud** module updates its rolling risk score, and the **analytics** module records the conversion. Today the transfers handler just... calls all four.
+
+```go
+// transfers/handler.go — the welded version (do NOT ship this)
+func (h *Handler) Complete(ctx context.Context, t Transfer) error {
+	if err := h.ledger.Post(ctx, t); err != nil {
+		return err // notifier, fraud, analytics never ran
+	}
+	if err := h.notifier.SendReceipt(ctx, t); err != nil {
+		return err // fraud + analytics never ran; ledger already committed
+	}
+	if err := h.fraud.Observe(ctx, t); err != nil {
+		return err
+	}
+	return h.analytics.Record(ctx, t)
+}
+```
+
+Look at what this `Handler` now *knows*. It imports `ledger`, `notifier`, `fraud`, and `analytics`. It knows the order they run in. It knows their method names. Add a fifth consumer — a webhook dispatcher — and you edit this function and recompile the transfers module to teach it about a module it has no business knowing. That is the definition of **tight coupling**: a change *there* forces a change *here*.
+
+**On the job:** you hit this the moment a second module cares about something the first module did. The transfers handler should know how to move money. The instant it also has to know who's *watching* it move money, every new feature becomes a surgery on the hottest code path you own — and a slow notifier turns a successful transfer into a timed-out request.
+
+<Define term="Event bus" since="Messaging & Pub/Sub Foundations (Part 3)">
+An **event bus** is an in-process publish/subscribe mediator. A component *publishes* a typed event to the bus and returns immediately; it does not know or care who is listening. Other components *subscribe* to the event types they care about and receive a copy of each one. The publisher and subscribers are decoupled completely — they share a type, not a function call. It is the broker pattern from the last chapter, collapsed into a single address space: the "network" is a channel, the "message" is a Go value.
+</Define>
+
+The fix: the transfers handler stops calling anyone. It **publishes one event** — `TransferCompleted` — to a bus, and returns. Whoever cares, subscribes. The handler's import list shrinks to one thing: the bus.
+
+<Scene
+  title="Four direct calls vs. one published event"
+  actors={[
+    { id: "txf", label: "transfers" },
+    { id: "led", label: "ledger" },
+    { id: "ntf", label: "notifier" },
+    { id: "frd", label: "fraud" },
+    { id: "ana", label: "analytics" }
+  ]}
+  frames={[
+    {
+      caption: "Welded: the transfers handler calls ledger, notifier, fraud, analytics in sequence. It imports and knows all four.",
+      beat: "problem",
+      actors: [
+        { id: "txf", state: "active" },
+        { id: "led", state: "active" },
+        { id: "ntf", state: "idle" },
+        { id: "frd", state: "idle" },
+        { id: "ana", state: "idle" }
+      ]
+    },
+    {
+      caption: "The notifier is mid-deploy and blocks. The handler stalls, then errors. Fraud + analytics never ran; the ledger already committed. Partial state.",
+      beat: "problem",
+      actors: [
+        { id: "txf", state: "bad" },
+        { id: "led", state: "done" },
+        { id: "ntf", state: "bad" },
+        { id: "frd", state: "idle" },
+        { id: "ana", state: "idle" }
+      ]
+    },
+    {
+      caption: "With a bus: transfers publishes one TransferCompleted event and returns. It imports only the bus — not one downstream module.",
+      beat: "solution",
+      actors: [
+        { id: "txf", state: "done" },
+        { id: "led", state: "idle" },
+        { id: "ntf", state: "idle" },
+        { id: "frd", state: "idle" },
+        { id: "ana", state: "idle" }
+      ]
+    },
+    {
+      caption: "The bus fans the event out to every subscriber. Each module reacts on its own goroutine. Add a fifth subscriber and the transfers handler never changes.",
+      beat: "solution",
+      actors: [
+        { id: "txf", state: "done" },
+        { id: "led", state: "done" },
+        { id: "ntf", state: "done" },
+        { id: "frd", state: "done" },
+        { id: "ana", state: "done" }
+      ]
+    }
+  ]}
+  caption="The welded handler knows four modules and breaks on any of them. The published event knows none — it states a fact (a transfer completed) and lets the bus carry it to whoever is listening."
+/>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Decoupling">The transfers handler imports the bus, not the ledger. New consumer? Subscribe it. The publisher's code, tests, and import graph never move.</ConceptCard>
+  <ConceptCard label="No network">Unlike Kafka or NATS, nothing serializes, nothing leaves the process. The "message" is a struct pointer on the heap — zero marshaling, zero RPC, nanoseconds not milliseconds.</ConceptCard>
+  <ConceptCard label="Same model">It's the exact pub/sub semantics from last chapter — topics, fan-out, subscribers — so the day you split the monolith, the publish sites barely change.</ConceptCard>
+  <Gotcha>An in-process bus dies with the process. It is **not** durable — a crash loses every un-handled event. It decouples *modules*, not *services*. For cross-process, at-least-once, survives-a-restart delivery you still need a real broker (next chapter). Know which problem you're solving.</Gotcha>
+</ConceptGrid>
+
+## A Naive Channel Bus
+
+Let's build the simplest thing that works, then watch it fail in an instructive way.
+
+You already know channels are Go's in-process pipe. So the crudest possible bus is: keep a slice of subscriber channels; to publish, send the value to each one. Here it is, carrying Meridian's `TransferCompleted` event to a ledger listener and a notifier listener.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// TransferCompleted is the one fact the transfers module announces.
+type TransferCompleted struct {
+	TransferID string
+	Cents      int64
+}
+
+// TransferBus carries exactly one event type. No generics, no reflection.
+type TransferBus struct {
+	mu   sync.Mutex
+	subs []chan TransferCompleted
+}
+
+// Subscribe hands back a receive-only channel of future events.
+func (b *TransferBus) Subscribe() <-chan TransferCompleted {
+	ch := make(chan TransferCompleted, 16) // buffered so Publish doesn't block on a slow reader
+	b.mu.Lock()
+	b.subs = append(b.subs, ch)
+	b.mu.Unlock()
+	return ch
+}
+
+// Publish fans one event out to every subscriber.
+func (b *TransferBus) Publish(ev TransferCompleted) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.subs {
+		ch <- ev // each subscriber gets its own copy
+	}
+}
+
+func main() {
+	bus := &TransferBus{}
+	ledger := bus.Subscribe()
+	notifier := bus.Subscribe()
+
+	bus.Publish(TransferCompleted{TransferID: "txn-7823", Cents: 4200})
+
+	fmt.Printf("ledger:   post double-entry for %+v\n", <-ledger)
+	fmt.Printf("notifier: email receipt for %+v\n", <-notifier)
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type TransferCompleted struct {
+	TransferID string
+	Cents      int64
+}
+
+type TransferBus struct {
+	mu   sync.Mutex
+	subs []chan TransferCompleted
+}
+
+func (b *TransferBus) Subscribe() <-chan TransferCompleted {
+	ch := make(chan TransferCompleted, 16)
+	b.mu.Lock()
+	b.subs = append(b.subs, ch)
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *TransferBus) Publish(ev TransferCompleted) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.subs {
+		ch <- ev
+	}
+}
+
+func main() {
+	bus := &TransferBus{}
+	ledger := bus.Subscribe()
+	notifier := bus.Subscribe()
+
+	bus.Publish(TransferCompleted{TransferID: "txn-7823", Cents: 4200})
+
+	fmt.Printf("ledger:   post double-entry for %+v\n", <-ledger)
+	fmt.Printf("notifier: email receipt for %+v\n", <-notifier)
+}
+```
+
+</GoPlayground>
+
+That works. It decouples transfers from ledger and notifier — exactly what we wanted. So what's wrong with it?
+
+**It carries one type.** The day the fraud module wants to hear about `AccountFrozen`, and the analytics module wants `LimitRaised`, you are writing `AccountFrozenBus` and `LimitRaisedBus`, each an identical copy-paste with the type swapped. A bus per event type is not a bus — it's a parking lot full of one-seat cars. We want *one* bus that any module can publish *any* event type onto, and subscribers pick out only the types they asked for.
+
+Two instincts are both half-right, and seeing why each fails is the whole lesson:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="“Use interface{} / any”">One bus, one `chan any`, send anything. But now every subscriber receives *every* event and must type-assert each one in a giant switch — and the bus has thrown away which channel wants which type. We lost routing.</ConceptCard>
+  <ConceptCard label="“Use generics”">`Bus[T]` is type-safe but it's *still one type per bus instance* — `Bus[TransferCompleted]` and `Bus[AccountFrozen]` are different types that can't share one router. Generics alone can't hold a heterogeneous set of subscribers.</ConceptCard>
+</ConceptGrid>
+
+The production answer — Tailscale's answer — is to use **both, at different layers**: generics for the *typed edges* the caller touches, and reflection for the *untyped core* that routes. Let's build exactly that.
+
+## Typed Edges with Generics
+
+Here's the design in one sentence: **the caller only ever touches `Publisher[T]` and `Subscriber[T]`; inside, everything is boxed to `any` and routed by `reflect.Type`.**
+
+Start with the typed facades. A `Publisher[T]` is a thin wrapper that knows its event type `T` and forwards values into the untyped bus. A `Subscriber[T]` is a thin wrapper that pulls untyped values out and asserts them back to `T` before the caller sees them. The type safety lives entirely at these two edges.
+
+```go
+// Publisher[T] is the typed handle a module uses to emit events of type T.
+type Publisher[T any] struct{ bus *Bus }
+
+// Publish[T] registers nothing — it just types a handle onto the shared bus.
+func NewPublisher[T any](b *Bus) *Publisher[T] { return &Publisher[T]{bus: b} }
+
+// Emit boxes v into `any` and hands it to the untyped core.
+func (p *Publisher[T]) Emit(v T) { p.bus.publish(v) }
+
+// Subscriber[T] is the typed handle a module uses to receive events of type T.
+type Subscriber[T any] struct{ ch <-chan T }
+
+// Events is the receive-only channel the module ranges over.
+func (s *Subscriber[T]) Events() <-chan T { return s.ch }
+```
+
+Notice what the caller sees: `p.Emit(TransferCompleted{...})` won't compile if you hand it an `AccountFrozen`. `for ev := range sub.Events()` gives you a `TransferCompleted`, statically — no assertion, no `, ok`, no switch. The generics buy **compile-time safety at the call site**. The reflection we're about to add buys **runtime routing in the core**. Neither could do the other's job.
+
+<QuickCheck
+  question="Why not just make the whole bus generic — Bus[T] — and skip reflection entirely?"
+  options={[
+    "Generics are slower than reflection at runtime, so reflection is the optimization",
+    "Bus[TransferCompleted] and Bus[AccountFrozen] are distinct types that can't share one router, so a single bus can't hold subscribers of many different event types",
+    "Go doesn't allow generic methods, so Bus[T] won't compile",
+    "Reflection is required to send on a channel"
+  ]}
+  answer={1}
+  explain="A generic type is instantiated per type argument: Bus[TransferCompleted] and Bus[AccountFrozen] are different concrete types. One bus instance that routes many unrelated event types needs a single non-generic container — a map keyed by reflect.Type — because there is no single static T that spans all events. Generics give the typed edges; reflection gives the heterogeneous core. (And yes, Go also can't add new type parameters on a method, which is a second reason a generic dispatch method won't save you.)"
+/>
+
+## Routing by Type
+
+Now the core. The bus keeps a map from **event type** to the list of subscriber channels that want that type. The key is a `reflect.Type` — Go's runtime handle for "the type `TransferCompleted`," usable as a comparable map key.
+
+```go
+package main
+
+import (
+	"fmt"
+	"reflect"
+	"sync"
+)
+
+// Bus is the untyped router. One bus carries every event type in the process.
+type Bus struct {
+	mu   sync.Mutex
+	subs map[reflect.Type][]chan any // event type -> subscriber channels
+}
+
+func NewBus() *Bus {
+	return &Bus{subs: make(map[reflect.Type][]chan any)}
+}
+
+// typeOf returns the reflect.Type of T even when T is an interface type.
+// reflect.TypeOf(&v).Elem() dereferences a *T, so a nil-interface v still
+// yields the right type instead of nil.
+func typeOf[T any]() reflect.Type {
+	var v T
+	return reflect.TypeOf(&v).Elem()
+}
+
+// publish boxes v and fans it to every channel registered for v's type.
+func (b *Bus) publish(v any) {
+	t := reflect.TypeOf(v) // concrete type of the boxed value
+	b.mu.Lock()
+	// Copy the slice so we hold the lock briefly and never send under it.
+	chans := append([]chan any(nil), b.subs[t]...)
+	b.mu.Unlock()
+	for _, ch := range chans {
+		ch <- v // boxed; the Subscriber[T] will unbox it
+	}
+}
+
+// Publisher[T] / Subscriber[T] — the typed edges.
+type Publisher[T any] struct{ bus *Bus }
+
+func NewPublisher[T any](b *Bus) *Publisher[T] { return &Publisher[T]{bus: b} }
+func (p *Publisher[T]) Emit(v T)               { p.bus.publish(v) }
+
+type Subscriber[T any] struct{ ch <-chan T }
+
+func (s *Subscriber[T]) Events() <-chan T { return s.ch }
+
+// Subscribe wires a typed subscriber: a raw `chan any` lands in the bus map,
+// and a goroutine unboxes each value to T before the caller sees it.
+func Subscribe[T any](b *Bus) *Subscriber[T] {
+	t := typeOf[T]()
+	raw := make(chan any, 16)
+	b.mu.Lock()
+	b.subs[t] = append(b.subs[t], raw)
+	b.mu.Unlock()
+
+	out := make(chan T, 16)
+	go func() {
+		for v := range raw {
+			out <- v.(T) // safe: routing guarantees v's dynamic type is T
+		}
+	}()
+	return &Subscriber[T]{ch: out}
+}
+
+// ── Meridian uses it: two event TYPES, one bus ──
+
+type TransferCompleted struct {
+	TransferID string
+	Cents      int64
+}
+type AccountFrozen struct {
+	AccountID string
+	Reason    string
+}
+
+func main() {
+	bus := NewBus()
+
+	transfers := Subscribe[TransferCompleted](bus)
+	freezes := Subscribe[AccountFrozen](bus)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ev := <-transfers.Events()
+		fmt.Printf("ledger:  post double-entry for %s (%d cents)\n", ev.TransferID, ev.Cents)
+	}()
+	go func() {
+		defer wg.Done()
+		ev := <-freezes.Events()
+		fmt.Printf("fraud:   account %s frozen: %s\n", ev.AccountID, ev.Reason)
+	}()
+
+	// Same bus, two different event types. Each goes only to its subscriber.
+	NewPublisher[TransferCompleted](bus).Emit(TransferCompleted{"txn-7823", 4200})
+	NewPublisher[AccountFrozen](bus).Emit(AccountFrozen{"acct-19", "velocity rule"})
+
+	wg.Wait()
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"reflect"
+	"sync"
+)
+
+type Bus struct {
+	mu   sync.Mutex
+	subs map[reflect.Type][]chan any
+}
+
+func NewBus() *Bus { return &Bus{subs: make(map[reflect.Type][]chan any)} }
+
+func typeOf[T any]() reflect.Type {
+	var v T
+	return reflect.TypeOf(&v).Elem()
+}
+
+func (b *Bus) publish(v any) {
+	t := reflect.TypeOf(v)
+	b.mu.Lock()
+	chans := append([]chan any(nil), b.subs[t]...)
+	b.mu.Unlock()
+	for _, ch := range chans {
+		ch <- v
+	}
+}
+
+type Publisher[T any] struct{ bus *Bus }
+
+func NewPublisher[T any](b *Bus) *Publisher[T] { return &Publisher[T]{bus: b} }
+func (p *Publisher[T]) Emit(v T)               { p.bus.publish(v) }
+
+type Subscriber[T any] struct{ ch <-chan T }
+
+func (s *Subscriber[T]) Events() <-chan T { return s.ch }
+
+func Subscribe[T any](b *Bus) *Subscriber[T] {
+	t := typeOf[T]()
+	raw := make(chan any, 16)
+	b.mu.Lock()
+	b.subs[t] = append(b.subs[t], raw)
+	b.mu.Unlock()
+
+	out := make(chan T, 16)
+	go func() {
+		for v := range raw {
+			out <- v.(T)
+		}
+	}()
+	return &Subscriber[T]{ch: out}
+}
+
+type TransferCompleted struct {
+	TransferID string
+	Cents      int64
+}
+type AccountFrozen struct {
+	AccountID string
+	Reason    string
+}
+
+func main() {
+	bus := NewBus()
+
+	transfers := Subscribe[TransferCompleted](bus)
+	freezes := Subscribe[AccountFrozen](bus)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ev := <-transfers.Events()
+		fmt.Printf("ledger:  post double-entry for %s (%d cents)\n", ev.TransferID, ev.Cents)
+	}()
+	go func() {
+		defer wg.Done()
+		ev := <-freezes.Events()
+		fmt.Printf("fraud:   account %s frozen: %s\n", ev.AccountID, ev.Reason)
+	}()
+
+	NewPublisher[TransferCompleted](bus).Emit(TransferCompleted{"txn-7823", 4200})
+	NewPublisher[AccountFrozen](bus).Emit(AccountFrozen{"acct-19", "velocity rule"})
+
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+One bus. Two event types. Each event reaches *only* its type's subscriber, with full static typing at both ends. That's the whole trick — and it's the architecture Tailscale ships.
+
+<UnderTheHood title="What reflect.Type, interface boxing, and the type assertion actually cost — Go 1.25">
+
+Three mechanics make this work, and each has a price worth knowing.
+
+**1. Boxing into `any`.** When `Emit` passes `v T` to `publish(v any)`, Go puts `v` into an interface value: a two-word pair `(type-pointer, data-pointer)`. The type-pointer references the `*runtime._type` for `TransferCompleted`; the data-pointer references the value (heap-allocated if it escapes, which here it does because it flows through a channel into another goroutine). So each published event is one small interface header plus, usually, one heap allocation for the value. That's the cost of erasing the static type — and it's why a hot path that fires millions of events still measures this.
+
+**2. `reflect.Type` as a map key.** `reflect.TypeOf(v)` reads the type-pointer straight out of that interface header — it's nearly free, just a field read. The returned `reflect.Type` is an interface backed by a single canonical `*rtype` per type, so two `TransferCompleted` values yield the *same* `reflect.Type`, and `==` / map lookup compares one pointer. Routing is an O(1) map probe keyed by a pointer. This is why the map approach is fast despite the word "reflection" scaring people.
+
+**3. The type assertion `v.(T)`.** On the receive side, `out <- v.(T)` checks that the boxed value's type-pointer equals `T`'s and then copies the data word out. Because the bus only ever delivers a value to channels registered under its own type, the assertion *always* succeeds — we could use the comma-ok form defensively, but the invariant is enforced by routing, so the panic form documents "this can't fail." The assertion is a pointer compare plus a copy: cheap.
+
+**Why not skip the extra `out` channel and the goroutine?** Because the bus map must store `chan any` (heterogeneous), but the caller wants `<-chan T`. Something has to unbox. Our teaching version spends a goroutine per subscriber to do it. Tailscale's production bus is smarter: it stores the unboxing *function* (a `dispatchFn` closure) on each subscriber's non-generic core and runs the assertion inside that subscriber's *client* dispatch loop — no per-subscriber, per-event goroutine. We'll see that in the last section. The semantics are identical; the allocation profile is better.
+
+**A cleaner type handle.** Our `typeOf[T]()` helper uses `reflect.TypeOf(&v).Elem()` so it works even when `T` is an interface (a nil interface value would otherwise give a nil type). The real bus uses the purpose-built `reflect.TypeFor[T]()` (Go 1.22+), which returns the `reflect.Type` of `T` directly from the type parameter — no value, no `&`, no `.Elem()` — and caches it once per publisher/subscriber at construction. Same result, less ceremony; prefer `reflect.TypeFor[T]()` in real code.
+
+**Version note:** generics (`[T any]`) are Go 1.18+; `reflect.TypeFor` is Go 1.22+; this all assumes the Go 1.25 runtime. None of the reflection here touches `unsafe` — it's all `reflect`'s safe surface.
+
+</UnderTheHood>
+
+## Backpressure & the Pump
+
+Our teaching bus has a hidden flaw, and it's the same one every real bus must answer: **what happens when a subscriber is slow?**
+
+In our `publish`, the fan-out loop does `ch <- v` for each subscriber. Those channels are buffered (size 16). Fire the seventeenth event at a subscriber that hasn't drained, and `ch <- v` **blocks** — which means the *publisher* blocks, which means the transfers handler that called `Emit` is now stuck waiting on a sluggish analytics module. We've reintroduced the coupling we set out to kill, just dressed as a full channel.
+
+This is **backpressure**, and it is not a bug to be eliminated — it's a force to be *placed deliberately*.
+
+<Define term="Backpressure" since="Messaging & Pub/Sub Foundations (Part 3)">
+**Backpressure** is the resistance a slow consumer exerts back on its producer. When a subscriber can't keep up, its buffer fills; once full, the producer must either **block** (wait — preserving every event, at the cost of slowing the producer), **drop** (discard events — protecting the producer's speed, at the cost of losing data), or **grow** an unbounded buffer (preserve everything and stay fast — at the cost of unbounded memory, i.e. an eventual OOM). There is no fourth option; every event bus picks among these three, and the choice *is* the design.
+</Define>
+
+The naive answer — make every channel buffer enormous, or unbounded — just trades a stall for an out-of-memory crash under sustained load. The production answer is a **single dispatch goroutine** (call it the *pump*) with a **bounded** internal queue, that imposes a clear ordering and a predictable backpressure point. One goroutine owns the timeline: it reads published events one at a time and hands each to the right subscribers. Because one goroutine sequences everything, you get a property that's otherwise expensive — a **total order** of events.
+
+<ExecTimeline
+  title="The pump: one goroutine sequences publishes and fans them out"
+  lanes={[
+    { id: "txf", label: "transfers (publisher)" },
+    { id: "pump", label: "pump goroutine" },
+    { id: "led", label: "ledger sub" },
+    { id: "ntf", label: "notifier sub" }
+  ]}
+  steps={[
+    { lane: "txf", kind: "send", label: "Emit TransferCompleted{7823}", note: "The transfers handler publishes one event onto the pump's inbound queue and returns immediately — it does not wait for any subscriber." },
+    { lane: "pump", kind: "recv", label: "dequeue 7823", note: "The single pump goroutine takes the event off its bounded inbound queue. It is now the one true 'now' for this event." },
+    { lane: "pump", kind: "send", label: "→ ledger", note: "Pump looks up subscribers for TransferCompleted and delivers to the ledger subscriber's channel first." },
+    { lane: "led", kind: "recv", label: "← 7823 (posting)", note: "Ledger receives and starts posting the double-entry. The pump moves on to the next subscriber." },
+    { lane: "pump", kind: "send", label: "→ notifier", note: "Pump delivers the SAME event to the notifier subscriber. Both subscribers of this type get it, in registration order." },
+    { lane: "ntf", kind: "block", label: "notifier buffer full!", note: "The notifier is slow and its buffer is full. The pump's send blocks here — it will not accept the NEXT published event until the notifier drains. That is backpressure, applied at one well-defined point." },
+    { lane: "ntf", kind: "recv", label: "← 7823 (draining)", note: "Notifier finally receives. The pump unblocks, finishes this event, and only now dequeues the next publish. Total order preserved; memory bounded." }
+  ]}
+  caption="A single pump goroutine gives two things at once: a total order over all events (one goroutine decides 'next'), and a single, predictable place where a slow subscriber applies backpressure — instead of a slow subscriber randomly stalling whichever publisher happens to hit its full channel."
+/>
+
+Here's the bus rebuilt around a pump. Publishers drop events into one inbound channel; the pump owns the subscriber map and does all the sending, so no lock is needed on the hot path and the order is whatever the pump dequeues.
+
+```go
+package main
+
+import (
+	"fmt"
+	"reflect"
+	"sync"
+)
+
+type envelope struct {
+	t reflect.Type
+	v any
+}
+
+type Bus struct {
+	in   chan envelope               // every publish lands here
+	subs map[reflect.Type][]chan any // owned solely by the pump goroutine
+	done chan struct{}
+}
+
+func NewBus() *Bus {
+	b := &Bus{
+		in:   make(chan envelope, 16), // bounded: the one backpressure point
+		subs: make(map[reflect.Type][]chan any),
+		done: make(chan struct{}),
+	}
+	go b.pump()
+	return b
+}
+
+// pump is the single goroutine that owns subs and sequences delivery.
+func (b *Bus) pump() {
+	for env := range b.in {
+		for _, ch := range b.subs[env.t] {
+			ch <- env.v // backpressure: a full subscriber stalls the pump
+		}
+	}
+	close(b.done)
+}
+
+func typeOf[T any]() reflect.Type {
+	var v T
+	return reflect.TypeOf(&v).Elem()
+}
+
+// register runs ON the pump goroutine via a tiny control message, so subs is
+// never touched concurrently. For brevity here we register before pump work
+// begins; the lab makes you handle concurrent registration properly.
+func (b *Bus) publish(v any) { b.in <- envelope{t: reflect.TypeOf(v), v: v} }
+
+type Publisher[T any] struct{ bus *Bus }
+
+func NewPublisher[T any](b *Bus) *Publisher[T] { return &Publisher[T]{bus: b} }
+func (p *Publisher[T]) Emit(v T)               { p.bus.publish(v) }
+
+type Subscriber[T any] struct{ ch <-chan T }
+
+func (s *Subscriber[T]) Events() <-chan T { return s.ch }
+
+func Subscribe[T any](b *Bus) *Subscriber[T] {
+	t := typeOf[T]()
+	raw := make(chan any, 16)
+	b.subs[t] = append(b.subs[t], raw) // safe here: called before any publish
+	out := make(chan T, 16)
+	go func() {
+		for v := range raw {
+			out <- v.(T)
+		}
+	}()
+	return &Subscriber[T]{ch: out}
+}
+
+type TransferCompleted struct{ TransferID string }
+
+func main() {
+	bus := NewBus()
+	led := Subscribe[TransferCompleted](bus)
+	ntf := Subscribe[TransferCompleted](bus)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); fmt.Println("ledger:  ", (<-led.Events()).TransferID) }()
+	go func() { defer wg.Done(); fmt.Println("notifier:", (<-ntf.Events()).TransferID) }()
+
+	NewPublisher[TransferCompleted](bus).Emit(TransferCompleted{"txn-7823"})
+	wg.Wait()
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"reflect"
+	"sync"
+)
+
+type envelope struct {
+	t reflect.Type
+	v any
+}
+
+type Bus struct {
+	in   chan envelope
+	subs map[reflect.Type][]chan any
+	done chan struct{}
+}
+
+func NewBus() *Bus {
+	b := &Bus{
+		in:   make(chan envelope, 16),
+		subs: make(map[reflect.Type][]chan any),
+		done: make(chan struct{}),
+	}
+	go b.pump()
+	return b
+}
+
+func (b *Bus) pump() {
+	for env := range b.in {
+		for _, ch := range b.subs[env.t] {
+			ch <- env.v
+		}
+	}
+	close(b.done)
+}
+
+func typeOf[T any]() reflect.Type {
+	var v T
+	return reflect.TypeOf(&v).Elem()
+}
+
+func (b *Bus) publish(v any) { b.in <- envelope{t: reflect.TypeOf(v), v: v} }
+
+type Publisher[T any] struct{ bus *Bus }
+
+func NewPublisher[T any](b *Bus) *Publisher[T] { return &Publisher[T]{bus: b} }
+func (p *Publisher[T]) Emit(v T)               { p.bus.publish(v) }
+
+type Subscriber[T any] struct{ ch <-chan T }
+
+func (s *Subscriber[T]) Events() <-chan T { return s.ch }
+
+func Subscribe[T any](b *Bus) *Subscriber[T] {
+	t := typeOf[T]()
+	raw := make(chan any, 16)
+	b.subs[t] = append(b.subs[t], raw)
+	out := make(chan T, 16)
+	go func() {
+		for v := range raw {
+			out <- v.(T)
+		}
+	}()
+	return &Subscriber[T]{ch: out}
+}
+
+type TransferCompleted struct{ TransferID string }
+
+func main() {
+	bus := NewBus()
+	led := Subscribe[TransferCompleted](bus)
+	ntf := Subscribe[TransferCompleted](bus)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); fmt.Println("ledger:  ", (<-led.Events()).TransferID) }()
+	go func() { defer wg.Done(); fmt.Println("notifier:", (<-ntf.Events()).TransferID) }()
+
+	NewPublisher[TransferCompleted](bus).Emit(TransferCompleted{"txn-7823"})
+	wg.Wait()
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question="A subscriber's handler does a slow synchronous DB write inside its receive loop, so it drains its channel slowly. With a single-pump bus and bounded queues, what happens to the rest of the system?"
+  options={[
+    "Nothing — other subscribers and publishers are unaffected because each has its own goroutine",
+    "The slow subscriber's full channel eventually stalls the pump, which stalls every publisher — backpressure propagates to the whole bus until that subscriber drains",
+    "The bus silently drops events for the slow subscriber only, and everyone else is fine",
+    "The bus grows the slow subscriber's buffer without limit to keep the pump moving"
+  ]}
+  answer={1}
+  explain="In the single-pump, bounded-buffer bus we built, the slow subscriber is a head-of-line block: once its channel is full the pump blocks delivering to it, can't dequeue the next event, and publishers back up. doc.go documents exactly this blocking-backpressure model for Tailscale's bus — though it flags the semantics as 'provisional,' and the current code actually gives subscribers UNBOUNDED queues (issue #18020) with only the central 16-event queue bounded, so in practice a slow subscriber there now grows memory (the 'grow' choice) before any publisher stalls. Either way the engineering rule is the same: 'receive fast, offload slow work to your own goroutine,' so your receive loop never becomes the bottleneck. Dropping (option 3) and unbounded growth (option 4) are the other two backpressure choices; the bus we built chose blocking."
+/>
+
+## The Actor Model
+
+Step back from channels for a second, because the bus is really a vehicle for a *design discipline*, and that discipline has a name.
+
+<Define term="Actor model">
+The **actor model** structures a program as independent **actors**, each owning its own private state, that never touch each other's memory. An actor changes the world in exactly two ways: it **emits** messages, and it **reacts** to messages it receives. There is no shared mutable state to lock, because there is no sharing — coordination happens entirely through message passing. An event bus is the message-passing substrate; each subscribing module is an actor.
+</Define>
+
+Tailscale's bus documentation says it plainly: structure each component to **hold authority over its own state and interact with everything else only by emitting and receiving events.** The ledger module owns the ledger. Nobody reaches into it; they publish facts, and it decides what to do. The fraud module owns its risk scores. Nobody mutates them; they publish `TransferCompleted` and fraud updates *itself*.
+
+This is why the bus guarantees a **total order** ("one true timeline," in their docs): if every actor only reacts to a single, agreed sequence of events, then every actor sees the same history, and the system as a whole has one coherent story of what happened — which is exactly what you want when that story is a sequence of money movements.
+
+<BeforeAfter
+  before={{
+    title: "shared-state coupling",
+    code: `// Every module holds a pointer to every other.
+// Mutations reach across boundaries; locks everywhere.
+type Transfers struct {
+	ledger    *Ledger   // I reach in
+	fraud     *Fraud    // and here
+	notifier  *Notifier // and here
+}
+
+func (t *Transfers) Complete(x Transfer) {
+	t.ledger.mu.Lock()        // I lock YOUR state
+	t.ledger.post(x)
+	t.ledger.mu.Unlock()
+	t.fraud.observe(x)        // I mutate YOUR scores
+	t.notifier.send(x)        // I block on YOUR I/O
+}`
+  }}
+  after={{
+    title: "actors over a bus",
+    code: `// Each module owns its state. Transfers knows
+// only the bus. Facts flow; nobody reaches in.
+type Transfers struct {
+	pub *Publisher[TransferCompleted]
+}
+
+func (t *Transfers) Complete(x Transfer) {
+	// ... move the money ...
+	t.pub.Emit(TransferCompleted{x.ID})
+	// done. ledger, fraud, notifier each
+	// react on their own goroutine, to their
+	// own state, in the one true order.
+}`
+  }}
+  caption="The actor rewrite deletes the cross-module pointers, the cross-module locks, and the cross-module blocking. Transfers states a fact and leaves. Each actor is now independently testable: feed it events, observe what it emits."
+/>
+
+**On the job:** you feel this most in *testing*. An actor is a pure-ish function of its event stream — publish a sequence in, assert on the events it emits out. No mocking four collaborators, no wiring a graph of pointers. The bus is also the cheapest possible seam for the day you split the monolith: a subscriber that today reads from an in-memory channel tomorrow reads from Kafka, and the actor's logic never knows the difference. That's the Watermill chapter, two chapters out — same shape, different transport.
+
+## Why So Many Parts
+
+Here's the honest thing about reading `util/eventbus` cold: it looks like *overkill*. There's a `Bus`, a `Client`, a `subscribeState`, a `subscriber` interface, a `Subscriber[T]`, a `subscriberCore`, a `SubscriberFunc[T]`, a `PublishedEvent`, a `DeliveredEvent`, and a tangle of methods named `dispatch`, `dispatchFunc`, and `dispatchTyped` that call *each other*. The natural reaction is "why on earth does an event bus need ten types?"
+
+The answer is the best kind of lesson Go has to offer: **every one of those parts exists to fix a specific problem the previous version created.** Nobody designed this all at once. It grew, one forced move at a time. So let's grow it the same way — start from the naive bus you already built, and at each step, break it, see exactly *why* it breaks, and add the one part that fixes it. By the end, all ten types will feel not just sensible but *inevitable*.
+
+We'll keep using Meridian's two event types — `TransferCompleted` and `AccountFrozen` — as our stand-ins for any two unrelated events on one bus.
+
+### Problem 1 → the pump: ordering across publishers
+
+You already met this in "Backpressure & the Pump," but now it's the *first domino*, so look again. In the naive bus, `publish` itself walks the subscriber slice and sends. So if the transfers goroutine and the fraud goroutine both publish at the same instant, each is running `publish` independently, sending to subscribers at its own pace. A subscriber listening to both types can see them **interleaved in any order** — and worse, two different subscribers can disagree on the order. For a stream of money events, "no agreed order" is a non-starter.
+
+**The fix** is the single pump goroutine: publishers stop sending directly and instead drop their event into one channel; *one* goroutine drains that channel and does all the delivery. Because one goroutine decides "next," there is now exactly one order — the "one true timeline."
+
+```go
+type Bus struct {
+	write chan PublishedEvent // every publisher writes here
+	// ...
+}
+
+func (b *Bus) pump() {
+	for evt := range b.write { // ONE goroutine, so ONE order
+		// ... deliver evt to its subscribers ...
+	}
+}
+```
+
+### Problem 2 → non-generic wrappers: the pump can't type-assert
+
+Now the move that shapes *everything else*, and the single most important idea in this whole codebase. Watch what happens when we try to write the delivery step inside `pump`.
+
+To deliver, the pump must take the boxed `any` event and send it on a subscriber's *typed* channel — which means it must do the assertion `evt.(TransferCompleted)`. But to write `evt.(T)`, the code needs `T` in scope. And here's the wall:
+
+<Define term="Type parameter scope">
+A **type parameter** like the `T` in `func Subscribe[T any]()` exists *only inside that generic function or method*. A plain, non-generic function has no `T` — there is no type variable for it to name. So you can box a value into `any` anywhere, but you can only *un*box it with `v.(T)` somewhere that `T` is a visible type parameter. This is the constraint the entire bus is built around.
+</Define>
+
+The pump is a method on `Bus`. `Bus` is **not** generic — it has to hold subscribers of *many* event types at once, so it can't carry a single `T`. Therefore the pump has no `T`, therefore it **cannot** write `evt.(T)`. The code simply won't compile.
+
+```go
+func (b *Bus) pump() {
+	for evt := range b.write {
+		for _, sub := range b.subs[evt.Type] {
+			sub.ch <- evt.Event.(???) // ← what T? The pump has none. Won't compile.
+		}
+	}
+}
+```
+
+So the type assertion **cannot happen in the bus**. It can only happen back out at the edges, inside a generic function where `T` is in scope. Every awkward-looking part that follows is a consequence of shuttling events through the non-generic middle and only ever unboxing them at a generic edge.
+
+The first thing this forces: the events moving through the non-generic core must themselves be carried in **non-generic envelopes**. That's exactly what `PublishedEvent` and `DeliveredEvent` are — plain structs whose payload is an `any`:
+
+```go
+type PublishedEvent struct {
+	Event any      // the boxed event — assertion deferred to a generic edge
+	From  *Client  // who published it (for ordering + debugging)
+}
+
+type DeliveredEvent struct {
+	Event any
+	From  *Client
+	To    *Client  // which subscriber it's headed to
+}
+```
+
+The second thing it forces: a **non-generic stand-in for "a subscriber,"** because the non-generic bus can't hold a `Subscriber[T]` (that would require a `T`). Enter `subscribeState` — a plain struct the bus *can* store, with its own delivery channel and its own map of outputs:
+
+```go
+type subscribeState struct {
+	client  *Client
+	write   chan DeliveredEvent          // the bus pump delivers here
+	outputs map[reflect.Type]subscriber  // type → the real (generic) subscriber
+}
+```
+
+So the bus's routing table changes from "type → channels" to **"type → `subscribeState`s"**, and the pump's job shrinks to: look up the `subscribeState`s for the event's type, and hand each one a `DeliveredEvent`. No assertion needed — it's all non-generic structs and channels. The assertion has been pushed one layer further out, to whoever owns the `subscribeState`.
+
+And who owns it? We *still need the generic `Subscriber[T]`*, because the assertion has to land somewhere that `T` is in scope, and `Subscriber[T]` is the only place that is. So the `subscribeState` will route to a `Subscriber[T]`, and the `Subscriber[T]` runs its own little loop that finally does `evt.(T)` and sends on its typed channel.
+
+### Problem 3 → the Client: ordering across subscriptions
+
+We fixed ordering across *publishers* with one pump. But if every call to `Subscribe` spins up its own `subscribeState` with its own goroutine, then a component that subscribes to *both* `TransferCompleted` and `AccountFrozen` has **two** independent goroutines pulling events — and they can fall out of order relative to each other again. The "one true timeline" leaks at the subscription boundary.
+
+**The fix** is the `Client`: a named handle that owns **one** `subscribeState` and therefore **one** dispatch goroutine, no matter how many event types it subscribes to. All of that client's subscriptions are served by that single goroutine, so they're delivered in the one true order.
+
+```go
+client := bus.Client("fraud-engine") // one subscribeState, one goroutine
+frz := Subscribe[AccountFrozen](client)
+tx  := Subscribe[TransferCompleted](client)
+// both served in publication order by the SAME goroutine
+```
+
+This is also why `Bus.Client(name)` wants a human name: it's the unit of "an actor," and the name shows up in the debugger so you can see which subsystem is behind a slow subscriber.
+
+To make the non-generic `subscribeState` able to call the generic `Subscriber[T]` it routes to, we need a contract between them that doesn't mention `T`. That's the **`subscriber` interface**:
+
+<Define term="Interface (as a non-generic bridge)">
+An **interface** is a set of method signatures; any type implementing those methods satisfies it, and you can hold it in a variable whose static type is the interface — *without knowing the concrete type*. Here it's the bridge across the generic boundary: `subscribeState` holds its outputs as the non-generic `subscriber` interface, and the generic `Subscriber[T]` implements that interface. The non-generic side can call `sub.dispatch(...)` without ever naming `T`; the concrete `Subscriber[T]` on the other end *does* know `T` and does the assertion.
+</Define>
+
+```go
+type subscriber interface {
+	subscribeType() reflect.Type
+	dispatch(/* queue + control channels */) bool
+	Close()
+}
+```
+
+### Problem 4 → the queue + multi-way select: a slow subscriber can't stall the pump
+
+The `subscribeState` delivers to a `Subscriber[T]` over a single channel. If that subscriber is slow and its channel fills, the send blocks — which blocks the `subscribeState`'s goroutine, which blocks the bus pump feeding it, which blocks **every** publisher. One sluggish handler freezes the whole bus.
+
+**The fix** is to never let the delivering loop get stuck. The dispatch loop runs a **multi-way `select`**: one case tries to send the current event to the subscriber; *another case, in the same select,* keeps **accepting** newly-arriving events into an internal **queue** so the upstream pump is never blocked just because this one subscriber is slow; a third case handles shutdown.
+
+```go
+for {
+	select {
+	case s.read <- t:        // 1. subscriber took the event — done with it
+		vals.Drop()
+		return true
+	case val := <-acceptCh(): // 2. subscriber still busy — buffer the next event
+		vals.Add(val)         //    so the pump upstream doesn't stall
+	case <-ctx.Done():        // 3. bus closing — bail out cleanly
+		return false
+	}
+}
+```
+
+`acceptCh()` is a small function that returns the inbound channel — or `nil` when the queue is full, which (since a receive on a `nil` channel blocks forever) is exactly how you *re-enable* backpressure once the buffer is genuinely exhausted. (In our teaching bus we used a buffered channel for the same effect; this is the grown-up version with an explicit queue and an explicit "still accepting" case.)
+
+### Problem 5 → the subscriberCore: one itab instead of one per event type
+
+Now a pure-Go cost problem, and the reason there's a `subscriberCore` at all. `Subscriber[T]` implements the `subscriber` interface. But `Subscriber[TransferCompleted]` and `Subscriber[AccountFrozen]` are **different concrete types**, so Go generates separate interface plumbing for each.
+
+<Define term="itab (interface table)">
+When a concrete type is stored in an interface, Go builds an **itab** — an interface method table mapping the interface's methods to that concrete type's implementations, so a call like `sub.dispatch(...)` can find the right code at runtime. There's one itab per (interface, concrete type) pair. If `Subscriber[T]` implements `subscriber`, you get a *fresh itab for every event type `T` ever used* — plus a generic method body (a "stencil") per type shape. Each is only tens of bytes, but Tailscale's node software ships on every device and defines many event types, so "per-type" overhead in the binary is real and worth removing.
+</Define>
+
+**The fix** is to make a *single, non-generic* type implement the interface, so there's exactly **one** itab regardless of how many event types exist. That type is `subscriberCore`:
+
+```go
+type subscriberCore struct {
+	typ        reflect.Type
+	dispatchFn func(/* queue + control channels */) bool // the per-T work, captured
+	// ... slow timer, logf, unregister ...
+}
+
+// ONE itab for (subscriber, *subscriberCore), no matter how many event types.
+func (c *subscriberCore) dispatch(/* ... */) bool { return c.dispatchFn(/* ... */) }
+```
+
+But `subscriberCore` is non-generic — it still can't do the assertion itself. So how does its `dispatch` reach the one place that *can*, the generic `Subscriber[T]`? Through a **closure**.
+
+<Define term="Closure">
+A **closure** is a function value that *captures* variables from the scope where it was created, and can use them later when it's called elsewhere. Here, inside the generic constructor `newSubscriber[T]` — where `T` *is* in scope — we build a function that calls `s.dispatchTyped(...)` (the per-`T` method that does `evt.(T)`), and store that function in the non-generic core's `dispatchFn` field. The core later calls `dispatchFn()` without any `T`; the captured closure carries the type knowledge with it.
+</Define>
+
+```go
+func newSubscriber[T any](/* ... */) *Subscriber[T] {
+	s := &Subscriber[T]{ /* ... */ read: make(chan T) }
+	// We are inside a generic function: T is in scope HERE. Capture it.
+	s.core.dispatchFn = func(/* queue + control channels */) bool {
+		return s.dispatchTyped(/* ... */) // the only place evt.(T) can happen
+	}
+	return s
+}
+```
+
+That's the whole reason for the `dispatch → dispatchFn → dispatchTyped` call chain that looks so redundant at first glance:
+
+1. The non-generic `subscribeState.pump` holds a `subscriber` interface and calls `sub.dispatch(...)`.
+2. The single itab routes that to `(*subscriberCore).dispatch`, which calls its captured `dispatchFn(...)` closure.
+3. The closure — born inside `newSubscriber[T]` where `T` lived — calls `(*Subscriber[T]).dispatchTyped`, which finally runs `evt.(T)` and sends on the typed channel.
+
+Three hops, each one a deliberate step across the generic ↔ non-generic boundary, paying for **one** itab instead of one per event type.
+
+### Problem 6 → SubscriberFunc: a friendlier API
+
+Last part, and this one's a convenience, not a correctness fix. With `Subscribe[T]`, the caller gets back a `<-chan T` and has to spin up its own goroutine to range over it. Common and a little tedious. So the bus also offers `SubscriberFunc[T]`: you hand it a callback `func(T)`, and *its* `dispatchFn` runs your callback on a goroutine per event, signaling completion through a `callDone` channel so the same multi-way-select machinery knows when the event is finished.
+
+```go
+client.SubscribeFunc(func(ev TransferCompleted) {
+	ledger.Post(ev) // the bus runs this for you; no goroutine boilerplate
+})
+```
+
+It reuses *every* piece above — the core, the interface, the queue, the closure trick — and only swaps "send on a typed channel" for "call a typed function." That it slots in with so little new code is the proof the design's bones are good.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Problem → the pump">Concurrent publishers → no agreed order. One goroutine draining one channel imposes the single "true timeline."</ConceptCard>
+  <ConceptCard label="Problem → non-generic core">The non-generic pump can't do `evt.(T)`. Carry events in `PublishedEvent`/`DeliveredEvent` and route to a non-generic `subscribeState`; defer every assertion to a generic edge.</ConceptCard>
+  <ConceptCard label="Problem → the Client">Per-subscription goroutines reorder across subscriptions. One `Client` = one `subscribeState` = one goroutine = ordered across all its subscriptions.</ConceptCard>
+  <ConceptCard label="Problem → the interface">A non-generic `subscribeState` must call a generic subscriber. The `subscriber` interface is the bridge that names no `T`.</ConceptCard>
+  <ConceptCard label="Problem → queue + select">A slow subscriber stalls the whole pump. A multi-way select keeps accepting into a queue so upstream never blocks on one laggard.</ConceptCard>
+  <ConceptCard label="Problem → core + closure">One itab per `Subscriber[T]` bloats the binary. A single non-generic `subscriberCore` implements the interface once; a closure captured where `T` lives reaches `dispatchTyped` for the assertion.</ConceptCard>
+</ConceptGrid>
+
+Now re-read the file listing from the top of this section. `Bus`, `Client`, `subscribeState`, `subscriber`, `Subscriber[T]`, `subscriberCore`, `SubscriberFunc[T]`, `PublishedEvent`, `DeliveredEvent`, `dispatch`/`dispatchFunc`/`dispatchTyped` — not overkill. Each is one forced move in a chain that starts at "money events need an order" and ends at "and do it without bloating a binary that ships on a million devices."
+
+## Tailscale's Real Bus
+
+You've built the model. Now read the production version and watch every piece you wrote show up — hardened. Tailscale's `util/eventbus` (package by David Anderson — the open-source design landed across PRs [#15089](https://github.com/tailscale/tailscale/pull/15089), [#15200](https://github.com/tailscale/tailscale/pull/15200), and [#15228](https://github.com/tailscale/tailscale/pull/15228)) is the in-process bus connecting the `tailscaled` daemon's subsystems — `LocalBackend`, `magicsock`, the WireGuard engine, the control client — so none of them import each other directly.
+
+These are excerpts for reading, not running — the real package is several files. Map each to what you built.
+
+**The typed edges — same `Publisher[T]` / `Subscriber[T]` you wrote:**
+
+```go
+// A thin generic facade over a non-generic core — exactly our pattern,
+// so the bus's internal maps don't duplicate state per event type.
+type Publisher[T any] struct {
+	core *publisherCore
+}
+
+func (p *Publisher[T]) Publish(v T) {
+	publish(p.core, v) // delegates to the non-generic implementation
+}
+
+type Subscriber[T any] struct {
+	core *subscriberCore
+	read chan T // the typed delivery channel the caller ranges over
+}
+
+func (s *Subscriber[T]) Events() <-chan T { return s.read }
+```
+
+**Boxing on publish — our `envelope`, but it also records *who* sent it (for debugging):**
+
+```go
+func publish(c *publisherCore, v any) {
+	select {
+	case <-c.stop.Done(): // publisher closed: drop silently
+		return
+	default:
+	}
+	evt := PublishedEvent{
+		Event: v,        // the boxed value — our envelope.v
+		From:  c.client, // which client published it — for introspection
+	}
+	select {
+	case c.client.publish() <- evt: // into the bus's inbound queue
+	case <-c.stop.Done():
+	}
+}
+```
+
+**The router and the pump — our `subs map[reflect.Type]` and our `pump` goroutine, split into two tiers:**
+
+```go
+// The bus keeps a map from event type to the SUBSCRIBE STATES interested in it.
+// Each Client has one subscribeState (and one dispatch goroutine).
+type Bus struct {
+	router *worker                            // the central routing goroutine
+	write  chan PublishedEvent                // every Publish lands here
+	topics map[reflect.Type][]*subscribeState // routing table, keyed by type
+	// ...
+}
+
+// The central router goroutine (Bus.pump) drains a BOUNDED queue of published
+// events — `const maxPublishedEvents = 16` — looks up destinations by
+// reflect.TypeOf(event), and hands each event to every destination client's
+// dispatch loop. When ITS OWN 16-slot queue is full, its accept channel goes
+// nil so it stops taking new publishes: that 16-deep central queue is the
+// backstop that bounds the whole bus.
+//
+// Then each Client's subscribeState.pump unboxes and delivers to that client's
+// Subscriber[T] channels. Note: as of tailscale/tailscale#18020 these
+// per-subscriber DeliveredEvent queues are UNBOUNDED, so a single slow
+// subscriber now grows memory rather than immediately stalling publishers.
+// doc.go still documents the blocking-backpressure model and explicitly marks
+// those semantics "provisional and subject to change" — so treat the exact
+// backpressure behavior as in-flux, and the bounded-central-queue + "receive
+// fast, offload slow work" discipline as the stable part.
+```
+
+**Unboxing on delivery — our `v.(T)`, done inside the dispatch loop instead of a per-subscriber goroutine:**
+
+```go
+func (s *Subscriber[T]) dispatchTyped(/* ... */) bool {
+	t := vals.Peek().Event.(T) // the type assertion — our out <- v.(T)
+	for {
+		select {
+		case s.read <- t: // deliver the typed value to the caller
+			vals.Drop()
+			return true
+		// ... accept/snapshot cases ...
+		}
+	}
+}
+```
+
+The differences from your version are all *productionization*, not *concept*:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Client abstraction">A `Bus.Client("magicsock")` carries an actor's publishers *and* subscribers together under a debug name. You held a bare `*Bus`; the named client is a better seam for introspection and lifecycle.</ConceptCard>
+  <ConceptCard label="No per-sub goroutine">You spent a goroutine per subscriber to unbox. Tailscale's `Subscriber[T]` does the assertion inline in its client's `dispatchTyped` loop — no per-subscriber, per-event goroutine. (They kept `dispatchTyped` generic rather than bridging the typed channel send through a goroutine, because that bridge measured a ~2.7× throughput regression.)</ConceptCard>
+  <ConceptCard label="Introspection built in">`PublishedEvent.From` and a `RoutedEvent` (event + destinations) feed a live debugger — `Bus.Debugger()`, an HTML/HTMX view, and `tailscale debug daemon-bus-events` to watch the timeline in production.</ConceptCard>
+  <ConceptCard label="Documented ordering">Their `doc.go` pins the contract: an event is published "at some instant between the start and end of Publish," events are totally ordered, and each client dispatches to its subscribers in that order. Your single pump gives the same guarantee; they wrote it down as an API promise.</ConceptCard>
+</ConceptGrid>
+
+That's the payoff of this chapter: a real, load-bearing piece of infrastructure in a widely-used Go codebase is *the thing you just built*, plus a debug UI and a name tag. You can read `util/eventbus` now and nothing in it is mysterious.
+
+---
+
+## Exercises
+
+<Exercise n={1} title="A third event type, zero bus changes" level="easy">
+
+Take the routing bus from the "Routing by Type" section. Add a **third** Meridian event type, `LimitRaised{AccountID string; NewCents int64}`, a subscriber for it, and publish one — *without changing a single line of `Bus`, `Publisher`, `Subscriber`, or `Subscribe`.* The point: a correct bus is closed to modification and open to new event types.
+
+<Solution>
+
+```go
+// Add the type:
+type LimitRaised struct {
+	AccountID string
+	NewCents  int64
+}
+
+// In main, subscribe and publish — bus code untouched:
+limits := Subscribe[LimitRaised](bus)
+go func() {
+	ev := <-limits.Events()
+	fmt.Printf("compliance: limit for %s raised to %d cents\n", ev.AccountID, ev.NewCents)
+}()
+NewPublisher[LimitRaised](bus).Emit(LimitRaised{"acct-19", 1_000_000})
+```
+
+That you added a whole new event flow with *only* application code — no edit to the bus — is the proof the design is right. The `map[reflect.Type]` keys itself on the new type automatically; `Subscribe[LimitRaised]` registers under a key that didn't exist a moment ago and the pump routes to it with no special case.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Drop instead of block" level="medium">
+
+Our bus blocks the publisher when a subscriber's buffer is full (the blocking backpressure choice). For a *lossy* event like a metrics tick, you'd rather drop than stall money movement. Write a `publishLossy(v any)` on the routing bus that sends to each subscriber with a non-blocking `select`/`default`, dropping (and counting) when the channel is full. Demonstrate the drop.
+
+<Solution>
+
+```go
+func (b *Bus) publishLossy(v any) (dropped int) {
+	t := reflect.TypeOf(v)
+	b.mu.Lock()
+	chans := append([]chan any(nil), b.subs[t]...)
+	b.mu.Unlock()
+	for _, ch := range chans {
+		select {
+		case ch <- v: // delivered
+		default:
+			dropped++ // buffer full — drop this one, keep the publisher fast
+		}
+	}
+	return dropped
+}
+
+// Demo: a subscriber that never receives; fill its buffer (16) then overflow.
+type MetricTick struct{ N int }
+
+func main() {
+	bus := NewBus()
+	_ = Subscribe[MetricTick](bus) // subscribes but never drains
+	p := NewPublisher[MetricTick](bus)
+	dropped := 0
+	for i := 0; i < 25; i++ {
+		dropped += bus.publishLossy(MetricTick{i})
+	}
+	fmt.Printf("dropped %d of 25 ticks (buffer was 16)\n", dropped)
+}
+```
+
+The `select`/`default` is the entire difference between the *blocking* and *dropping* backpressure strategies — one keyword. Note the buffered `out` channel and the unboxing goroutine mean the real fill point is a little fuzzy (two buffers of 16 plus a goroutine in flight), so the exact drop count varies; the lesson is the *mechanism*, not the number. Choose blocking for money, dropping for telemetry.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Unsubscribe without racing the pump" level="medium">
+
+Add `Unsubscribe[T]` that removes a subscriber and closes its channel so its range loop exits cleanly. The trap: the pump (or `publish`) may be ranging the slice concurrently. Explain how Tailscale dodges the lock contention, and implement a safe version for our lock-based bus.
+
+<Solution>
+
+```go
+// Safe for the lock-based routing bus: build a NEW slice without the target,
+// then swap it in under the lock. Never mutate the slice the pump might read.
+func Unsubscribe[T any](b *Bus, raw chan any) {
+	t := typeOf[T]()
+	b.mu.Lock()
+	old := b.subs[t]
+	next := make([]chan any, 0, len(old))
+	for _, ch := range old {
+		if ch != raw {
+			next = append(next, ch)
+		}
+	}
+	b.subs[t] = next // atomic-ish swap of the slice header under the lock
+	b.mu.Unlock()
+	close(raw) // the unboxing goroutine's `range raw` now returns
+}
+```
+
+The discipline — **replace the whole slice rather than delete in place** — is exactly what Tailscale's bus does on unsubscribe, so the pump goroutine that's mid-iteration is always walking a slice that won't be mutated underneath it. (Our `publish` already copies the slice before sending for the same reason.) Removing the element with `slices.Delete` in place would be a data race against any concurrent reader; rebuilding sidesteps it. This is the slice-aliasing lesson from the Data, Slices & Maps mistakes chapter, applied under concurrency.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Total order under concurrent publishers" level="hard">
+
+Two modules publish on the same bus concurrently: the transfers module emits `TransferCompleted` and the fraud module emits `AccountFrozen`, each from its own goroutine, 100 events apiece. A single subscriber listens to *both* types and records the order it sees them. Show that the pump-based bus produces *one* total order (no interleaving corruption, no lost events), and explain why the lock-based fan-out version can't make the same promise as cleanly.
+
+<Solution>
+
+```go
+// With the single-pump bus: both publishers send into the ONE `in` channel.
+// The channel serializes concurrent sends, so the pump dequeues a single,
+// well-defined sequence. A subscriber to both types sees that exact sequence.
+func main() {
+	bus := NewBus() // pump-based version
+	all := Subscribe[any](bus) // (sketch) or two subs feeding one collector
+
+	var got []string
+	var mu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		for range 200 {
+			ev := <-all.Events()
+			mu.Lock()
+			got = append(got, fmt.Sprintf("%T", ev))
+			mu.Unlock()
+		}
+		close(done)
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); p := NewPublisher[TransferCompleted](bus); for range 100 { p.Emit(TransferCompleted{}) } }()
+	go func() { defer wg.Done(); p := NewPublisher[AccountFrozen](bus);   for range 100 { p.Emit(AccountFrozen{}) } }()
+	wg.Wait()
+	<-done
+	fmt.Printf("observed %d events in one total order\n", len(got))
+}
+```
+
+The key insight: **the single inbound channel is the serialization point.** Go's channel send is safe under concurrency, so two goroutines racing to `Emit` simply line up; the pump then imposes one order on the whole stream. Every subscriber dispatched by that one pump sees events in that one order — the "one true timeline." The lock-based fan-out version *also* serializes (the mutex does it), but each subscriber runs its own unboxing goroutine with its own buffer, so two subscribers can fall arbitrarily far out of step with each other; there's no single object whose progress *is* the canonical clock. The pump makes "now" a thing you can point at. (Subscribing to `any` is a sketch — in the real bus you'd register one collector that both publishers' types route to; the point is the ordering guarantee, not the literal `any` subscription.)
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Put the book down, sport. Time to prove the centerpiece with your own hands. I want the **type-routed core** — the thing that makes one bus carry many event types and deliver each one *only* to the subscribers that asked for its type. Get the routing wrong and a `PaymentCompleted` leaks into a fraud subscriber, and in a payments system that's not a bug, that's an incident. I'll be reading the verifier personally.
+
+<Lab
+  title="Build a type-routed in-process event bus"
+  archetype="build-it"
+  difficulty="guided"
+  points={90}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Implement an in-process event bus that routes events BY TYPE. Provide NewBus() *Bus, a generic Subscribe[T any](b *Bus) <-chan T returning a typed receive channel, and a generic Publish[T any](b *Bus, v T) that fans the value to every Subscribe[T] of the SAME type T. A PaymentCompleted must never reach an AccountFrozen subscriber. main is the self-check harness — do not edit it. It subscribes to two different event types, publishes an interleaved stream, and asserts each subscriber received exactly its own type's events. When routing is correct it prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Two Meridian events of DIFFERENT Go types must share one bus.
+type PaymentCompleted struct{ ID string }
+type AccountFrozen struct{ ID string }
+
+// TODO: implement a type-routed event bus.
+//
+//   NewBus() *Bus
+//   Subscribe[T any](b *Bus) <-chan T   // typed receive channel for events of type T
+//   Publish[T any](b *Bus, v T)         // fan v out to every Subscribe[T] of the same T
+//
+// Routing MUST be by the event's type. Hints: a map keyed by reflect.Type,
+// a chan any per subscriber in the map, and a small goroutine that unboxes
+// each value back to T with a type assertion before the caller sees it.
+
+type Bus struct {
+	// your fields here
+}
+
+func NewBus() *Bus {
+	panic("not implemented")
+}
+
+// ── checks: do not edit. Run to verify your implementation. ──
+
+func main() {
+	b := NewBus()
+	pay := Subscribe[PaymentCompleted](b)
+	frz := Subscribe[AccountFrozen](b)
+
+	var mu sync.Mutex
+	var pays, frzs []string
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 3 {
+			e := <-pay
+			mu.Lock()
+			pays = append(pays, e.ID)
+			mu.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 2 {
+			e := <-frz
+			mu.Lock()
+			frzs = append(frzs, e.ID)
+			mu.Unlock()
+		}
+	}()
+
+	// Interleaved publish of two different types onto one bus.
+	Publish(b, PaymentCompleted{"p1"})
+	Publish(b, AccountFrozen{"f1"})
+	Publish(b, PaymentCompleted{"p2"})
+	Publish(b, AccountFrozen{"f2"})
+	Publish(b, PaymentCompleted{"p3"})
+
+	wg.Wait()
+
+	ok := true
+	if len(pays) != 3 {
+		fmt.Printf("FAIL routing: payment subscriber got %v (want 3 payments)\\n", pays)
+		ok = false
+	}
+	if len(frzs) != 2 {
+		fmt.Printf("FAIL routing: freeze subscriber got %v (want 2 freezes)\\n", frzs)
+		ok = false
+	}
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main subscribes to PaymentCompleted and AccountFrozen on one bus, publishes 3 payments and 2 freezes interleaved, and asserts the payment subscriber received exactly the 3 payments and the freeze subscriber exactly the 2 freezes. The flag unlocks only when the program builds clean and prints ALL CHECKS PASS — which is impossible unless routing is keyed by type."
+  hints={[
+    "Field: subs map[reflect.Type][]chan any. NewBus initializes the map. Use a sync.Mutex to guard it since Subscribe may be called from several goroutines.",
+    "Subscribe[T]: compute the type with reflect.TypeOf via a *T to be interface-safe (var z T; reflect.TypeOf(&z).Elem()). Make a buffered `raw := make(chan any, 8)`, append it under the type key, then start a goroutine that ranges raw and sends v.(T) onto a typed `out` channel (buffer >= 3 so Publish never blocks before the receiver loops).",
+    "Publish[T]: t := reflect.TypeOf(&v).Elem(); copy the slice b.subs[t] under the lock, unlock, then send v to each chan any. Sending the value boxed as `any` is the whole point — the matching Subscribe[T] goroutine asserts it back to T."
+  ]}
+  flag="GO{typed_in_process_event_bus}"
+>
+
+Two types. One bus. Five publishes, interleaved on purpose. The payment subscriber must end with exactly `[p1 p2 p3]` and the freeze subscriber with exactly `[f1 f2]` — a single misrouted event and a FAIL line prints and the flag stays locked. No broker, no network: pure in-process channels routed by `reflect.Type`. Build it right.
+
+</Lab>
+
+<Recap>
+
+You can now build, and read, an in-process event bus from first principles:
+
+- An **in-process event bus** applies last chapter's pub/sub model inside a single binary: the "wire" is a channel, the "message" is a Go value. It **decouples modules** with zero serialization and zero network — but it's **not durable**, so it decouples modules, not services.
+- The crude version — a slice of channels of one concrete type — works but needs a new bus per event type. The production design uses **generics for the typed edges** (`Publisher[T]`/`Subscriber[T]`) and **reflection for the untyped core** (`map[reflect.Type][]chan any`). Neither alone suffices: generics can't hold a heterogeneous set of subscribers; `any` alone throws away routing.
+- **Boxing** a value into `any` is a two-word interface header (+ usually one heap allocation); `reflect.TypeOf` reads the type word for free; the **`v.(T)` assertion** on delivery is safe because routing guarantees the type.
+- A **single pump goroutine** with a **bounded queue** buys two things at once: a **total order** over all events ("one true timeline") and **one predictable backpressure point**. Backpressure is a forced choice among **block** (preserve events, slow the producer), **drop** (stay fast, lose events), or **grow unbounded** (preserve + fast, eventually OOM) — `select`/`default` is the one keyword that switches block→drop.
+- The bus is the substrate for the **actor model**: each module owns its state and interacts only by emitting and reacting to events — deleting cross-module pointers, locks, and blocking, and making each module independently testable.
+- Tailscale's `util/eventbus` is this exact design, hardened: a central router goroutine drains a bounded 16-event queue and fans out to per-client dispatch loops that unbox inline (no per-subscriber goroutine), a named `Client` carries an actor's pubs+subs, and `PublishedEvent.From` + `RoutedEvent` feed a live debugger. Backpressure specifics are in flux (subscriber queues are currently unbounded, issue #18020; doc.go calls the semantics "provisional"), but the shape is the model you built plus a name tag and an introspection UI.
+- As of Go 1.25, prefer `wg.Go(func(){ ... })` over the `wg.Add(1)`/`defer wg.Done()` pair when launching the subscriber goroutines.
+
+</Recap>
+
+<Scoreboard
+  streak={6}
+  items={[
+    { label: "Quick check — why generics + reflection, not generics alone", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — slow subscriber and backpressure", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — third event type, zero bus changes", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — drop instead of block", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — unsubscribe without racing the pump", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — total order under concurrent publishers", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Type-routed event bus", captured: false, points: 90 }}
+/>
+
+Not bad, sport. You built the thing a billion-dollar networking company runs in production, and you understand why every piece is shaped the way it is. That's not memorizing an API — that's *engineering*. Next up: **Event-Driven Architecture & Kafka**, where we take this exact pub/sub model and stretch it across the network — durable, partitioned, surviving a crash. Everything you just learned about ordering and backpressure is about to pay off at a far larger scale. You're ready. I made sure of it.
+
