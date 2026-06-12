@@ -120,15 +120,24 @@ const KIND_GLYPH: Record<StepKind, string> = {
   done: "✓",
 };
 
-/** Map a lane's CURRENT activity to a gopher pose + tint. */
-function lanePose(now: Step | null, laneId: string, everRan: boolean): { pose: GopherPose; state: GopherState } {
-  if (!now || now.lane !== laneId)
+/** Map a lane's CURRENT activity to a gopher pose + tint. A lane whose final
+ *  step was `done` EXITS through the door (the goroutine returned); a lane
+ *  whose current step is `spawn` ENTERS through it. */
+function lanePose(
+  now: Step | null,
+  laneId: string,
+  everRan: boolean,
+  finished: boolean
+): { pose: GopherPose; state: GopherState } {
+  if (!now || now.lane !== laneId) {
+    if (finished) return { pose: "exit", state: "done" };
     return { pose: everRan ? "idle" : "sleep", state: "idle" };
+  }
   switch (now.kind ?? "run") {
     case "run":
       return { pose: "run", state: "active" };
     case "spawn":
-      return { pose: "wave", state: "active" };
+      return { pose: "enter", state: "active" };
     case "send":
       return { pose: "carry", state: "active" };
     case "recv":
@@ -136,7 +145,7 @@ function lanePose(now: Step | null, laneId: string, everRan: boolean): { pose: G
     case "block":
       return { pose: "blocked", state: "warn" };
     case "done":
-      return { pose: "happy", state: "done" };
+      return { pose: "exit", state: "done" };
   }
 }
 
@@ -273,7 +282,6 @@ export function ExecTimeline({
 
       <div ref={matrixRef} className="xt-stage">
         {lanes.map((l) => {
-          const gp = lanePose(now, l.id, ranLanes.has(l.id));
           /* this lane's history: indexes of steps already played */
           const played = steps
             .map((s, i) => ({ s, i }))
@@ -281,6 +289,16 @@ export function ExecTimeline({
           const active = played.length > 0 && played[played.length - 1].i === cur;
           const pills = active ? played.slice(0, -1) : played;
           const current = active ? played[played.length - 1] : null;
+          /* finished = its last authored step was `done` and has played:
+             the gopher has left the building */
+          const allLane = steps.filter((s) => s.lane === l.id);
+          const lastKind = allLane[allLane.length - 1]?.kind ?? "run";
+          const finished =
+            played.length === allLane.length &&
+            allLane.length > 0 &&
+            lastKind === "done" &&
+            now?.lane !== l.id;
+          const gp = lanePose(now, l.id, ranLanes.has(l.id), finished);
           return (
             <div key={l.id} className={`xt-lane ${now?.lane === l.id ? "xt-lane-now" : ""}`}>
               <div className="xt-actor">
@@ -289,6 +307,7 @@ export function ExecTimeline({
                   state={gp.state}
                   size={34}
                   title={l.label}
+                  tag={l.label.match(/(\d+)\s*$/)?.[1]}
                   role={
                     (now?.lane === l.id ? now.role : undefined) ??
                     l.role ??
@@ -379,6 +398,11 @@ type SceneActor = {
   state?: SceneState;
   at?: string;
   role?: GopherRole;
+  /** explicit verb for this actor (overrides the state→pose mapping):
+   *  "exit" walks out through a door, "enter" walks in, "carry", "sleep", … */
+  pose?: GopherPose;
+  /** chest badge; defaults to a trailing number in the label ("worker 3" → 3) */
+  tag?: string;
 };
 type SceneCell = { id: string; label?: string; state?: SceneState };
 type SceneFrame = {
@@ -449,6 +473,17 @@ export function Scene({
     frame.actors?.find((x) => x.id === a.id)?.role ??
     a.role ??
     inferRole(actorLabel(a));
+  /* Per-frame pose override = the VERB: "worker 3 exits" is authored as
+     { id: "w3", pose: "exit" } and the gopher walks out through a door. */
+  const actorPose = (a: SceneActor, st: SceneState): GopherPose =>
+    frame.actors?.find((x) => x.id === a.id)?.pose ?? a.pose ?? ACTOR_POSE[st];
+  /* identity badge: explicit tag, else the trailing number in the label */
+  const actorTag = (a: SceneActor): string | undefined =>
+    frame.actors?.find((x) => x.id === a.id)?.tag ??
+    a.tag ??
+    actorLabel(a).match(/(\d+)\s*$/)?.[1];
+  const prevActorPose = (id: string): GopherPose | undefined =>
+    prev?.actors?.find((x) => x.id === id)?.pose;
 
   // a cell/actor whose state OR costume changed this frame gets a pop
   const prevCellState = (id: string): SceneState | undefined =>
@@ -504,22 +539,29 @@ export function Scene({
             {actors.map((a) => {
               const st = actorState(a);
               const role = actorRole(a);
+              const pose = actorPose(a, st);
               const stateChanged =
                 prevActorState(a.id) !== undefined && prevActorState(a.id) !== st;
               const morphed =
                 prevActorRole(a.id) !== undefined && prevActorRole(a.id) !== role;
-              const changed = stateChanged || morphed;
+              const verbChanged =
+                prevActorPose(a.id) !== undefined && prevActorPose(a.id) !== pose;
+              const changed = stateChanged || morphed || verbChanged;
+              const gone = pose === "exit";
               return (
                 <span
                   key={changed ? `${a.id}@${cur}` : a.id}
-                  className={`scn-actor-wrap ${changed ? "scn-pop" : ""}`}
+                  className={`scn-actor-wrap ${changed && !gone ? "scn-pop" : ""} ${
+                    gone ? "scn-gone" : ""
+                  }`}
                 >
                   <Gopher
-                    pose={ACTOR_POSE[st]}
+                    pose={pose}
                     state={st}
                     size={46}
                     title={actorLabel(a)}
                     role={role}
+                    tag={actorTag(a)}
                   />
                   <span className={`scn-actor scn-${st}`}>{actorLabel(a)}</span>
                 </span>

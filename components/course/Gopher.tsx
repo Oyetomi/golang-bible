@@ -18,7 +18,9 @@ export type GopherPose =
   | "sleep" // eyes closed, Zzz drifting up
   | "panic" // shaking, wide eyes, open mouth
   | "happy" // single bounce, smile
-  | "wave"; // one arm waving
+  | "wave" // one arm waving
+  | "exit" // walks out through a door and is gone (worker exits, goroutine returns)
+  | "enter"; // walks in through the door (spawn, new worker joins)
 
 export type GopherState = "idle" | "active" | "ok" | "warn" | "bad" | "done";
 
@@ -44,7 +46,8 @@ export type GopherRole =
   | "captain" // ship wheel — Docker, Kubernetes, deploys
   | "runner" // race flag — labs, CTF, goroutine racers
   | "analyst" // bar chart — analytics, metrics, observability
-  | "consumer"; // drumstick — queue/topic consumers (they CONSUME)
+  | "consumer" // drumstick — queue/topic consumers (they CONSUME)
+  | "producer"; // freshly-made parcel + sparkle — producers CREATE messages
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
@@ -52,7 +55,8 @@ const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/money|pay|charge|transfer|balance|account|bank|fintech|settle|coin|card/i, "banker"],
   [/auth|secur|secret|lock|tls|token|jwt|password|vault|cred/i, "guard"],
   [/debug|trace|profil|pprof|fraud|detect|search|find|inspect|delve|dlv/i, "detective"],
-  [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream|produc/i, "courier"],
+  [/produc/i, "producer"],
+  [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream/i, "courier"],
   [/\bdb\b|sql|postgres|redis|database|storage|disk|cache|store|repo|table|index/i, "librarian"],
   [/time|clock|timer|cron|schedul|ticker|deadline|ttl/i, "timekeeper"],
   [/lint|vet|build|\bci\b|tool|generate|compile|release/i, "mechanic"],
@@ -81,11 +85,16 @@ export function inferRole(label?: string): GopherRole | undefined {
    Hats sit on the head (y 0–14); held items hang by the right arm (x 48–64). */
 function RoleGear({ role }: { role: GopherRole }) {
   switch (role) {
-    case "worker": // yellow hard hat
+    case "worker": // yellow hard hat + pickaxe over the shoulder
       return (
         <g className="gph-gear">
           <path d="M19 10 a13 11 0 0 1 26 0 z" fill="#e8c35a" stroke="var(--gph-line)" strokeWidth="1.6" />
           <rect x="15" y="9" width="34" height="3.6" rx="1.8" fill="#d4af37" stroke="var(--gph-line)" strokeWidth="1.2" />
+          {/* pickaxe: handle slung past the right arm, curved head up top */}
+          <g className="gph-pickaxe">
+            <line x1="50" y1="47" x2="61" y2="28" stroke="#b08868" strokeWidth="2.4" strokeLinecap="round" />
+            <path d="M54 26 q7 -3.5 14 1.5" fill="none" stroke="#9aa3b5" strokeWidth="3" strokeLinecap="round" />
+          </g>
         </g>
       );
     case "detective": // magnifier in right paw
@@ -237,6 +246,20 @@ function RoleGear({ role }: { role: GopherRole }) {
           <rect x="58.5" y="35.5" width="2.6" height="7.9" fill="var(--accent, #e8c35a)" />
         </g>
       );
+    case "producer": // a parcel it JUST made — sparkle says "fresh off the line"
+      return (
+        <g className="gph-gear">
+          {/* parcel */}
+          <rect x="49" y="36" width="12" height="10" rx="1.6" fill="#c98a4b" stroke="#8a5a28" strokeWidth="1.4" />
+          <line x1="55" y1="36" x2="55" y2="46" stroke="#8a5a28" strokeWidth="1.2" />
+          <line x1="49" y1="41" x2="61" y2="41" stroke="#8a5a28" strokeWidth="1.2" />
+          {/* creation sparkle */}
+          <g className="gph-spark">
+            <path d="M59 30 l1.2 2.6 2.6 1.2 -2.6 1.2 -1.2 2.6 -1.2 -2.6 -2.6 -1.2 2.6 -1.2 z" fill="var(--accent, #e8c35a)" />
+            <circle cx="51" cy="31" r="1.1" fill="var(--accent, #e8c35a)" />
+          </g>
+        </g>
+      );
     case "consumer": // drumstick raised to the mouth — it consumes
       return (
         <g className="gph-gear gph-chomp">
@@ -263,6 +286,7 @@ export function Gopher({
   flip = false,
   title,
   role,
+  tag,
 }: {
   pose?: GopherPose;
   state?: GopherState;
@@ -273,9 +297,12 @@ export function Gopher({
   title?: string;
   /** topic gear — see GopherRole; use inferRole(label) when you only have text */
   role?: GopherRole;
+  /** identity badge on the chest — "3" makes this THE worker-3 gopher */
+  tag?: string;
 }) {
   const eyesClosed = pose === "sleep";
   const panicked = pose === "panic";
+  const doored = pose === "exit" || pose === "enter";
   return (
     <span
       className={`gph gph-pose-${pose} gph-st-${state} ${flip ? "gph-flip" : ""}`}
@@ -283,6 +310,7 @@ export function Gopher({
       role="img"
       aria-label={title ?? `gopher (${role ?? pose})`}
     >
+      {doored && <span className="gph-door" aria-hidden />}
       {pose === "carry" && (
         <span className="gph-payload">{payload ?? "▣"}</span>
       )}
@@ -326,6 +354,15 @@ export function Gopher({
             <circle className="gph-eye" cx="40.5" cy="25" r="6.6" />
             <circle className="gph-pupil" cx="25" cy="26" r={panicked ? 3.4 : 2.3} />
             <circle className="gph-pupil" cx="42" cy="26" r={panicked ? 3.4 : 2.3} />
+          </>
+        )}
+        {/* identity badge on the chest */}
+        {tag && (
+          <>
+            <circle className="gph-tag" cx="32" cy="47" r="6" />
+            <text className="gph-tag-text" x="32" y="50" textAnchor="middle">
+              {tag}
+            </text>
           </>
         )}
         {/* nose + teeth */}
