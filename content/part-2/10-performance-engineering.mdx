@@ -3,7 +3,7 @@ title: "Performance Engineering"
 part: 2
 order: 10
 type: "course"
-description: "pprof, benchmarking, escape analysis, cutting allocations, sync.Pool, GC tuning; mechanical sympathy (caches, cache lines, false sharing); and the execution tracer (runtime/trace, go tool trace)."
+description: "pprof, benchmarking, escape analysis, cutting allocations, sync.Pool, GC tuning; mechanical sympathy (caches, cache lines, false sharing); the execution tracer (runtime/trace, go tool trace); and profile-guided optimization (default.pgo) — feeding production profiles back into the compiler."
 prerequisites: ["debugging-go"]
 ---
 
@@ -13,11 +13,11 @@ Listen up, sport. Every amateur I've ever fired — and there have been *many* �
 
 Here's the truth only someone of my caliber can deliver: performance engineering is a **measurement discipline** first, last, and always. You profile. You read the numbers. You *then* fix what the numbers are pointing at — nothing else, nothing more. I once cut Meridian's ledger-report endpoint from 340ms to 11ms by fixing four lines the profiler found. Not forty. Four. Because I measured.
 
-By the end of this chapter you'll wield Go's full performance toolkit: `pprof`, benchmarks, escape analysis, `sync.Pool`, GC tuning, mechanical sympathy, and the execution tracer. You'll profile a real slow endpoint, identify the waste, and eliminate it surgically. And when you're done, *maybe* you'll be worth keeping around.
+By the end of this chapter you'll wield Go's full performance toolkit: `pprof`, benchmarks, escape analysis, `sync.Pool`, GC tuning, mechanical sympathy, the execution tracer, and PGO — feeding production profiles back into the compiler itself. You'll profile a real slow endpoint, identify the waste, and eliminate it surgically. And when you're done, *maybe* you'll be worth keeping around.
 
 </HeroCard>
 
-<ChapterTabs tabs={["pprof", "Benchmarking", "Escape Analysis & Allocations", "GC Tuning", "Mechanical Sympathy", "The Execution Tracer"]} />
+<ChapterTabs tabs={["pprof", "Benchmarking", "Escape Analysis & Allocations", "GC Tuning", "Mechanical Sympathy", "The Execution Tracer", "Profile-Guided Optimization"]} />
 
 ## pprof
 
@@ -981,6 +981,165 @@ The `go tool trace` browser UI parses the binary and renders goroutines as color
 
 ---
 
+## Profile-Guided Optimization
+
+Everything in this chapter so far runs one loop: **you** measure, **you** read the profile, **you** change the code. Profile-guided optimization — PGO — closes a second loop most engineers never touch: the profile goes back into `go build`, and the **compiler** changes *its* decisions. Same source, faster binary. The machine does the work. That's how I like my machines.
+
+**On the job:** PGO is the cheapest real win in Go performance. The Go team measured **2–7%** CPU reduction on representative benchmarks when it shipped in Go 1.21, and the devirtualization work in 1.22 pushed some dispatch-heavy workloads past 10%. The price is one committed file and a refresh habit. If your service already exposes `net/http/pprof` — and after the first section of this chapter, it does — you are one `curl` away from the input.
+
+<Define term="Profile-guided optimization (PGO)">
+**PGO** feeds a CPU profile from a real run back into the compiler, which uses the sample weights to optimize the paths your program *actually* takes — more aggressive inlining of hot functions, and devirtualization of hot interface calls. `go build` activates it automatically when a pprof file named `default.pgo` sits in the main package's directory. Stable since Go 1.21.
+</Define>
+
+### Why the compiler guesses without you
+
+The compiler's static heuristics are tuned for the *average* of all Go programs, because at compile time that's all it can know. The inliner has a fixed cost budget per call site — small functions inline, anything past the budget stays a call. Interface method calls go through the itable indirection (the two-word interface header from the Idiomatic Go chapter) unless the compiler can statically prove the concrete type. Sane defaults — but your ledger service is not average. Production says most of its CPU lives in a handful of functions under `POST /transfers`: decode, validate, balance check. The compiler has no idea. The profile is how you tell it.
+
+The history explains the design. Classic PGO — GCC, MSVC, LLVM — demanded an **instrumented build**: compile a special counting binary, run a synthetic benchmark against it, rebuild using the recorded counts. Two builds, plus a benchmark that has to stay representative of production forever. In practice the benchmark rotted, the second build annoyed everyone, and teams quietly turned the whole thing off. Google's AutoFDO work flipped the model: *sample the production binary you already run* with an ordinary profiler, and accept slightly fuzzier counts in exchange for data that is true by construction. Go adopted the AutoFDO shape wholesale — the input is a stock pprof CPU profile, the exact bytes `/debug/pprof/profile` already serves. No instrumented build, no synthetic benchmark. Your fleet *is* the benchmark.
+
+### The loop
+
+<ExecTimeline
+  title="The PGO feedback loop, release to release"
+  lanes={[{ id: "prod", label: "Production" }, { id: "build", label: "CI / Build" }]}
+  steps={[
+    { lane: "prod", kind: "run", label: "v1.4 serves peak traffic", note: "Friday payroll spike — the workload you actually care about, not a synthetic benchmark." },
+    { lane: "prod", kind: "send", label: "sample 30s of CPU", note: "curl /debug/pprof/profile?seconds=30 on two or three pods. A few hundred KB each." },
+    { lane: "build", kind: "run", label: "merge into default.pgo", note: "go tool pprof -proto p1 p2 p3 — sample weights add, smoothing out per-pod noise." },
+    { lane: "build", kind: "run", label: "commit next to package main", note: "The profile is a build input: versioned, reviewed, auditable like source." },
+    { lane: "build", kind: "run", label: "go build ./cmd/ledger", note: "Toolchain auto-detects default.pgo: raises inline budgets on hot paths, devirtualizes hot interface calls." },
+    { lane: "build", kind: "done", label: "ship v1.5, ~2–7% less CPU", note: "Same source. The optimizations are aimed at YOUR hot path, not the average Go program." },
+    { lane: "prod", kind: "run", label: "repeat next release", note: "Profiles of a PGO-built binary feed the next build without oscillating — the docs call it iterative stability." }
+  ]}
+  caption="PGO turns profiling from a one-off investigation into a standing feedback loop: production teaches the compiler what to optimize, every release."
+/>
+
+### Feeding the compiler
+
+```shell
+# 1. Sample CPU during representative load — peak, not idle
+curl -o cpu-1.pprof 'https://ledger-1:6060/debug/pprof/profile?seconds=30'
+curl -o cpu-2.pprof 'https://ledger-2:6060/debug/pprof/profile?seconds=30'
+
+# 2. Merge pods into one profile (sample weights add)
+go tool pprof -proto cpu-1.pprof cpu-2.pprof > default.pgo
+
+# 3. It lives next to package main, versioned like source
+mv default.pgo cmd/ledger/
+git add cmd/ledger/default.pgo
+
+# 4. go build auto-detects it — no flag needed
+go build ./cmd/ledger
+
+# Audit what any binary was built with
+go version -m ledger | grep -- -pgo
+```
+
+`-pgo=off` builds without it; `-pgo=path/to/profile.pprof` overrides the default. The filename convention is deliberate: the profile is a **build input**, so it belongs in version control, goes through code review, and is recorded in the binary's build metadata — the same provenance discipline as the `-ldflags` build stamping from the Building & Shipping chapter.
+
+### What actually changes: the hot interface call
+
+Here's the optimization PGO unlocks that you cannot cleanly write by hand — not without wrecking your interface-based design. Watch the call site:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// Validator is what the handler sees — an interface, so every call
+// is indirect: load the itable, load the method pointer, jump.
+type Validator interface {
+	Validate(amountCents int64) error
+}
+
+type TransferValidator struct{ maxCents int64 }
+
+func (v TransferValidator) Validate(amountCents int64) error {
+	if amountCents <= 0 || amountCents > v.maxCents {
+		return fmt.Errorf("amount %d out of range", amountCents)
+	}
+	return nil
+}
+
+func validateBatch(v Validator, amounts []int64) (ok int) {
+	for _, a := range amounts {
+		// The hot call. Statically, the compiler can't prove which
+		// concrete type is behind v. A production profile can:
+		// 99.8% of samples here hit TransferValidator.Validate.
+		// PGO specializes this exact call site.
+		if v.Validate(a) == nil {
+			ok++
+		}
+	}
+	return ok
+}
+
+func main() {
+	amounts := []int64{4_999, -3, 12_000, 999_999_999}
+	v := TransferValidator{maxCents: 500_000_00}
+	fmt.Printf("%d of %d transfers pass validation\n",
+		validateBatch(v, amounts), len(amounts))
+}
+```
+
+</GoPlayground>
+
+Statically, the compiler usually can't prove which concrete type hides behind `Validator` at that call site — the value crosses a function boundary and could be anything. So it emits indirect dispatch. Cheap, but it blocks **inlining**, and inlining is the gateway optimization: once a body is inlined, escape analysis, bounds-check elimination, and constant propagation all get to see through it.
+
+With a profile showing one type dominating the site, the compiler emits a **guarded devirtualization**:
+
+```go
+// Conceptually, what the compiled hot path becomes:
+if tv, ok := v.(TransferValidator); ok {
+	err = tv.Validate(a) // direct call — now inlinable
+} else {
+	err = v.Validate(a) // rare path: normal interface dispatch
+}
+```
+
+The fast path is one type-descriptor comparison, then a direct — now inlinable — call. The slow path still handles the other 0.2% correctly. Your interfaces stay clean; the binary gets concrete-call speed where it counts. This is the "PGO-guided devirtualization" the Idiomatic Go chapter promised when it showed you the itable.
+
+<UnderTheHood title="What the compiler does with default.pgo (Go 1.26)">
+
+*The thresholds below are internal tuning constants, not API — treat the numbers as illustrative.*
+
+1. **Parse and weight.** The pprof file decodes into a weighted call graph: nodes are functions, edge weights are stack-sample counts. Built once per `go build`, consulted as every package compiles.
+2. **Hot-callsite inlining (Go 1.21+).** Call edges in roughly the hottest few percent of cumulative weight get a raised inlining budget — a function too big to inline under the static rules inlines anyway *at hot call sites only*. Cold sites keep the default budget. That asymmetry is the point: the binary grows single-digit percent, not 2×.
+3. **Devirtualization (Go 1.22+).** Interface-call sites with a dominant concrete type in the profile compile to the guarded direct call you saw above. The guard costs one comparison; a miss falls back to ordinary dispatch.
+4. **Name-based matching.** Samples are keyed by symbol name. Rename or heavily reshape a function and its weight is silently orphaned — that call site just reverts to static heuristics. A stale, partial, or even corrupt-ish profile **never breaks a build**; the worst case is a slightly slower binary. That graceful-degradation contract is what makes committing `default.pgo` safe.
+5. **Iterative stability.** Profiles collected from a PGO-built binary attribute inlined frames back to their source functions, so feeding `profile(build(profile))` around the loop doesn't oscillate or compound. You can run the loop forever, release after release.
+6. **Cost.** Builds with a profile run more analysis — expect mid-single-digit-percent slower compiles. The runtime cost is zero; everything happens at compile time.
+
+</UnderTheHood>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="default.pgo">Lives in the main package directory; auto-detected by `go build`. Commit it, review it, refresh it. Override with `-pgo=path`, disable with `-pgo=off`.</ConceptCard>
+  <ConceptCard label="The input">A stock pprof CPU profile — `/debug/pprof/profile?seconds=30` under peak production load. Merge several pods or days with `go tool pprof -proto a b > default.pgo`; weights add.</ConceptCard>
+  <ConceptCard label="Refresh cadence">Profiles age as code changes — renames orphan their weights silently. Re-collect per release or monthly, and automate it. Stale never breaks; it just fades toward baseline.</ConceptCard>
+  <ConceptCard label="What improves">Hot-path inlining and interface devirtualization: 2–7% CPU typically, more on dispatch-heavy services. Free money at fleet scale; invisible on a cold CLI tool.</ConceptCard>
+  <Gotcha>A profile of the wrong workload is worse than none: profile an idle staging pod and you optimize log flushing; profile a load test that hammers one endpoint and you tune the compiler away from the other twelve. Sample peak production, several pods, merged.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="You commit default.pgo, then a refactor renames half of the hot functions. What happens on the next go build?"
+  options={[
+    "The build fails — the profile no longer matches the source",
+    "The compiler emits a warning and ignores the entire profile",
+    "Renamed functions silently lose their PGO boost, everything else keeps it, and the build succeeds",
+    "The binary panics at runtime when a renamed function is called"
+  ]}
+  answer={2}
+  explain="PGO matching is by symbol name. Weights for renamed functions are orphaned, and those call sites fall back to the static heuristics — silently. Nothing fails and nothing warns; the binary just drifts toward baseline speed. That is exactly why you refresh the profile on a cadence instead of treating it as one-time setup."
+/>
+
+<Callout kind="pro" title="Wire it into the release train">
+The collection step is the same pprof endpoint you stood up in the first section, so automate the loop: a scheduled CI job curls `/debug/pprof/profile` from two or three production pods during the weekly peak, merges them, and opens a PR updating `default.pgo`. Review is a sanity check on the `go tool pprof -top` diff — you are reviewing *what the compiler will believe about production*. If the top-10 looks wrong, the profile is lying, and the compiler will faithfully optimize the lie.
+</Callout>
+
+---
+
 ## Exercises
 
 Stop reading. Start measuring.
@@ -1440,6 +1599,7 @@ You now own the full performance engineering stack:
 - **GC tuning**: `GOGC` sets the relative headroom (default 100 = GC fires at 2× live heap). `GOMEMLIMIT` (Go 1.19+) sets the hard ceiling — always pair them in containers. Go's collector still has short STW phases and runs most tracing work concurrently.
 - **Mechanical sympathy**: data lives in 64-byte **cache lines**. Contiguous flat slices are cache-friendly; pointer-chased linked structures are cache-hostile. **False sharing** between goroutines on the same cache line causes constant invalidation — fix with padding to 64-byte boundaries. The payoff of data-oriented design (Part 1, Chapter 3).
 - **The execution tracer** (`runtime/trace`, `go tool trace`) records goroutine scheduling, GC pauses, and I/O events on a precise timeline — not to be confused with distributed tracing. Use it to find scheduler stalls and GC interference. The new flight recorder (Go 1.23+) keeps a ring buffer always ready.
+- **PGO** (`default.pgo`, stable since Go 1.21): a merged production CPU profile committed next to `package main` makes `go build` raise inlining budgets on hot call sites and devirtualize hot interface calls — 2–7% CPU typical, zero source changes. Matching is by function name, so stale profiles degrade silently and never break the build. Refresh per release.
 - The **micro vs. macro** discipline: profile the whole system first, benchmark the specific fix, then profile again to confirm the win carried through. Never optimize what the profiler hasn't pointed at.
 
 </Recap>
@@ -1450,6 +1610,7 @@ You now own the full performance engineering stack:
     { label: "Quick check — high cum, low flat", kind: "quiz", points: 10, done: false },
     { label: "Quick check — escape analysis", kind: "quiz", points: 10, done: false },
     { label: "Quick check — false sharing", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — PGO staleness", kind: "quiz", points: 10, done: false },
     { label: "Exercise 1 — pprof on a server", kind: "exercise", points: 10, done: false },
     { label: "Exercise 2 — write and read a benchmark", kind: "exercise", points: 10, done: false },
     { label: "Exercise 3 — diagnose an escape", kind: "exercise", points: 15, done: false },
