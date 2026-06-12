@@ -1,6 +1,7 @@
 import * as S from "@/components/course/server";
 import * as C from "@/components/course/client";
 import * as A from "@/components/course/anim";
+import { CodeWalk } from "@/components/course/CodeWalk";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -32,6 +33,7 @@ export const mdxComponents = {
   CacheAnim: A.CacheAnim,
   CircuitAnim: A.CircuitAnim,
   PoolAnim: A.PoolAnim,
+  CodeWalk,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
   Gotcha: S.Gotcha,
