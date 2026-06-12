@@ -5,17 +5,29 @@ import {
   Fragment,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
   type ReactNode,
 } from "react";
 import { slug as ghSlug } from "github-slugger";
+import {
+  Gopher,
+  inferRole,
+  type GopherPose,
+  type GopherRole,
+  type GopherState,
+} from "./Gopher";
 
 /* ──────────────────────────────────────────────
    Interactive (client) course components.
    Animations are CSS/JS only — no animation libs,
    honoring the prompt's "no deps beyond React".
+   Motion principle: things TRAVEL (tokens between
+   lanes, gophers between states) rather than just
+   recolouring in place. prefers-reduced-motion
+   collapses all of it to instant state changes.
    ────────────────────────────────────────────── */
 
 /** Numbered sub-topic tab strip with a scroll-synced progress bar.
@@ -77,13 +89,16 @@ export function ChapterTabs({ tabs }: { tabs: string[] }) {
   );
 }
 
-type Lane = { id: string; label: string };
+type Lane = { id: string; label: string; role?: GopherRole };
 type StepKind = "run" | "block" | "send" | "recv" | "spawn" | "done";
 type Step = {
   lane: string;
   label: string;
   note?: string;
   kind?: StepKind;
+  /** morph: while this step is current, its lane's gopher wears this costume
+   *  (e.g. a "acquire lock" step turns the goroutine into a "guard") */
+  role?: GopherRole;
 };
 
 const KIND_LABEL: Record<StepKind, string> = {
@@ -95,9 +110,50 @@ const KIND_LABEL: Record<StepKind, string> = {
   done: "done ✓",
 };
 
+/* compact glyphs for collapsed (already-played) steps */
+const KIND_GLYPH: Record<StepKind, string> = {
+  run: "▸",
+  block: "⛔",
+  send: "►",
+  recv: "◄",
+  spawn: "✦",
+  done: "✓",
+};
+
+/** Map a lane's CURRENT activity to a gopher pose + tint. */
+function lanePose(now: Step | null, laneId: string, everRan: boolean): { pose: GopherPose; state: GopherState } {
+  if (!now || now.lane !== laneId)
+    return { pose: everRan ? "idle" : "sleep", state: "idle" };
+  switch (now.kind ?? "run") {
+    case "run":
+      return { pose: "run", state: "active" };
+    case "spawn":
+      return { pose: "wave", state: "active" };
+    case "send":
+      return { pose: "carry", state: "active" };
+    case "recv":
+      return { pose: "carry", state: "ok" };
+    case "block":
+      return { pose: "blocked", state: "warn" };
+    case "done":
+      return { pose: "happy", state: "done" };
+  }
+}
+
+type TokenFlight = {
+  key: number;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+};
+
 /** Stepped "play" timeline. Lanes on the Y axis (e.g. goroutines / main),
- *  global ticks on the X axis. Reveals one step per tick so you watch the
- *  mechanism unfold — sequential on one lane, concurrent across many. */
+ *  global ticks on the X axis. Each lane is fronted by a gopher actor whose
+ *  pose tracks what that lane is doing RIGHT NOW; on a send, a token visibly
+ *  flies from the send cell to the matching recv cell; a playhead glides
+ *  across columns. Falls back to instant state changes under
+ *  prefers-reduced-motion. */
 export function ExecTimeline({
   title,
   lanes,
@@ -112,6 +168,9 @@ export function ExecTimeline({
   const [cur, setCur] = useState(-1);
   const [playing, setPlaying] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const matrixRef = useRef<HTMLDivElement | null>(null);
+  const [flight, setFlight] = useState<TokenFlight | null>(null);
+  const [flying, setFlying] = useState(false);
 
   useEffect(() => {
     if (!playing) return;
@@ -123,11 +182,60 @@ export function ExecTimeline({
         }
         return c + 1;
       });
-    }, 820);
+    }, 1050);
     return () => {
       if (timer.current) clearInterval(timer.current);
     };
   }, [playing, steps.length]);
+
+  /* For each send step, the cell index of the recv it pairs with (the next
+     recv after it). Precomputed once — drives the token flights. */
+  const recvFor = useMemo(() => {
+    const m = new Map<number, number>();
+    steps.forEach((s, i) => {
+      if ((s.kind ?? "run") !== "send") return;
+      for (let j = i + 1; j < steps.length; j++) {
+        if ((steps[j].kind ?? "run") === "recv") {
+          m.set(i, j);
+          break;
+        }
+      }
+    });
+    return m;
+  }, [steps]);
+
+  /* On entering a send step: launch a token from the send card to the
+     receiving lane's track. Pure CSS transition does the travel. */
+  useEffect(() => {
+    const host = matrixRef.current;
+    if (!host || cur < 0) {
+      setFlight(null);
+      return;
+    }
+    const j = recvFor.get(cur);
+    if (j === undefined) {
+      setFlight(null);
+      return;
+    }
+    const from = host
+      .querySelector<HTMLElement>(`[data-i="${cur}"]`)
+      ?.getBoundingClientRect();
+    const toTrack = host
+      .querySelector<HTMLElement>(`[data-track="${steps[j].lane}"]`)
+      ?.getBoundingClientRect();
+    const base = host.getBoundingClientRect();
+    if (!from || !toTrack) return;
+    setFlying(false);
+    setFlight({
+      key: cur,
+      x0: from.right - 10 - base.left,
+      y0: from.top + from.height / 2 - base.top,
+      x1: toTrack.left + 26 - base.left,
+      y1: toTrack.top + toTrack.height / 2 - base.top,
+    });
+    const raf = requestAnimationFrame(() => requestAnimationFrame(() => setFlying(true)));
+    return () => cancelAnimationFrame(raf);
+  }, [cur, recvFor, steps]);
 
   const reset = () => {
     setPlaying(false);
@@ -144,6 +252,7 @@ export function ExecTimeline({
 
   const laneIdx = Object.fromEntries(lanes.map((l, i) => [l.id, i]));
   const now = cur >= 0 && cur < steps.length ? steps[cur] : null;
+  const ranLanes = new Set(steps.slice(0, cur + 1).map((s) => s.lane));
 
   return (
     <figure className="xt">
@@ -162,38 +271,73 @@ export function ExecTimeline({
         </div>
       </div>
 
-      <div className="xt-scroll">
-        <div
-          className="xt-matrix"
-          style={{ "--ticks": String(steps.length) } as CSSProperties}
-        >
-          {lanes.map((l, li) => (
-            <Fragment key={l.id}>
-              <div
-                className="xt-row-label"
-                style={{ gridRow: li + 1, gridColumn: 1 }}
-              >
-                {l.label}
+      <div ref={matrixRef} className="xt-stage">
+        {lanes.map((l) => {
+          const gp = lanePose(now, l.id, ranLanes.has(l.id));
+          /* this lane's history: indexes of steps already played */
+          const played = steps
+            .map((s, i) => ({ s, i }))
+            .filter(({ s, i }) => s.lane === l.id && i <= cur);
+          const active = played.length > 0 && played[played.length - 1].i === cur;
+          const pills = active ? played.slice(0, -1) : played;
+          const current = active ? played[played.length - 1] : null;
+          return (
+            <div key={l.id} className={`xt-lane ${now?.lane === l.id ? "xt-lane-now" : ""}`}>
+              <div className="xt-actor">
+                <Gopher
+                  pose={gp.pose}
+                  state={gp.state}
+                  size={34}
+                  title={l.label}
+                  role={
+                    (now?.lane === l.id ? now.role : undefined) ??
+                    l.role ??
+                    inferRole(l.label)
+                  }
+                />
+                <span className="xt-actor-name">{l.label}</span>
               </div>
-              {steps.map((s, i) =>
-                s.lane === l.id ? (
-                  <div
+              <div className="xt-track" data-track={l.id}>
+                {pills.map(({ s, i }) => (
+                  <span
                     key={i}
-                    className={`xt-cell xt-${s.kind ?? "run"} ${
-                      i <= cur ? "on" : ""
-                    } ${i === cur ? "now" : ""}`}
-                    style={{ gridRow: li + 1, gridColumn: i + 2 }}
+                    className={`xt-pill xt-${s.kind ?? "run"}`}
+                    title={s.label}
                   >
-                    <span className="xt-cell-k">
-                      {KIND_LABEL[s.kind ?? "run"]}
+                    {KIND_GLYPH[s.kind ?? "run"]}
+                  </span>
+                ))}
+                {current && (
+                  <span
+                    key={current.i}
+                    data-i={current.i}
+                    className={`xt-card xt-${current.s.kind ?? "run"}`}
+                  >
+                    <span className="xt-card-k">
+                      {KIND_LABEL[current.s.kind ?? "run"]}
                     </span>
-                    <span className="xt-cell-l">{s.label}</span>
-                  </div>
-                ) : null
-              )}
-            </Fragment>
-          ))}
-        </div>
+                    <span className="xt-card-l">{current.s.label}</span>
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        {flight && (
+          <span
+            key={flight.key}
+            className={`xt-token ${flying ? "xt-token-fly" : ""}`}
+            style={
+              {
+                "--x0": `${flight.x0}px`,
+                "--y0": `${flight.y0}px`,
+                "--x1": `${flight.x1}px`,
+                "--y1": `${flight.y1}px`,
+              } as CSSProperties
+            }
+            aria-hidden
+          />
+        )}
       </div>
 
       <div className="xt-now">
@@ -202,11 +346,25 @@ export function ExecTimeline({
             <span className="xt-now-lane">
               {lanes[laneIdx[now.lane]]?.label}
             </span>
-            {now.note ?? now.label}
+            <span className="xt-now-note">{now.note ?? now.label}</span>
           </>
         ) : (
           <span className="xt-now-idle">Press ▶ to watch it run, step by step.</span>
         )}
+      </div>
+
+      <div className="xt-progress">
+        {steps.map((_, i) => (
+          <button
+            key={i}
+            className={`xt-dot ${i === cur ? "on" : ""} ${i < cur ? "past" : ""}`}
+            onClick={() => {
+              setPlaying(false);
+              setCur(i);
+            }}
+            aria-label={`Step ${i + 1}`}
+          />
+        ))}
       </div>
 
       {caption && <figcaption className="xt-cap">{caption}</figcaption>}
@@ -215,7 +373,13 @@ export function ExecTimeline({
 }
 
 type SceneState = "idle" | "active" | "ok" | "warn" | "bad" | "done";
-type SceneActor = { id: string; label: string; state?: SceneState; at?: string };
+type SceneActor = {
+  id: string;
+  label: string;
+  state?: SceneState;
+  at?: string;
+  role?: GopherRole;
+};
 type SceneCell = { id: string; label?: string; state?: SceneState };
 type SceneFrame = {
   caption: string;
@@ -267,6 +431,7 @@ export function Scene({
   }, [playing, frames.length]);
 
   const frame = frames[cur] ?? frames[0];
+  const prev = cur > 0 ? frames[cur - 1] : null;
   const beat = frame.beat ?? "neutral";
 
   // resolve per-frame overrides on top of base definitions
@@ -276,6 +441,31 @@ export function Scene({
   };
   const actorLabel = (a: SceneActor): string =>
     frame.actors?.find((x) => x.id === a.id)?.label ?? a.label;
+  /* Per-frame role override = the MORPH: a frame can re-dress an actor as the
+     character the beat is teaching (follower → "leader" when elected, service
+     → "detective" when it starts tracing). Falls back to the actor's base
+     role, then to inference from its label. */
+  const actorRole = (a: SceneActor): GopherRole | undefined =>
+    frame.actors?.find((x) => x.id === a.id)?.role ??
+    a.role ??
+    inferRole(actorLabel(a));
+
+  // a cell/actor whose state OR costume changed this frame gets a pop
+  const prevCellState = (id: string): SceneState | undefined =>
+    prev?.cells?.find((c) => c.id === id)?.state;
+  const prevActorState = (id: string): SceneState | undefined =>
+    prev?.actors?.find((x) => x.id === id)?.state;
+  const prevActorRole = (id: string): GopherRole | undefined =>
+    prev?.actors?.find((x) => x.id === id)?.role;
+
+  const ACTOR_POSE: Record<SceneState, GopherPose> = {
+    idle: "idle",
+    active: "run",
+    ok: "happy",
+    warn: "blocked",
+    bad: "panic",
+    done: "happy",
+  };
 
   const gridCells: SceneCell[] =
     rows && cols
@@ -311,11 +501,30 @@ export function Scene({
       <div className="scn-stage">
         {actors.length > 0 && (
           <div className="scn-actors">
-            {actors.map((a) => (
-              <span key={a.id} className={`scn-actor scn-${actorState(a)}`}>
-                {actorLabel(a)}
-              </span>
-            ))}
+            {actors.map((a) => {
+              const st = actorState(a);
+              const role = actorRole(a);
+              const stateChanged =
+                prevActorState(a.id) !== undefined && prevActorState(a.id) !== st;
+              const morphed =
+                prevActorRole(a.id) !== undefined && prevActorRole(a.id) !== role;
+              const changed = stateChanged || morphed;
+              return (
+                <span
+                  key={changed ? `${a.id}@${cur}` : a.id}
+                  className={`scn-actor-wrap ${changed ? "scn-pop" : ""}`}
+                >
+                  <Gopher
+                    pose={ACTOR_POSE[st]}
+                    state={st}
+                    size={46}
+                    title={actorLabel(a)}
+                    role={role}
+                  />
+                  <span className={`scn-actor scn-${st}`}>{actorLabel(a)}</span>
+                </span>
+              );
+            })}
           </div>
         )}
 
@@ -326,8 +535,14 @@ export function Scene({
           >
             {gridCells.map((c) => {
               const st = cellState(c.id, c.state);
+              const before = prevCellState(c.id);
+              const changed = before !== undefined && before !== st;
               return (
-                <span key={c.id} className={`scn-cell scn-${st}`} title={c.id}>
+                <span
+                  key={changed ? `${c.id}@${cur}` : c.id}
+                  className={`scn-cell scn-${st} ${changed ? "scn-pop" : ""}`}
+                  title={c.id}
+                >
                   {cellLabel(c)}
                 </span>
               );
