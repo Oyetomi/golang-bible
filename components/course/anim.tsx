@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { Gopher, type GopherRole } from "./Gopher";
+import { SPEEDS, speedLabel } from "./client";
 
 /* ──────────────────────────────────────────────
    Bespoke, chapter-tailored animations. Each one
@@ -21,10 +22,11 @@ import { Gopher, type GopherRole } from "./Gopher";
    prefers-reduced-motion. No deps beyond React.
    ────────────────────────────────────────────── */
 
-/* shared stepped-playback state */
+/* shared stepped-playback state with adjustable speed */
 function useStepper(total: number, ms = 1500) {
   const [cur, setCur] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
     if (!playing) return;
@@ -36,14 +38,19 @@ function useStepper(total: number, ms = 1500) {
         }
         return c + 1;
       });
-    }, ms);
+    }, ms / speed);
     return () => {
       if (timer.current) clearInterval(timer.current);
     };
-  }, [playing, total, ms]);
+  }, [playing, total, ms, speed]);
   return {
     cur,
     playing,
+    speed,
+    cycleSpeed: () =>
+      setSpeed(
+        (s) => SPEEDS[(SPEEDS.indexOf(s as (typeof SPEEDS)[number]) + 1) % SPEEDS.length]
+      ),
     reset: () => {
       setPlaying(false);
       setCur(0);
@@ -72,6 +79,8 @@ function AnimShell({
   cur,
   total,
   playing,
+  speed,
+  onSpeed,
   onReset,
   onStep,
   onToggle,
@@ -86,6 +95,8 @@ function AnimShell({
   cur: number;
   total: number;
   playing: boolean;
+  speed?: number;
+  onSpeed?: () => void;
   onReset: () => void;
   onStep: () => void;
   onToggle: () => void;
@@ -99,6 +110,16 @@ function AnimShell({
         <span className="anim-kicker">{kicker}</span>
         <span className="anim-title">{title}</span>
         <div className="anim-ctrls">
+          {onSpeed && (
+            <button
+              className="anim-btn"
+              onClick={onSpeed}
+              aria-label="Playback speed"
+              title="Playback speed"
+            >
+              {speedLabel(speed ?? 1)}
+            </button>
+          )}
           <button className="anim-btn" onClick={onReset} aria-label="Reset">
             ⤺
           </button>
@@ -191,6 +212,8 @@ export function ChannelAnim({
       cur={st.cur}
       total={ops.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -276,6 +299,8 @@ export function SchedulerAnim({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -365,6 +390,8 @@ export function GCAnim({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -445,6 +472,8 @@ export function SliceAnim({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -523,6 +552,8 @@ export function LockAnim({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -596,6 +627,8 @@ export function LedgerAnim({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -680,6 +713,8 @@ export function JourneyAnim({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}
@@ -754,6 +789,8 @@ export function AlgoGrid({
       cur={st.cur}
       total={frames.length}
       playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
       onReset={st.reset}
       onStep={st.step}
       onToggle={st.toggle}

@@ -120,6 +120,11 @@ const KIND_GLYPH: Record<StepKind, string> = {
   done: "✓",
 };
 
+/* playback speed: cycles slow → fast. interval = base / speed. */
+export const SPEEDS = [1, 0.5, 0.25, 2] as const;
+export const speedLabel = (s: number) =>
+  s === 0.5 ? "½×" : s === 0.25 ? "¼×" : `${s}×`;
+
 /** Map a lane's CURRENT activity to a gopher pose + tint. A lane whose final
  *  step was `done` EXITS through the door (the goroutine returned); a lane
  *  whose current step is `spawn` ENTERS through it. */
@@ -176,6 +181,7 @@ export function ExecTimeline({
 }) {
   const [cur, setCur] = useState(-1);
   const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const matrixRef = useRef<HTMLDivElement | null>(null);
   const [flight, setFlight] = useState<TokenFlight | null>(null);
@@ -191,11 +197,11 @@ export function ExecTimeline({
         }
         return c + 1;
       });
-    }, 1050);
+    }, 1050 / speed);
     return () => {
       if (timer.current) clearInterval(timer.current);
     };
-  }, [playing, steps.length]);
+  }, [playing, steps.length, speed]);
 
   /* For each send step, the cell index of the recv it pairs with (the next
      recv after it). Precomputed once — drives the token flights. */
@@ -268,6 +274,14 @@ export function ExecTimeline({
       <div className="xt-head">
         <span className="xt-title">{title ?? "Execution"}</span>
         <div className="xt-ctrls">
+          <button
+            className="xt-btn"
+            onClick={() => setSpeed(SPEEDS[(SPEEDS.indexOf(speed as (typeof SPEEDS)[number]) + 1) % SPEEDS.length])}
+            aria-label="Playback speed"
+            title="Playback speed"
+          >
+            {speedLabel(speed)}
+          </button>
           <button className="xt-btn" onClick={reset} aria-label="Reset">
             ⤺
           </button>
@@ -436,6 +450,7 @@ export function Scene({
 }) {
   const [cur, setCur] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -448,11 +463,11 @@ export function Scene({
         }
         return c + 1;
       });
-    }, 1600);
+    }, 1600 / speed);
     return () => {
       if (timer.current) clearInterval(timer.current);
     };
-  }, [playing, frames.length]);
+  }, [playing, frames.length, speed]);
 
   const frame = frames[cur] ?? frames[0];
   const prev = cur > 0 ? frames[cur - 1] : null;
@@ -527,6 +542,14 @@ export function Scene({
       <div className="scn-head">
         <span className="scn-title">{title ?? "Scenario"}</span>
         <div className="scn-ctrls">
+          <button
+            className="scn-btn"
+            onClick={() => setSpeed(SPEEDS[(SPEEDS.indexOf(speed as (typeof SPEEDS)[number]) + 1) % SPEEDS.length])}
+            aria-label="Playback speed"
+            title="Playback speed"
+          >
+            {speedLabel(speed)}
+          </button>
           <button className="scn-btn" onClick={() => { setPlaying(false); setCur(0); }} aria-label="Reset">⤺</button>
           <button className="scn-btn" onClick={() => { setPlaying(false); setCur((c) => Math.min(c + 1, frames.length - 1)); }} aria-label="Step">⏭</button>
           <button className="scn-btn scn-play" onClick={toggle}>{playing ? "❚❚ Pause" : "▶ Play"}</button>
