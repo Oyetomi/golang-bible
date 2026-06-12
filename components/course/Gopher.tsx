@@ -43,7 +43,8 @@ export type GopherRole =
   | "hacker" // terminal — CLIs, shells
   | "captain" // ship wheel — Docker, Kubernetes, deploys
   | "runner" // race flag — labs, CTF, goroutine racers
-  | "analyst"; // bar chart — analytics, metrics, observability
+  | "analyst" // bar chart — analytics, metrics, observability
+  | "consumer"; // drumstick — queue/topic consumers (they CONSUME)
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
@@ -51,7 +52,7 @@ const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/money|pay|charge|transfer|balance|account|bank|fintech|settle|coin|card/i, "banker"],
   [/auth|secur|secret|lock|tls|token|jwt|password|vault|cred/i, "guard"],
   [/debug|trace|profil|pprof|fraud|detect|search|find|inspect|delve|dlv/i, "detective"],
-  [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream/i, "courier"],
+  [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream|produc/i, "courier"],
   [/\bdb\b|sql|postgres|redis|database|storage|disk|cache|store|repo|table|index/i, "librarian"],
   [/time|clock|timer|cron|schedul|ticker|deadline|ttl/i, "timekeeper"],
   [/lint|vet|build|\bci\b|tool|generate|compile|release/i, "mechanic"],
@@ -62,7 +63,8 @@ const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/algorithm|interview|dsa|sort|graph|heap|pointer/i, "scholar"],
   [/\bcli\b|terminal|shell|command|prompt/i, "hacker"],
   [/docker|kubernetes|k8s|container|deploy|pod|ship|infra/i, "captain"],
-  [/worker|pool|consumer|process|batch|job|task/i, "worker"],
+  [/consum/i, "consumer"],
+  [/worker|pool|process|batch|job|task/i, "worker"],
   [/lab|flag|ctf|race|goroutine/i, "runner"],
   [/analytic|metric|dashboard|observ|telemetry|slo|monitor/i, "analyst"],
   [/net|http|grpc|server|client|request|api|dns|proxy|gateway|socket|conn/i, "operator"],
@@ -233,6 +235,19 @@ function RoleGear({ role }: { role: GopherRole }) {
           <rect x="50.5" y="40" width="2.6" height="3.4" fill="#6ee7aa" />
           <rect x="54.5" y="38" width="2.6" height="5.4" fill="#9fc2ff" />
           <rect x="58.5" y="35.5" width="2.6" height="7.9" fill="var(--accent, #e8c35a)" />
+        </g>
+      );
+    case "consumer": // drumstick raised to the mouth — it consumes
+      return (
+        <g className="gph-gear gph-chomp">
+          {/* meat */}
+          <ellipse cx="50" cy="38" rx="6" ry="4.6" transform="rotate(-35 50 38)" fill="#c98a4b" stroke="#8a5a28" strokeWidth="1.4" />
+          {/* bone */}
+          <line x1="54.5" y1="42" x2="60" y2="47" stroke="#f4f6fb" strokeWidth="2.6" strokeLinecap="round" />
+          <circle cx="60.5" cy="46" r="2" fill="#f4f6fb" stroke="#c8cfdd" strokeWidth=".8" />
+          <circle cx="58.5" cy="48.5" r="2" fill="#f4f6fb" stroke="#c8cfdd" strokeWidth=".8" />
+          {/* bite taken */}
+          <circle cx="47" cy="35.5" r="2.2" fill="var(--gph-tint)" />
         </g>
       );
   }
