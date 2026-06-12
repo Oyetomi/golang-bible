@@ -3,7 +3,7 @@ title: "Auth & API Design"
 part: 1
 order: 20
 type: "course"
-description: "Password hashing, sessions vs tokens, JWTs and their footguns, OAuth2/OIDC; plus REST conventions, versioning, pagination, idempotency and OpenAPI."
+description: "Password hashing, sessions vs tokens, JWTs and their footguns, OAuth2/OIDC, passkeys (WebAuthn) and MFA; plus REST conventions, versioning, pagination, idempotency and OpenAPI."
 prerequisites: ["http-servers"]
 ---
 
@@ -13,7 +13,7 @@ Listen up, because I'm only going to say this once: the most catastrophic breach
 
 You are not going to be one of those people. Not on my watch.
 
-This chapter is two disciplines in one. The **Auth half** covers password hashing done right, sessions versus stateless tokens, the full JWT machinery and every footgun bolted onto it, and OAuth2/OIDC so you stop treating "Login with Google" as magic. The **API Design half** covers REST conventions, status codes that actually mean something, versioning, pagination, idempotency, error shapes, and generating an OpenAPI contract from Go. We'll secure and design Meridian's ledger API — specifically the `POST /transfers` endpoint and the checkout auth flow — all the way through this chapter.
+This chapter is two disciplines in one. The **Auth half** covers password hashing done right, sessions versus stateless tokens, the full JWT machinery and every footgun bolted onto it, OAuth2/OIDC so you stop treating "Login with Google" as magic, and passkeys & MFA — the factors that hold when the password itself has already leaked. The **API Design half** covers REST conventions, status codes that actually mean something, versioning, pagination, idempotency, error shapes, and generating an OpenAPI contract from Go. We'll secure and design Meridian's ledger API — specifically the `POST /transfers` endpoint and the checkout auth flow — all the way through this chapter.
 
 This chapter is long because it has to be. Auth done halfway is worse than auth not done at all.
 
@@ -78,7 +78,7 @@ This chapter is long because it has to be. Auth done halfway is worse than auth 
   caption="The alg:none attack exploits libraries that trust the algorithm field from the token header. Defense: always assert the expected algorithm in your key function before returning the signing key."
 />
 
-<ChapterTabs tabs={["Password Hashing", "Email Verification", "Sessions vs Tokens", "JWTs", "Authorization and RBAC", "OAuth2 and OIDC", "REST Design", "Versioning and Pagination", "Idempotency and Errors", "OpenAPI and GraphQL"]} />
+<ChapterTabs tabs={["Password Hashing", "Email Verification", "Sessions vs Tokens", "JWTs", "Authorization and RBAC", "OAuth2 and OIDC", "Passkeys and MFA", "REST Design", "Versioning and Pagination", "Idempotency and Errors", "OpenAPI and GraphQL"]} />
 
 ---
 
@@ -1178,6 +1178,210 @@ func main() {
 	fmt.Println(url)
 }
 ```
+
+---
+
+## Passkeys and MFA
+
+Monday, 03:40. Meridian's login endpoint is suddenly handling forty thousand attempts an hour — and 0.8% of them **succeed**. Not because anything you built is broken: those are correct email-and-password pairs, harvested from some other company's breach and replayed by bots, because humans reuse passwords. This is **credential stuffing**, and it's the most humbling attack in the book: your bcrypt verification, your sessions, your JWTs all behave *exactly as designed* — and you lose anyway. The password is a secret your user already gave to a hundred other websites. You never controlled it.
+
+**On the job:** for a fintech, the second factor isn't optional hardening. The EU's PSD2 **Strong Customer Authentication** rules require two independent factors for payment actions, SOC 2 auditors ask where MFA is enforced, and your fraud team will tell you account takeover is the top loss vector. Meridian ships MFA, or Meridian doesn't operate in Europe.
+
+<Define term="Multi-factor authentication (MFA)">
+**MFA** requires proof from two or more *different categories* of factor: something you **know** (password, PIN), something you **have** (phone, hardware key), something you **are** (fingerprint, face). The category rule is the whole game: a password plus a security question is two knowledge factors — that's still single-factor authentication wearing a disguise.
+</Define>
+
+### TOTP: the offline second factor
+
+The six-digit code from Google Authenticator is a **TOTP** — a time-based one-time password. The design is twenty years old and a small masterpiece of constraint engineering. HOTP (RFC 4226, 2005) generated codes from a shared secret and a *counter*, but counters drift out of sync. TOTP (RFC 6238, 2011) made one substitution: the counter is the current Unix time divided by 30. Now both sides can compute the same code with no communication at all — the phone needs no network, no SMS, no battery beyond the clock. That's why it works in airplane mode, and why it became the default second factor for a decade.
+
+The full mechanism, end to end:
+
+1. **Enrollment.** The server generates a 20-byte random secret (`crypto/rand`, nothing less) and shows it once as a QR code encoding an `otpauth://totp/Meridian:dana@example.com?secret=BASE32...&issuer=Meridian` URI. The phone stores the secret. From this moment, server and phone share a symmetric key.
+2. **Code generation.** Both sides compute `HMAC-SHA1(secret, floor(unixTime/30))`, then *dynamically truncate*: the low nibble of the final HMAC byte picks an offset, 31 bits are read from there, and the result mod 10⁶ becomes the six digits.
+3. **Verification.** The server computes the code for the current 30-second step *and one step either side* — forgiving clock drift and slow thumbs — and compares in constant time. And it **rate-limits hard**: six digits is a million possibilities, which is brute-forceable in minutes against an unthrottled endpoint.
+
+Yes, HMAC-**SHA1** — and here, that's fine. The 2017 collision attacks that killed SHA-1 for certificates require crafting two colliding inputs; HMAC uses the hash as a keyed PRF, where collision resistance isn't the property doing the work. RFC 6238 interoperability standardized on it, and breaking TOTP via SHA-1 remains science fiction. Knowing *which* property of a primitive matters is the difference between cargo-cult crypto and engineering.
+
+The entire algorithm fits in a page of stdlib Go — run it:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/binary"
+	"fmt"
+)
+
+// totp computes an RFC 6238 code: HMAC-SHA1 over the time-step
+// counter, dynamically truncated to 6 decimal digits.
+func totp(secret []byte, unixTime int64) string {
+	counter := uint64(unixTime / 30) // 30-second time step
+
+	var msg [8]byte
+	binary.BigEndian.PutUint64(msg[:], counter)
+
+	mac := hmac.New(sha1.New, secret)
+	mac.Write(msg[:])
+	sum := mac.Sum(nil) // 20 bytes
+
+	// Dynamic truncation (RFC 4226 §5.3): the low nibble of the
+	// last byte picks an offset; read 31 bits from there.
+	off := sum[len(sum)-1] & 0x0f
+	code := binary.BigEndian.Uint32(sum[off:off+4]) & 0x7fffffff
+	return fmt.Sprintf("%06d", code%1_000_000)
+}
+
+func main() {
+	// The shared secret — provisioned once via the QR code.
+	// Real secrets: 20 random bytes from crypto/rand.
+	secret := []byte("meridian-demo-secret")
+
+	// Friday 2026-06-12, 09:00:00 UTC — payroll morning.
+	const now int64 = 1781254800
+
+	fmt.Println("server accepts any of these (skew window):")
+	for _, t := range []int64{now - 30, now, now + 30} {
+		fmt.Printf("  step %d → %s\n", t/30, totp(secret, t))
+	}
+}
+```
+
+</GoPlayground>
+
+<ExecTimeline
+  title="TOTP login: two factors, one shared secret"
+  lanes={[{ id: "server", label: "Meridian API" }, { id: "phone", label: "Authenticator app" }]}
+  steps={[
+    { lane: "server", kind: "run", label: "password verified", note: "Factor one (knowledge) passes bcrypt verification. No session yet — the login is parked in an awaiting-MFA state." },
+    { lane: "server", kind: "send", label: "prompt for code", note: "Six digits, 30-second window. The attacker with a stuffed password list stalls right here." },
+    { lane: "phone", kind: "run", label: "HMAC-SHA1(secret, now/30)", note: "Computed entirely offline — no network, no SMS. Both sides hold the secret from enrollment; the clock is the only message." },
+    { lane: "phone", kind: "send", label: "user types 196 119", note: "The exact code the playground above computes for this time step. Possession proven — to whoever asked. Hold that thought for the phishing discussion." },
+    { lane: "server", kind: "run", label: "compare T-1, T, T+1 in constant time", note: "The skew window forgives clock drift and slow thumbs. Rate-limit attempts brutally: one million codes is nothing against an unthrottled endpoint." },
+    { lane: "server", kind: "done", label: "session upgraded", note: "The session records mfa=true and the auth time — step-up checks will read both later." }
+  ]}
+  caption="TOTP adds a possession factor with zero network dependency — the elegance that made it the default second factor for a decade."
+/>
+
+Two storage rules that separate the adults from the amateurs. The TOTP secret is **symmetric** — the server must *recompute* codes, so unlike a password hash it must be recoverable: encrypt it at rest (AES-GCM under a KMS-managed key; Part 3's security chapter does this properly) rather than hashing it. **Recovery codes** — the eight one-time codes you hand the user at enrollment — are the opposite: they *are* passwords, so store them hashed like passwords, and burn each one on use.
+
+### Where TOTP dies
+
+Now the uncomfortable part. A pixel-perfect phishing page at `meridian-payments.app` proxies your real login in real time: the victim types their password *and* their fresh TOTP code into the wrong website, the attacker's script replays both against the real `meridian.app` within the 30-second window, and the session is gone. TOTP proved possession — **to whoever asked**. The human is the origin check, and humans fail origin checks at 3am.
+
+The other second factors fare no better. **SMS** is strictly worse: SIM-swap attacks and SS7 interception led NIST SP 800-63B to restrict it back in 2017 — in a fintech context, treat SMS codes as a legacy liability. **Push approvals** ("Tap to approve this login") die to **MFA fatigue**: bomb the victim's phone with prompts at 2am until they tap Approve to make it stop — that's how Uber's internal network fell in 2022. Number-matching patches it, but the pattern stands: every factor a human can relay, a human can be tricked into relaying.
+
+### Passkeys: making phishing structurally impossible
+
+The fix is to take the human out of the trust path entirely. The lineage: hardware **U2F** keys (Yubico and Google, 2014) proved that challenge-response with per-site keys kills phishing; **FIDO2/WebAuthn** (a W3C standard, 2019) built that ceremony into every browser; **passkeys** (2022 onward) made the same WebAuthn credential discoverable and synced through iCloud Keychain / Google Password Manager, so ordinary humans get hardware-key security without ever seeing a USB stick. As of 2026, every mainstream browser and OS ships it.
+
+<Define term="Passkey (WebAuthn credential)">
+A **passkey** is an asymmetric keypair minted by the user's device for exactly one website. The private key lives in the platform authenticator (Secure Enclave, TPM, or a synced keychain) and never leaves; the server stores only the public key. Login is challenge-response: the server sends fresh random bytes, the device signs them after a biometric/PIN unlock, the server verifies with the stored public key. There is no shared secret to steal, stuff, or phish.
+</Define>
+
+Two ceremonies, both brokered by the browser's `navigator.credentials` API:
+
+- **Registration.** The server sends a random challenge plus its **rpID** (`meridian.app`). The authenticator mints a keypair *scoped to that rpID*, seals the private key, and returns a credential ID and the public key. The server stores both, plus a signature counter.
+- **Authentication.** The server sends a fresh challenge; the user unlocks the authenticator with Face ID or a PIN — note that this single gesture combines *possession* (the device) with *inherence or knowledge* (the biometric/PIN), which is two factor categories in one motion, PSD2-grade SCA included. The authenticator signs, and the server verifies.
+
+Here is the load-bearing detail, the one that makes the whole design phishing-proof — read it twice. Before anything is signed, the **browser** — not the page's JavaScript, not the user — writes the page's *actual origin* into the `clientDataJSON` structure that gets signed. On the phishing domain, one of two things happens: the browser finds no credential scoped to `meridian-payments.app`, so the passkey prompt simply never offers the Meridian credential — or any signature produced binds the *wrong origin*, and your server rejects it. There is no code for the victim to retype into the wrong box. TOTP asks the *user* to verify the origin; WebAuthn asks the *browser*. Browsers don't get tired at 2am.
+
+And the breach math inverts: a stolen Meridian credentials table now contains only public keys — useless to stuff anywhere — and because every site gets its own keypair, nothing is reusable across sites in either direction.
+
+<ExecTimeline
+  title="Passkey login — why the phishing site gets nothing"
+  lanes={[{ id: "server", label: "Meridian API" }, { id: "browser", label: "Browser" }, { id: "auth", label: "Authenticator" }]}
+  steps={[
+    { lane: "server", kind: "send", label: "challenge + rpID", note: "32 fresh random bytes, single-use, stored server-side against this login attempt." },
+    { lane: "browser", kind: "run", label: "navigator.credentials.get", note: "The browser owns the ceremony from here — page JavaScript hands over the options and never touches key material." },
+    { lane: "auth", kind: "block", label: "Face ID / PIN unlock", note: "User presence + verification. Possession and inherence in one gesture; the private key never leaves the Secure Enclave or synced keychain." },
+    { lane: "auth", kind: "run", label: "sign(challenge, origin, rpID hash)", note: "The browser wrote the page's REAL origin into clientDataJSON before signing. The page cannot lie about where it is running." },
+    { lane: "browser", kind: "send", label: "assertion → server", note: "Signature + authenticatorData + clientDataJSON travel back. Nothing here is a secret — replaying it fails the next fresh challenge." },
+    { lane: "server", kind: "run", label: "verify with stored public key", note: "Checks: challenge matches and is unused, origin equals https://meridian.app, rpID hash matches, signature valid." },
+    { lane: "server", kind: "done", label: "session upgraded, mfa=true", note: "On a phishing domain the signature binds the wrong origin — verification fails with zero effort from the user. That is the entire trick." }
+  ]}
+  caption="The browser, not the human, attests to the origin. A pixel-perfect fake site produces either no credential prompt or an unusable signature."
+/>
+
+In Go, the de-facto standard library is `github.com/go-webauthn/webauthn` — it implements the verification rules so you don't hand-roll CBOR parsing and signature checks. The shape of the server side (browser interaction elided — this needs a real frontend, so it's a sketch, not a playground):
+
+```go
+import "github.com/go-webauthn/webauthn/webauthn"
+
+wa, err := webauthn.New(&webauthn.Config{
+	RPDisplayName: "Meridian",
+	RPID:          "meridian.app", // every credential is scoped to this
+	RPOrigins:     []string{"https://meridian.app"},
+})
+
+// ── Registration ceremony ──
+func beginRegistration(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r) // your type implementing webauthn.User
+	options, session, err := wa.BeginRegistration(user)
+	if err != nil { /* 500 */ }
+	saveCeremonySession(r, session) // the challenge you expect back
+	writeJSON(w, options)           // → navigator.credentials.create
+}
+
+func finishRegistration(w http.ResponseWriter, r *http.Request) {
+	user, session := currentUser(r), loadCeremonySession(r)
+	cred, err := wa.FinishRegistration(user, session, r)
+	if err != nil { /* 400: bad origin, stale challenge, bad sig */ }
+	// Persist: credential ID + public key + sign counter.
+	storeCredential(user.ID, cred)
+}
+
+// Login mirrors it: wa.BeginLogin issues the challenge,
+// wa.FinishLogin verifies the assertion against stored public keys.
+```
+
+One nuance the library surfaces: the **signature counter**. Hardware keys increment it on every use, so a counter that goes *backwards* betrays a cloned key. Synced passkeys legitimately report zero forever — so treat a *decrease* as the alarm, not a zero.
+
+### Step-up authentication
+
+MFA isn't a login-time binary; it's a freshness property. The session (or JWT claims — you built both earlier in this chapter) records *how* the user authenticated and *when*. Reading a balance can ride a day-old session; moving $25,000 should demand strong auth from the last few minutes:
+
+```go
+func requireFreshMFA(maxAge time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sess := sessionFrom(r.Context())
+		if !sess.MFA || time.Since(sess.AuthTime) > maxAge {
+			// 403 + machine-readable code, per our error envelope:
+			// the client knows to re-prompt the passkey, not re-login.
+			writeError(w, http.StatusForbidden, "step_up_required",
+				"fresh strong authentication required for this action")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+This composes exactly like the `requirePermission` middleware from the RBAC section — authorization asked *may you*; step-up asks *is it really, recently you*.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="SMS codes">Phishable, SIM-swappable, SS7-interceptable. NIST has restricted them since 2017. In a fintech, an SMS-only second factor is a finding, not a feature.</ConceptCard>
+  <ConceptCard label="TOTP">Offline, cheap, standardized — and relayable in real time by a proxy phishing page. Encrypt the secret at rest (it must be recoverable); hash the recovery codes (they are passwords); rate-limit verification.</ConceptCard>
+  <ConceptCard label="Push approvals">One tap at 2am under prompt-bombing and the account is gone — MFA fatigue took down Uber in 2022. Number-matching helps; the human relay problem remains.</ConceptCard>
+  <ConceptCard label="Passkeys">Per-origin keypairs; the browser signs the true origin into the ceremony. Phishing fails structurally, breaches leak only public keys, and one biometric gesture covers two factor categories.</ConceptCard>
+  <Gotcha>Account recovery is the new perimeter. An email-only reset flow that quietly disables MFA converts your entire factor stack back into "password, but with extra steps" — the attacker just clicks Forgot Password. Recovery must cost at least as much as the factor it replaces: recovery codes, a second registered passkey, or a manual review queue.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="A pixel-perfect phishing site proxies Meridian's real login in real time. It captures the victim's password and TOTP code and replays both within the 30-second window — account stolen. Why does the same attack yield nothing against a passkey?"
+  options={[
+    "Passkey signatures are too long for the attacker to retype",
+    "The browser binds the page's true origin into the signed clientDataJSON, so the phishing domain produces no usable credential or an unverifiable signature",
+    "Passkeys are rate-limited to one login per minute",
+    "The TLS connection encrypts the passkey so the proxy cannot read it"
+  ]}
+  answer={1}
+  explain="TOTP can be phished because the user relays a code to whoever asks — the human is the origin check. In WebAuthn, the browser writes the actual origin into clientDataJSON before the authenticator signs, and credentials are scoped to the rpID. On the fake domain the Meridian passkey is either never offered, or the signature binds the wrong origin and the server rejects it. There is nothing for the victim to retype and no decision for them to get wrong."
+/>
 
 ---
 
@@ -2435,6 +2639,8 @@ You now have both halves of auth and API design locked down for Meridian's `POST
 - JWT footguns: the `alg:none` attack (always validate the algorithm in the key function), weak secrets (32+ bytes of entropy for HS256), missing `exp` (always set expiry; short-lived access + long-lived revocable refresh tokens). Use `errors.Is(err, jwt.ErrTokenExpired)` — or `errors.AsType[T]` (new in Go 1.26) — to distinguish expiry from other parse failures.
 - **Authentication ≠ authorization.** Authn = *who you are* (fail → 401); authz = *what you may do* (fail → 403). **Permission-based RBAC**: define capability codes (`transactions:read`, `transactions:write`), grant users a set (via roles), and gate each endpoint with one `requirePermission(code, handler)` middleware that returns 403 when the code is absent. Look permissions up server-side; don't trust a stale set baked into a long-lived token. Least privilege by default.
 - **OAuth2 authorization-code flow**: the user authenticates with the provider directly; you exchange a short-lived code for tokens. Never skip the `state` CSRF parameter. With OIDC, use the `sub` claim as the stable user identifier — not email.
+- **MFA**: factors are *categories* — knowledge, possession, inherence — and two of the same category is still one factor. **TOTP** = HMAC-SHA1 over `floor(unixTime/30)` from a shared secret: offline and cheap, but relayable by a real-time phishing proxy and brute-forceable without rate limits. Encrypt the secret at rest (it must be recoverable); hash the recovery codes (they are passwords). SMS is NIST-restricted; push approvals fall to MFA fatigue.
+- **Passkeys (WebAuthn)**: per-origin keypairs in the platform authenticator; the *browser* signs the page's true origin into `clientDataJSON`, so phishing fails structurally and a breached credentials table holds only public keys. One biometric gesture = possession + inherence (PSD2-grade SCA). **Step-up auth** re-demands fresh strong auth before high-value actions like big transfers — and account recovery must cost as much as the factor it replaces.
 - **CSRF** abuses ambient cookies, so it hits **cookie/session** auth — a `Authorization: Bearer` header API is largely immune. Defenses: `SameSite=Strict`/`Lax` cookies first, `net/http.CrossOriginProtection` (Go 1.25+) for Fetch-metadata checks, and a synchronizer/double-submit token for legacy-browser defense-in-depth. Never put a state change behind a `GET`.
 
 **API Design:**
@@ -2454,6 +2660,7 @@ You now have both halves of auth and API design locked down for Meridian's `POST
     { label: "Quick check — why not SHA-256 for passwords", kind: "quiz", points: 10, done: false },
     { label: "Quick check — alg:none JWT attack", kind: "quiz", points: 10, done: false },
     { label: "Quick check — cursor vs offset pagination", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — why passkeys defeat phishing", kind: "quiz", points: 10, done: false },
     { label: "Exercise 1 — bcrypt round-trip", kind: "exercise", points: 10, done: false },
     { label: "Exercise 2 — JWT with expiry", kind: "exercise", points: 20, done: false },
     { label: "Exercise 3 — Idempotency middleware", kind: "exercise", points: 20, done: false },
