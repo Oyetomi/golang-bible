@@ -337,7 +337,7 @@ export function ExecTimeline({
                     className={`xt-pill xt-${s.kind ?? "run"}`}
                     title={s.label}
                   >
-                    {KIND_GLYPH[s.kind ?? "run"]}
+                    {KIND_GLYPH[s.kind ?? "run"] ?? "▸"}
                   </span>
                 ))}
                 {current && (
@@ -347,7 +347,7 @@ export function ExecTimeline({
                     className={`xt-card xt-${current.s.kind ?? "run"}`}
                   >
                     <span className="xt-card-k">
-                      {KIND_LABEL[current.s.kind ?? "run"]}
+                      {KIND_LABEL[current.s.kind ?? "run"] ?? current.s.kind}
                     </span>
                     <span className="xt-card-l">{current.s.label}</span>
                   </span>
