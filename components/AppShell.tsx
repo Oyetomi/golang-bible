@@ -50,7 +50,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       >
         {collapsed ? "»" : "«"}
       </button>
-      <main className="content">{children}</main>
+      <main className="content">
+        {children}
+        <footer className="site-foot">
+          Gopher mascot inspired by the Go gopher, designed by{" "}
+          <a href="https://reneefrench.blogspot.com/" target="_blank" rel="noreferrer">
+            Renée French
+          </a>{" "}
+          (CC BY 4.0).
+        </footer>
+      </main>
       <CodeEnhancer />
       <Search />
       <Ribbon />

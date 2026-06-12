@@ -1,5 +1,6 @@
 import * as S from "@/components/course/server";
 import * as C from "@/components/course/client";
+import * as A from "@/components/course/anim";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -16,6 +17,21 @@ export const mdxComponents = {
   // Visual explainers
   ExecTimeline: C.ExecTimeline,
   Scene: C.Scene,
+  // Bespoke, chapter-tailored animations (gopher-driven)
+  ChannelAnim: A.ChannelAnim,
+  SchedulerAnim: A.SchedulerAnim,
+  GCAnim: A.GCAnim,
+  SliceAnim: A.SliceAnim,
+  LockAnim: A.LockAnim,
+  LedgerAnim: A.LedgerAnim,
+  JourneyAnim: A.JourneyAnim,
+  AlgoGrid: A.AlgoGrid,
+  MapAnim: A.MapAnim,
+  StackHeapAnim: A.StackHeapAnim,
+  GraphAnim: A.GraphAnim,
+  CacheAnim: A.CacheAnim,
+  CircuitAnim: A.CircuitAnim,
+  PoolAnim: A.PoolAnim,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
   Gotcha: S.Gotcha,
