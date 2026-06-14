@@ -1,0 +1,1540 @@
+---
+title: "Project: A DNS Resolver"
+part: "appendix"
+order: 21
+type: "project"
+description: "Build a DNS resolver from scratch in Go: model A/AAAA/CNAME/MX/TXT records and a zone store, resolve names through the lookup chain, add a TTL cache that expires entries, validate records, detect CNAME cycles, serve a zone transfer (AXFR-style), and format results dig-style — every stage runnable and stdlib-only."
+prerequisites: ["security-tooling-in-go"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Project" title="Project: A DNS Resolver">
+
+Here's the thing, sport. Every website you have ever opened started with a question you never saw asked: *what IP address is hiding behind this name?* A name like `api.example.com` is for humans. The network moves packets by IP — `93.184.216.34` — and the thing that translates one into the other is a **DNS resolver**. It runs billions of times a second, under every request on Earth, and almost nobody who relies on it could tell you how it works.
+
+You're going to build one. Not a toy that calls `net.LookupHost` and shrugs — the actual machinery: a record model, a zone store, the recursive lookup chain that walks from the root of the internet down to the authoritative server, a TTL cache that expires entries on a clock, CNAME resolution with **cycle detection** so a misconfigured alias can't loop you forever, a zone transfer that dumps an entire zone, and a `dig`-style formatter so your output looks like the tool the pros actually use. Every stage is runnable, stdlib-only, and built on top of the last. By the end you'll never look at a slow page load the same way again — you'll know exactly which lookup is to blame.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Lookup Chain", "Stage 1 · Records & the Zone", "Stage 2 · Resolving a Name", "Stage 3 · The TTL Cache", "Stage 4 · CNAMEs & Cycle Detection", "Stage 5 · Zone Transfer", "Stage 6 · dig-Style Output", "The Lab"]} />
+
+## The Lookup Chain
+
+Before any code, the mental model. No single machine knows every domain on the internet — that would be impossible to keep current. Instead the answer is found by walking a **chain** of servers, each one pointing you closer to the source.
+
+<Define term="DNS record / zone / resolver" since="Networking & Web Fundamentals (Part 1)">
+A **DNS record** maps a name to a value — most commonly an **A** record (name → IPv4 address). A **zone** is the set of records one server is authoritative for (e.g. everything under `example.com`). A **resolver** is the client-side machinery that, given a name and a record type, finds the answer — either from its **cache** or by walking the lookup chain to an **authoritative** server. The record's **TTL** (time-to-live, in seconds) says how long the answer may be cached before it must be looked up again.
+</Define>
+
+<ExecTimeline
+  title="Resolving api.example.com — root → TLD → authoritative"
+  lanes={[
+    { id: "stub", label: "your resolver", role: "detective" },
+    { id: "root", label: "root server", role: "leader" },
+    { id: "tld", label: ".com TLD", role: "operator" },
+    { id: "auth", label: "example.com authoritative", role: "librarian" }
+  ]}
+  steps={[
+    { lane: "stub", kind: "run", label: "need A for api.example.com", note: "Your resolver has nothing cached. It starts at the top of the chain — the only address it knows by heart is a root server's." },
+    { lane: "stub", kind: "send", label: "ask root: where is .com?", note: "The root doesn't know api.example.com. It knows who runs each top-level domain." },
+    { lane: "root", kind: "send", label: "ask the .com servers", note: "The root replies with a referral: 'I don't have the answer, but the .com TLD servers do. Here's how to reach them.'" },
+    { lane: "stub", kind: "send", label: "ask .com: where is example.com?", note: "Your resolver follows the referral and asks the .com TLD servers." },
+    { lane: "tld", kind: "send", label: "ask example.com's authoritative server", note: "The TLD doesn't have the A record either — but it knows which server is authoritative for example.com. Another referral, one step closer." },
+    { lane: "stub", kind: "send", label: "ask authoritative: A for api.example.com?", note: "Now your resolver asks the server that actually owns the zone." },
+    { lane: "auth", kind: "send", label: "A 93.184.216.34, TTL 300", note: "The authoritative server holds the record. It answers with the IP and a TTL — 300 seconds — that says how long you may cache it." },
+    { lane: "stub", kind: "done", label: "cache + return 93.184.216.34", note: "Your resolver caches the answer for its TTL and hands the IP back to the caller. The next lookup within 5 minutes skips the whole chain." }
+  ]}
+  caption="No server knows everything. The root knows the TLDs, the TLD knows the zones, the zone knows the records. Each hop is a referral pointing one level closer — and the answer, once found, is cached for its TTL."
+/>
+
+This chapter builds that machine bottom-up. We start with the thing at the *end* of the chain — the zone that actually holds records — then add the resolver, the cache, CNAME handling, zone transfer, and finally the output formatter. Six stages, each runnable on its own.
+
+---
+
+## Stage 1 · Records & the Zone
+
+A zone is a store of records keyed by name. We model a `Record` (name, type, value, TTL) and a `Zone` that holds them and answers lookups by name **and** type — because one name can carry several records (an `A` and an `MX` and a `TXT`, say).
+
+```go
+package main
+
+import "fmt"
+
+// RecordType is the kind of a DNS record. A maps a name to an IPv4 address;
+// AAAA to IPv6; CNAME aliases one name to another; MX names a mail server;
+// TXT carries arbitrary text (SPF, domain verification, …).
+type RecordType string
+
+const (
+	TypeA     RecordType = "A"
+	TypeAAAA  RecordType = "AAAA"
+	TypeCNAME RecordType = "CNAME"
+	TypeMX    RecordType = "MX"
+	TypeTXT   RecordType = "TXT"
+)
+
+// Record is a single DNS record. TTL is in seconds — how long an answer
+// may be cached before it must be looked up again.
+type Record struct {
+	Name  string
+	Type  RecordType
+	Value string
+	TTL   int
+}
+
+// Zone is an authoritative store of records for one origin (e.g. example.com).
+// Records are indexed by name; a name can hold several records of different types.
+type Zone struct {
+	Origin  string
+	records map[string][]Record
+}
+
+func NewZone(origin string) *Zone {
+	return &Zone{Origin: origin, records: map[string][]Record{}}
+}
+
+// AddRecord stores a record under its name.
+func (z *Zone) AddRecord(r Record) {
+	z.records[r.Name] = append(z.records[r.Name], r)
+}
+
+// Lookup returns every record matching the name AND the query type.
+// A query type of "" matches any type (used by zone transfer later).
+func (z *Zone) Lookup(name string, qtype RecordType) []Record {
+	var out []Record
+	for _, r := range z.records[name] {
+		if qtype == "" || r.Type == qtype {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func main() {
+	zone := NewZone("example.com")
+	zone.AddRecord(Record{Name: "api.example.com", Type: TypeA, Value: "93.184.216.34", TTL: 300})
+	zone.AddRecord(Record{Name: "api.example.com", Type: TypeTXT, Value: "v=spf1 -all", TTL: 3600})
+	zone.AddRecord(Record{Name: "cdn.example.com", Type: TypeCNAME, Value: "d1234.cloudfront.net", TTL: 3600})
+
+	fmt.Printf("zone %q holds records for %d names\n", zone.Origin, len(zone.records))
+
+	for _, r := range zone.Lookup("api.example.com", TypeA) {
+		fmt.Printf("  %s %s -> %s (TTL %ds)\n", r.Name, r.Type, r.Value, r.TTL)
+	}
+	for _, r := range zone.Lookup("api.example.com", TypeTXT) {
+		fmt.Printf("  %s %s -> %q (TTL %ds)\n", r.Name, r.Type, r.Value, r.TTL)
+	}
+}
+```
+
+<CodeWalk
+  title="The record model and the zone store"
+  steps={[
+    { lines: "5-13", note: "RecordType is a string-typed enum of the record kinds. A/AAAA are addresses, CNAME is an alias, MX names a mail server, TXT is free text. Modeling it as a named type (not a bare string) means the compiler catches a typo'd type at the call site.", pose: "scribe", role: "librarian", state: "active", beat: "neutral" },
+    { lines: "15-20", note: "Record is one DNS record: a name, a type, a value, and a TTL in seconds. The TTL is the whole reason caching works — it's the record owner telling every resolver how long the answer stays fresh.", pose: "carry", role: "librarian", state: "active", beat: "neutral" },
+    { lines: "22-33", note: "Zone indexes records by name in a map. The slice value matters: one name (api.example.com) can hold several records — an A and a TXT here — so a name maps to a list, not a single record.", pose: "guard", role: "librarian", state: "ok", beat: "solution" },
+    { lines: "35-43", note: "Lookup filters by name AND type. A query for A on api.example.com returns just the address, not the TXT. The empty-type case (qtype == \"\") matches everything — we'll reuse that for the zone transfer in Stage 5.", pose: "detective", role: "detective", state: "ok", beat: "solution" },
+    { lines: "45-58", note: "Build a zone, add three records (two share a name), and look them up by type. len(zone.records) is 2 — it counts distinct names, and api.example.com's A and TXT live under one key.", pose: "happy", role: "librarian", state: "done", beat: "solution" }
+  ]}
+  caption="A zone is a map from name to a slice of records. Lookup filters by name and type. This is the authoritative store at the bottom of the lookup chain — everything else in the chapter sits on top of it."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+type RecordType string
+
+const (
+	TypeA     RecordType = "A"
+	TypeAAAA  RecordType = "AAAA"
+	TypeCNAME RecordType = "CNAME"
+	TypeMX    RecordType = "MX"
+	TypeTXT   RecordType = "TXT"
+)
+
+type Record struct {
+	Name  string
+	Type  RecordType
+	Value string
+	TTL   int
+}
+
+type Zone struct {
+	Origin  string
+	records map[string][]Record
+}
+
+func NewZone(origin string) *Zone {
+	return &Zone{Origin: origin, records: map[string][]Record{}}
+}
+
+func (z *Zone) AddRecord(r Record) {
+	z.records[r.Name] = append(z.records[r.Name], r)
+}
+
+func (z *Zone) Lookup(name string, qtype RecordType) []Record {
+	var out []Record
+	for _, r := range z.records[name] {
+		if qtype == "" || r.Type == qtype {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func main() {
+	zone := NewZone("example.com")
+	zone.AddRecord(Record{Name: "api.example.com", Type: TypeA, Value: "93.184.216.34", TTL: 300})
+	zone.AddRecord(Record{Name: "api.example.com", Type: TypeTXT, Value: "v=spf1 -all", TTL: 3600})
+	zone.AddRecord(Record{Name: "cdn.example.com", Type: TypeCNAME, Value: "d1234.cloudfront.net", TTL: 3600})
+
+	fmt.Printf("zone %q holds records for %d names\n", zone.Origin, len(zone.records))
+
+	for _, r := range zone.Lookup("api.example.com", TypeA) {
+		fmt.Printf("  %s %s -> %s (TTL %ds)\n", r.Name, r.Type, r.Value, r.TTL)
+	}
+	for _, r := range zone.Lookup("api.example.com", TypeTXT) {
+		fmt.Printf("  %s %s -> %q (TTL %ds)\n", r.Name, r.Type, r.Value, r.TTL)
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<QuickCheck
+  question="Why does the Zone index records as map[string][]Record (a slice value) rather than map[string]Record (a single record)?"
+  options={[
+    "Slices are faster to look up than single structs",
+    "One name can hold several records — different types (A, MX, TXT) or multiple addresses — so a name must map to a list",
+    "Go maps require slice values",
+    "It avoids copying the Record struct on lookup"
+  ]}
+  answer={1}
+  explain="A single DNS name routinely carries multiple records: an A and an AAAA for dual-stack, several A records for load balancing, plus MX and TXT. The zone must return all matching records for a (name, type) query, so each name maps to a slice."
+/>
+
+---
+
+## Stage 2 · Resolving a Name
+
+The zone answers within itself. A **resolver** is the layer above: it takes a name and a type, and returns the answer — for now, straight from a zone, but with the shape that the cache and CNAME logic will slot into next. We also add the lookup chain in miniature: a resolver that holds **several** zones (root, the TLD, the authoritative zone) and follows delegation from one to the next.
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+// Resolver holds a set of authoritative zones keyed by origin, plus the order
+// to consult them — the in-memory stand-in for the root → TLD → authoritative
+// chain. A real resolver would follow NS referrals over the network; here we
+// model delegation by picking the most specific zone that owns the name.
+type Resolver struct {
+	zones map[string]map[string][]Record // origin -> name -> records
+}
+
+func NewResolver() *Resolver {
+	return &Resolver{zones: map[string]map[string][]Record{}}
+}
+
+func (r *Resolver) AddZone(origin string) {
+	r.zones[origin] = map[string][]Record{}
+}
+
+func (r *Resolver) AddRecord(origin string, rec Record) {
+	r.zones[origin][rec.Name] = append(r.zones[origin][rec.Name], rec)
+}
+
+// zoneFor returns the most specific zone origin that the name falls under —
+// the delegation step. "api.example.com" prefers the "example.com" zone over
+// the "com" zone over the root ".".
+func (r *Resolver) zoneFor(name string) string {
+	best := ""
+	for origin := range r.zones {
+		if origin == "." || name == origin || strings.HasSuffix(name, "."+origin) {
+			if len(origin) > len(best) {
+				best = origin
+			}
+		}
+	}
+	return best
+}
+
+// Resolve walks to the zone that owns the name and returns matching records.
+func (r *Resolver) Resolve(name, qtype string) ([]Record, error) {
+	origin := r.zoneFor(name)
+	if origin == "" {
+		return nil, fmt.Errorf("no zone authoritative for %q", name)
+	}
+	var out []Record
+	for _, rec := range r.zones[origin][name] {
+		if rec.Type == qtype {
+			out = append(out, rec)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("NXDOMAIN: no %s record for %q (zone %q)", qtype, name, origin)
+	}
+	return out, nil
+}
+
+func main() {
+	res := NewResolver()
+	res.AddZone("example.com")
+	res.AddZone("com")
+	res.AddRecord("example.com", Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+	res.AddRecord("example.com", Record{Name: "www.example.com", Type: "A", Value: "93.184.216.35", TTL: 300})
+
+	for _, q := range []string{"api.example.com", "www.example.com", "ghost.example.com"} {
+		recs, err := res.Resolve(q, "A")
+		if err != nil {
+			fmt.Printf("%-22s -> %v\n", q, err)
+			continue
+		}
+		fmt.Printf("%-22s -> %s (zone %q)\n", q, recs[0].Value, res.zoneFor(q))
+	}
+}
+```
+
+<CodeWalk
+  title="A resolver that follows delegation to the owning zone"
+  steps={[
+    { lines: "13-27", note: "Resolver holds several zones keyed by origin — the in-memory model of the root/TLD/authoritative chain. AddZone and AddRecord populate them. A real resolver follows NS referrals over UDP; the delegation logic is the same shape.", pose: "scribe", role: "detective", state: "active", beat: "neutral" },
+    { lines: "29-39", note: "zoneFor is the delegation step: of all zones that could own the name, pick the MOST SPECIFIC. api.example.com falls under both 'com' and 'example.com'; the longer-suffix match (example.com) wins, just as the real chain ends at the most specific authoritative server.", pose: "detective", role: "detective", state: "ok", beat: "solution" },
+    { lines: "41-56", note: "Resolve finds the owning zone, then filters its records by type. No zone owns the name -> error (the resolver has no one to ask). Zone owns the name but no matching record -> NXDOMAIN, the real DNS 'no such record' answer.", pose: "guard", role: "detective", state: "ok", beat: "solution" },
+    { lines: "58-72", note: "Two real names resolve to their addresses; ghost.example.com falls under the zone but has no A record, so you get a clean NXDOMAIN instead of an empty success. Distinguishing 'no zone' from 'no record' is exactly what real resolvers do.", pose: "happy", role: "detective", state: "done", beat: "solution" }
+  ]}
+  caption="The resolver picks the most specific zone that owns the name (delegation), then looks the record up there. 'No zone' and 'no record' are different failures — and a real resolver reports them differently, just like this."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type Resolver struct {
+	zones map[string]map[string][]Record
+}
+
+func NewResolver() *Resolver {
+	return &Resolver{zones: map[string]map[string][]Record{}}
+}
+
+func (r *Resolver) AddZone(origin string) {
+	r.zones[origin] = map[string][]Record{}
+}
+
+func (r *Resolver) AddRecord(origin string, rec Record) {
+	r.zones[origin][rec.Name] = append(r.zones[origin][rec.Name], rec)
+}
+
+func (r *Resolver) zoneFor(name string) string {
+	best := ""
+	for origin := range r.zones {
+		if origin == "." || name == origin || strings.HasSuffix(name, "."+origin) {
+			if len(origin) > len(best) {
+				best = origin
+			}
+		}
+	}
+	return best
+}
+
+func (r *Resolver) Resolve(name, qtype string) ([]Record, error) {
+	origin := r.zoneFor(name)
+	if origin == "" {
+		return nil, fmt.Errorf("no zone authoritative for %q", name)
+	}
+	var out []Record
+	for _, rec := range r.zones[origin][name] {
+		if rec.Type == qtype {
+			out = append(out, rec)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("NXDOMAIN: no %s record for %q (zone %q)", qtype, name, origin)
+	}
+	return out, nil
+}
+
+func main() {
+	res := NewResolver()
+	res.AddZone("example.com")
+	res.AddZone("com")
+	res.AddRecord("example.com", Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+	res.AddRecord("example.com", Record{Name: "www.example.com", Type: "A", Value: "93.184.216.35", TTL: 300})
+
+	for _, q := range []string{"api.example.com", "www.example.com", "ghost.example.com"} {
+		recs, err := res.Resolve(q, "A")
+		if err != nil {
+			fmt.Printf("%-22s -> %v\n", q, err)
+			continue
+		}
+		fmt.Printf("%-22s -> %s (zone %q)\n", q, recs[0].Value, res.zoneFor(q))
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## Stage 3 · The TTL Cache
+
+Walking the whole chain for every lookup would melt the internet. The fix is the **cache**: once a record is found, store it for its TTL and serve the next request straight from memory. When the TTL elapses, the entry is **stale** and must be looked up again. This is the same TTL-cache pattern as the Pokedex project (Part 1) and the caching chapter — here keyed by DNS name and expiring on the record's own TTL.
+
+<Scene
+  title="Cache: miss → fill → hit → expire → re-fill"
+  actors={[
+    { id: "res", label: "resolver", role: "detective" },
+    { id: "cache", label: "TTL cache", role: "timekeeper" },
+    { id: "auth", label: "authoritative", role: "librarian" }
+  ]}
+  rows={1}
+  cols={4}
+  frames={[
+    {
+      caption: "First lookup of api.example.com: the cache is empty — a MISS. The resolver walks the chain to the authoritative server.",
+      beat: "problem",
+      actors: [{ id: "res", state: "active" }, { id: "cache", state: "warn" }, { id: "auth", state: "active" }],
+      cells: [{ id: "A1", state: "bad", label: "MISS" }, { id: "A2", state: "active", label: "→ auth" }, { id: "A3", state: "idle", label: "" }, { id: "A4", state: "idle", label: "" }]
+    },
+    {
+      caption: "The authoritative server answers A 93.184.216.34, TTL 300. The cache stores it with an expiry 300s in the future.",
+      beat: "solution",
+      actors: [{ id: "cache", state: "ok" }, { id: "auth", state: "done" }],
+      cells: [{ id: "A1", state: "done", label: "fill" }, { id: "A2", state: "done", label: "exp=+300s" }, { id: "A3", state: "idle", label: "" }, { id: "A4", state: "idle", label: "" }]
+    },
+    {
+      caption: "Next lookup, 10s later: the entry is fresh — a HIT. The answer comes straight from memory; the chain is never touched.",
+      beat: "solution",
+      actors: [{ id: "res", state: "ok" }, { id: "cache", state: "done" }],
+      cells: [{ id: "A1", state: "done", label: "HIT" }, { id: "A2", state: "done", label: "from cache" }, { id: "A3", state: "done", label: "0 network" }, { id: "A4", state: "idle", label: "" }]
+    },
+    {
+      caption: "301s later: the entry has expired — stale, evicted. The next lookup is a MISS again and re-walks the chain. TTL is the contract that keeps cached answers honest.",
+      beat: "problem",
+      actors: [{ id: "cache", state: "bad" }, { id: "res", state: "active" }],
+      cells: [{ id: "A1", state: "bad", label: "EXPIRED" }, { id: "A2", state: "warn", label: "evict" }, { id: "A3", state: "active", label: "MISS" }, { id: "A4", state: "active", label: "re-fill" }]
+    }
+  ]}
+  caption="A cache hit skips the entire lookup chain. The TTL is the record owner's promise about how long the answer stays valid — honor it, and you're fast and correct; ignore it, and you serve stale addresses after a failover."
+/>
+
+We inject a clock as a `func() time.Time` so the cache is deterministic in tests — fast-forward time instead of sleeping, the discipline from the **Time, Clocks & Timers** chapter.
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type entry struct {
+	record  Record
+	expires time.Time
+}
+
+// Cache stores records until their TTL elapses. The clock is injected so tests
+// can fast-forward time instead of sleeping.
+type Cache struct {
+	now     func() time.Time
+	entries map[string]entry // key: name|type
+}
+
+func NewCache(now func() time.Time) *Cache {
+	return &Cache{now: now, entries: map[string]entry{}}
+}
+
+func key(name, qtype string) string { return name + "|" + qtype }
+
+// Get returns the cached record if present AND still fresh. A stale entry is
+// treated as a miss (and lazily deleted) — the TTL has expired.
+func (c *Cache) Get(name, qtype string) (Record, bool) {
+	e, ok := c.entries[key(name, qtype)]
+	if !ok {
+		return Record{}, false
+	}
+	if !c.now().Before(e.expires) { // now >= expires -> stale
+		delete(c.entries, key(name, qtype))
+		return Record{}, false
+	}
+	return e.record, true
+}
+
+// Put stores a record with an expiry computed from its TTL.
+func (c *Cache) Put(r Record) {
+	c.entries[key(r.Name, r.Type)] = entry{
+		record:  r,
+		expires: c.now().Add(time.Duration(r.TTL) * time.Second),
+	}
+}
+
+func main() {
+	// A controllable clock: a pointer we advance by hand.
+	clock := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	cache := NewCache(func() time.Time { return clock })
+
+	cache.Put(Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+
+	// t+10s: still fresh — HIT.
+	clock = clock.Add(10 * time.Second)
+	if r, ok := cache.Get("api.example.com", "A"); ok {
+		fmt.Printf("t+10s   HIT  -> %s\n", r.Value)
+	}
+
+	// t+301s: TTL was 300 — now stale, MISS.
+	clock = clock.Add(291 * time.Second)
+	if _, ok := cache.Get("api.example.com", "A"); !ok {
+		fmt.Println("t+301s  MISS -> expired, must re-resolve")
+	}
+
+	fmt.Printf("entries after expiry sweep: %d\n", len(cache.entries))
+}
+```
+
+<CodeWalk
+  title="A TTL cache with an injected clock"
+  steps={[
+    { lines: "13-21", note: "An entry pairs a record with an absolute expiry time. Cache holds entries keyed by name|type and — crucially — a now func() time.Time. Injecting the clock is what makes the cache testable without real sleeps.", pose: "timekeeper", role: "timekeeper", state: "active", beat: "neutral" },
+    { lines: "29-39", note: "Get is freshness-aware: present but now >= expires means the TTL elapsed, so it's a MISS and the stale entry is lazily deleted. A naive cache that skips this check serves dead addresses after a failover — the classic DNS-caching bug.", pose: "guard", role: "timekeeper", state: "warn", beat: "problem" },
+    { lines: "41-46", note: "Put computes the expiry from the record's own TTL: now + TTL seconds. The record owner sets the TTL; the cache simply honors it. Short TTLs mean fast failover but more lookups; long TTLs mean fewer lookups but slower propagation.", pose: "carry", role: "timekeeper", state: "ok", beat: "solution" },
+    { lines: "48-65", note: "The clock is a value we advance by hand — no time.Sleep anywhere. At t+10s the entry is fresh (HIT); at t+301s the TTL of 300 has passed (MISS, evicted). Deterministic, instant, and exactly how you test time-dependent code in Go.", pose: "happy", role: "scientist", state: "done", beat: "solution" }
+  ]}
+  caption="Cache hits skip the lookup chain; the TTL decides when an answer goes stale. Inject the clock as func() time.Time and you can fast-forward through expiry in a test instead of sleeping for five minutes."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type entry struct {
+	record  Record
+	expires time.Time
+}
+
+type Cache struct {
+	now     func() time.Time
+	entries map[string]entry
+}
+
+func NewCache(now func() time.Time) *Cache {
+	return &Cache{now: now, entries: map[string]entry{}}
+}
+
+func key(name, qtype string) string { return name + "|" + qtype }
+
+func (c *Cache) Get(name, qtype string) (Record, bool) {
+	e, ok := c.entries[key(name, qtype)]
+	if !ok {
+		return Record{}, false
+	}
+	if !c.now().Before(e.expires) {
+		delete(c.entries, key(name, qtype))
+		return Record{}, false
+	}
+	return e.record, true
+}
+
+func (c *Cache) Put(r Record) {
+	c.entries[key(r.Name, r.Type)] = entry{
+		record:  r,
+		expires: c.now().Add(time.Duration(r.TTL) * time.Second),
+	}
+}
+
+func main() {
+	clock := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	cache := NewCache(func() time.Time { return clock })
+
+	cache.Put(Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+
+	clock = clock.Add(10 * time.Second)
+	if r, ok := cache.Get("api.example.com", "A"); ok {
+		fmt.Printf("t+10s   HIT  -> %s\n", r.Value)
+	}
+
+	clock = clock.Add(291 * time.Second)
+	if _, ok := cache.Get("api.example.com", "A"); !ok {
+		fmt.Println("t+301s  MISS -> expired, must re-resolve")
+	}
+
+	fmt.Printf("entries after expiry sweep: %d\n", len(cache.entries))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Gotcha>
+A cache that ignores TTL is worse than no cache: after a server fails over to a new IP, every client still holding the old address keeps hammering a dead host until *someone* notices. The TTL is the failover budget. Honor it — `now >= expires` is a miss, no exceptions — and never cache a record for longer than its TTL says.
+</Gotcha>
+
+---
+
+## Stage 4 · CNAMEs & Cycle Detection
+
+A **CNAME** record aliases one name to another: `cdn.example.com` is really `d1234.cloudfront.net`. To resolve a CNAME you follow the alias to its target, then resolve *that* — possibly through more CNAMEs. The danger: a misconfiguration where `a → b → a` loops forever. A real resolver caps the chain and detects the cycle; so will yours.
+
+<JourneyAnim
+  title="Following a CNAME chain — and catching the loop"
+  hops={[
+    { id: "start", label: "cdn.example.com", role: "detective" },
+    { id: "mid", label: "d1234.cloudfront.net", role: "operator" },
+    { id: "addr", label: "A 13.32.0.1", role: "librarian" },
+    { id: "loop", label: "a → b → a", role: "thief" }
+  ]}
+  frames={[
+    { note: "Resolve cdn.example.com type A. It's a CNAME, not an address — so the resolver doesn't stop. It follows the alias to the target name and resolves THAT.", at: "start" },
+    { note: "d1234.cloudfront.net is itself a name to resolve. This time it's an A record — a real address. The chain terminates: cdn.example.com → d1234.cloudfront.net → 13.32.0.1.", beat: "solution", at: "addr" },
+    { note: "Now the failure mode: someone aliases a → b and b → a. A naive resolver follows a → b → a → b … forever, pinning a goroutine and a stack until it crashes. This is a real outage shape.", beat: "problem", at: "loop", failed: true },
+    { note: "The fix: track every name you've already visited in this resolution. Revisit one → it's a cycle, return an error. (Belt and braces: also cap the chain length, since a long non-looping chain is itself abuse.)", beat: "solution", at: "loop" }
+  ]}
+  caption="CNAME resolution is a walk: follow the alias until you hit an address. A visited-set turns an infinite loop into an immediate, honest error — the difference between a clean failure and a crashed resolver."
+/>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type DB struct {
+	records map[string][]Record
+}
+
+func (db *DB) add(r Record) { db.records[r.Name] = append(db.records[r.Name], r) }
+
+func (db *DB) first(name, qtype string) (Record, bool) {
+	for _, r := range db.records[name] {
+		if r.Type == qtype {
+			return r, true
+		}
+	}
+	return Record{}, false
+}
+
+const maxCNAMEDepth = 8
+
+var errCNAMECycle = errors.New("CNAME cycle detected")
+
+// resolveA follows CNAMEs until it reaches an A record, guarding against cycles
+// with a visited-set and a hard depth cap. Returns the final A record plus the
+// chain of names walked, so you can see exactly how the alias unwound.
+func (db *DB) resolveA(name string) (Record, []string, error) {
+	visited := map[string]bool{}
+	chain := []string{}
+	for depth := 0; depth < maxCNAMEDepth; depth++ {
+		if visited[name] {
+			return Record{}, chain, errCNAMECycle
+		}
+		visited[name] = true
+		chain = append(chain, name)
+
+		if a, ok := db.first(name, "A"); ok {
+			return a, chain, nil // reached an address — done
+		}
+		cname, ok := db.first(name, "CNAME")
+		if !ok {
+			return Record{}, chain, fmt.Errorf("NXDOMAIN: no A or CNAME for %q", name)
+		}
+		name = cname.Value // follow the alias and loop
+	}
+	return Record{}, chain, fmt.Errorf("CNAME chain exceeded %d hops", maxCNAMEDepth)
+}
+
+func main() {
+	db := &DB{records: map[string][]Record{}}
+	// A healthy CNAME chain ending in an address.
+	db.add(Record{Name: "cdn.example.com", Type: "CNAME", Value: "d1234.cloudfront.net", TTL: 3600})
+	db.add(Record{Name: "d1234.cloudfront.net", Type: "A", Value: "13.32.0.1", TTL: 60})
+	// A poisoned loop: a -> b -> a.
+	db.add(Record{Name: "a.example.com", Type: "CNAME", Value: "b.example.com", TTL: 300})
+	db.add(Record{Name: "b.example.com", Type: "CNAME", Value: "a.example.com", TTL: 300})
+
+	rec, chain, err := db.resolveA("cdn.example.com")
+	fmt.Printf("cdn.example.com: %v  via %v\n", rec.Value, chain)
+	_ = err
+
+	_, loopChain, err := db.resolveA("a.example.com")
+	fmt.Printf("a.example.com:   %v  (walked %v)\n", err, loopChain)
+}
+```
+
+<CodeWalk
+  title="Following CNAMEs with cycle detection"
+  steps={[
+    { lines: "28-30", note: "Two guards against runaway resolution: maxCNAMEDepth caps the chain length, and errCNAMECycle is the sentinel for a detected loop. Either one alone is good; both together is how production resolvers do it.", pose: "guard", role: "guard", state: "active", beat: "neutral" },
+    { lines: "32-40", note: "resolveA walks the chain. The visited-set is the cycle detector: the instant a name reappears, we've looped — return errCNAMECycle immediately instead of following the alias again. chain records the path for diagnostics.", pose: "detective", role: "detective", state: "ok", beat: "solution" },
+    { lines: "42-49", note: "Each step: if the name has an A record, we've reached an address — done. Otherwise follow its CNAME to the target and loop. No A and no CNAME is an honest NXDOMAIN.", pose: "run", role: "detective", state: "active", beat: "neutral" },
+    { lines: "54-67", note: "Two chains: cdn → cloudfront → 13.32.0.1 resolves cleanly. The poisoned a → b → a loop is caught the moment 'a' is seen twice — errCNAMECycle, with the walked path attached. A naive follow-the-alias loop would spin until it crashed.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="CNAME resolution is a guarded walk: a visited-set catches cycles immediately, a depth cap backstops abusively long chains. The chain slice gives you the exact path for debugging a misconfigured alias."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type DB struct {
+	records map[string][]Record
+}
+
+func (db *DB) add(r Record) { db.records[r.Name] = append(db.records[r.Name], r) }
+
+func (db *DB) first(name, qtype string) (Record, bool) {
+	for _, r := range db.records[name] {
+		if r.Type == qtype {
+			return r, true
+		}
+	}
+	return Record{}, false
+}
+
+const maxCNAMEDepth = 8
+
+var errCNAMECycle = errors.New("CNAME cycle detected")
+
+func (db *DB) resolveA(name string) (Record, []string, error) {
+	visited := map[string]bool{}
+	chain := []string{}
+	for depth := 0; depth < maxCNAMEDepth; depth++ {
+		if visited[name] {
+			return Record{}, chain, errCNAMECycle
+		}
+		visited[name] = true
+		chain = append(chain, name)
+
+		if a, ok := db.first(name, "A"); ok {
+			return a, chain, nil
+		}
+		cname, ok := db.first(name, "CNAME")
+		if !ok {
+			return Record{}, chain, fmt.Errorf("NXDOMAIN: no A or CNAME for %q", name)
+		}
+		name = cname.Value
+	}
+	return Record{}, chain, fmt.Errorf("CNAME chain exceeded %d hops", maxCNAMEDepth)
+}
+
+func main() {
+	db := &DB{records: map[string][]Record{}}
+	db.add(Record{Name: "cdn.example.com", Type: "CNAME", Value: "d1234.cloudfront.net", TTL: 3600})
+	db.add(Record{Name: "d1234.cloudfront.net", Type: "A", Value: "13.32.0.1", TTL: 60})
+	db.add(Record{Name: "a.example.com", Type: "CNAME", Value: "b.example.com", TTL: 300})
+	db.add(Record{Name: "b.example.com", Type: "CNAME", Value: "a.example.com", TTL: 300})
+
+	rec, chain, err := db.resolveA("cdn.example.com")
+	fmt.Printf("cdn.example.com: %v  via %v\n", rec.Value, chain)
+	_ = err
+
+	_, loopChain, err := db.resolveA("a.example.com")
+	fmt.Printf("a.example.com:   %v  (walked %v)\n", err, loopChain)
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<QuickCheck
+  question="Why track a visited-set when following CNAMEs, instead of only capping the chain depth?"
+  options={[
+    "The visited-set is faster than counting hops",
+    "A depth cap eventually stops a loop, but the visited-set stops it immediately and names it as a cycle — a misconfiguration, not just a long chain",
+    "CNAMEs are not allowed to chain at all",
+    "The depth cap doesn't work for CNAMEs, only for A records"
+  ]}
+  answer={1}
+  explain="A depth cap alone would let a → b → a spin up to maxDepth times before failing, and it reports 'too long' rather than the real problem. The visited-set detects the loop the instant a name repeats and reports it as a cycle — the actual misconfiguration — while the depth cap still backstops abusively long but non-looping chains."
+/>
+
+---
+
+## Stage 5 · Zone Transfer
+
+A **zone transfer** (AXFR in real DNS) copies an entire zone from one server to another — how a secondary nameserver mirrors the primary. We implement the dump side: serialize every record in the zone in a stable order so two servers can compare and sync. Stable order matters — a diff between primary and secondary must be deterministic.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type Zone struct {
+	Origin  string
+	records map[string][]Record
+}
+
+func NewZone(origin string) *Zone { return &Zone{Origin: origin, records: map[string][]Record{}} }
+func (z *Zone) AddRecord(r Record) { z.records[r.Name] = append(z.records[r.Name], r) }
+
+// Transfer returns every record in the zone in a stable order (by name, then
+// type, then value) — the AXFR dump a secondary nameserver consumes to mirror
+// the primary. Stable order makes primary/secondary diffs deterministic.
+func (z *Zone) Transfer() []Record {
+	var all []Record
+	for _, recs := range z.records {
+		all = append(all, recs...)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Name != all[j].Name {
+			return all[i].Name < all[j].Name
+		}
+		if all[i].Type != all[j].Type {
+			return all[i].Type < all[j].Type
+		}
+		return all[i].Value < all[j].Value
+	})
+	return all
+}
+
+func main() {
+	z := NewZone("example.com")
+	z.AddRecord(Record{Name: "www.example.com", Type: "A", Value: "93.184.216.35", TTL: 300})
+	z.AddRecord(Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+	z.AddRecord(Record{Name: "api.example.com", Type: "TXT", Value: "v=spf1 -all", TTL: 3600})
+	z.AddRecord(Record{Name: "example.com", Type: "MX", Value: "10 mail.example.com", TTL: 3600})
+
+	fmt.Printf("; AXFR transfer of zone %s (%d records)\n", z.Origin, len(z.Transfer()))
+	for _, r := range z.Transfer() {
+		fmt.Printf("%-20s %5d IN %-5s %s\n", r.Name, r.TTL, r.Type, strings.TrimSpace(r.Value))
+	}
+}
+```
+
+<CodeWalk
+  title="Dumping a zone in stable order (AXFR)"
+  steps={[
+    { lines: "22-26", note: "Transfer flattens the name->records map into one slice. Iterating a Go map is randomized, so a raw dump would differ run to run — useless for comparing a primary against a secondary. We must impose an order.", pose: "scribe", role: "courier", state: "active", beat: "neutral" },
+    { lines: "27-36", note: "sort.Slice gives a stable total order: by name, then type, then value. Now two servers holding the same zone produce byte-identical transfers, and a diff between them is meaningful — the foundation of primary/secondary replication.", pose: "guard", role: "courier", state: "ok", beat: "solution" },
+    { lines: "40-44", note: "A small zone with mixed types — A, TXT, MX — across several names. AddRecord drops them in arbitrary order; Transfer will re-sort them deterministically.", pose: "carry", role: "librarian", state: "active", beat: "neutral" },
+    { lines: "46-49", note: "The dump is formatted like a real zone file / dig answer: name, TTL, class (IN), type, value — sorted. This is exactly what a secondary nameserver consumes to mirror the primary, and what Stage 6 polishes into dig-style output.", pose: "happy", role: "courier", state: "done", beat: "solution" }
+  ]}
+  caption="A zone transfer is a deterministic dump of every record. Go map iteration is randomized, so you MUST sort — by name, type, then value — or primary and secondary can never be compared. Stable order is the whole point."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type Zone struct {
+	Origin  string
+	records map[string][]Record
+}
+
+func NewZone(origin string) *Zone  { return &Zone{Origin: origin, records: map[string][]Record{}} }
+func (z *Zone) AddRecord(r Record) { z.records[r.Name] = append(z.records[r.Name], r) }
+
+func (z *Zone) Transfer() []Record {
+	var all []Record
+	for _, recs := range z.records {
+		all = append(all, recs...)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Name != all[j].Name {
+			return all[i].Name < all[j].Name
+		}
+		if all[i].Type != all[j].Type {
+			return all[i].Type < all[j].Type
+		}
+		return all[i].Value < all[j].Value
+	})
+	return all
+}
+
+func main() {
+	z := NewZone("example.com")
+	z.AddRecord(Record{Name: "www.example.com", Type: "A", Value: "93.184.216.35", TTL: 300})
+	z.AddRecord(Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+	z.AddRecord(Record{Name: "api.example.com", Type: "TXT", Value: "v=spf1 -all", TTL: 3600})
+	z.AddRecord(Record{Name: "example.com", Type: "MX", Value: "10 mail.example.com", TTL: 3600})
+
+	fmt.Printf("; AXFR transfer of zone %s (%d records)\n", z.Origin, len(z.Transfer()))
+	for _, r := range z.Transfer() {
+		fmt.Printf("%-20s %5d IN %-5s %s\n", r.Name, r.TTL, r.Type, strings.TrimSpace(r.Value))
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## Stage 6 · dig-Style Output
+
+The capstone of usability: format a resolution result the way `dig`, the standard DNS tool, does — a header with status and timing, a question section, and an answer section in zone-file form. Engineers read `dig` output all day; matching it makes your resolver instantly familiar.
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+// Answer is one resolution result: the question asked, the records found,
+// the status, and how long the lookup took.
+type Answer struct {
+	QName    string
+	QType    string
+	Status   string // NOERROR, NXDOMAIN, SERVFAIL
+	Records  []Record
+	Elapsed  time.Duration
+}
+
+// Dig formats an Answer the way the `dig` command-line tool does.
+func Dig(a Answer) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, ";; ->>HEADER<<- opcode: QUERY, status: %s\n", a.Status)
+	fmt.Fprintf(&b, ";; QUESTION SECTION:\n;%s.\tIN\t%s\n\n", a.QName, a.QType)
+
+	if len(a.Records) > 0 {
+		fmt.Fprintf(&b, ";; ANSWER SECTION:\n")
+		for _, r := range a.Records {
+			fmt.Fprintf(&b, "%s.\t%d\tIN\t%s\t%s\n", r.Name, r.TTL, r.Type, r.Value)
+		}
+		fmt.Fprintln(&b)
+	}
+	fmt.Fprintf(&b, ";; Query time: %d ms\n", a.Elapsed.Milliseconds())
+	return b.String()
+}
+
+func main() {
+	ans := Answer{
+		QName:  "api.example.com",
+		QType:  "A",
+		Status: "NOERROR",
+		Records: []Record{
+			{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300},
+			{Name: "api.example.com", Type: "A", Value: "93.184.216.36", TTL: 300},
+		},
+		Elapsed: 23 * time.Millisecond,
+	}
+	fmt.Print(Dig(ans))
+
+	fmt.Println(strings.Repeat("-", 40))
+
+	missing := Answer{QName: "ghost.example.com", QType: "A", Status: "NXDOMAIN", Elapsed: 8 * time.Millisecond}
+	fmt.Print(Dig(missing))
+}
+```
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type Answer struct {
+	QName   string
+	QType   string
+	Status  string
+	Records []Record
+	Elapsed time.Duration
+}
+
+func Dig(a Answer) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, ";; ->>HEADER<<- opcode: QUERY, status: %s\n", a.Status)
+	fmt.Fprintf(&b, ";; QUESTION SECTION:\n;%s.\tIN\t%s\n\n", a.QName, a.QType)
+
+	if len(a.Records) > 0 {
+		fmt.Fprintf(&b, ";; ANSWER SECTION:\n")
+		for _, r := range a.Records {
+			fmt.Fprintf(&b, "%s.\t%d\tIN\t%s\t%s\n", r.Name, r.TTL, r.Type, r.Value)
+		}
+		fmt.Fprintln(&b)
+	}
+	fmt.Fprintf(&b, ";; Query time: %d ms\n", a.Elapsed.Milliseconds())
+	return b.String()
+}
+
+func main() {
+	ans := Answer{
+		QName:  "api.example.com",
+		QType:  "A",
+		Status: "NOERROR",
+		Records: []Record{
+			{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300},
+			{Name: "api.example.com", Type: "A", Value: "93.184.216.36", TTL: 300},
+		},
+		Elapsed: 23 * time.Millisecond,
+	}
+	fmt.Print(Dig(ans))
+
+	fmt.Println(strings.Repeat("-", 40))
+
+	missing := Answer{QName: "ghost.example.com", QType: "A", Status: "NXDOMAIN", Elapsed: 8 * time.Millisecond}
+	fmt.Print(Dig(missing))
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="What a real resolver adds — and where Go's stdlib already does this for you">
+
+Your resolver is the real machinery, simplified in two honest ways:
+
+1. **The wire format.** Real DNS is a binary protocol over UDP port 53 (falling back to TCP for large answers, and the wire format is what `golang.org/x/net/dns/dnsmessage` packs and parses). A query and answer are packed structs with a header, question, and resource-record sections — not Go structs in memory. The *logic* you built (records, zones, the chain, the cache, CNAME following) is identical; only the transport differs.
+
+2. **Recursion vs. delegation.** A real recursive resolver sends actual queries to the root, TLD, and authoritative servers, following **NS** (nameserver) referrals at each hop. We modeled that with the in-memory `zoneFor` delegation in Stage 2 — same shape, no network.
+
+For everyday Go code you rarely write any of this: `net.LookupHost`, `net.LookupCNAME`, `net.LookupMX`, and `net.Resolver` (with a custom `Dial` if you need a specific server) call the OS resolver or a server you point them at. Reach for `golang.org/x/net/dns/dnsmessage` only when you need to build or inspect packets directly — a custom resolver, a DNS server, or a network tool. Now that you've built the model by hand, those stdlib calls are no longer magic: you know exactly what `net.LookupHost` is doing under the covers.
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+You've built every stage. Now sharpen the edges.
+
+<Exercise n={1} title="Lookup by multiple types" level="easy">
+
+Add a `LookupAny(name string) []Record` method to the Stage 1 `Zone` that returns *all* records for a name regardless of type, in the order they were added. Demonstrate it on a name holding an A, a TXT, and an MX.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type Zone struct{ records map[string][]Record }
+
+func NewZone() *Zone               { return &Zone{records: map[string][]Record{}} }
+func (z *Zone) AddRecord(r Record) { z.records[r.Name] = append(z.records[r.Name], r) }
+
+// LookupAny returns every record for the name, any type, in insertion order.
+func (z *Zone) LookupAny(name string) []Record { return z.records[name] }
+
+func main() {
+	z := NewZone()
+	z.AddRecord(Record{Name: "example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+	z.AddRecord(Record{Name: "example.com", Type: "TXT", Value: "v=spf1 -all", TTL: 3600})
+	z.AddRecord(Record{Name: "example.com", Type: "MX", Value: "10 mail.example.com", TTL: 3600})
+
+	for _, r := range z.LookupAny("example.com") {
+		fmt.Printf("%s %-4s %s\n", r.Name, r.Type, r.Value)
+	}
+}
+```
+
+The map already stores records per name in insertion order within the slice; `LookupAny` just returns that slice unfiltered.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Negative caching" level="medium">
+
+Real resolvers cache *failures* too (NXDOMAIN) for a short time, so a flood of lookups for a non-existent name doesn't re-walk the chain every time. Extend the Stage 3 `Cache` with `PutMiss(name, qtype string, ttl int)` and have `Get` return a third state: `(Record, found bool, negative bool)`. Demonstrate a cached miss that expires.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type entry struct {
+	record   Record
+	negative bool
+	expires  time.Time
+}
+
+type Cache struct {
+	now     func() time.Time
+	entries map[string]entry
+}
+
+func NewCache(now func() time.Time) *Cache { return &Cache{now: now, entries: map[string]entry{}} }
+
+func k(n, t string) string { return n + "|" + t }
+
+func (c *Cache) Put(r Record) {
+	c.entries[k(r.Name, r.Type)] = entry{record: r, expires: c.now().Add(time.Duration(r.TTL) * time.Second)}
+}
+
+func (c *Cache) PutMiss(name, qtype string, ttl int) {
+	c.entries[k(name, qtype)] = entry{negative: true, expires: c.now().Add(time.Duration(ttl) * time.Second)}
+}
+
+// Get returns (record, found, negative). negative=true means a cached NXDOMAIN.
+func (c *Cache) Get(name, qtype string) (Record, bool, bool) {
+	e, ok := c.entries[k(name, qtype)]
+	if !ok || !c.now().Before(e.expires) {
+		delete(c.entries, k(name, qtype))
+		return Record{}, false, false
+	}
+	return e.record, true, e.negative
+}
+
+func main() {
+	clock := time.Now()
+	c := NewCache(func() time.Time { return clock })
+
+	c.PutMiss("ghost.example.com", "A", 30) // cache the NXDOMAIN for 30s
+
+	if _, found, neg := c.Get("ghost.example.com", "A"); found && neg {
+		fmt.Println("t+0s   cached NXDOMAIN — no chain walk needed")
+	}
+	clock = clock.Add(31 * time.Second)
+	if _, found, _ := c.Get("ghost.example.com", "A"); !found {
+		fmt.Println("t+31s  negative entry expired — re-resolve")
+	}
+}
+```
+
+Negative caching uses the same expiry machinery; the `negative` flag distinguishes a cached failure from a cached answer. Negative TTLs are kept short so a name that *starts* existing is picked up quickly.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Round-robin A records" level="medium">
+
+When a name has several A records (load balancing), resolvers rotate which one comes first on each query. Write `RoundRobin(recs []Record) []Record` that rotates the slice by one position each call (use a package-level counter), so successive queries return a different head. Show three calls cycling the head.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+type Record struct{ Name, Type, Value string }
+
+var rrCounter int
+
+// RoundRobin returns a rotated copy of recs, advancing the start each call.
+func RoundRobin(recs []Record) []Record {
+	if len(recs) == 0 {
+		return recs
+	}
+	n := len(recs)
+	out := make([]Record, n)
+	for i := 0; i < n; i++ {
+		out[i] = recs[(i+rrCounter)%n]
+	}
+	rrCounter = (rrCounter + 1) % n
+	return out
+}
+
+func main() {
+	recs := []Record{
+		{Value: "10.0.0.1"}, {Value: "10.0.0.2"}, {Value: "10.0.0.3"},
+	}
+	for call := 1; call <= 3; call++ {
+		fmt.Printf("call %d head -> %s\n", call, RoundRobin(recs)[0].Value)
+	}
+}
+```
+
+Rotating the order spreads load across the addresses. Real resolvers do this so a name with three A records sends roughly a third of clients to each — DNS as a poor man's load balancer. (Note the package-level counter is not goroutine-safe; a production version would guard it with an atomic or a mutex.)
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Resolve with cache + chain" level="hard">
+
+Wire Stage 2's resolver to Stage 3's cache: a `ResolveCached(name, qtype string)` that checks the cache first (HIT → return, MISS → resolve from the zone, then `Put` the result) and reports which path it took. Demonstrate a miss-then-hit on the same name.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+type entry struct {
+	rec     Record
+	expires time.Time
+}
+
+type Resolver struct {
+	now   func() time.Time
+	zone  map[string][]Record
+	cache map[string]entry
+}
+
+func NewResolver(now func() time.Time) *Resolver {
+	return &Resolver{now: now, zone: map[string][]Record{}, cache: map[string]entry{}}
+}
+
+func (r *Resolver) Add(rec Record) { r.zone[rec.Name] = append(r.zone[rec.Name], rec) }
+
+func (r *Resolver) ResolveCached(name, qtype string) (Record, string) {
+	key := name + "|" + qtype
+	if e, ok := r.cache[key]; ok && r.now().Before(e.expires) {
+		return e.rec, "HIT"
+	}
+	for _, rec := range r.zone[name] {
+		if rec.Type == qtype {
+			r.cache[key] = entry{rec: rec, expires: r.now().Add(time.Duration(rec.TTL) * time.Second)}
+			return rec, "MISS (resolved + cached)"
+		}
+	}
+	return Record{}, "NXDOMAIN"
+}
+
+func main() {
+	clock := time.Now()
+	res := NewResolver(func() time.Time { return clock })
+	res.Add(Record{Name: "api.example.com", Type: "A", Value: "93.184.216.34", TTL: 300})
+
+	rec, path := res.ResolveCached("api.example.com", "A")
+	fmt.Printf("1st: %s via %s\n", rec.Value, path)
+
+	clock = clock.Add(5 * time.Second) // still within TTL
+	rec, path = res.ResolveCached("api.example.com", "A")
+	fmt.Printf("2nd: %s via %s\n", rec.Value, path)
+}
+```
+
+The first call misses, resolves from the zone, and caches the result with its TTL; the second call (within the TTL) hits the cache and skips the zone entirely. This is the whole resolver in one method.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Reverse lookup (PTR)" level="medium">
+
+A **PTR** record maps an IP back to a name (reverse DNS). Build a `ReverseZone` with `AddPTR(ip, name string)` and `Reverse(ip string) (string, bool)`. Demonstrate resolving `93.184.216.34` back to `api.example.com`, and a miss for an unknown IP.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+// ReverseZone maps IPs to names — the PTR (reverse DNS) direction.
+type ReverseZone struct{ ptr map[string]string }
+
+func NewReverseZone() *ReverseZone { return &ReverseZone{ptr: map[string]string{}} }
+
+func (z *ReverseZone) AddPTR(ip, name string) { z.ptr[ip] = name }
+
+func (z *ReverseZone) Reverse(ip string) (string, bool) {
+	name, ok := z.ptr[ip]
+	return name, ok
+}
+
+func main() {
+	z := NewReverseZone()
+	z.AddPTR("93.184.216.34", "api.example.com")
+
+	if name, ok := z.Reverse("93.184.216.34"); ok {
+		fmt.Printf("93.184.216.34 -> %s\n", name)
+	}
+	if _, ok := z.Reverse("10.0.0.99"); !ok {
+		fmt.Println("10.0.0.99 -> no PTR record")
+	}
+}
+```
+
+Reverse DNS is just a second index in the other direction. Real PTR records live in the special `in-addr.arpa` zone with the IP octets reversed, but the mapping is the same idea: IP → name.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Time to put the resolver under fire — with the one bug that turns a helpful cache into an outage.
+
+I've written a mini resolver with a cache, and it has **two** defects: the cache ignores TTL (it returns expired records forever — so after a server fails over, every client keeps hitting the dead IP), and the CNAME follower has no cycle guard (a looping alias spins until it blows the depth budget *with the wrong error*). Fix both so the self-check passes: an expired entry must be a miss, and a CNAME cycle must return the `errCycle` sentinel — not a generic "too deep" error.
+
+Fully sandboxed — an in-memory zone, a hand-advanced clock, no network. Just you, a broken resolver, and four checks.
+
+<Lab
+  title="Make the cache honor TTL and the CNAME follower catch cycles"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Two defects. (1) Cache.Get returns a record even after its TTL has elapsed — add the freshness check so now >= expires is a MISS (return false). (2) resolveCNAME has no cycle detection — add a visited-set so a looping alias returns errCycle immediately, before the depth cap trips. main is the self-check harness — do not edit it. It checks a fresh entry hits, an expired entry misses, a healthy CNAME chain resolves, and a cyclic chain returns errCycle. When all pass it prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Record struct {
+	Name, Type, Value string
+	TTL               int
+}
+
+// ---- TTL cache ----
+type entry struct {
+	rec     Record
+	expires time.Time
+}
+
+type Cache struct {
+	now     func() time.Time
+	entries map[string]entry
+}
+
+func NewCache(now func() time.Time) *Cache {
+	return &Cache{now: now, entries: map[string]entry{}}
+}
+
+func (c *Cache) Put(r Record) {
+	c.entries[r.Name] = entry{rec: r, expires: c.now().Add(time.Duration(r.TTL) * time.Second)}
+}
+
+// BUG 1: Get ignores the expiry — a stale entry is returned as a hit forever.
+// FIX: if the entry exists but c.now() is NOT before e.expires, it's stale:
+// delete it and return false.
+func (c *Cache) Get(name string) (Record, bool) {
+	e, ok := c.entries[name]
+	if !ok {
+		return Record{}, false
+	}
+	// FIX: add the freshness check here.
+	return e.rec, true
+}
+
+// ---- CNAME follower ----
+type DB struct{ records map[string]Record }
+
+var errCycle = errors.New("CNAME cycle detected")
+
+const maxDepth = 16
+
+// BUG 2: resolveCNAME has no cycle guard — a -> b -> a loops until maxDepth
+// and returns the wrong error.
+// FIX: track visited names in a set; if a name repeats, return errCycle.
+func (db *DB) resolveCNAME(name string) (string, error) {
+	for depth := 0; depth < maxDepth; depth++ {
+		r, ok := db.records[name]
+		if !ok {
+			return "", fmt.Errorf("NXDOMAIN: %q", name)
+		}
+		if r.Type == "A" {
+			return r.Value, nil
+		}
+		// FIX: before following the alias, check/record visited.
+		name = r.Value // follow CNAME
+	}
+	return "", fmt.Errorf("chain too deep")
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	allOK := true
+
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cache := NewCache(func() time.Time { return clock })
+	cache.Put(Record{Name: "api.example.com", Type: "A", Value: "1.2.3.4", TTL: 60})
+
+	// Check 1: fresh entry hits.
+	if _, ok := cache.Get("api.example.com"); !ok {
+		fmt.Println("FAIL check 1: fresh entry should hit")
+		allOK = false
+	}
+
+	// Check 2: after TTL, the entry must miss.
+	clock = clock.Add(61 * time.Second)
+	if _, ok := cache.Get("api.example.com"); ok {
+		fmt.Println("FAIL check 2: expired entry must miss")
+		allOK = false
+	}
+
+	db := &DB{records: map[string]Record{
+		"cdn.example.com":      {Name: "cdn.example.com", Type: "CNAME", Value: "edge.example.com"},
+		"edge.example.com":     {Name: "edge.example.com", Type: "A", Value: "9.9.9.9"},
+		"a.example.com":        {Name: "a.example.com", Type: "CNAME", Value: "b.example.com"},
+		"b.example.com":        {Name: "b.example.com", Type: "CNAME", Value: "a.example.com"},
+	}}
+
+	// Check 3: a healthy CNAME chain resolves to the address.
+	if ip, err := db.resolveCNAME("cdn.example.com"); err != nil || ip != "9.9.9.9" {
+		fmt.Printf("FAIL check 3: healthy chain should resolve to 9.9.9.9, got %q %v\n", ip, err)
+		allOK = false
+	}
+
+	// Check 4: a cyclic chain must return errCycle (not "too deep").
+	if _, err := db.resolveCNAME("a.example.com"); !errors.Is(err, errCycle) {
+		fmt.Printf("FAIL check 4: cycle must return errCycle, got %v\n", err)
+		allOK = false
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main runs four in-process checks: a fresh cache entry hits, an entry past its TTL misses, a healthy CNAME chain resolves to its A record, and a cyclic CNAME chain returns the errCycle sentinel. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  hints={[
+    "Bug 1: in Get, after fetching the entry, add `if !c.now().Before(e.expires) { delete(c.entries, name); return Record{}, false }` before the success return. now >= expires means the TTL has elapsed.",
+    "Bug 2: declare `visited := map[string]bool{}` before the loop. At the top of each iteration, `if visited[name] { return \"\", errCycle }`, then `visited[name] = true`. The instant a name repeats, you've found the loop.",
+    "Check 4 uses errors.Is(err, errCycle) — you must return the errCycle sentinel itself (or wrap it), not a freshly-formatted error string, or the check won't match.",
+  ]}
+  flag="GO{ttl_honored_and_cname_cycles_caught}"
+>
+
+Bug 1 is the outage-maker: a cache that never expires serves dead addresses long after a failover. Bug 2 is the resolver-killer: an aliased loop with no visited-set. Add the freshness check, add the cycle guard, return the right sentinel. Four checks. All must pass. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **The lookup chain** finds an answer no single server holds: root → TLD → authoritative, each hop a referral one level closer. Once found, the answer is cached for its TTL.
+- **Records & the zone** (Stage 1): a `Record` is name + type + value + TTL; a `Zone` is a `map[string][]Record` answering lookups by name *and* type, because one name carries many records.
+- **The resolver** (Stage 2) picks the most specific zone that owns a name (delegation), then looks the record up there — distinguishing "no zone" from NXDOMAIN, exactly as real DNS does.
+- **The TTL cache** (Stage 3) skips the whole chain on a hit and treats `now >= expires` as a miss. Inject the clock as `func() time.Time` and you can fast-forward through expiry in tests instead of sleeping. A cache that ignores TTL serves dead addresses after a failover.
+- **CNAMEs & cycle detection** (Stage 4): follow aliases until you reach an address, guarded by a **visited-set** (catches loops instantly) and a depth cap (backstops abusive chains). `a → b → a` returns a cycle error, not a crash.
+- **Zone transfer** (Stage 5) dumps every record in a **stable order** (name, type, value) so primary and secondary nameservers can diff and sync — Go map iteration is randomized, so you *must* sort.
+- **dig-style output** (Stage 6) formats results like the tool engineers actually read: header, question, answer sections in zone-file form.
+- **Real DNS** adds the binary wire format over UDP/53 and network recursion — but the logic is what you built. For everyday Go, `net.LookupHost`/`net.Resolver` do it for you; reach for `golang.org/x/net/dns/dnsmessage` only when you build packets directly. You now know exactly what those calls do under the hood.
+
+</Recap>
+
+<Scoreboard
+  streak={12}
+  items={[
+    { label: "Quick check — why a name maps to a slice", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — visited-set vs depth cap", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — LookupAny", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Negative caching", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Round-robin A records", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Resolve with cache + chain", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — Reverse lookup (PTR)", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Honor TTL, catch CNAME cycles", captured: false, points: 80 }}
+/>
+
+That's a DNS resolver — a real one, the same shape as the thing answering under every request on the internet. You modeled records and zones, walked the lookup chain, cached on a clock you control, followed CNAMEs without ever looping, dumped a zone deterministically, and formatted it like `dig`. The next time a page hangs and someone shrugs "must be DNS," you won't shrug — you'll know exactly which lookup, which cache, which alias to check. Six stages, one binary, zero mystery. Go build something with it, sport.
+
