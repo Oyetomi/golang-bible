@@ -43,6 +43,7 @@ export type GopherRole =
   | "sweeper" // broom — the garbage collector
   | "scholar" // mortarboard — DSA, interviews, algorithms
   | "hacker" // terminal — CLIs, shells
+  | "thief" // balaclava + loot sack + shifty eyes — attackers, IDOR/SSRF/exploit actors
   | "captain" // ship wheel — Docker, Kubernetes, deploys
   | "runner" // race flag — labs, CTF, goroutine racers
   | "analyst" // bar chart — analytics, metrics, observability
@@ -51,6 +52,7 @@ export type GopherRole =
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
+  [/attacker|adversary|malicious|intruder|\bthief\b|\bmallory\b|burglar|exfiltrat|\bidor\b|\bbola\b/i, "thief"],
   [/ledger|audit|complian|book|journal|entry/i, "scribe"],
   [/money|pay|charge|transfer|balance|account|bank|fintech|settle|coin|card/i, "banker"],
   [/auth|secur|secret|lock|tls|token|jwt|password|vault|cred/i, "guard"],
@@ -209,6 +211,37 @@ function RoleGear({ role }: { role: GopherRole }) {
           <text x="50" y="42" fontSize="6.5" fontFamily="monospace" fill="#6ee7aa">&gt;_</text>
         </g>
       );
+    case "thief": // knit balaclava, shifty eyes, loot sack — the attacker
+      return (
+        <g className="gph-gear">
+          {/* knit balaclava hugging the whole crown; eye opening + bare snout */}
+          <path
+            d="M13.5 26 Q13 9.5 32 9 Q51 9.5 50.5 26 Q32 33 13.5 26 Z"
+            fill="#20232c"
+            stroke="var(--gph-line)"
+            strokeWidth="1.4"
+          />
+          {/* eye opening cut into the knit */}
+          <path
+            d="M17 24.5 Q32 19.5 47 24.5 Q32 29.5 17 24.5 Z"
+            fill="#14161d"
+            opacity="0.55"
+          />
+          {/* shifty thief eyes peering from the mask */}
+          <g className="gph-thief-eyes">
+            <ellipse cx="23.5" cy="24.5" rx="4.4" ry="3.3" fill="#f4f6fb" />
+            <ellipse cx="40.5" cy="24.5" rx="4.4" ry="3.3" fill="#f4f6fb" />
+            <circle className="gph-thief-pupil" cx="24.4" cy="25" r="1.7" fill="#14161d" />
+            <circle className="gph-thief-pupil" cx="41.4" cy="25" r="1.7" fill="#14161d" />
+          </g>
+          {/* loot sack in the right paw */}
+          <g className="gph-loot">
+            <path d="M49 39 q6.5 -7 13 0 q2.5 7 -1 11 q-5.5 3 -11 0 q-3.5 -4 -1 -11 z" fill="#4a3b29" stroke="#2c2114" strokeWidth="1.3" />
+            <path d="M50.5 39 q5 -2.5 10 0" fill="none" stroke="#2c2114" strokeWidth="1.6" />
+            <text x="55.5" y="48" textAnchor="middle" fontSize="7.4" fontWeight="700" fill="#e8c35a">$</text>
+          </g>
+        </g>
+      );
     case "captain": // ship's wheel
       return (
         <g className="gph-gear">
@@ -303,6 +336,8 @@ export function Gopher({
   const eyesClosed = pose === "sleep";
   const panicked = pose === "panic";
   const doored = pose === "exit" || pose === "enter";
+  // the balaclava draws its own shifty eyes, so hide the default ones
+  const masked = role === "thief";
   return (
     <span
       className={`gph gph-pose-${pose} gph-st-${state} ${flip ? "gph-flip" : ""}`}
@@ -348,7 +383,7 @@ export function Gopher({
             <path className="gph-eye-shut" d="M18 26 q5 3.4 10 0" />
             <path className="gph-eye-shut" d="M36 26 q5 3.4 10 0" />
           </>
-        ) : (
+        ) : masked ? null : (
           <>
             <circle className="gph-eye" cx="23.5" cy="25" r="6.6" />
             <circle className="gph-eye" cx="40.5" cy="25" r="6.6" />
