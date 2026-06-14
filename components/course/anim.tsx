@@ -1320,3 +1320,332 @@ export function PoolAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   TerminalAnim — a real terminal window, because
+   a command-line topic should LOOK like a command
+   line, not a gopher on a lane. Two modes:
+   • line mode: a shell session — each frame types
+     a `$ cmd` and reveals its output; scrollback
+     accumulates so it reads like a real session.
+   • screen mode: a frame supplies `screen` (lines)
+     that REPLACE the body each step — for TUIs /
+     full-screen apps (Bubble Tea, a redraw loop).
+   ════════════════════════════════════════════ */
+type TermFrame = {
+  cmd?: string; // typed at the prompt this frame (line mode)
+  out?: string[]; // output the command prints (line mode)
+  screen?: string[]; // full-screen body that replaces the terminal (screen mode)
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+export function TerminalAnim({
+  title = "terminal",
+  prompt = "$",
+  frames,
+  caption,
+}: {
+  title?: string;
+  prompt?: string;
+  frames: TermFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const screenMode = !!f.screen;
+
+  // line mode: accumulate every command+output up to and including the current frame
+  const history: { kind: "cmd" | "out" | "blank"; text: string; cur?: boolean }[] = [];
+  if (!screenMode) {
+    for (let i = 0; i <= st.cur; i++) {
+      const fr = frames[i];
+      if (fr.screen) continue;
+      if (fr.cmd !== undefined) history.push({ kind: "cmd", text: fr.cmd, cur: i === st.cur });
+      // only show output for frames strictly before the current one, OR the
+      // current one once its command has "landed" (we reveal both together)
+      if (fr.out) for (const line of fr.out) history.push({ kind: "out", text: line });
+      if (i !== st.cur) history.push({ kind: "blank", text: "" });
+    }
+  }
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="terminal"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="term" role="img" aria-label={title}>
+        <div className="term-bar">
+          <span className="term-dot term-dot-r" />
+          <span className="term-dot term-dot-y" />
+          <span className="term-dot term-dot-g" />
+          <span className="term-bar-title">{title}</span>
+        </div>
+        <div className={`term-body ${screenMode ? "term-screen" : ""}`}>
+          {screenMode
+            ? (f.screen ?? []).map((line, i) => (
+                <div className="term-line term-tui" key={i}>
+                  {line || " "}
+                </div>
+              ))
+            : history.map((h, i) =>
+                h.kind === "cmd" ? (
+                  <div className="term-line" key={i}>
+                    <span className="term-prompt">{prompt}</span>{" "}
+                    <span className="term-cmd">{h.text}</span>
+                    {h.cur && <span className="term-cursor" aria-hidden />}
+                  </div>
+                ) : h.kind === "blank" ? (
+                  <div className="term-line" key={i}>
+                    &nbsp;
+                  </div>
+                ) : (
+                  <div className="term-line term-out" key={i}>
+                    {h.text || " "}
+                  </div>
+                )
+              )}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   HttpAnim — an HTTP exchange drawn as what it
+   IS: a request card (method, path, headers,
+   body) leaving the client, a packet crossing
+   the wire, the server responding with a status
+   card. The artifact is the illustration, not a
+   gopher on a lane.
+   ════════════════════════════════════════════ */
+type HttpHeader = { k: string; v: string };
+type HttpPhase = "compose" | "request" | "server" | "response" | "done";
+type HttpFrame = { phase: HttpPhase; note: string; beat?: "problem" | "solution" | "neutral" };
+
+export function HttpAnim({
+  title = "HTTP exchange",
+  method = "GET",
+  path = "/",
+  host,
+  reqHeaders = [],
+  reqBody,
+  status = 200,
+  statusText = "OK",
+  resHeaders = [],
+  resBody,
+  frames,
+  caption,
+}: {
+  title?: string;
+  method?: string;
+  path?: string;
+  host?: string;
+  reqHeaders?: HttpHeader[];
+  reqBody?: string;
+  status?: number;
+  statusText?: string;
+  resHeaders?: HttpHeader[];
+  resBody?: string;
+  frames: HttpFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const reqVisible = f.phase !== "compose";
+  const resVisible = f.phase === "response" || f.phase === "done";
+  const wire =
+    f.phase === "request" ? "up" : f.phase === "response" ? "down" : f.phase === "server" ? "wait" : "idle";
+  const statusClass = status >= 500 ? "bad" : status >= 400 ? "warn" : "ok";
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="http"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="http">
+        <div className="http-node">
+          <Gopher pose="idle" state="idle" size={34} role="operator" title="client" />
+          <span className="http-node-label">client</span>
+        </div>
+
+        <div className="http-mid">
+          <div className={`http-card http-req ${reqVisible ? "on" : "off"}`}>
+            <div className="http-req-line">
+              <span className="http-method">{method}</span> {path}{" "}
+              <span className="http-ver">HTTP/1.1</span>
+            </div>
+            {host && (
+              <div className="http-hdr">
+                <span className="http-hk">Host:</span> {host}
+              </div>
+            )}
+            {reqHeaders.map((h) => (
+              <div className="http-hdr" key={h.k}>
+                <span className="http-hk">{h.k}:</span> {h.v}
+              </div>
+            ))}
+            {reqBody && <div className="http-body">{reqBody}</div>}
+          </div>
+
+          <div className={`http-wire http-wire-${wire}`}>
+            <span className="http-packet" aria-hidden />
+          </div>
+
+          <div className={`http-card http-res ${resVisible ? "on" : "off"}`}>
+            <div className="http-status-line">
+              <span className="http-ver">HTTP/1.1</span>{" "}
+              <span className={`http-status http-status-${statusClass}`}>
+                {status} {statusText}
+              </span>
+            </div>
+            {resHeaders.map((h) => (
+              <div className="http-hdr" key={h.k}>
+                <span className="http-hk">{h.k}:</span> {h.v}
+              </div>
+            ))}
+            {resBody && <div className="http-body">{resBody}</div>}
+          </div>
+        </div>
+
+        <div className="http-node">
+          <Gopher
+            pose={f.phase === "server" ? "run" : "idle"}
+            state={f.phase === "server" ? "active" : "idle"}
+            size={34}
+            role="operator"
+            title="server"
+          />
+          <span className="http-node-label">server</span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   SqlAnim — a SQL query and its RESULT SET drawn
+   as what they are: a query card and a rows×cols
+   table, with rows.Scan consuming one row at a
+   time and mapping each column to a struct field
+   (in order — the cardinal database/sql rule).
+   ════════════════════════════════════════════ */
+type SqlFrame = {
+  phase: "query" | "result" | "scan" | "done";
+  row?: number; // which result row is being scanned (scan phase)
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+export function SqlAnim({
+  title = "SQL query",
+  query,
+  columns,
+  fields,
+  rows,
+  frames,
+  caption,
+}: {
+  title?: string;
+  query: string;
+  columns: string[];
+  fields?: string[]; // struct fields Scan targets, aligned to columns
+  rows: string[][];
+  frames: SqlFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const showTable = f.phase !== "query";
+  const scanRow = f.phase === "scan" ? f.row ?? -1 : -1;
+  const scannedThrough =
+    f.phase === "done" ? rows.length - 1 : f.phase === "scan" ? (f.row ?? -1) : -1;
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="sql"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="sql">
+        <div className="sql-query">
+          <span className="sql-prompt">SQL</span>
+          <code>{query}</code>
+        </div>
+
+        {showTable && (
+          <div className="sql-table-wrap">
+            <table className="sql-table">
+              <thead>
+                <tr>
+                  {columns.map((c, i) => (
+                    <th key={c}>
+                      {c}
+                      {fields && f.phase === "scan" && (
+                        <span className="sql-field"> → {fields[i]}</span>
+                      )}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, ri) => (
+                  <tr
+                    key={ri}
+                    className={
+                      ri === scanRow ? "sql-row-scan" : ri <= scannedThrough ? "sql-row-done" : "sql-row-pending"
+                    }
+                  >
+                    {r.map((cell, ci) => (
+                      <td key={ci}>{cell}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="sql-cursor-note">
+              {f.phase === "result" && `${rows.length} rows returned`}
+              {f.phase === "scan" && `rows.Next() → Scan row ${(f.row ?? 0) + 1}/${rows.length}`}
+              {f.phase === "done" && `✓ scanned ${rows.length} rows into []Account`}
+            </div>
+          </div>
+        )}
+      </div>
+    </AnimShell>
+  );
+}
