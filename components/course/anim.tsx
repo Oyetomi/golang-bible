@@ -1546,3 +1546,106 @@ export function HttpAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   SqlAnim — a SQL query and its RESULT SET drawn
+   as what they are: a query card and a rows×cols
+   table, with rows.Scan consuming one row at a
+   time and mapping each column to a struct field
+   (in order — the cardinal database/sql rule).
+   ════════════════════════════════════════════ */
+type SqlFrame = {
+  phase: "query" | "result" | "scan" | "done";
+  row?: number; // which result row is being scanned (scan phase)
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+export function SqlAnim({
+  title = "SQL query",
+  query,
+  columns,
+  fields,
+  rows,
+  frames,
+  caption,
+}: {
+  title?: string;
+  query: string;
+  columns: string[];
+  fields?: string[]; // struct fields Scan targets, aligned to columns
+  rows: string[][];
+  frames: SqlFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const showTable = f.phase !== "query";
+  const scanRow = f.phase === "scan" ? f.row ?? -1 : -1;
+  const scannedThrough =
+    f.phase === "done" ? rows.length - 1 : f.phase === "scan" ? (f.row ?? -1) : -1;
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="sql"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="sql">
+        <div className="sql-query">
+          <span className="sql-prompt">SQL</span>
+          <code>{query}</code>
+        </div>
+
+        {showTable && (
+          <div className="sql-table-wrap">
+            <table className="sql-table">
+              <thead>
+                <tr>
+                  {columns.map((c, i) => (
+                    <th key={c}>
+                      {c}
+                      {fields && f.phase === "scan" && (
+                        <span className="sql-field"> → {fields[i]}</span>
+                      )}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, ri) => (
+                  <tr
+                    key={ri}
+                    className={
+                      ri === scanRow ? "sql-row-scan" : ri <= scannedThrough ? "sql-row-done" : "sql-row-pending"
+                    }
+                  >
+                    {r.map((cell, ci) => (
+                      <td key={ci}>{cell}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="sql-cursor-note">
+              {f.phase === "result" && `${rows.length} rows returned`}
+              {f.phase === "scan" && `rows.Next() → Scan row ${(f.row ?? 0) + 1}/${rows.length}`}
+              {f.phase === "done" && `✓ scanned ${rows.length} rows into []Account`}
+            </div>
+          </div>
+        )}
+      </div>
+    </AnimShell>
+  );
+}

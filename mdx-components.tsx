@@ -35,6 +35,7 @@ export const mdxComponents = {
   PoolAnim: A.PoolAnim,
   TerminalAnim: A.TerminalAnim,
   HttpAnim: A.HttpAnim,
+  SqlAnim: A.SqlAnim,
   CodeWalk,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
