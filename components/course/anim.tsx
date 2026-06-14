@@ -1320,3 +1320,105 @@ export function PoolAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   TerminalAnim — a real terminal window, because
+   a command-line topic should LOOK like a command
+   line, not a gopher on a lane. Two modes:
+   • line mode: a shell session — each frame types
+     a `$ cmd` and reveals its output; scrollback
+     accumulates so it reads like a real session.
+   • screen mode: a frame supplies `screen` (lines)
+     that REPLACE the body each step — for TUIs /
+     full-screen apps (Bubble Tea, a redraw loop).
+   ════════════════════════════════════════════ */
+type TermFrame = {
+  cmd?: string; // typed at the prompt this frame (line mode)
+  out?: string[]; // output the command prints (line mode)
+  screen?: string[]; // full-screen body that replaces the terminal (screen mode)
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+export function TerminalAnim({
+  title = "terminal",
+  prompt = "$",
+  frames,
+  caption,
+}: {
+  title?: string;
+  prompt?: string;
+  frames: TermFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const screenMode = !!f.screen;
+
+  // line mode: accumulate every command+output up to and including the current frame
+  const history: { kind: "cmd" | "out" | "blank"; text: string; cur?: boolean }[] = [];
+  if (!screenMode) {
+    for (let i = 0; i <= st.cur; i++) {
+      const fr = frames[i];
+      if (fr.screen) continue;
+      if (fr.cmd !== undefined) history.push({ kind: "cmd", text: fr.cmd, cur: i === st.cur });
+      // only show output for frames strictly before the current one, OR the
+      // current one once its command has "landed" (we reveal both together)
+      if (fr.out) for (const line of fr.out) history.push({ kind: "out", text: line });
+      if (i !== st.cur) history.push({ kind: "blank", text: "" });
+    }
+  }
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="terminal"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="term" role="img" aria-label={title}>
+        <div className="term-bar">
+          <span className="term-dot term-dot-r" />
+          <span className="term-dot term-dot-y" />
+          <span className="term-dot term-dot-g" />
+          <span className="term-bar-title">{title}</span>
+        </div>
+        <div className={`term-body ${screenMode ? "term-screen" : ""}`}>
+          {screenMode
+            ? (f.screen ?? []).map((line, i) => (
+                <div className="term-line term-tui" key={i}>
+                  {line || " "}
+                </div>
+              ))
+            : history.map((h, i) =>
+                h.kind === "cmd" ? (
+                  <div className="term-line" key={i}>
+                    <span className="term-prompt">{prompt}</span>{" "}
+                    <span className="term-cmd">{h.text}</span>
+                    {h.cur && <span className="term-cursor" aria-hidden />}
+                  </div>
+                ) : h.kind === "blank" ? (
+                  <div className="term-line" key={i}>
+                    &nbsp;
+                  </div>
+                ) : (
+                  <div className="term-line term-out" key={i}>
+                    {h.text || " "}
+                  </div>
+                )
+              )}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
