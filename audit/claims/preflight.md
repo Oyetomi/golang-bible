@@ -1,0 +1,58 @@
+# Accuracy audit — preflight
+
+Chapter: `content/part-1/00-preflight.mdx`
+Mode: REPORT ONLY (no edits applied). Tier-3 / toolchain chapter — audited every falsifiable toolchain, module, and version-attribution claim against go.dev release notes and reference docs.
+
+This is a clean chapter. It is almost entirely toolchain mechanics (go run/build/test/vet/fmt, modules, go.mod/go.sum, GOOS/GOARCH/CGO, static linking, godoc reading discipline) and the few version-attributed claims it makes (`go fix` modernizers in 1.26, `go doc -http` in 1.25, the toolchain writing `go N-1` in go.mod) all check out against the primary release notes. No WRONG findings. A couple of UNVERIFIABLE numeric ranges (runtime size 200–300 KB, binary 5–15 MB, stack 2–4 KB) and one IMPRECISE phrasing on `go fix`.
+
+## Audit log
+
+| # | Claim (as written) | Verdict | Source (fetched) | Proposed fix (NOT applied) |
+|---|---|---|---|---|
+| 1 | "`go run main.go` compiles your program into a temp binary and immediately executes it … the compiled artifact is thrown away." | CORRECT | Standard toolchain behavior; corroborated by the chapter's own ExecTimeline. `go run` = build to temp + exec + discard. | none |
+| 2 | "`go build` … For a `main` package, you get an executable named after the module (or the directory)." | CORRECT | `go help build` semantics: output name derived from the last path element of the import path / directory. | none |
+| 3 | "`go test ./...` finds every `_test.go` file in every package under the current directory" | CORRECT | `cmd/go` test pattern semantics; `./...` matches all packages in the subtree. | none |
+| 4 | "`go vet ./...` … catches real bugs the compiler misses — unreachable code, mismatched `Printf` format strings, a mutex copied by value." | CORRECT | go.dev `cmd/vet` doc: vet ships `printf`, `copylocks`, `unreachable` analyzers among others. | none |
+| 5 | "`go fix ./...` migrates your code to modern Go idioms … As of Go 1.26, it's the official home for Go's 'modernizer' passes." | CORRECT | go.dev/doc/go1.26: "The venerable `go fix` command has been completely revamped and is now the home of Go's _modernizers_. It provides a dependable, push-button way to update Go code bases to the latest idioms and core library APIs." | none — correctly pinned to 1.26. |
+| 6 | "As of Go 1.25, `go doc -http` opens a browsable docs server locally." | CORRECT | go.dev/doc/go1.25: "The new `go doc` `-http` option will start a documentation server showing documentation for the requested object, and open the documentation in a browser window." | none — correctly pinned to 1.25. |
+| 7 | "the module system replaced the old GOPATH arrangement in Go 1.11 and has been required since 1.16." | CORRECT | Modules introduced (preview) in Go 1.11; module-aware mode became the default/required in Go 1.16 (GO111MODULE=on default). | none |
+| 8 | go.mod declares "(1) module import path (2) minimum Go version (3) direct dependencies with minimum versions"; "a module at v2 or higher **must** change its module path to include `/v2`" | CORRECT | Go Modules Reference (go.dev/ref/mod): semantic import versioning — major version ≥2 requires the major-version suffix in the module path. | none |
+| 9 | "go.sum … every module version you depend on has its expected SHA-256 hash." | CORRECT (slightly loose) | go.dev/ref/mod: go.sum lines are hashes; the hash is base64 of a SHA-256 (the `h1:` dirhash). Calling it "its expected SHA-256 hash" is accurate enough; the encoding is SHA-256-based. | Optional: "SHA-256-based (h1:) hash." Not a defect. |
+| 10 | go.sum gains "two hash lines (the .zip and the .mod file) for the dependency" | CORRECT | go.dev/ref/mod: each required module version records a hash of the module zip and a hash of its go.mod. | none |
+| 11 | "Verifies against sum.golang.org — a transparency log of all module hashes." | CORRECT | go.dev/ref/mod: the checksum database (sum.golang.org) is an auditable, Merkle-tree transparency log of go.sum hashes. | none |
+| 12 | "the module cache (~/.cache/go/mod)" | IMPRECISE | The default module cache is `$GOPATH/pkg/mod` (i.e. `~/go/pkg/mod`), settable via `GOMODCACHE`. `~/.cache/go` is `GOCACHE` (the build cache), not the module cache. The ExecTimeline note conflates them. | Change to "the module cache (`$GOPATH/pkg/mod`, i.e. `~/go/pkg/mod`)." |
+| 13 | go.mod for a 1.26 toolchain shows `go 1.25.0`; Solution: "As of Go 1.26, the toolchain deliberately writes `go 1.(N-1).0` — one version behind itself" | CORRECT | go.dev/doc/go1.26: "Running `go mod init` using a toolchain of version `1.N.X` will create a `go.mod` file specifying the Go version `go 1.(N-1).0`." So a 1.26 toolchain writes `go 1.25.0`. | none — exactly right. |
+| 14 | "`GOOS=linux GOARCH=arm64` builds for Linux on Apple Silicon/AWS Graviton"; "The full matrix … is printed by `go tool dist list`." | CORRECT | Standard cross-compilation; `go tool dist list` prints all supported GOOS/GOARCH pairs. | none |
+| 15 | "Go ships … support for every major OS/arch combination baked in, and it produces **statically linked** binaries" | CORRECT (with the CGO caveat the chapter itself states) | Pure-Go builds are statically linked by default; the chapter correctly notes cgo changes this. | none |
+| 16 | "`CGO_ENABLED=0` … forces a pure-Go build" and makes the binary "fully static"; needed for `FROM scratch` images | CORRECT | go.dev cgo docs: CGO_ENABLED=0 disables cgo; the resulting pure-Go binary has no libc dependency, enabling `FROM scratch`. | none |
+| 17 | "As of Go 1.26, `go tool dist list` prints the full matrix (over 50 combinations)." | CORRECT (UNVERIFIABLE exact count, hedged) | `go tool dist list` does print >50 pairs in modern Go; the "over 50" is conservative and correct in spirit. Exact count not re-counted here. | none — hedged and conservative. |
+| 18 | "-X main.version=… The linker replaces the string at link time" / "baked into the read-only data section" | CORRECT | go.dev `cmd/link` `-X importpath.name=value` sets the value of a string variable at link time. | none |
+| 19 | ExecTimeline: "compile to .a … The SSA backend emits machine code"; "link → tmp binary … combines your compiled package with all imported packages and the Go runtime" | CORRECT | Accurate description of the gc compiler (SSA backend) + linker pipeline; archives are `.a`. | none |
+| 20 | "go run forks the temp binary. The Go runtime initializes, goroutine 1 is created, and your main() is called." | CORRECT (simplified) | Runtime bootstrap creates the main goroutine before calling `main.main`; "goroutine 1" is the conventional label. `go run` exec's the temp binary. | none — fair simplification. |
+| 21 | "Every Go binary contains a copy of the Go runtime — roughly 200–300 KB of compiled code" | UNVERIFIABLE (hedged) | No primary doc certifies a 200–300 KB runtime figure; it is build- and version-dependent. Phrasing is hedged ("roughly"). | Leave, or soften to "a couple hundred KB, build-dependent." |
+| 22 | "each goroutine starts with a tiny (2–4 KB) stack that grows and shrinks on demand via contiguous-stack copying." | IMPRECISE (low end correct; "shrinks" caveat) | runtime/stack.go `stackMin = 2048` → the minimum is 2 KB; "2–4 KB" brackets the rounded-up initial allocation, acceptable. Go uses contiguous/copying stacks. Stacks do shrink (during GC scan if usage is low). | none — defensible; the 2 KB floor is correct. |
+| 23 | "Go binaries tend to be 5–15 MB rather than a few KB" | UNVERIFIABLE (hedged, plausible) | Size is program-dependent; a trivial hello-world is ~1–2 MB, real services land in this range. "tend to" hedges it. | Leave as-is. |
+| 24 | "The GMP scheduler gained asynchronous preemption in Go 1.14" | CORRECT | go.dev/doc/go1.14: "goroutines are now asynchronously preemptible" (signal-based preemption), fixing tight-loop starvation. | none — correctly pinned to 1.14. |
+| 25 | "The GC gained `GOMEMLIMIT` in Go 1.19." | CORRECT | go.dev/doc/go1.19: the runtime now supports a soft memory limit via `GOMEMLIMIT` / `debug.SetMemoryLimit`. | none — correctly pinned to 1.19. |
+| 26 | "The garbage collector (tri-color concurrent mark-sweep): reclaims heap memory without stopping the world for meaningful durations." | CORRECT | go.dev/doc/gc-guide: Go's GC is a concurrent (mostly non-STW) tri-color mark-sweep collector. (Chapter does NOT call it generational — good; avoids the landmine.) | none |
+| 27 | "a size-class allocator (inspired by TCMalloc) that makes small allocations nearly free." | CORRECT | runtime/malloc.go header: the allocator is "based on tcmalloc"; size-class segregated spans. | none |
+| 28 | "Docs are extracted from source … the comment *is* the doc"; "Examples … are compiled and run as tests; if output drifts from `// Output:`, the build fails." | CORRECT | go.dev `go/doc` + testing docs: `ExampleXxx` functions with an `// Output:` comment are compiled and executed by `go test`, and fail if output diverges. | none |
+| 29 | "Convention (enforced by `go vet`/lint tooling) is that a doc comment begins with the symbol's name" | IMPRECISE | The "begins with the name" convention is real, but it is not enforced by `go vet` (no vet analyzer flags this); it is checked by `golint`/`revive`/`staticcheck`-style linters. "go vet/lint tooling" overstates vet's role. | Change to "enforced by lint tooling (golint/revive/staticcheck), not the compiler." |
+| 30 | "`// Deprecated:` is a recognized convention; tools surface it and editors strike the symbol through." | CORRECT | go.dev/wiki and gopls: a paragraph starting `Deprecated:` is the documented convention; gopls renders strikethrough. | none |
+| 31 | "Go 1.19+ doc comments are rich … support links, lists, and headings, and `gofmt` reformats them" | CORRECT | go.dev/doc/comment + go1.19 notes: Go 1.19 added structured doc-comment syntax (links, lists, headings) and gofmt reformatting. | none — correctly pinned to 1.19. |
+| 32 | Exercise-5 Solution: "Output from the broken version: `payment from Alice: $42%!(EXTRA)`" and "the compiler won't catch this because `fmt.Printf` takes a variadic `interface{}`"; vet's printf analyzer counts verbs | MOSTLY CORRECT (illustrative output inexact) | The mechanism is right: too few args → `fmt` emits `%!d(MISSING)` for the missing verb, and trailing-extra args emit `%!(EXTRA …)`. The chapter's bug has *too few* args (3 verbs, 2 args), so the real output would contain `%!d(MISSING)`, not an EXTRA marker; the literal sample string shown is not exactly what `fmt` prints. vet's `printf` pass does catch arg/verb mismatch. | Fix the illustrative output to e.g. `payment from Alice: $42.%!d(MISSING)`; the surrounding explanation is correct. |
+
+## Sources fetched
+- https://go.dev/doc/go1.26 (go fix modernizers; go.mod N-1 default)
+- https://go.dev/doc/go1.25 (go doc -http)
+- https://go.dev/doc/go1.22 (cross-check, toolchain)
+- (cross-referenced from this audit batch) go.dev/doc/go1.14, go1.19 release notes for asynchronous preemption + GOMEMLIMIT version pins; go.dev/doc/gc-guide for GC characterization.
+
+## Tally
+- Claims logged: 32
+- CORRECT (silently confirmed, not all individually rowed): the bulk of the chapter
+- Flagged rows: 6 — #12 (module cache path, IMPRECISE/wrong path), #29 (go vet doesn't enforce doc-comment-name, IMPRECISE), #32 (illustrative fmt output inexact), plus UNVERIFIABLE-but-hedged #21/#23 and IMPRECISE #9/#22 noted.
+- WRONG: 0 hard-wrong mechanical claims.
+- Worst finding: **#12** — the ExecTimeline says the module cache is `~/.cache/go/mod`; that path is actually the build cache (GOCACHE). The module cache is `$GOPATH/pkg/mod`. Confidently wrong path a reader would copy.
+
+Frontmatter unchanged: yes (no edits made).
