@@ -1422,3 +1422,127 @@ export function TerminalAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   HttpAnim — an HTTP exchange drawn as what it
+   IS: a request card (method, path, headers,
+   body) leaving the client, a packet crossing
+   the wire, the server responding with a status
+   card. The artifact is the illustration, not a
+   gopher on a lane.
+   ════════════════════════════════════════════ */
+type HttpHeader = { k: string; v: string };
+type HttpPhase = "compose" | "request" | "server" | "response" | "done";
+type HttpFrame = { phase: HttpPhase; note: string; beat?: "problem" | "solution" | "neutral" };
+
+export function HttpAnim({
+  title = "HTTP exchange",
+  method = "GET",
+  path = "/",
+  host,
+  reqHeaders = [],
+  reqBody,
+  status = 200,
+  statusText = "OK",
+  resHeaders = [],
+  resBody,
+  frames,
+  caption,
+}: {
+  title?: string;
+  method?: string;
+  path?: string;
+  host?: string;
+  reqHeaders?: HttpHeader[];
+  reqBody?: string;
+  status?: number;
+  statusText?: string;
+  resHeaders?: HttpHeader[];
+  resBody?: string;
+  frames: HttpFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const reqVisible = f.phase !== "compose";
+  const resVisible = f.phase === "response" || f.phase === "done";
+  const wire =
+    f.phase === "request" ? "up" : f.phase === "response" ? "down" : f.phase === "server" ? "wait" : "idle";
+  const statusClass = status >= 500 ? "bad" : status >= 400 ? "warn" : "ok";
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="http"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="http">
+        <div className="http-node">
+          <Gopher pose="idle" state="idle" size={34} role="operator" title="client" />
+          <span className="http-node-label">client</span>
+        </div>
+
+        <div className="http-mid">
+          <div className={`http-card http-req ${reqVisible ? "on" : "off"}`}>
+            <div className="http-req-line">
+              <span className="http-method">{method}</span> {path}{" "}
+              <span className="http-ver">HTTP/1.1</span>
+            </div>
+            {host && (
+              <div className="http-hdr">
+                <span className="http-hk">Host:</span> {host}
+              </div>
+            )}
+            {reqHeaders.map((h) => (
+              <div className="http-hdr" key={h.k}>
+                <span className="http-hk">{h.k}:</span> {h.v}
+              </div>
+            ))}
+            {reqBody && <div className="http-body">{reqBody}</div>}
+          </div>
+
+          <div className={`http-wire http-wire-${wire}`}>
+            <span className="http-packet" aria-hidden />
+          </div>
+
+          <div className={`http-card http-res ${resVisible ? "on" : "off"}`}>
+            <div className="http-status-line">
+              <span className="http-ver">HTTP/1.1</span>{" "}
+              <span className={`http-status http-status-${statusClass}`}>
+                {status} {statusText}
+              </span>
+            </div>
+            {resHeaders.map((h) => (
+              <div className="http-hdr" key={h.k}>
+                <span className="http-hk">{h.k}:</span> {h.v}
+              </div>
+            ))}
+            {resBody && <div className="http-body">{resBody}</div>}
+          </div>
+        </div>
+
+        <div className="http-node">
+          <Gopher
+            pose={f.phase === "server" ? "run" : "idle"}
+            state={f.phase === "server" ? "active" : "idle"}
+            size={34}
+            role="operator"
+            title="server"
+          />
+          <span className="http-node-label">server</span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
