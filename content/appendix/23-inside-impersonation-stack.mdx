@@ -1,0 +1,1020 @@
+---
+title: "Inside the Impersonation Stack: uTLS, tls-client & surf"
+part: "appendix"
+order: 23
+type: "course"
+description: "The source code, line by line: the TLSExtension interface (Len/Read/writeToUConn) every uTLS extension implements, how SupportedCurvesExtension serializes to exact wire bytes, the real Chrome ClientHelloSpec explained extension by extension, the build pipeline (buildHandshakeState → applyPresetByID → ApplyConfig → MarshalClientHello), extension shuffling, tls-client's ClientProfile struct that bundles the TLS and HTTP/2 fingerprints, and surf's Impersonate/applyVariant — with runnable stdlib re-implementations that emit genuine ClientHello bytes."
+prerequisites: ["tls-fingerprinting-impersonation"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Source Deep Dive" title="Inside the Impersonation Stack: uTLS, tls-client & surf">
+
+Here's the thing, sport. The last chapter taught you *what* a fingerprint is and *why* it works. This one opens the hood and shows you the actual machinery — the real source of **uTLS**, **`bogdanfinn/tls-client`**, and **`enetx/surf`** — so you don't just use these libraries, you could *write* them. We're going to read the genuine code: the interface every TLS extension implements, the exact byte-level serialization that turns a `[]CurveID` into the `supported_curves` extension on the wire, the literal `ClientHelloSpec` that *is* Chrome, the pipeline that marshals it, and the structs in tls-client and surf that bundle it all into one consistent browser identity.
+
+And you won't just read it — you'll **rebuild it**, in runnable stdlib Go, and watch your own code emit the same bytes the real library does. By the end, "uTLS forges the ClientHello" stops being a sentence and becomes a thing you can trace instruction by instruction: the extension's `Read` method writing `00 0a 00 0a 00 08 …` into a buffer, the `Len` accumulation that sizes the message, the `writeToUConn` that wires a spec field into the handshake state. Nothing assumed. This is the mastery layer.
+
+</HeroCard>
+
+<Callout kind="warn" title="Same framing as the last chapter">
+This is internals knowledge for understanding, building, and defending against fingerprinting — authorized testing, scraping-defense research, and learning how anti-bot systems work. The code quoted here is the real, open-source library code (links in the sources callout); the runnable examples are faithful stdlib re-implementations so you can verify the bytes yourself. Use it on systems you own or are authorized to test.
+</Callout>
+
+<ChapterTabs tabs={["The TLSExtension Interface", "Serializing an Extension", "GREASE in the Source", "Chrome's Real ClientHelloSpec", "The Build Pipeline", "tls-client's ClientProfile", "surf's Impersonate", "The Whole Call Graph"]} />
+
+## The TLSExtension Interface
+
+Everything in uTLS hangs off one small interface. A ClientHello is a list of **extensions**, and every extension type — SNI, ALPN, supported_curves, key_share, the GREASE placeholder — implements the same contract. Get this interface and the entire library unfolds from it.
+
+<Define term="TLSExtension (uTLS)">
+In uTLS, a **`TLSExtension`** is any type that can (a) report its serialized byte length, (b) write its serialized bytes into a buffer, and (c) apply its values into the connection's handshake state. The first two come from implementing `io.Reader`-style methods — `Len() int` and `Read([]byte) (int, error)` — so an extension can be *read out* as bytes. The third, `writeToUConn(*UConn) error`, lets the extension push its data (e.g. the curve list) into the `Hello` struct that crypto/tls will use. A `ClientHelloSpec` is just an ordered `[]TLSExtension` plus a cipher list — so the ClientHello's byte layout is literally the concatenation of each extension reading itself out, in order.
+</Define>
+
+Here is the real interface from uTLS, and a faithful stdlib mirror you can build against:
+
+```go
+// From refraction-networking/utls (u_tls_extensions.go), the contract every
+// extension implements. Len + Read make an extension serialize itself to bytes;
+// writeToUConn pushes its values into the handshake state.
+type TLSExtension interface {
+	writeToUConn(*UConn) error
+	Len() int
+	Read([]byte) (int, error) // io.Reader: fill b with the extension's wire bytes
+}
+```
+
+<Callout kind="note" title="Why Read, of all methods?">
+Making an extension an `io.Reader` is the elegant trick. To marshal the whole ClientHello, uTLS doesn't need a giant switch over extension types — it just calls `Read` on each one in order and concatenates. A `bufio`-style writer `ReadFrom`s each extension straight into the message buffer. Adding a brand-new extension means writing one type with `Len`/`Read`/`writeToUConn` — no change to the marshaller. That's the Go idiom from the **Design Patterns** chapter (small interfaces, composition) doing real work in production security code.
+</Callout>
+
+---
+
+## Serializing an Extension
+
+Now the concrete payoff: how a `[]CurveID` becomes the exact bytes of the `supported_curves` extension. This is the real uTLS `SupportedCurvesExtension`, and it is small enough to understand completely.
+
+```go
+// From refraction-networking/utls — the REAL SupportedCurvesExtension.
+type SupportedCurvesExtension struct {
+	Curves []CurveID // e.g. {GREASE, X25519, CurveP256, CurveP384}
+}
+
+// Len: a 6-byte header (ext type 2 + ext len 2 + list len 2) plus 2 bytes/curve.
+func (e *SupportedCurvesExtension) Len() int {
+	return 6 + 2*len(e.Curves)
+}
+
+// Read serializes the extension into b, big-endian, and returns io.EOF when done.
+func (e *SupportedCurvesExtension) Read(b []byte) (int, error) {
+	if len(b) < e.Len() {
+		return 0, io.ErrShortBuffer
+	}
+	// bytes 0-1: extension TYPE (supported_curves = 0x000a)
+	b[0] = byte(extensionSupportedCurves >> 8)
+	b[1] = byte(extensionSupportedCurves)
+	// bytes 2-3: extension LENGTH (everything after this field)
+	b[2] = byte((2 + 2*len(e.Curves)) >> 8)
+	b[3] = byte(2 + 2*len(e.Curves))
+	// bytes 4-5: the curve LIST length
+	b[4] = byte((2 * len(e.Curves)) >> 8)
+	b[5] = byte(2 * len(e.Curves))
+	// then each curve as a big-endian uint16
+	for i, curve := range e.Curves {
+		b[6+2*i] = byte(curve >> 8)
+		b[7+2*i] = byte(curve)
+	}
+	return e.Len(), io.EOF
+}
+
+// writeToUConn pushes the curves into the handshake state crypto/tls reads.
+func (e *SupportedCurvesExtension) writeToUConn(uc *UConn) error {
+	uc.config.CurvePreferences = e.Curves
+	uc.HandshakeState.Hello.SupportedCurves = e.Curves
+	return nil
+}
+```
+
+That's the entire mechanism for one extension — and every other extension is the same shape with different bytes. Here it is as a **runnable** stdlib re-implementation that produces the genuine wire bytes:
+
+<CodeWalk
+  title="A real TLS extension, serialized to wire bytes"
+  steps={[
+    { lines: "12-15", note: "The struct is just the data: a list of curve IDs (each a uint16). GREASE, X25519, P-256, P-384 — the exact curves Chrome offers. No behaviour yet; behaviour is the three methods.", pose: "scribe", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "17", note: "Len() = 6 + 2·len(curves). The 6 is the fixed TLS extension header (2-byte type, 2-byte extension length, 2-byte list length); each curve adds 2 bytes. The marshaller calls this to size the buffer before writing.", pose: "guard", role: "scientist", state: "ok", beat: "solution" },
+    { lines: "23-28", note: "Read writes the three length fields, big-endian: bytes 0-1 are the extension type (10 = supported_curves), 2-3 the extension length, 4-5 the curve-list length. This nested-length framing is how every TLS extension is structured.", pose: "run", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "29-33", note: "Then each curve as two big-endian bytes. After this loop the buffer holds the complete extension. The real uTLS Read is byte-for-byte this — you're looking at production TLS-fingerprinting code.", pose: "run", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "36-45", note: "Serialize Chrome's curve list and print the hex. Out comes 00 0a 00 0a 00 08 3a3a 001d 0017 0018 — type 10, length 10, list-length 8, then GREASE/X25519/P256/P384. That is exactly what crosses the wire in Chrome's ClientHello.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="One extension = a struct plus Len/Read/writeToUConn. Read emits the nested-length TLS framing and the values, big-endian. Your stdlib version produces the identical bytes uTLS sends — because it's the same algorithm."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+)
+
+type CurveID uint16
+
+const extensionSupportedCurves = 0x000a // supported_groups, IANA #10
+
+// A faithful re-implementation of uTLS's SupportedCurvesExtension.
+type SupportedCurvesExtension struct {
+	Curves []CurveID
+}
+
+func (e *SupportedCurvesExtension) Len() int { return 6 + 2*len(e.Curves) }
+
+func (e *SupportedCurvesExtension) Read(b []byte) (int, error) {
+	if len(b) < e.Len() {
+		return 0, io.ErrShortBuffer
+	}
+	b[0] = byte(extensionSupportedCurves >> 8)
+	b[1] = byte(extensionSupportedCurves)
+	b[2] = byte((2 + 2*len(e.Curves)) >> 8)
+	b[3] = byte(2 + 2*len(e.Curves))
+	b[4] = byte((2 * len(e.Curves)) >> 8)
+	b[5] = byte(2 * len(e.Curves))
+	for i, curve := range e.Curves {
+		b[6+2*i] = byte(curve >> 8)
+		b[7+2*i] = byte(curve)
+	}
+	return e.Len(), io.EOF
+}
+
+func main() {
+	// Chrome's supported_curves: GREASE, X25519, CurveP256, CurveP384.
+	ext := &SupportedCurvesExtension{Curves: []CurveID{0x3a3a, 0x001d, 0x0017, 0x0018}}
+	buf := make([]byte, ext.Len())
+	ext.Read(buf)
+	fmt.Printf("supported_curves extension (% x)\n", buf)
+	fmt.Printf("  type=%d  ext_len=%d  list_len=%d\n", buf[1], buf[3], buf[5])
+	for i := 6; i < len(buf); i += 2 {
+		fmt.Printf("  curve %#04x\n", uint16(buf[i])<<8|uint16(buf[i+1]))
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## GREASE in the Source
+
+The most important thing to internalize about GREASE: it is **not special**. To the serializer, a GREASE extension is an ordinary extension that happens to carry a reserved random type value. Here is the real uTLS `UtlsGREASEExtension`:
+
+```go
+// From refraction-networking/utls — GREASE serializes EXACTLY like any extension.
+type UtlsGREASEExtension struct {
+	Value uint16 // a reserved GREASE type, e.g. 0x?a?a
+	Body  []byte // usually empty
+}
+
+func (e *UtlsGREASEExtension) Read(b []byte) (int, error) {
+	if len(b) < e.Len() {
+		return 0, io.ErrShortBuffer
+	}
+	b[0] = byte(e.Value >> 8) // 2-byte type — same slot as any extension
+	b[1] = byte(e.Value)
+	b[2] = byte(len(e.Body) >> 8) // 2-byte length
+	b[3] = byte(len(e.Body))
+	if len(e.Body) > 0 {
+		copy(b[4:], e.Body)
+	}
+	return e.Len(), io.EOF
+}
+```
+
+<Callout kind="pro" title="Why GREASE looks like a real extension on purpose">
+GREASE (RFC 8701) exists so servers *can't* ossify on a fixed extension set — browsers send unknown, reserved values that a correct server must ignore. For that to work, a GREASE extension has to be **indistinguishable in structure** from a real one: same 2-byte-type, 2-byte-length framing. That's exactly what the code shows — `UtlsGREASEExtension.Read` writes the identical layout as `SupportedCurvesExtension.Read`. This is also why faking Chrome means *including* GREASE in the right slots: a real Chrome ClientHello has GREASE extensions interleaved, and a fingerprinter that strips GREASE before hashing expects to find it there to strip. Omit it and your spec doesn't match Chrome's structure even after the strip.
+</Callout>
+
+The GREASE *value* itself is generated at runtime — uTLS picks one of the 16 reserved values per connection (via a function like `GetBoringGREASEValue`), so the placeholder `GREASE_PLACEHOLDER` you'll see in the spec is replaced with a concrete `0x?a?a` when the Hello is built. The JA3/JA4 fingerprinter then strips it back out, so the *fingerprint* is stable even though the *bytes* vary per connection — exactly the design goal.
+
+---
+
+## Chrome's Real ClientHelloSpec
+
+Now the centerpiece. This is the **actual** `ClientHelloSpec` for Chrome in uTLS — the literal definition that *is* Chrome's TLS fingerprint. Read it once for shape, then we'll walk every extension and say what it is and why Chrome sends it.
+
+```go
+// From refraction-networking/utls (u_parrots.go) — the real Chrome ClientHelloSpec.
+ClientHelloSpec{
+	CipherSuites: []uint16{
+		GREASE_PLACEHOLDER,                          // GREASE — ignored by fingerprinters
+		TLS_AES_128_GCM_SHA256,                      // TLS 1.3 AEAD suites first
+		TLS_AES_256_GCM_SHA384,
+		TLS_CHACHA20_POLY1305_SHA256,
+		TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,     // TLS 1.2 ECDHE suites
+		TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,          // older CBC fallbacks
+		TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		TLS_RSA_WITH_AES_128_GCM_SHA256,
+		TLS_RSA_WITH_AES_256_GCM_SHA384,
+		TLS_RSA_WITH_AES_128_CBC_SHA,
+		TLS_RSA_WITH_AES_256_CBC_SHA,
+	},
+	Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
+		&UtlsGREASEExtension{},                                            // GREASE (leading)
+		&SNIExtension{},                                                   // server_name (the host)
+		&ExtendedMasterSecretExtension{},                                 // session-hijack hardening
+		&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
+		&SupportedCurvesExtension{Curves: []CurveID{                       // supported_groups
+			GREASE_PLACEHOLDER, X25519, CurveP256, CurveP384,
+		}},
+		&SupportedPointsExtension{SupportedPoints: []byte{0x00}},          // ec_point_formats: uncompressed
+		&SessionTicketExtension{},
+		&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},         // ALPN: HTTP/2 then 1.1
+		&StatusRequestExtension{},                                        // OCSP stapling
+		&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{ /* ... */ }},
+		&SCTExtension{},                                                  // signed_certificate_timestamp
+		&KeyShareExtension{KeyShares: []KeyShare{                         // key_share (TLS 1.3)
+			{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}},
+			{Group: X25519},
+		}},
+		&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+		&SupportedVersionsExtension{Versions: []uint16{                   // TLS 1.3 then 1.2
+			GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12,
+		}},
+		&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}},
+		&ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}}, // ALPS
+		BoringGREASEECH(),                                               // GREASE'd Encrypted ClientHello
+		&UtlsGREASEExtension{},                                          // GREASE (trailing)
+		&UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle},        // pad to a round size
+	}),
+}
+```
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="GREASE bookends">Chrome leads *and* trails its extension list with `UtlsGREASEExtension`, plus a GREASE curve, key-share group, and version. Fingerprinters strip these — but their *presence and position* are part of looking like Chrome.</ConceptCard>
+  <ConceptCard label="SNIExtension">`server_name` — the hostname you're connecting to, sent in the clear. Always present for a browser hitting a named host.</ConceptCard>
+  <ConceptCard label="SupportedCurvesExtension">`supported_groups` — the elliptic curves Chrome will do key exchange over: GREASE, X25519, P-256, P-384, in that order. This is the JA3 "EllipticCurve" field.</ConceptCard>
+  <ConceptCard label="ALPNExtension">`{"h2","http/1.1"}` — Chrome offers HTTP/2 first, HTTP/1.1 as fallback. The first ALPN value feeds JA4's `a` part (the `h2`).</ConceptCard>
+  <ConceptCard label="KeyShareExtension">TLS 1.3 sends a key share *speculatively* in the ClientHello (a GREASE group + a real X25519 share) so a 1-RTT handshake can complete without a round-trip. Browser-specific.</ConceptCard>
+  <ConceptCard label="SupportedVersionsExtension">`{GREASE, TLS1.3, TLS1.2}` — in TLS 1.3 the real version negotiation moved into this extension; the record-layer version is a legacy 1.2 for compatibility.</ConceptCard>
+  <ConceptCard label="UtlsCompressCertExtension">`compress_certificate: brotli` — Chrome advertises it'll accept a Brotli-compressed certificate chain. A strong Chrome tell; most non-browsers omit it.</ConceptCard>
+  <ConceptCard label="ApplicationSettingsExtension">ALPS (`application_settings`) for `h2` — Chrome-specific HTTP/2 settings negotiation. Another distinctive Chrome marker.</ConceptCard>
+  <ConceptCard label="UtlsPaddingExtension">Pads the ClientHello to a round byte size (the old F5 bug workaround). The padding length is *computed* from the message size, so it's the last extension.</ConceptCard>
+  <ConceptCard label="BoringGREASEECH">A GREASE'd Encrypted ClientHello placeholder — modern Chrome advertises ECH support even when not using it, as forward signalling.</ConceptCard>
+</ConceptGrid>
+
+<Gotcha>
+**This is why you can't hand-roll Chrome from `crypto/tls`.** Look at that list: GREASE bookends, ALPS, compress_certificate, a speculative GREASE'd key share, GREASE'd ECH, computed padding — `crypto/tls` emits *none* of these and exposes no API to add them. Matching Chrome means emitting this exact ordered set with the right GREASE slots — which is the entire reason uTLS maintains a hand-built spec per browser version, updated as Chrome ships changes. The spec *is* the fingerprint, in source form.
+</Gotcha>
+
+---
+
+## The Build Pipeline
+
+You have the spec and you have the extensions. The pipeline that turns one into wire bytes is four steps, and uTLS names them clearly.
+
+<ExecTimeline
+  title="uTLS build pipeline: spec → handshake state → wire bytes"
+  lanes={[
+    { id: "id", label: "ClientHelloID", role: "scribe" },
+    { id: "spec", label: "ClientHelloSpec", role: "mechanic" },
+    { id: "hello", label: "HandshakeState.Hello", role: "guard" },
+    { id: "wire", label: "hello.Raw (bytes)", role: "operator" }
+  ]}
+  steps={[
+    { lane: "id", kind: "run", label: "buildHandshakeState()", note: "Entry point. The UConn knows its ClientHelloID (e.g. HelloChrome_120). buildHandshakeState orchestrates the whole assembly before the handshake sends anything." },
+    { lane: "spec", kind: "run", label: "applyPresetByID(ClientHelloID)", note: "Look up the ClientHelloID's stored ClientHelloSpec — the literal Chrome spec from the last section — and load its CipherSuites and Extensions into the UConn. The named preset becomes a concrete spec.", beat: "neutral" },
+    { lane: "hello", kind: "run", label: "ApplyConfig(): for ext := range Extensions { ext.writeToUConn(uc) }", note: "Iterate every extension and call writeToUConn — each pushes its values into HandshakeState.Hello (curves into Hello.SupportedCurves, ALPN into Hello.AlpnProtocols, …). After this loop, Hello holds the full logical ClientHello.", beat: "solution" },
+    { lane: "wire", kind: "run", label: "MarshalClientHello(): accumulate Len(), Read() each ext", note: "Size the message by summing every ext.Len(), then serialize: write the header (version, random, session ID, cipher suites), then ReadFrom each extension in order into the buffer. UtlsPaddingExtension is handled last so it can pad to the target size." },
+    { lane: "wire", kind: "done", label: "store hello.Raw → send on handshake", note: "The finished bytes land in hello.Raw. When the handshake runs, THIS is the ClientHello that goes out — and it hashes to Chrome's JA3/JA4. crypto/tls's own Hello-builder was never invoked.", beat: "solution" }
+  ]}
+  caption="Four steps: load the spec for the ID, push each extension's values into Hello (writeToUConn), then marshal by summing Len() and concatenating Read() output. The padding extension goes last because its length depends on everything before it."
+/>
+
+Here is that marshalling loop as a runnable mini-marshaller — a real ClientHello body built from a cipher list and a slice of the extensions you just implemented:
+
+<CodeWalk
+  title="Marshalling a ClientHello body from extensions"
+  steps={[
+    { lines: "33-37", note: "Sum every extension's Len() to size the extensions block — exactly uTLS's first marshalling pass. You must know the total length before you write the 2-byte extensions-length field that precedes them.", pose: "guard", role: "mechanic", state: "ok", beat: "solution" },
+    { lines: "40-44", note: "Write the cipher-suite block: a 2-byte length, then each suite big-endian. This is the part of the ClientHello before extensions — the same suites the JA3 'Cipher' field reads.", pose: "scribe", role: "mechanic", state: "active", beat: "neutral" },
+    { lines: "47-49", note: "Write the 2-byte total extensions length, then ReadFrom each extension in order — every ext.Read serializes itself into the buffer, just like the real MarshalClientHello does with a buffered writer.", pose: "run", role: "mechanic", state: "active", beat: "neutral" },
+    { lines: "57-66", note: "Build a tiny Chrome-shaped ClientHello body: two TLS 1.3 ciphers and three extensions (GREASE, supported_curves, ALPN). The hex dump shows the real wire structure — cipher block, then each extension's type/length/value, GREASE included.", pose: "happy", role: "operator", state: "done", beat: "solution" }
+  ]}
+  caption="Marshalling is two passes: sum Len() to size the buffer, then Read() each extension into it, in order. Your stdlib marshaller emits the same cipher-then-extensions byte structure uTLS sends — the spec became wire bytes."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+)
+
+// The extension contract — Len + Read, exactly uTLS's TLSExtension (minus
+// writeToUConn, which we don't need just to marshal bytes).
+type Ext interface {
+	Len() int
+	Read([]byte) (int, error)
+}
+
+type GREASE struct{ Value uint16 }
+
+func (e *GREASE) Len() int { return 4 }
+func (e *GREASE) Read(b []byte) (int, error) {
+	b[0], b[1], b[2], b[3] = byte(e.Value>>8), byte(e.Value), 0, 0
+	return 4, io.EOF
+}
+
+type Curves struct{ IDs []uint16 }
+
+func (e *Curves) Len() int { return 6 + 2*len(e.IDs) }
+func (e *Curves) Read(b []byte) (int, error) {
+	b[0], b[1] = 0x00, 0x0a // supported_curves
+	b[2], b[3] = byte((2+2*len(e.IDs))>>8), byte(2+2*len(e.IDs))
+	b[4], b[5] = byte((2*len(e.IDs))>>8), byte(2*len(e.IDs))
+	for i, id := range e.IDs {
+		b[6+2*i], b[7+2*i] = byte(id>>8), byte(id)
+	}
+	return e.Len(), io.EOF
+}
+
+type ALPN struct{ Protos []string }
+
+func (e *ALPN) Len() int {
+	n := 7 // type(2)+extlen(2)+listlen(2)+... actually: 2+2+2 header, then 1 len byte per proto
+	for _, p := range e.Protos {
+		n += 1 + len(p)
+	}
+	return n
+}
+func (e *ALPN) Read(b []byte) (int, error) {
+	var list []byte
+	for _, p := range e.Protos {
+		list = append(list, byte(len(p)))
+		list = append(list, p...)
+	}
+	b[0], b[1] = 0x00, 0x10 // application_layer_protocol_negotiation
+	b[2], b[3] = byte((2+len(list))>>8), byte(2+len(list))
+	b[4], b[5] = byte(len(list)>>8), byte(len(list))
+	copy(b[6:], list)
+	return e.Len(), io.EOF
+}
+
+// marshalBody builds the cipher block + extensions block of a ClientHello.
+func marshalBody(ciphers []uint16, exts []Ext) []byte {
+	extLen := 0
+	for _, e := range exts {
+		extLen += e.Len()
+	}
+	var out []byte
+	// cipher suites: 2-byte length, then each suite big-endian
+	out = append(out, byte((2*len(ciphers))>>8), byte(2*len(ciphers)))
+	for _, c := range ciphers {
+		out = append(out, byte(c>>8), byte(c))
+	}
+	// extensions: 2-byte total length, then each extension's bytes
+	out = append(out, byte(extLen>>8), byte(extLen))
+	for _, e := range exts {
+		buf := make([]byte, e.Len())
+		e.Read(buf)
+		out = append(out, buf...)
+	}
+	return out
+}
+
+func main() {
+	body := marshalBody(
+		[]uint16{0x1301, 0x1302}, // TLS_AES_128_GCM, TLS_AES_256_GCM
+		[]Ext{
+			&GREASE{Value: 0x3a3a},
+			&Curves{IDs: []uint16{0x3a3a, 0x001d, 0x0017, 0x0018}},
+			&ALPN{Protos: []string{"h2", "http/1.1"}},
+		},
+	)
+	fmt.Printf("ClientHello body (% x)\n", body)
+	fmt.Printf("(%d bytes: 2-len cipher block, then 2-len extensions block)\n", len(body))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## ShuffleChromeTLSExtensions
+
+You may have noticed the spec wraps its extensions in `ShuffleChromeTLSExtensions(...)`. Modern Chrome **randomizes the order of most of its extensions per connection** — its own anti-ossification move, the extension-level cousin of GREASE. uTLS mirrors it.
+
+<Callout kind="note" title="What shuffles, what stays put">
+`ShuffleChromeTLSExtensions` permutes the *middle* of the extension list but holds certain positions fixed: the **leading GREASE** stays first, the **padding extension stays last** (its length is computed from everything before it, so it can't move), and **pre-shared-key** (when present) must be last per the TLS spec. Everything between is shuffled. The defensive consequence is large: **extension *order* is no longer a reliable Chrome signal** — which is precisely why JA4 sorts extensions before hashing (last chapter). A detector keying on a fixed Chrome extension order will false-positive on real Chrome; a detector keying on the sorted *set* (JA4) won't. The library and the fingerprint format co-evolved against each other.
+</Callout>
+
+This is the deepest reason the JA3→JA4 shift happened, seen from the source side: the browser itself started shuffling, so an order-sensitive fingerprint (JA3) became unstable for the *real* browser, and a set-based one (JA4) became necessary for both detection and impersonation.
+
+---
+
+## tls-client's ClientProfile
+
+uTLS gives you the TLS layer. **`bogdanfinn/tls-client`** adds the second layer (HTTP/2) and bundles both into one unit — the `ClientProfile`. This is the real struct:
+
+```go
+// From bogdanfinn/tls-client (profiles/profiles.go) — the real ClientProfile.
+type ClientProfile struct {
+	clientHelloId          tls.ClientHelloID         // the uTLS spec (TLS layer)
+	headerPriority         *http2.PriorityParam      // HTTP/2 header-priority behaviour
+	settings               map[http2.SettingID]uint32 // HTTP/2 SETTINGS values
+	settingsOrder          []http2.SettingID         // the ORDER they're sent in
+	priorities             []http2.Priority          // standalone PRIORITY frames
+	pseudoHeaderOrder      []string                  // :method/:authority/:scheme/:path order
+	connectionFlow         uint32                    // the WINDOW_UPDATE increment
+	streamID               uint32
+	allowHTTP              bool
+	http3Settings          map[uint64]uint64         // HTTP/3 equivalents...
+	http3SettingsOrder     []uint64
+	http3PriorityParam     uint32
+	http3PseudoHeaderOrder []string
+	http3SendGreaseFrames  bool
+}
+```
+
+<Scene
+  title="A ClientProfile IS both fingerprint layers, in one struct"
+  actors={[{ id: "p", label: "ClientProfile", role: "captain" }]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "The TLS layer: clientHelloId points at the uTLS ClientHelloSpec for this browser version. That's the JA3/JA4 surface — the cipher and extension bytes from the earlier sections.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "clientHelloId" },
+        { id: "A2", state: "done", label: "→ uTLS spec" },
+        { id: "A3", state: "done", label: "JA3/JA4" }
+      ]
+    },
+    {
+      caption: "The HTTP/2 layer: settings + settingsOrder + connectionFlow + pseudoHeaderOrder + priorities. That's the Akamai fingerprint — every section of SETTINGS|WINDOW_UPDATE|PRIORITY|m,a,s,p, in source form.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "settings(+order)" },
+        { id: "A2", state: "active", label: "connectionFlow" },
+        { id: "A3", state: "active", label: "pseudoHeaderOrder" }
+      ]
+    },
+    {
+      caption: "Both layers in ONE struct is the whole point: profiles.Chrome_133 carries a Chrome TLS fingerprint AND the matching Chrome HTTP/2 fingerprint, so they can never drift apart. Picking a profile picks a consistent identity at every layer.",
+      beat: "solution",
+      cells: [
+        { id: "A1", state: "done", label: "TLS ✓" },
+        { id: "A2", state: "done", label: "HTTP/2 ✓" },
+        { id: "A3", state: "done", label: "consistent" }
+      ]
+    }
+  ]}
+  caption="The ClientProfile struct bundles the uTLS ClientHelloID (TLS fingerprint) with the HTTP/2 settings, order, flow, and pseudo-header order (Akamai fingerprint). One struct = one consistent browser at both layers — which is exactly what defeats cross-layer detection."
+/>
+
+The `settingsOrder` field deserves a second look: HTTP/2 SETTINGS are a *map*, but the **order** they're sent in is part of the fingerprint, and Go maps don't preserve order. So tls-client keeps an explicit `settingsOrder []http2.SettingID` and emits the SETTINGS frame in that slice's order — the same reason `surf` uses ordered maps for headers. **Anywhere order is fingerprinted, you'll find an explicit order slice in the source**, because Go's native map can't carry it.
+
+---
+
+## surf's Impersonate
+
+**`enetx/surf`** wraps the same foundation behind its fluent builder. Here is the real `Impersonate` type and the `applyVariant` that does the work:
+
+```go
+// From enetx/surf (impersonate.go) — the real Impersonate pipeline.
+type Impersonate struct {
+	builder *Builder
+	os      profiles.OSKey
+}
+
+// .Windows()/.MacOS()/.IOS() set the OS persona — which affects browser variant.
+func (im *Impersonate) Windows() *Impersonate { im.os = profiles.Windows; return im }
+
+// .Chrome() picks desktop vs mobile by OS, then applies the variant.
+func (im *Impersonate) Chrome() *Builder {
+	v := chrome.Desktop
+	if im.os.IsMobile() {
+		v = chrome.Mobile
+	}
+	return im.applyVariant(v)
+}
+
+// applyVariant wires the chosen variant into every fingerprint layer.
+func (im *Impersonate) applyVariant(v profiles.Variant) *Builder {
+	im.builder.headersApplier = v.Headers
+	im.builder.Boundary(v.Boundary)
+
+	if v.HelloSpec != nil {
+		im.builder.JA().SetHelloSpec(*v.HelloSpec) // exact uTLS spec
+	} else {
+		im.builder.JA().SetHelloID(v.HelloID)      // or a named uTLS preset
+	}
+
+	h2 := im.builder.HTTP2Settings()
+	v.ConfigureH2(h2adapter{h2}) // SETTINGS, window, priority, pseudo-order
+	h2.Set()
+
+	h3 := im.builder.HTTP3Settings()
+	v.ConfigureH3(h3adapter{h3}) // QUIC / HTTP/3 fingerprint
+	h3.Set()
+
+	return im.builder.SetHeaders(*v.BuildHeaders(im.os)) // headers, ordered, per OS
+}
+```
+
+<CodeWalk
+  title="surf: from .Chrome() to a fully-configured fingerprint"
+  steps={[
+    { lines: "7-12", note: "A Variant bundles every fingerprint layer — the uTLS preset (TLS), the HTTP/2 SETTINGS order, the pseudo-header order. surf's equivalent of a tls-client ClientProfile. This is the model the real applyVariant configures from.", pose: "scribe", role: "captain", state: "active", beat: "neutral" },
+    { lines: "14-18", note: "Impersonate holds an OS persona (Windows/MacOS/iOS/Android). The OS isn't cosmetic — in the real library it changes which browser variant and which headers get applied. isMobile() drives the desktop-vs-mobile split.", pose: "run", role: "captain", state: "active", beat: "neutral" },
+    { lines: "20-25", note: "Chrome() chooses the desktop or mobile variant based on whether the OS persona is mobile — mirroring surf's real `v := chrome.Desktop; if im.os.IsMobile() { v = chrome.Mobile }`. In the real applyVariant this Variant then sets the HelloSpec/HelloID, ConfigureH2/H3, and headers.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "22-24", note: "Notice the mobile and desktop variants carry DIFFERENT HTTP/2 settings orders — a real difference between Chrome-on-Windows and Chrome-on-iOS. The variant keeps every layer's fingerprint matched to that exact browser build.", pose: "run", role: "captain", state: "active", beat: "neutral" },
+    { lines: "27-33", note: "Driving both: each .Chrome() yields a fully-specified identity — TLS preset, H2 settings order, pseudo-header order. One call configured every layer to one consistent Chrome. That cross-layer consistency is the entire game.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="surf's .Chrome() resolves an OS-specific Variant, then applyVariant wires it into all four fingerprint surfaces: the uTLS TLS spec, HTTP/2 settings, HTTP/3 settings, and ordered headers. Different API from tls-client, identical job — configure every layer to one browser."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// A self-contained model of surf's applyVariant logic: an OS persona picks a
+// variant, the variant configures every fingerprint layer to one identity.
+type Variant struct {
+	name        string
+	helloID     string   // the uTLS preset (TLS layer)
+	h2Settings  []string // SETTINGS order (HTTP/2 layer)
+	pseudoOrder string   // pseudo-header order
+}
+
+type Impersonate struct{ os string }
+
+func (im *Impersonate) Windows() *Impersonate { im.os = "windows"; return im }
+func (im *Impersonate) IOS() *Impersonate      { im.os = "ios"; return im }
+func (im *Impersonate) isMobile() bool         { return im.os == "ios" || im.os == "android" }
+
+func (im *Impersonate) Chrome() Variant {
+	if im.isMobile() {
+		return Variant{"chrome-mobile", "HelloChrome_Auto", []string{"1", "2", "4", "6"}, "m,a,s,p"}
+	}
+	return Variant{"chrome-desktop", "HelloChrome_Auto", []string{"1", "2", "3", "4", "6"}, "m,a,s,p"}
+}
+
+func main() {
+	desktop := (&Impersonate{}).Windows().Chrome()
+	mobile := (&Impersonate{}).IOS().Chrome()
+	for _, v := range []Variant{desktop, mobile} {
+		fmt.Printf("%-14s TLS=%s  H2 settings order=%v  pseudo=%s\n",
+			v.name, v.helloID, v.h2Settings, v.pseudoOrder)
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## The Whole Call Graph
+
+Zoom all the way out. Here is the complete path from `surf.NewClient().Impersonate().Windows().Chrome()` down to the bytes on the wire — every layer you now understand from its source.
+
+<JourneyAnim
+  title="One .Chrome() call → genuine Chrome bytes on the wire"
+  hops={[
+    { id: "surf", label: "surf .Chrome()", role: "captain" },
+    { id: "variant", label: "Variant / Profile", role: "scribe" },
+    { id: "utls", label: "uTLS spec + build", role: "mechanic" },
+    { id: "h2", label: "HTTP/2 layer", role: "operator" },
+    { id: "wire", label: "the wire", role: "guard" }
+  ]}
+  frames={[
+    { note: "surf .Impersonate().Windows().Chrome() resolves an OS-specific Variant (or, in tls-client, you pick profiles.Chrome_133 — a ClientProfile). Same idea: a bundle of every layer's fingerprint.", at: "surf" },
+    { note: "The variant/profile carries the uTLS ClientHelloID (or HelloSpec), the HTTP/2 settings + order + pseudo-header order, and the ordered headers. One object, all layers, guaranteed consistent.", at: "variant", beat: "neutral" },
+    { note: "uTLS runs the build pipeline you read: applyPresetByID loads Chrome's real ClientHelloSpec, ApplyConfig pushes each extension's values into Hello via writeToUConn, MarshalClientHello sums Len() and Reads each extension into hello.Raw — GREASE, ALPS, key shares, padding, all in Chrome's order.", at: "utls", beat: "solution" },
+    { note: "After the handshake opens the tunnel, the HTTP/2 layer sends Chrome's SETTINGS frame in settingsOrder, the connectionFlow WINDOW_UPDATE, and emits requests with the m,a,s,p pseudo-header order. The Akamai fingerprint matches too.", at: "h2", beat: "solution" },
+    { note: "What crosses the wire — ClientHello bytes and HTTP/2 frames — hashes to Chrome's JA3, JA4, AND Akamai fingerprint, all at once, all consistent. A passive observer sees Chrome at every layer because every layer was driven from one bundle. That's mastery: you can name each byte and the line of code that wrote it.", at: "wire", beat: "solution" }
+  ]}
+  caption="Top to bottom: a single .Chrome() resolves a bundle → uTLS materializes and marshals Chrome's exact ClientHello → the HTTP/2 layer sends Chrome's SETTINGS and header order. Every fingerprint surface agrees because one object drove them all. You've now traced it from the fluent call to the wire bytes."
+/>
+
+---
+
+## Exercises
+
+You've read the real source. Now reproduce its pieces — the surest sign you've mastered it.
+
+<Exercise n={1} title="Implement an extension's Read" level="medium">
+
+Implement `SupportedPointsExtension` (the `ec_point_formats` extension, type `0x000b`): a struct holding `Formats []byte`, a `Len()` returning `5 + len(Formats)` (2-byte type, 2-byte ext length, 1-byte list length, then the formats), and a `Read([]byte)` that serializes it. For Chrome's `Formats: []byte{0x00}` (uncompressed), the bytes should be `00 0b 00 02 01 00`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+)
+
+const extPointFormats = 0x000b
+
+type SupportedPointsExtension struct{ Formats []byte }
+
+func (e *SupportedPointsExtension) Len() int { return 5 + len(e.Formats) }
+
+func (e *SupportedPointsExtension) Read(b []byte) (int, error) {
+	if len(b) < e.Len() {
+		return 0, io.ErrShortBuffer
+	}
+	b[0] = byte(extPointFormats >> 8)
+	b[1] = byte(extPointFormats)
+	b[2] = byte((1 + len(e.Formats)) >> 8) // ext length = 1 (list-len byte) + formats
+	b[3] = byte(1 + len(e.Formats))
+	b[4] = byte(len(e.Formats)) // 1-byte list length (note: not 2 bytes here)
+	copy(b[5:], e.Formats)
+	return e.Len(), io.EOF
+}
+
+func main() {
+	e := &SupportedPointsExtension{Formats: []byte{0x00}}
+	buf := make([]byte, e.Len())
+	e.Read(buf)
+	fmt.Printf("ec_point_formats (% x)\n", buf)
+	fmt.Println("matches Chrome:", fmt.Sprintf("% x", buf) == "00 0b 00 02 01 00")
+}
+```
+
+Note the asymmetry from supported_curves: `ec_point_formats` uses a **1-byte** list-length, not 2. The TLS spec varies the length-prefix width per extension — reading the real uTLS source is how you learn each one's exact framing.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Sum extension lengths" level="easy">
+
+Write `totalExtLen(exts []Ext) int` (where `Ext` has `Len() int`) that returns the sum of all extension lengths — the first marshalling pass. Given three extensions of lengths 4, 14, and 13, it returns 31.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+type Ext interface{ Len() int }
+
+type fixed int
+
+func (f fixed) Len() int { return int(f) }
+
+func totalExtLen(exts []Ext) int {
+	n := 0
+	for _, e := range exts {
+		n += e.Len()
+	}
+	return n
+}
+
+func main() {
+	exts := []Ext{fixed(4), fixed(14), fixed(13)} // GREASE, curves(4 ids), ALPN(h2+http1.1)
+	fmt.Println("total extensions length:", totalExtLen(exts)) // 31
+}
+```
+
+This sum is what gets written into the 2-byte extensions-length field that precedes the extension block — you must know it *before* you serialize, which is why marshalling is two passes (size, then write).
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="The GREASE extension" level="easy">
+
+Implement `GREASEExt{ Value uint16 }` with `Len()` = 4 (2-byte type, 2-byte length, empty body) and a `Read` that writes the value as the type and a zero length. Show it serializes to `3a 3a 00 00` for value `0x3a3a` — structurally identical to any real extension.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+)
+
+type GREASEExt struct{ Value uint16 }
+
+func (e *GREASEExt) Len() int { return 4 }
+func (e *GREASEExt) Read(b []byte) (int, error) {
+	if len(b) < 4 {
+		return 0, io.ErrShortBuffer
+	}
+	b[0], b[1] = byte(e.Value>>8), byte(e.Value) // type slot carries the GREASE value
+	b[2], b[3] = 0, 0                            // zero-length body
+	return 4, io.EOF
+}
+
+func main() {
+	e := &GREASEExt{Value: 0x3a3a}
+	buf := make([]byte, e.Len())
+	e.Read(buf)
+	fmt.Printf("GREASE extension (% x)\n", buf)
+	fmt.Println("same framing as a real extension:", fmt.Sprintf("% x", buf) == "3a 3a 00 00")
+}
+```
+
+GREASE is structurally a normal extension — that's the design. A correct server ignores the unknown type; a fingerprinter strips it; an impersonator must include it in Chrome's slots.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Marshal a ClientHello body" level="hard">
+
+Combine the pieces: write `marshal(ciphers []uint16, exts []Ext)` (where `Ext` has `Len()` and `Read([]byte)`) that emits the cipher block (2-byte length + suites) followed by the extensions block (2-byte total length + each extension's bytes). Feed it two ciphers and a GREASE + curves extension and print the hex.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+)
+
+type Ext interface {
+	Len() int
+	Read([]byte) (int, error)
+}
+
+type GREASE struct{ V uint16 }
+
+func (e *GREASE) Len() int                 { return 4 }
+func (e *GREASE) Read(b []byte) (int, error) { b[0], b[1] = byte(e.V>>8), byte(e.V); return 4, io.EOF }
+
+type Curves struct{ IDs []uint16 }
+
+func (e *Curves) Len() int { return 6 + 2*len(e.IDs) }
+func (e *Curves) Read(b []byte) (int, error) {
+	b[0], b[1] = 0x00, 0x0a
+	b[2], b[3] = byte((2+2*len(e.IDs))>>8), byte(2+2*len(e.IDs))
+	b[4], b[5] = byte((2*len(e.IDs))>>8), byte(2*len(e.IDs))
+	for i, id := range e.IDs {
+		b[6+2*i], b[7+2*i] = byte(id>>8), byte(id)
+	}
+	return e.Len(), io.EOF
+}
+
+func marshal(ciphers []uint16, exts []Ext) []byte {
+	total := 0
+	for _, e := range exts {
+		total += e.Len()
+	}
+	out := []byte{byte((2 * len(ciphers)) >> 8), byte(2 * len(ciphers))}
+	for _, c := range ciphers {
+		out = append(out, byte(c>>8), byte(c))
+	}
+	out = append(out, byte(total>>8), byte(total))
+	for _, e := range exts {
+		buf := make([]byte, e.Len())
+		e.Read(buf)
+		out = append(out, buf...)
+	}
+	return out
+}
+
+func main() {
+	body := marshal([]uint16{0x1301, 0x1302},
+		[]Ext{&GREASE{0x3a3a}, &Curves{[]uint16{0x3a3a, 0x001d, 0x0017, 0x0018}}})
+	fmt.Printf("ClientHello body (% x)\n", body)
+}
+```
+
+You've now written, in stdlib, the core of what uTLS's `MarshalClientHello` does: size by `Len()`, serialize by `Read()`, cipher block then extensions block. The bytes you print are a real ClientHello body.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="A profile bundles both layers" level="medium">
+
+Model tls-client's insight: write a `Profile` struct with a `HelloID string` (TLS layer) and `Settings []struct{ ID, Val uint32 }` + `PseudoOrder string` (HTTP/2 layer), and a `Fingerprint()` method that returns `"<HelloID> | <akamai-string>"`. Show that one `Profile` value carries a consistent identity at both layers.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Setting struct{ ID, Val uint32 }
+
+// Profile bundles the TLS fingerprint (HelloID) with the HTTP/2 fingerprint
+// (settings order + pseudo-header order) — tls-client's ClientProfile, minimized.
+type Profile struct {
+	HelloID     string
+	Settings    []Setting
+	PseudoOrder string
+}
+
+func (p Profile) Fingerprint() string {
+	var s []string
+	for _, kv := range p.Settings {
+		s = append(s, fmt.Sprintf("%d:%d", kv.ID, kv.Val))
+	}
+	akamai := strings.Join(s, ";") + "|15663105|0|" + p.PseudoOrder
+	return p.HelloID + " | " + akamai
+}
+
+func main() {
+	chrome := Profile{
+		HelloID:     "HelloChrome_133",
+		Settings:    []Setting{{1, 65536}, {2, 0}, {4, 6291456}, {6, 262144}},
+		PseudoOrder: "m,a,s,p",
+	}
+	fmt.Println(chrome.Fingerprint())
+	// HelloChrome_133 | 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+}
+```
+
+One struct, both fingerprints, guaranteed to match. That bundling is the architectural heart of tls-client and surf — and the reason picking a single profile gives you a consistent browser at every layer.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Master it by fixing it. I've given you a mini-marshaller with **two** byte-level bugs in its extension serialization: one extension writes the wrong length field (so the whole ClientHello is malformed and every downstream length is off by the error), and another uses the wrong extension type number (so a fingerprinter reads the wrong extension and the JA3 changes). Fix both so the emitted bytes exactly match the expected Chrome-shaped body.
+
+Self-contained — pure stdlib, the real serialization logic from this chapter.
+
+<Lab
+  title="Fix the ClientHello byte serialization"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Two byte-level bugs. (1) curvesExt writes the wrong extension-length: it uses 2*len(curves) but the field must be 2 + 2*len(curves) (the 2 accounts for the list-length sub-field). (2) alpnExt uses extension type 0x0011 but ALPN is 0x0010. Fix both so the marshalled body matches the expected hex. main is the self-check harness — do not edit it. It marshals a fixed cipher+extension set and compares to the known-correct Chrome-shaped bytes. When it matches it prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"fmt"
+	"io"
+)
+
+type Ext interface {
+	Len() int
+	Read([]byte) (int, error)
+}
+
+// supported_curves (type 0x000a)
+type curvesExt struct{ ids []uint16 }
+
+func (e *curvesExt) Len() int { return 6 + 2*len(e.ids) }
+func (e *curvesExt) Read(b []byte) (int, error) {
+	b[0], b[1] = 0x00, 0x0a
+	// BUG 1: extension length must be 2 + 2*len(ids) (the +2 is the list-len field).
+	b[2], b[3] = byte((2*len(e.ids))>>8), byte(2*len(e.ids)) // FIX: 2 + 2*len(e.ids)
+	b[4], b[5] = byte((2*len(e.ids))>>8), byte(2*len(e.ids))
+	for i, id := range e.ids {
+		b[6+2*i], b[7+2*i] = byte(id>>8), byte(id)
+	}
+	return e.Len(), io.EOF
+}
+
+// ALPN (type 0x0010)
+type alpnExt struct{ protos []string }
+
+func (e *alpnExt) Len() int {
+	n := 6
+	for _, p := range e.protos {
+		n += 1 + len(p)
+	}
+	return n
+}
+func (e *alpnExt) Read(b []byte) (int, error) {
+	var list []byte
+	for _, p := range e.protos {
+		list = append(list, byte(len(p)))
+		list = append(list, p...)
+	}
+	// BUG 2: ALPN is extension type 0x0010, not 0x0011.
+	b[0], b[1] = 0x00, 0x11 // FIX: 0x00, 0x10
+	b[2], b[3] = byte((2+len(list))>>8), byte(2+len(list))
+	b[4], b[5] = byte(len(list)>>8), byte(len(list))
+	copy(b[6:], list)
+	return e.Len(), io.EOF
+}
+
+func marshal(ciphers []uint16, exts []Ext) []byte {
+	total := 0
+	for _, e := range exts {
+		total += e.Len()
+	}
+	out := []byte{byte((2 * len(ciphers)) >> 8), byte(2 * len(ciphers))}
+	for _, c := range ciphers {
+		out = append(out, byte(c>>8), byte(c))
+	}
+	out = append(out, byte(total>>8), byte(total))
+	for _, e := range exts {
+		buf := make([]byte, e.Len())
+		e.Read(buf)
+		out = append(out, buf...)
+	}
+	return out
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	body := marshal(
+		[]uint16{0x1301, 0x1302},
+		[]Ext{
+			&curvesExt{ids: []uint16{0x001d, 0x0017}},
+			&alpnExt{protos: []string{"h2"}},
+		},
+	)
+	got := fmt.Sprintf("% x", body)
+	// Expected: cipher block (00 04 13 01 13 02), ext total len (00 13),
+	// curves (00 0a 00 06 00 04 00 1d 00 17), alpn (00 10 00 05 00 03 02 68 32).
+	want := "00 04 13 01 13 02 00 13 00 0a 00 06 00 04 00 1d 00 17 00 10 00 05 00 03 02 68 32"
+	fmt.Println("got: ", got)
+	fmt.Println("want:", want)
+	if got == want {
+		fmt.Println("ALL CHECKS PASS")
+	} else {
+		fmt.Println("FAIL: bytes do not match")
+	}
+}`}
+  verifier="main marshals a fixed cipher+extension set and compares the hex to the known-correct Chrome-shaped ClientHello body. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  hints={[
+    "Bug 1: in curvesExt.Read, the extension-length field (b[2],b[3]) must be 2 + 2*len(e.ids), not 2*len(e.ids). The +2 accounts for the 2-byte curve-list-length sub-field that follows it. With 2 curves that's 6, written as 00 06.",
+    "Bug 2: in alpnExt.Read, set b[0],b[1] = 0x00, 0x10. ALPN's IANA extension type is 16 (0x0010); 0x0011 is a different extension entirely.",
+    "After both fixes the curves extension reads 00 0a 00 06 00 04 00 1d 00 17 and ALPN reads 00 10 00 05 00 03 02 68 32 (the protocol list 02 68 32 is the length-prefixed 'h2', 3 bytes). The expected line in main shows the full target.",
+  ]}
+  flag="GO{clienthello_bytes_exact}"
+>
+
+Bug 1 corrupts every length downstream (a malformed ClientHello a server rejects). Bug 2 silently changes the fingerprint (the server reads a different extension and your JA3 no longer matches Chrome). Both are the kind of byte-level error that separates "almost Chrome" from Chrome. Fix the length, fix the type, match the bytes exactly. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **One small interface drives everything.** A uTLS `TLSExtension` has `Len()`, `Read([]byte)`, and `writeToUConn(*UConn)`. `Len`+`Read` serialize the extension to wire bytes (it's an `io.Reader`); `writeToUConn` pushes its values into the handshake state. A `ClientHelloSpec` is an ordered `[]TLSExtension` plus a cipher list — so the ClientHello's bytes are just each extension reading itself out, in order.
+- **You can serialize an extension by hand.** `SupportedCurvesExtension.Read` writes the nested-length TLS framing (type, ext-length, list-length) then each curve big-endian — your stdlib version emits the identical `00 0a 00 0a 00 08 …` bytes uTLS sends.
+- **GREASE is structurally a normal extension** — same type/length framing — by design (RFC 8701), so servers ignore it and fingerprinters strip it; an impersonator must include it in the browser's slots. The value is randomized per connection but stripped before hashing, so the fingerprint stays stable.
+- **Chrome's real `ClientHelloSpec`** is a hand-built ordered list: GREASE bookends, SNI, supported_curves (GREASE+X25519+P256+P384), ALPN (`h2`,`http/1.1`), a speculative GREASE'd key share, supported_versions (GREASE+1.3+1.2), Brotli cert-compression, ALPS, GREASE'd ECH, and computed padding — none of which `crypto/tls` can emit, which is why uTLS maintains the spec per version.
+- **The build pipeline is four steps:** `buildHandshakeState` → `applyPresetByID` (load the spec) → `ApplyConfig` (`writeToUConn` each extension into `Hello`) → `MarshalClientHello` (sum `Len()`, `Read()` each into the buffer; padding last). The bytes land in `hello.Raw` and go out unchanged.
+- **`ShuffleChromeTLSExtensions`** randomizes the *middle* of Chrome's extension order per connection (GREASE first, padding/PSK last stay fixed) — Chrome's own anti-ossification, and the deepest reason JA4 sorts before hashing.
+- **`tls-client`'s `ClientProfile`** bundles the uTLS `ClientHelloID` (TLS fingerprint) with the HTTP/2 `settings`, `settingsOrder`, `connectionFlow`, `pseudoHeaderOrder`, and `priorities` (Akamai fingerprint) in one struct — so picking `profiles.Chrome_133` gives a consistent identity at both layers. **`surf`'s `applyVariant`** does the same job through a fluent builder: OS persona → Variant → set HelloSpec/HelloID + ConfigureH2/H3 + ordered headers.
+- **Anywhere order is fingerprinted, the source carries an explicit order slice** (`settingsOrder`, ordered header maps) because Go's native map can't preserve it — a recurring tell when you read this kind of code.
+
+</Recap>
+
+<Callout kind="note" title="Primary sources (the actual files)">
+Read the real code. **uTLS:** `u_tls_extensions.go` (the `TLSExtension` interface, `SupportedCurvesExtension`, `UtlsGREASEExtension`), `u_parrots.go` (the per-browser `ClientHelloSpec` definitions, `ShuffleChromeTLSExtensions`), `u_conn.go` (`buildHandshakeState`, `ApplyConfig`, `MarshalClientHello`) — github.com/refraction-networking/utls. **tls-client:** `profiles/profiles.go` (the `ClientProfile` struct and `NewClientProfile`) — github.com/bogdanfinn/tls-client. **surf:** `impersonate.go` (the `Impersonate` type, `applyVariant`) — github.com/enetx/surf. The code quoted in this chapter is from those files; the runnable examples are faithful stdlib re-implementations of the same algorithms.
+</Callout>
+
+<Scoreboard
+  streak={13}
+  items={[
+    { label: "Quick check — what makes a TLSExtension", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Implement an extension's Read", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — Sum extension lengths", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — The GREASE extension", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 4 — Marshal a ClientHello body", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — A profile bundles both layers", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the ClientHello byte serialization", captured: false, points: 80 }}
+/>
+
+That's the impersonation stack, demystified to the source. You've read the genuine `TLSExtension` interface, serialized a real extension to exact wire bytes with your own stdlib code, walked Chrome's literal `ClientHelloSpec` extension by extension, traced the four-step build pipeline that turns it into `hello.Raw`, and seen how `tls-client`'s `ClientProfile` and `surf`'s `applyVariant` bundle every fingerprint layer into one consistent browser. You don't use these libraries anymore — you understand them well enough to have written them, and to build the detector that catches them. That's mastery, sport. Go read the rest of the source; nothing in it will surprise you now.
+
