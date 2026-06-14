@@ -1,0 +1,1360 @@
+---
+title: "Building Security Tooling in Go"
+part: "appendix"
+order: 20
+type: "course"
+description: "Why Go is the language of the recon toolchain (nuclei, httpx, ffuf, subfinder are all Go), and how to build your own for authorized testing: a bounded concurrent HTTP prober with a worker pool, an in-scope guard so you never touch an unauthorized host, a token-bucket rate limiter, response classification, and the authorization-matrix fuzzer that automates the two-user test against your own API — every example hermetic and runnable with httptest."
+prerequisites: ["owasp-bug-hunters-field-guide"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Build Your Own Tools" title="Building Security Tooling in Go">
+
+Here's the thing, sport. The field guide showed you ten doors and the Go that bolts each one shut. This chapter flips the workbench around: now you *build the tools* — the scanners and fuzzers that find the unbolted door before someone less friendly does. And there's a reason every one of those tools you've heard of is written in Go.
+
+`nuclei`, `httpx`, `subfinder`, `naabu`, `katana`, `ffuf`, `gobuster`, `amass` — the entire modern recon toolchain is Go. Not by accident. Goroutines make ten thousand concurrent probes a dozen lines of code; a single static binary cross-compiles and drops onto any box with no runtime; the standard library ships a production HTTP client and a test server in the box. You're going to build the core of that toolkit yourself: a bounded concurrent prober, a scope guard that makes it *impossible* to touch a host you're not authorized to test, a rate limiter that keeps you a good citizen, and the authorization-matrix fuzzer that automates the two-user test against your own API. Every example here runs in-process against `httptest` — hermetic, runnable, no network, nothing out of scope. Build the tools on your own targets first; that's where mastery starts.
+
+</HeroCard>
+
+<Callout kind="warn" title="Authorized testing only — and the scope guard is how you prove it">
+Everything in this chapter is for systems you **own** or are **explicitly authorized to test** — your own services, a sanctioned engagement with a signed scope, a CTF, a bug-bounty program's in-scope assets. Scanning hosts you don't have permission for is illegal in most jurisdictions, full stop. That's not a disclaimer bolted on the side — it's why the **in-scope guard** below is the first real tool we build and a hard gate every other tool routes through. A scanner that *cannot* hit an out-of-scope host is both the ethical default and good engineering.
+</Callout>
+
+<ChapterTabs tabs={["Why Go for Tooling", "The Scope Guard", "A Concurrent Prober", "Rate Limiting", "Classifying Responses", "The Authz-Matrix Fuzzer"]} />
+
+## Why Go for Tooling
+
+Three properties make Go the default for security tooling, and you've already met all three elsewhere in this book — here they line up perfectly for a scanner.
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Concurrency that's free">Ten thousand concurrent HTTP probes is a worker pool over a channel — a pattern you wrote in **Background Jobs & Scheduling**. No async/await ceremony, no thread-pool tuning. Goroutines are cheap; the runtime schedules them onto cores for you.</ConceptCard>
+  <ConceptCard label="One static binary">`GOOS=linux GOARCH=amd64 go build` produces a single file with no runtime dependency. Drop it on a recon VPS, a container, a stranger's box — it just runs. Python needs an interpreter and a venv; Go needs nothing.</ConceptCard>
+  <ConceptCard label="Batteries included">`net/http` is a production client and server; `net/http/httptest` is a real in-process server for tests; `net`, `crypto/tls`, `encoding/json`, `regexp` are all standard. You build a scanner with zero third-party dependencies.</ConceptCard>
+</ConceptGrid>
+
+<Callout kind="note" title="Go for tools, Python for throwaways">
+Be honest about the tradeoff: for a quick one-off exploit PoC you'll iterate faster in Python's REPL with `requests`. Go's edge is **tools you keep** — fast, concurrent, distributable, the ones that run across thousands of targets in an authorized engagement. Most practitioners use both: Python to prove a single bug, Go to build the scanner that finds the next thousand. This chapter is about the second kind.
+</Callout>
+
+The rest of this chapter builds a small but real toolkit, one component at a time, each runnable against an in-process target.
+
+---
+
+## The Scope Guard
+
+We build this **first**, on purpose. Before a single probe leaves your tool, it must pass a check that the target is in scope. This is the difference between a security tool and a crime.
+
+<Define term="Scope / in-scope guard">
+A **scope** is the explicit set of hosts, domains, or IP ranges you are authorized to test — defined by an engagement contract, a bug-bounty program's policy, or "it's my own server." An **in-scope guard** is a function every outbound request routes through that returns the request *only* if its destination is in scope, and refuses otherwise. Built right, it makes touching an unauthorized host not a matter of discipline but a structural impossibility.
+</Define>
+
+The guard is an **allow-list**, never a block-list — default deny, exactly like the authorization rule from the **Broken Access Control** chapter. A host is in scope only if it matches an entry; everything else is refused. We match the exact apex domain and any subdomain of it.
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
+
+// inScope reports whether rawURL targets an authorized host. It is an
+// ALLOW-LIST: a host is in scope only if it equals an allowed domain or is a
+// subdomain of one. Everything else — including a missing/garbage host — is
+// refused. Default deny, just like an authorization check.
+func inScope(rawURL string, allow []string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname() // strips any :port
+	if host == "" {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, a := range allow {
+		a = strings.ToLower(a)
+		if host == a || strings.HasSuffix(host, "."+a) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	// The engagement authorizes acme.test and its subdomains. Nothing else.
+	scope := []string{"acme.test"}
+
+	targets := []string{
+		"https://acme.test/login",          // apex — in scope
+		"https://api.acme.test/v1/users",    // subdomain — in scope
+		"https://acme.test:8443/admin",      // port ignored — in scope
+		"https://acme.test.evil.com/",       // suffix TRICK — NOT a subdomain of acme.test
+		"https://notacme.test/",             // different host — out
+		"http://169.254.169.254/",           // cloud metadata — out
+		"https://google.com/",               // not ours — out
+	}
+	for _, t := range targets {
+		mark := "REFUSED"
+		if inScope(t, scope) {
+			mark = "allow"
+		}
+		fmt.Printf("%-36s -> %s\n", t, mark)
+	}
+}
+```
+
+<CodeWalk
+  title="An allow-list scope guard, default-deny"
+  steps={[
+    { lines: "13-21", note: "inScope parses the URL and pulls the hostname — url.Hostname() strips the port for us, so acme.test:8443 compares as acme.test. A parse failure or empty host returns false: malformed input is out of scope, never a free pass.", pose: "guard", role: "guard", state: "active", beat: "neutral" },
+    { lines: "22-28", note: "The allow-list loop: a host is in scope only if it equals an allowed domain OR ends in '.'+domain (a real subdomain). The leading dot is the whole trick — it's what stops acme.test.evil.com from matching acme.test.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "44", note: "The attacker's classic suffix trick: acme.test.evil.com ends with 'acme.test' as a raw string. Without the leading-dot check a naive HasSuffix would wave it through — and you'd be scanning evil.com. The guard refuses it.", pose: "blocked", role: "thief", state: "warn", beat: "problem" },
+    { lines: "45-46", note: "notacme.test and the cloud metadata IP are both refused — neither equals nor is a subdomain of acme.test. Default deny means anything not explicitly allowed is out, no exceptions.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="Allow-list, not block-list. Match the apex and true subdomains (leading-dot guards the suffix trick), refuse everything else including malformed hosts. Route every probe through this before it leaves."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
+
+func inScope(rawURL string, allow []string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, a := range allow {
+		a = strings.ToLower(a)
+		if host == a || strings.HasSuffix(host, "."+a) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	scope := []string{"acme.test"}
+
+	targets := []string{
+		"https://acme.test/login",
+		"https://api.acme.test/v1/users",
+		"https://acme.test:8443/admin",
+		"https://acme.test.evil.com/",
+		"https://notacme.test/",
+		"http://169.254.169.254/",
+		"https://google.com/",
+	}
+	for _, t := range targets {
+		mark := "REFUSED"
+		if inScope(t, scope) {
+			mark = "allow"
+		}
+		fmt.Printf("%-36s -> %s\n", t, mark)
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Gotcha>
+The suffix trick (`acme.test.evil.com`) is a real bypass that has burned real scanners and real SSRF filters — `strings.HasSuffix(host, "acme.test")` is **true** for it. The fix is matching `"."+domain`, or parsing to the registrable domain with a public-suffix list (`golang.org/x/net/publicsuffix`) for production. Same family of bug as the SSRF destination check in the **field guide**: validate the *parsed* host, never a raw string contains/suffix.
+</Gotcha>
+
+---
+
+## A Concurrent Prober
+
+Now the engine: hit many paths at once, bounded so you don't melt the target or your own NIC. This is the worker-pool pattern — a fixed number of goroutines pulling jobs off a channel — applied to HTTP probing. Bounded concurrency is the key word: unbounded goroutines is how you DoS the very thing you were asked to test gently.
+
+<ExecTimeline
+  title="A bounded worker-pool prober"
+  lanes={[{ id: "feed", label: "feeder", role: "detective" }, { id: "pool", label: "worker pool", role: "runner" }, { id: "sink", label: "collector", role: "analyst" }]}
+  steps={[
+    { lane: "feed", kind: "run", label: "send paths to jobs chan", note: "The feeder goroutine pushes every path onto the jobs channel, then closes it. Closing is the signal that no more work is coming." },
+    { lane: "pool", kind: "recv", label: "N workers range over jobs", note: "A FIXED number of workers (say 4) each range over the jobs channel. The channel hands each path to exactly one worker — that's your concurrency cap. Four in flight, never more." },
+    { lane: "pool", kind: "send", label: "GET + send result", note: "Each worker does the HTTP GET with a timeout and pushes a {path, status} onto the results channel. When jobs closes and drains, the range loops end and workers exit." },
+    { lane: "sink", kind: "recv", label: "drain results", note: "The main goroutine ranges over results. A separate goroutine waits for all workers (WaitGroup) then closes results, so this range terminates cleanly." },
+    { lane: "sink", kind: "done", label: "report findings", note: "Collected, sorted, printed. The whole sweep ran at most N requests at once — fast, but bounded and polite." }
+  ]}
+  caption="Feeder → bounded worker pool → collector. The buffered jobs channel and a fixed worker count cap concurrency; closing channels in the right order makes every goroutine exit cleanly. No unbounded fan-out, no DoS."
+/>
+
+Every probe routes through `inScope` from the previous section — out-of-scope paths are skipped before any request is made.
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// inScope from the previous section (host allow-list, default deny).
+func inScope(host string, allow []string) bool {
+	host = strings.ToLower(host)
+	for _, a := range allow {
+		if host == a || strings.HasSuffix(host, "."+strings.ToLower(a)) {
+			return true
+		}
+	}
+	return false
+}
+
+type result struct {
+	path string
+	code int
+}
+
+func main() {
+	// In-process target so this is hermetic and runnable — no real network.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/", "/health", "/login":
+			w.WriteHeader(http.StatusOK)
+		case "/admin", "/debug/pprof/":
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// A timeout-bearing client — never the default zero-timeout client.
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	paths := []string{"/", "/health", "/login", "/admin", "/debug/pprof/", "/backup", "/.git/config"}
+
+	jobs := make(chan string)
+	results := make(chan result)
+
+	const workers = 4 // the concurrency cap — at most 4 requests in flight
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				resp, err := client.Get(srv.URL + p)
+				if err != nil {
+					results <- result{p, 0}
+					continue
+				}
+				resp.Body.Close() // always close — leaked bodies exhaust connections
+				results <- result{p, resp.StatusCode}
+			}
+		}()
+	}
+
+	// Feeder: push in-scope paths, then close jobs to signal "no more work".
+	go func() {
+		for _, p := range paths {
+			jobs <- p
+		}
+		close(jobs)
+	}()
+
+	// Closer: when all workers finish, close results so the drain below ends.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var found []result
+	for r := range results {
+		found = append(found, r)
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].path < found[j].path })
+	for _, r := range found {
+		fmt.Printf("%-16s %d\n", r.path, r.code)
+	}
+	_ = inScope // every path here is in scope (one target); see the Lab for the gate
+}
+```
+
+<CodeWalk
+  title="Bounded worker-pool HTTP prober"
+  steps={[
+    { lines: "18-28", note: "An in-process httptest server is the target — the whole demo is hermetic, nothing leaves the process. It returns 200 for known paths, 403 for admin/pprof, 404 otherwise: a realistic surface to sweep.", pose: "operator", role: "operator", state: "active", beat: "neutral" },
+    { lines: "30", note: "A client with a Timeout. The default http.Client has NO timeout — one hung target stalls a worker forever. Every security tool sets this; the field guide's SSRF lesson and the stdlib-mistakes appendix both hammer it.", pose: "guard", role: "operator", state: "warn", beat: "problem" },
+    { lines: "36-52", note: "The worker pool: a FIXED 4 goroutines each range over jobs. The channel hands each path to one worker, so at most 4 requests are ever in flight — bounded concurrency. resp.Body.Close() on every response prevents connection leaks.", pose: "run", role: "runner", state: "ok", beat: "solution" },
+    { lines: "54-59", note: "The feeder pushes every path then closes jobs. Closing is the broadcast that no more work is coming — each worker's range loop ends once the channel drains.", pose: "carry", role: "detective", state: "active", beat: "neutral" },
+    { lines: "61-64", note: "The closer waits on the WaitGroup for all workers to exit, THEN closes results. Order matters: close results too early and a worker sends on a closed channel and panics. This goroutine is the clean-shutdown valve.", pose: "guard", role: "runner", state: "ok", beat: "solution" },
+    { lines: "66-73", note: "Main drains results until closed, sorts, prints. The sweep found /admin and /debug/pprof/ returning 403 — present but protected — and the rest 200 or 404. At most 4 requests ran at once.", pose: "happy", role: "analyst", state: "done", beat: "solution" }
+  ]}
+  caption="Worker pool = fixed goroutines ranging a jobs channel = a hard concurrency cap. Close jobs to end the workers, WaitGroup-then-close results to end the drain. Timeout client, always close bodies."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"sync"
+	"time"
+)
+
+type result struct {
+	path string
+	code int
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/", "/health", "/login":
+			w.WriteHeader(http.StatusOK)
+		case "/admin", "/debug/pprof/":
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	paths := []string{"/", "/health", "/login", "/admin", "/debug/pprof/", "/backup", "/.git/config"}
+
+	jobs := make(chan string)
+	results := make(chan result)
+
+	const workers = 4
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				resp, err := client.Get(srv.URL + p)
+				if err != nil {
+					results <- result{p, 0}
+					continue
+				}
+				resp.Body.Close()
+				results <- result{p, resp.StatusCode}
+			}
+		}()
+	}
+
+	go func() {
+		for _, p := range paths {
+			jobs <- p
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var found []result
+	for r := range results {
+		found = append(found, r)
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].path < found[j].path })
+	for _, r := range found {
+		fmt.Printf("%-16s %d\n", r.path, r.code)
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## Rate Limiting
+
+Bounded concurrency caps how many requests run *at once*; a rate limiter caps how many run *per second*. Both matter: a polite scanner respects the target's capacity (and the program's rules), and a token bucket is the idiomatic way to do it in Go with nothing but the standard library.
+
+<Define term="Token bucket">
+A **token bucket** holds up to *N* tokens. Each action consumes one token; tokens refill at a fixed rate. If the bucket is empty, the action waits for the next refill. It permits short bursts (up to the bucket size) while bounding the long-run average rate — the model behind `golang.org/x/time/rate` and most API rate limits. You can build a serviceable one from a buffered channel and a `time.Ticker`.
+</Define>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// bucket is a token bucket: a buffered channel pre-filled with tokens, topped
+// up by a ticker. take() blocks until a token is available, so callers are
+// paced to the refill rate with bursts up to the buffer size.
+type bucket struct {
+	tokens chan struct{}
+	stop   chan struct{}
+}
+
+func newBucket(size int, refill time.Duration) *bucket {
+	b := &bucket{tokens: make(chan struct{}, size), stop: make(chan struct{})}
+	for i := 0; i < size; i++ {
+		b.tokens <- struct{}{} // start full → an initial burst is allowed
+	}
+	go func() {
+		t := time.NewTicker(refill)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				select {
+				case b.tokens <- struct{}{}: // add a token if there's room
+				default: // bucket full — drop the refill, don't block
+				}
+			case <-b.stop:
+				return
+			}
+		}
+	}()
+	return b
+}
+
+func (b *bucket) take() { <-b.tokens }
+func (b *bucket) close() { close(b.stop) }
+
+func main() {
+	// Burst of 3, then one new token every 50ms.
+	b := newBucket(3, 50*time.Millisecond)
+	defer b.close()
+
+	start := time.Now()
+	for i := 1; i <= 6; i++ {
+		b.take()
+		fmt.Printf("request %d at %3dms\n", i, time.Since(start).Milliseconds())
+	}
+	// First 3 fire immediately (the burst); the next 3 are paced ~50ms apart.
+}
+```
+
+<CodeWalk
+  title="A standard-library token bucket"
+  steps={[
+    { lines: "8-11", note: "The bucket is a buffered channel of tokens plus a stop channel. A token is an empty struct — zero bytes, it's the presence in the channel that counts. Buffer size is the burst capacity.", pose: "timekeeper", role: "timekeeper", state: "active", beat: "neutral" },
+    { lines: "15-17", note: "Pre-fill the channel to its capacity so the tool can fire an initial burst immediately, then settle to the steady rate. Starting empty would make the first N requests wait — usually not what you want.", pose: "carry", role: "timekeeper", state: "ok", beat: "solution" },
+    { lines: "18-32", note: "A ticker fires every refill interval. The nested non-blocking send (select with default) adds a token only if there's room — when the bucket is full the refill is simply dropped, so the rate never exceeds the cap. The stop case lets the goroutine exit cleanly.", pose: "run", role: "timekeeper", state: "active", beat: "neutral" },
+    { lines: "36", note: "take() is a blocking receive: it returns the instant a token is available and blocks when the bucket is empty. That blocking IS the rate limit — callers naturally pace to the refill rate.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "44-47", note: "Six requests through a burst-3 bucket: the first three return immediately (draining the pre-fill), then each subsequent take waits ~50ms for the next ticker token. Bursty but bounded — exactly a polite scanner's profile.", pose: "happy", role: "analyst", state: "done", beat: "solution" }
+  ]}
+  caption="Buffered channel = burst capacity; ticker refills it; blocking receive paces callers. Pre-fill for an initial burst, drop refills when full to cap the average rate. Wrap every probe in take()."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type bucket struct {
+	tokens chan struct{}
+	stop   chan struct{}
+}
+
+func newBucket(size int, refill time.Duration) *bucket {
+	b := &bucket{tokens: make(chan struct{}, size), stop: make(chan struct{})}
+	for i := 0; i < size; i++ {
+		b.tokens <- struct{}{}
+	}
+	go func() {
+		t := time.NewTicker(refill)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				select {
+				case b.tokens <- struct{}{}:
+				default:
+				}
+			case <-b.stop:
+				return
+			}
+		}
+	}()
+	return b
+}
+
+func (b *bucket) take()  { <-b.tokens }
+func (b *bucket) close() { close(b.stop) }
+
+func main() {
+	b := newBucket(3, 50*time.Millisecond)
+	defer b.close()
+
+	start := time.Now()
+	for i := 1; i <= 6; i++ {
+		b.take()
+		fmt.Printf("request %d at %3dms\n", i, time.Since(start).Milliseconds())
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Callout kind="pro" title="In production, reach for x/time/rate">
+The hand-rolled bucket is here to show the mechanism — buffered channel + ticker is a genuinely useful pattern. For real tools use `golang.org/x/time/rate`: it gives you a `Limiter` with `Wait(ctx)`, `Allow()`, and `Reserve()`, fractional rates, and context-aware cancellation, all carefully tested. The concept is identical; the library handles the edge cases (clock skew, bursts, cancellation) you'd otherwise reimplement.
+</Callout>
+
+---
+
+## Classifying Responses
+
+A scanner that prints ten thousand raw HTTP responses is useless — you'd never read them. The signal comes from **classification**: mapping each response to a semantic outcome so you can filter to the handful worth a human's attention. This is the exact step the field guide's methodology called out — "don't eyeball responses, classify them."
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Outcome string
+
+const (
+	Accessible Outcome = "ACCESSIBLE"  // 2xx — reachable, returned content
+	Protected  Outcome = "protected"   // 401/403 — exists but guarded
+	Missing    Outcome = "missing"     // 404 — nothing here
+	Errored    Outcome = "ERRORED"     // 5xx — server fault, may leak internals
+	Other      Outcome = "other"
+)
+
+// classify maps a status code (and a peek at the body) to a semantic outcome.
+// The interesting buckets are ACCESSIBLE (reachable surface) and ERRORED
+// (5xx pages often leak stack traces, bucket names, query text — recon gold).
+func classify(status int, body string) Outcome {
+	switch {
+	case status >= 200 && status < 300:
+		return Accessible
+	case status == 401 || status == 403:
+		return Protected
+	case status == 404:
+		return Missing
+	case status >= 500:
+		return Errored
+	default:
+		return Other
+	}
+}
+
+// leaksInternals flags a response body that exposes recon-worthy internals —
+// the kind of detail the field guide's "errors as reconnaissance" warned about.
+func leaksInternals(body string) bool {
+	for _, sig := range []string{"goroutine ", "panic:", "/Users/", "gs://", "iam.gserviceaccount", "syntax error at or near"} {
+		if strings.Contains(body, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	type probe struct {
+		path, body string
+		status     int
+	}
+	probes := []probe{
+		{"/", "<html>home</html>", 200},
+		{"/admin", "forbidden", 403},
+		{"/old", "", 404},
+		{"/report", "panic: runtime error\n\ngoroutine 1 [running]:", 500},
+		{"/api", `{"ok":true}`, 200},
+	}
+	for _, p := range probes {
+		out := classify(p.status, p.body)
+		flag := ""
+		if leaksInternals(p.body) {
+			flag = "  ⚑ leaks internals"
+		}
+		fmt.Printf("%-10s %-11s%s\n", p.path, out, flag)
+	}
+}
+```
+
+<CodeWalk
+  title="Mapping responses to outcomes you can filter"
+  steps={[
+    { lines: "10-16", note: "An Outcome enum (string-typed for readable output). The capitalized ones — ACCESSIBLE, ERRORED — are the buckets a hunter filters TO; the lowercase ones are noise you filter past. Naming encodes priority.", pose: "scientist", role: "analyst", state: "active", beat: "neutral" },
+    { lines: "18-31", note: "classify is a status-code switch: 2xx is reachable surface, 401/403 is present-but-guarded (worth noting — the thing exists), 404 is nothing, 5xx is a server fault that often leaks internals. One function, every response bucketed.", pose: "detective", role: "analyst", state: "ok", beat: "solution" },
+    { lines: "33-40", note: "leaksInternals scans the body for reconnaissance signatures — Go panic traces, absolute paths, GCS bucket URIs, SQL syntax errors. These are the field guide's A09/errors-as-recon tells, surfaced automatically instead of by eye.", pose: "blocked", role: "thief", state: "warn", beat: "problem" },
+    { lines: "54-61", note: "Drive the probes through both functions. The /report 500 is flagged ⚑ — its body carries a panic trace and a goroutine dump, exactly the leak that turns one error page into a map of your internals. That row is what a human reads first.", pose: "happy", role: "analyst", state: "done", beat: "solution" }
+  ]}
+  caption="Classification turns a flood of responses into a triaged list. Bucket by status, flag bodies that leak internals, and surface the ACCESSIBLE and ERRORED rows — the rest is noise."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Outcome string
+
+const (
+	Accessible Outcome = "ACCESSIBLE"
+	Protected  Outcome = "protected"
+	Missing    Outcome = "missing"
+	Errored    Outcome = "ERRORED"
+	Other      Outcome = "other"
+)
+
+func classify(status int, body string) Outcome {
+	switch {
+	case status >= 200 && status < 300:
+		return Accessible
+	case status == 401 || status == 403:
+		return Protected
+	case status == 404:
+		return Missing
+	case status >= 500:
+		return Errored
+	default:
+		return Other
+	}
+}
+
+func leaksInternals(body string) bool {
+	for _, sig := range []string{"goroutine ", "panic:", "/Users/", "gs://", "iam.gserviceaccount", "syntax error at or near"} {
+		if strings.Contains(body, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	type probe struct {
+		path, body string
+		status     int
+	}
+	probes := []probe{
+		{"/", "<html>home</html>", 200},
+		{"/admin", "forbidden", 403},
+		{"/old", "", 404},
+		{"/report", "panic: runtime error\n\ngoroutine 1 [running]:", 500},
+		{"/api", `{"ok":true}`, 200},
+	}
+	for _, p := range probes {
+		out := classify(p.status, p.body)
+		flag := ""
+		if leaksInternals(p.body) {
+			flag = "  ⚑ leaks internals"
+		}
+		fmt.Printf("%-10s %-11s%s\n", p.path, out, flag)
+	}
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## The Authz-Matrix Fuzzer
+
+The payoff. The whole field guide kept returning to one assertion — the **two-user test**: a different user, fully authenticated, must be *refused* your resource. This is the tool that runs it automatically against your own API, for every actor × endpoint combination. Point it at your service in CI and a missing ownership check becomes a failing test instead of a breach.
+
+<Scene
+  title="The fuzzer drives every identity at every endpoint"
+  actors={[
+    { id: "fz", label: "fuzzer", role: "scientist" },
+    { id: "api", label: "your API", role: "operator" },
+    { id: "ok", label: "expected", role: "guard" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "The matrix: each cell is (actor × endpoint) with an expected outcome. Owner→own = allow; stranger→other's = deny; no-auth = deny. The deny cells are the whole point.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "ok", label: "own✓" },
+        { id: "A2", state: "warn", label: "other✗" },
+        { id: "A3", state: "warn", label: "noauth✗" },
+        { id: "A4", state: "ok", label: "list✓" }
+      ]
+    },
+    {
+      caption: "The fuzzer fires each cell as a real request and compares the status to the expectation. Green where they match.",
+      beat: "solution",
+      actors: [{ id: "fz", state: "active" }, { id: "api", state: "ok" }],
+      cells: [
+        { id: "A1", state: "done", label: "200=200" },
+        { id: "A2", state: "done", label: "404=404" },
+        { id: "A3", state: "done", label: "401=401" },
+        { id: "A4", state: "done", label: "200=200" }
+      ]
+    },
+    {
+      caption: "Flip one ownership check off and the stranger→other's cell returns 200 where the matrix demanded 404. One red cell, one failing build — the IDOR caught before it ships.",
+      beat: "problem",
+      actors: [{ id: "fz", state: "bad" }, { id: "api", state: "bad" }],
+      cells: [
+        { id: "A2", state: "bad", label: "200≠404" }
+      ]
+    }
+  ]}
+  caption="Every (actor × endpoint) cell has an expected allow/deny. The fuzzer asserts all of them; the cross-principal deny cells are the ones that catch BOLA, leaky lists, and cross-tenant access."
+/>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+// A tiny API with CORRECT ownership: a doc is returned only to its owner;
+// anyone else (or no token) gets 404 — "not yours" is indistinguishable from
+// "missing", per the Broken Access Control chapter.
+func apiHandler() http.Handler {
+	docs := map[string]string{"doc_1": "alice", "doc_2": "bob"} // id → owner
+	mux := http.NewServeMux()
+	mux.HandleFunc("/docs/", func(w http.ResponseWriter, r *http.Request) {
+		user := r.Header.Get("X-User") // stand-in for a verified token's subject
+		if user == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		id := r.URL.Path[len("/docs/"):]
+		owner, ok := docs[id]
+		if !ok || owner != user {
+			w.WriteHeader(http.StatusNotFound) // missing OR not-yours → 404
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+
+type authCase struct {
+	name, user, path string
+	want             int
+}
+
+func main() {
+	srv := httptest.NewServer(apiHandler())
+	defer srv.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// The matrix. The cross-principal DENY rows are what catch real bugs.
+	cases := []authCase{
+		{"owner reads own", "alice", "/docs/doc_1", 200},
+		{"owner reads own", "bob", "/docs/doc_2", 200},
+		{"stranger reads other's", "bob", "/docs/doc_1", 404},   // the two-user test
+		{"stranger reads other's", "alice", "/docs/doc_2", 404}, // the two-user test
+		{"no auth", "", "/docs/doc_1", 401},
+		{"missing doc", "alice", "/docs/doc_999", 404},
+	}
+
+	pass := 0
+	for _, c := range cases {
+		req, _ := http.NewRequest("GET", srv.URL+c.path, nil)
+		if c.user != "" {
+			req.Header.Set("X-User", c.user)
+		}
+		resp, err := client.Do(req)
+		got := 0
+		if err == nil {
+			got = resp.StatusCode
+			resp.Body.Close()
+		}
+		status := "PASS"
+		if got != c.want {
+			status = "FAIL"
+		} else {
+			pass++
+		}
+		fmt.Printf("[%s] %-24s user=%-5q %-14s want=%d got=%d\n",
+			status, c.name, c.user, c.path, c.want, got)
+	}
+	fmt.Printf("%d/%d authorization cases pass\n", pass, len(cases))
+}
+```
+
+<CodeWalk
+  title="Automating the two-user test against your API"
+  steps={[
+    { lines: "12-32", note: "A correct in-process API: it reads the caller's identity, 401s if absent, and returns the doc only when the caller owns it — 'not yours' and 'missing' both return 404, no existence oracle. This is the handler the fuzzer audits.", pose: "operator", role: "operator", state: "active", beat: "neutral" },
+    { lines: "41-49", note: "The matrix as data: each row is (actor, path, expected status). The owner→own rows expect 200; the stranger→other's rows expect 404; no-auth expects 401. Adding an endpoint means adding rows, not writing new test code.", pose: "scientist", role: "scientist", state: "ok", beat: "solution" },
+    { lines: "44-45", note: "The two-user test, encoded twice: bob requesting alice's doc and vice versa, both want=404. These cross-principal deny rows are the ones a missing ownership check fails — the assertion that catches BOLA, leaky lists, and cross-tenant reads.", pose: "blocked", role: "thief", state: "warn", beat: "problem" },
+    { lines: "51-71", note: "The driver fires each row as a real HTTP request with that actor's identity and compares got to want. In a Go test these are t.Run subtests; here they print PASS/FAIL. Point this at your service in CI and a regressed check goes red on the next push.", pose: "happy", role: "scientist", state: "done", beat: "solution" }
+  ]}
+  caption="The authorization matrix as a runnable tool: one row per (actor × endpoint × expectation), driven as real requests. The cross-principal deny rows are your standing regression test against every access-control bug in the field guide."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func apiHandler() http.Handler {
+	docs := map[string]string{"doc_1": "alice", "doc_2": "bob"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/docs/", func(w http.ResponseWriter, r *http.Request) {
+		user := r.Header.Get("X-User")
+		if user == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		id := r.URL.Path[len("/docs/"):]
+		owner, ok := docs[id]
+		if !ok || owner != user {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+
+type authCase struct {
+	name, user, path string
+	want             int
+}
+
+func main() {
+	srv := httptest.NewServer(apiHandler())
+	defer srv.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	cases := []authCase{
+		{"owner reads own", "alice", "/docs/doc_1", 200},
+		{"owner reads own", "bob", "/docs/doc_2", 200},
+		{"stranger reads other's", "bob", "/docs/doc_1", 404},
+		{"stranger reads other's", "alice", "/docs/doc_2", 404},
+		{"no auth", "", "/docs/doc_1", 401},
+		{"missing doc", "alice", "/docs/doc_999", 404},
+	}
+
+	pass := 0
+	for _, c := range cases {
+		req, _ := http.NewRequest("GET", srv.URL+c.path, nil)
+		if c.user != "" {
+			req.Header.Set("X-User", c.user)
+		}
+		resp, err := client.Do(req)
+		got := 0
+		if err == nil {
+			got = resp.StatusCode
+			resp.Body.Close()
+		}
+		status := "PASS"
+		if got != c.want {
+			status = "FAIL"
+		} else {
+			pass++
+		}
+		fmt.Printf("[%s] %-24s user=%-5q %-14s want=%d got=%d\n",
+			status, c.name, c.user, c.path, c.want, got)
+	}
+	fmt.Printf("%d/%d authorization cases pass\n", pass, len(cases))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Callout kind="pro" title="This is the one to actually ship">
+Of everything in this chapter, the authz-matrix fuzzer is the tool to put in your own CI today. It's the offense methodology from the field guide pointed inward: enumerate your endpoints, run each as owner / stranger / unauthenticated, assert the expected allow/deny. The attacker has to find one missing check; this asserts every one of yours on every push. Generate the matrix from your OpenAPI/protobuf spec and a new endpoint without authorization tests fails the build.
+</Callout>
+
+---
+
+## Exercises
+
+Build the toolkit. Each of these is a component you'd actually keep.
+
+<Exercise n={1} title="Scope guard" level="easy">
+
+Write `InScope(rawURL string, allow []string) bool` that parses the URL, lowercases the host, and returns true only if the host equals an allowed domain or is a subdomain (`"."+domain`). Prove it refuses the suffix trick `acme.test.evil.com` against scope `["acme.test"]`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
+
+func InScope(rawURL string, allow []string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, a := range allow {
+		a = strings.ToLower(a)
+		if host == a || strings.HasSuffix(host, "."+a) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	scope := []string{"acme.test"}
+	for _, t := range []string{"https://api.acme.test/x", "https://acme.test.evil.com/x", "https://evil.com/x"} {
+		fmt.Printf("%-30s %v\n", t, InScope(t, scope))
+	}
+	// api.acme.test true, acme.test.evil.com false, evil.com false
+}
+```
+
+The leading dot in `"."+a` is the entire defense against the suffix trick: `acme.test.evil.com` does not end in `.acme.test`, so it's refused.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Response classifier" level="easy">
+
+Write `Classify(status int) string` returning `"accessible"` (2xx), `"protected"` (401/403), `"missing"` (404), `"errored"` (5xx), or `"other"`. Demonstrate it on a spread of status codes.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func Classify(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "accessible"
+	case status == 401 || status == 403:
+		return "protected"
+	case status == 404:
+		return "missing"
+	case status >= 500:
+		return "errored"
+	default:
+		return "other"
+	}
+}
+
+func main() {
+	for _, s := range []int{200, 204, 301, 403, 404, 500, 503} {
+		fmt.Printf("%d -> %s\n", s, Classify(s))
+	}
+}
+```
+
+A status-code switch is the cheapest, most reliable first-pass triage. Body-content signatures (panic traces, bucket names) refine it into a "leaks internals" flag.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Bounded worker pool" level="medium">
+
+Write `probeAll(base string, paths []string, workers int) map[string]int` that probes every path against an in-process `httptest` server using a fixed worker pool, returning path→status. Use a `sync.WaitGroup` and a results channel; cap concurrency at `workers`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"time"
+)
+
+func probeAll(base string, paths []string, workers int) map[string]int {
+	client := &http.Client{Timeout: 5 * time.Second}
+	jobs := make(chan string)
+	type res struct {
+		path string
+		code int
+	}
+	out := make(chan res)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				resp, err := client.Get(base + p)
+				code := 0
+				if err == nil {
+					code = resp.StatusCode
+					resp.Body.Close()
+				}
+				out <- res{p, code}
+			}
+		}()
+	}
+	go func() { for _, p := range paths { jobs <- p }; close(jobs) }()
+	go func() { wg.Wait(); close(out) }()
+
+	m := map[string]int{}
+	for r := range out {
+		m[r.path] = r.code
+	}
+	return m
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ok" {
+			w.WriteHeader(200)
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	m := probeAll(srv.URL, []string{"/ok", "/nope", "/ok"}, 3)
+	fmt.Println("/ok =", m["/ok"], "  /nope =", m["/nope"])
+}
+```
+
+The fixed worker count is the concurrency cap; closing `jobs` ends the workers, and the `WaitGroup`-then-`close(out)` goroutine ends the drain without a send-on-closed panic.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Token-bucket pacing" level="medium">
+
+Build a `Bucket` with `Take()` backed by a buffered channel pre-filled to capacity and refilled by a `time.Ticker`. Show that the first `size` calls return immediately and later calls are paced to the refill interval.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type Bucket struct{ tokens chan struct{} }
+
+func NewBucket(size int, refill time.Duration) *Bucket {
+	b := &Bucket{tokens: make(chan struct{}, size)}
+	for i := 0; i < size; i++ {
+		b.tokens <- struct{}{}
+	}
+	go func() {
+		t := time.NewTicker(refill)
+		for range t.C {
+			select {
+			case b.tokens <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return b
+}
+
+func (b *Bucket) Take() { <-b.tokens }
+
+func main() {
+	b := NewBucket(2, 40*time.Millisecond)
+	start := time.Now()
+	for i := 1; i <= 5; i++ {
+		b.Take()
+		fmt.Printf("take %d @ %dms\n", i, time.Since(start).Milliseconds())
+	}
+}
+```
+
+The first two takes drain the pre-fill instantly; the next three each wait for a ticker token, so they land roughly 40ms apart. Burst capacity = buffer size; long-run rate = refill rate.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Two-user test driver" level="hard">
+
+Write `runMatrix(base string, cases []Case) int` where `Case` is `{user, path string; want int}`. For each case, send a GET with header `X-User` (omit if empty) and count how many returned the expected status. Drive it against an in-process API that enforces ownership.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+type Case struct {
+	user, path string
+	want       int
+}
+
+func runMatrix(base string, cases []Case) int {
+	client := &http.Client{Timeout: 5 * time.Second}
+	pass := 0
+	for _, c := range cases {
+		req, _ := http.NewRequest("GET", base+c.path, nil)
+		if c.user != "" {
+			req.Header.Set("X-User", c.user)
+		}
+		resp, err := client.Do(req)
+		got := 0
+		if err == nil {
+			got = resp.StatusCode
+			resp.Body.Close()
+		}
+		if got == c.want {
+			pass++
+		} else {
+			fmt.Printf("MISMATCH user=%q %s want=%d got=%d\n", c.user, c.path, c.want, got)
+		}
+	}
+	return pass
+}
+
+func main() {
+	docs := map[string]string{"d1": "alice"}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := r.Header.Get("X-User")
+		if u == "" {
+			w.WriteHeader(401)
+			return
+		}
+		owner, ok := docs[r.URL.Path[1:]]
+		if !ok || owner != u {
+			w.WriteHeader(404)
+			return
+		}
+		w.WriteHeader(200)
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	cases := []Case{
+		{"alice", "/d1", 200},
+		{"bob", "/d1", 404}, // two-user test
+		{"", "/d1", 401},
+	}
+	fmt.Printf("%d/%d pass\n", runMatrix(srv.URL, cases), len(cases))
+}
+```
+
+The `bob → /d1 → 404` row is the two-user test. Flip the handler's `owner != u` check off and that row prints MISMATCH (got 200) — the tool catching the IDOR.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Time to wire the toolkit together — with the safety gate that makes it a *security tool* and not a liability.
+
+I've written a mini scanner with **two** defects: its prober doesn't route through the scope guard (so it would happily hit out-of-scope hosts), and its classifier mislabels server errors. Fix both so the self-check passes: every out-of-scope target must be refused before any request, and a 500 must classify as `"errored"`.
+
+Fully sandboxed — the only "network" is an in-process `httptest` server, and the scope list is fixed. Just you, a broken scanner, and four checks.
+
+<Lab
+  title="Gate the scanner to scope and fix the classifier"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Two defects. (1) probe() never checks scope — route it through inScope first and return code -1 (refused) for any out-of-scope URL, making no request. (2) classify() is missing the 5xx case — add it so status>=500 returns 'errored'. main is the self-check harness — do not edit it. It verifies an out-of-scope host is refused (-1) with no request made, an in-scope path is probed, a 500 classifies as 'errored', and a 200 as 'accessible'. When all pass it prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// inScope: host allow-list, default deny (this part is correct — use it).
+func inScope(rawURL string, allow []string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, a := range allow {
+		a = strings.ToLower(a)
+		if host == a || strings.HasSuffix(host, "."+a) {
+			return true
+		}
+	}
+	return false
+}
+
+// BUG 1: probe makes a request to ANY url with no scope check.
+// FIX: if !inScope(rawURL, allow) return -1 BEFORE making the request.
+func probe(client *http.Client, rawURL string, allow []string) int {
+	// FIX: gate on inScope here; return -1 when out of scope.
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return 0
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// BUG 2: classify has no 5xx case, so a 500 falls through to "other".
+// FIX: add a case for status >= 500 returning "errored".
+func classify(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "accessible"
+	case status == 401 || status == 403:
+		return "protected"
+	case status == 404:
+		return "missing"
+	// FIX: add 5xx -> "errored"
+	default:
+		return "other"
+	}
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	allOK := true
+
+	// A target that serves 200 on /ok and 500 on /boom.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/boom" {
+			w.WriteHeader(500)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// The scope authorizes ONLY 127.0.0.1 (httptest's host). example.com is out.
+	scope := []string{"127.0.0.1"}
+
+	// Check 1: an out-of-scope host is refused (-1), no request made.
+	if probe(client, "http://example.com/", scope) != -1 {
+		fmt.Println("FAIL check 1: out-of-scope host was not refused")
+		allOK = false
+	}
+
+	// Check 2: an in-scope path is actually probed (200).
+	if probe(client, srv.URL+"/ok", scope) != 200 {
+		fmt.Println("FAIL check 2: in-scope probe did not return 200")
+		allOK = false
+	}
+
+	// Check 3: a 500 classifies as errored.
+	if classify(500) != "errored" {
+		fmt.Println("FAIL check 3: 500 did not classify as errored")
+		allOK = false
+	}
+
+	// Check 4: a 200 classifies as accessible.
+	if classify(200) != "accessible" {
+		fmt.Println("FAIL check 4: 200 did not classify as accessible")
+		allOK = false
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main runs four in-process checks: an out-of-scope host returns -1 (refused before any request), an in-scope path returns 200, classify(500) is 'errored', and classify(200) is 'accessible'. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  hints={[
+    "Bug 1: at the top of probe, add `if !inScope(rawURL, allow) { return -1 }` before client.Get. This makes the scope guard a hard gate — an out-of-scope URL never reaches the network.",
+    "Bug 2: add `case status >= 500:` returning \"errored\" to the switch, above the default. Put it after the 404 case so the specific codes are checked first.",
+    "Check 1 relies on probe returning -1 WITHOUT making a request — the whole point of the scope guard is that the request never happens, so gate before client.Get, not after.",
+  ]}
+  flag="GO{scope_gated_and_correctly_classified}"
+>
+
+Bug 1 is the one that matters most: a scanner that doesn't gate on scope is a scanner that hits hosts you're not authorized for. Route every probe through the allow-list and refuse out-of-scope before the request leaves. Bug 2 is triage hygiene — a misclassified 500 is a leak you'd scroll past. Fix both. Four checks. All must pass. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **Go is the recon toolchain's language** — nuclei, httpx, subfinder, ffuf and the rest are all Go — because goroutines make bounded concurrency trivial, a single static binary cross-compiles anywhere, and `net/http` + `httptest` are in the standard library. Use Go for tools you keep; Python for throwaway PoCs.
+- **The scope guard comes first.** An allow-list (default deny) that every probe routes through, matching the apex and true subdomains (`"."+domain` defeats the `acme.test.evil.com` suffix trick). It makes touching an unauthorized host a structural impossibility, not a matter of discipline — the ethical default and good engineering at once.
+- **A bounded worker pool** is the prober engine: a fixed set of goroutines ranging a jobs channel caps concurrency; close `jobs` to end the workers, `WaitGroup`-then-`close(results)` to end the drain. Always a timeout client, always close response bodies.
+- **A token bucket** paces requests per second — a buffered channel pre-filled for bursts, refilled by a ticker, drained by a blocking `Take()`. Reach for `golang.org/x/time/rate` in production.
+- **Classification turns a flood into a triage list** — bucket every response by status (accessible / protected / missing / errored) and flag bodies that leak internals (panic traces, bucket names, SQL errors). Surface the few rows worth a human's attention.
+- **The authz-matrix fuzzer is the one to ship.** It automates the two-user test — every (actor × endpoint) cell with an expected allow/deny, driven as real requests, the cross-principal deny rows catching BOLA, leaky lists, and cross-tenant access. Point it at your own service in CI and a missing ownership check fails the build instead of leaking the data.
+
+</Recap>
+
+<Scoreboard
+  streak={11}
+  items={[
+    { label: "Exercise 1 — Scope guard", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Response classifier", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Bounded worker pool", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Token-bucket pacing", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Two-user test driver", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Gate the scanner to scope, fix the classifier", captured: false, points: 80 }}
+/>
+
+That's a toolkit — a real one, the same shapes as the tools whose names you already know. A scope guard that keeps you legal, a worker pool that keeps you fast, a rate limiter that keeps you polite, a classifier that keeps you sane, and a fuzzer that turns the whole field guide into a test you run on every push. The hunters who make a living at this aren't running magic — they're running disciplined automation against systems they're allowed to touch. You can build that now, in a language that compiles to one fearless little binary. Go build it, sport — and point it at your own walls first.
+
