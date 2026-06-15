@@ -1,0 +1,1173 @@
+---
+title: "TLS Fingerprinting & Browser Impersonation"
+part: "appendix"
+order: 22
+type: "course"
+description: "Demystified from the bytes up: why a Go HTTP client is identifiable before it sends a single header, the TLS ClientHello and how JA3 (MD5 of cipher/extension/curve lists) and JA4 (sorted, SHA-256, GREASE-stripped) hash it into a fingerprint, the HTTP/2 Akamai fingerprint (SETTINGS frame + pseudo-header order), how uTLS forges an arbitrary ClientHello before crypto/tls sees it, and how bogdanfinn/tls-client and enetx/surf assemble browser-accurate fingerprints — for authorized testing, scraping-defense research, and understanding anti-bot systems."
+prerequisites: ["networking-web-fundamentals"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Deep Dive" title="TLS Fingerprinting & Browser Impersonation">
+
+Here's the thing, sport. You think your Go HTTP client is anonymous — that if you set a believable `User-Agent`, a server can't tell you apart from Chrome. You are wrong, and a server proves it **before your client sends a single header**. The very first packet of the TLS handshake — the *ClientHello* — carries a list of cipher suites, extensions, and curves in a specific order, and that order is as unique to your TLS library as a handwriting sample. Anti-bot systems hash it into a string called **JA3** (or the newer **JA4**), look it up against a database of known browsers, and flag "this is a Go program pretending to be Chrome" in microseconds. No header you set can fix it, because the tell is *underneath* the headers.
+
+This chapter demystifies that tell completely, from the bytes up, and the two Go libraries built to defeat it: **`bogdanfinn/tls-client`** and **`enetx/surf`**, both standing on **uTLS**. You'll learn exactly what's in a ClientHello, how JA3 and JA4 are computed (and compute them yourself, in runnable Go), why Go's `crypto/tls` is instantly identifiable, how uTLS *forges* a ClientHello before `crypto/tls` ever sees it, and the second fingerprint layer most people never reach: the **HTTP/2 Akamai fingerprint**, built from the SETTINGS frame and the order of your pseudo-headers. Nothing assumed. By the end you'll read a JA3 string like a sentence and know precisely which byte to change to look like a real browser.
+
+</HeroCard>
+
+<Callout kind="warn" title="What this is for — and what it isn't">
+This chapter teaches you **how fingerprinting works** — knowledge that is essential on both sides of the wire. You need it to **build** bot-detection and scraping defenses (you cannot defend against a fingerprint you don't understand), to **test** your own anti-bot stack, to **research** how anti-bot systems like Cloudflare, Akamai, and DataDome classify clients, and to build legitimate API clients for services you are **authorized** to access. Impersonating a browser to evade access controls on systems you don't own — or to violate a site's terms — is a different matter, and not what this is about. The mechanism is dual-use; the framing here is understanding and defense. Use it on systems you own or are authorized to test.
+</Callout>
+
+<ChapterTabs tabs={["The Tell", "The TLS ClientHello", "JA3 — the MD5 Fingerprint", "JA4 — the Modern Fingerprint", "Why Go Leaks", "uTLS — Forging the Hello", "The HTTP/2 Fingerprint", "tls-client & surf"]} />
+
+## The Tell
+
+Start with the thing that breaks the illusion. You write a careful Go scraper: a real Chrome `User-Agent`, the same `Accept`, `Accept-Language`, `Accept-Encoding` headers Chrome sends, in the same order. You send a request. The server returns a CAPTCHA — or a 403, or a block page — and a real Chrome from the same IP sails through. **What gave you away?**
+
+<Define term="TLS fingerprinting" since="Networking & Web Fundamentals (Part 1)">
+**TLS fingerprinting** identifies a client from the structure of its TLS handshake — specifically the **ClientHello** message, the first thing a client sends. The ClientHello advertises which cipher suites, TLS extensions, elliptic curves, and signature algorithms the client supports, **in a library-specific order**. Because every TLS implementation builds that list differently (and most never change it), the ClientHello is a stable, passive signature: the server reads it during the handshake, before any HTTP data is exchanged, and before it has to send anything back. No header you set in your HTTP request can alter it, because it happens one layer down, in the TLS library.
+</Define>
+
+The headers you so carefully spoofed live in the HTTP layer, *inside* the encrypted tunnel. The fingerprint is in the TLS layer, the tunnel's own setup handshake — it travels in the clear, and it's decided entirely by your TLS library (`crypto/tls`), not your application code. Chrome's TLS library produces Chrome's fingerprint; Go's produces Go's. Setting `User-Agent: Chrome` while sending Go's ClientHello is like mailing a letter signed "Chrome" in an envelope with your own return address printed on it — the envelope is read first.
+
+<JourneyAnim
+  title="Where the tell lives — the layer your headers can't reach"
+  hops={[
+    { id: "app", label: "your Go code", role: "scribe" },
+    { id: "tls", label: "crypto/tls (ClientHello)", role: "guard" },
+    { id: "net", label: "the wire", role: "operator" },
+    { id: "server", label: "anti-bot edge", role: "detective" }
+  ]}
+  frames={[
+    { note: "Your code sets a perfect Chrome User-Agent and header order. You're confident. But headers are HTTP — they live inside the TLS tunnel, and the tunnel isn't open yet.", at: "app" },
+    { note: "To open the tunnel, crypto/tls sends the ClientHello FIRST — your cipher/extension/curve list, in Go's fixed order. You never wrote this; the library did. It is the same for every Go program on earth.", beat: "problem", at: "tls" },
+    { note: "The ClientHello crosses the wire in the CLEAR (the tunnel it's negotiating doesn't exist yet). Anyone watching — including the server's edge — reads it verbatim.", at: "net" },
+    { note: "The anti-bot edge hashes the ClientHello into JA3/JA4, looks it up: 'Go crypto/tls'. Your beautiful Chrome headers haven't been sent yet — and now never matter. Flagged before byte one of HTTP.", beat: "problem", at: "server", failed: true },
+    { note: "The fix isn't a better header. It's forging the ClientHello itself so the fingerprint says 'Chrome' — which is the entire job of uTLS, tls-client, and surf. That's the rest of this chapter.", beat: "solution", at: "tls" }
+  ]}
+  caption="Your HTTP headers ride inside the TLS tunnel; the fingerprint is the tunnel's own opening handshake, sent in the clear before any header exists. You cannot spoof a layer from above it — you have to change crypto/tls itself."
+/>
+
+That's the whole motivation. Now we go down to the bytes.
+
+---
+
+## The TLS ClientHello
+
+The handshake that opens a TLS connection begins with the client sending a **ClientHello**: a structured message listing everything the client is willing to use, so the server can pick a mutually-supported set. The fingerprint is built from a handful of its fields.
+
+<ExecTimeline
+  title="The TLS 1.3 handshake — and the one message that fingerprints you"
+  lanes={[{ id: "client", label: "client", role: "operator" }, { id: "server", label: "server", role: "librarian" }]}
+  steps={[
+    { lane: "client", kind: "send", label: "ClientHello", note: "The client sends, in the CLEAR: the TLS version, an ordered list of cipher suites it supports, a list of extensions (SNI, ALPN, supported_groups, signature_algorithms, key_share, …) in a specific order, the elliptic curves, and the EC point formats. This is the fingerprinted message — everything in it is library-chosen and visible.", beat: "problem" },
+    { lane: "server", kind: "recv", label: "read + (optionally) fingerprint", note: "Before responding, the server has the full ClientHello. An anti-bot edge hashes it here — JA3/JA4 — and can already decide to block, challenge, or allow based purely on this." },
+    { lane: "server", kind: "send", label: "ServerHello + cert + Finished", note: "The server picks one cipher suite and one key-share group from the client's lists, sends its certificate, and (in TLS 1.3) its Finished — most of this now encrypted. The server's choices are constrained to what the client offered." },
+    { lane: "client", kind: "recv", label: "verify cert + key exchange", note: "The client validates the certificate chain and completes the key exchange. Both sides now share a session key." },
+    { lane: "client", kind: "done", label: "encrypted tunnel open → HTTP flows", note: "ONLY NOW does the HTTP request — with all your carefully-ordered headers — travel, encrypted. By this point the JA3/JA4 verdict was already rendered from the ClientHello two steps ago." }
+  ]}
+  caption="The ClientHello is step one, in the clear, and it's the fingerprint. The HTTP layer where your headers live doesn't open until step five — long after the server could have already classified and blocked you."
+/>
+
+<Callout kind="note" title="The fields that matter, in ClientHello order">
+JA3 reads exactly five things from the ClientHello: the **TLS version**, the **cipher suites** (ordered list), the **extensions** (ordered list), the **supported elliptic curves** (the `supported_groups` extension), and the **EC point formats**. JA4 reads more (ALPN, SNI presence, signature algorithms) and treats some of it differently — covered below. Everything is just 16-bit numbers (`uint16`) defined by IANA; the fingerprint is those numbers, decimal-encoded and joined.
+</Callout>
+
+---
+
+## JA3 — the MD5 Fingerprint
+
+JA3 (Salesforce, 2017) is the original and still the most widely deployed TLS-client fingerprint. The algorithm is small enough to hold in your head, and you're about to compute it by hand.
+
+<Define term="JA3">
+**JA3** builds one string from five ClientHello fields, in this exact order: `SSLVersion,Ciphers,Extensions,EllipticCurves,ECPointFormats`. Fields are separated by **commas**; the values within a field (each a decimal `uint16`) are separated by **hyphens**. That string is then **MD5-hashed** into a 32-character hex fingerprint. Crucially, **GREASE values are removed first** (more below), so a browser's deliberately-random GREASE entries don't change its fingerprint. JA3 captures *which* parameters a client offers **and the order** it offers them in.
+</Define>
+
+Here is the canonical JA3 string and its hash — the example from Salesforce's reference — and the same computation in runnable Go:
+
+<Scene
+  title="JA3: five ClientHello fields → one MD5"
+  actors={[{ id: "h", label: "hasher", role: "scientist" }]}
+  rows={2}
+  cols={5}
+  frames={[
+    {
+      caption: "Pull the five fields from the ClientHello, each a list of decimal uint16s. Version 769 = TLS 1.2; then the cipher list, the extension list, the curve list, the point-format list.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "769" },
+        { id: "A2", state: "active", label: "ciphers" },
+        { id: "A3", state: "active", label: "extensions" },
+        { id: "A4", state: "active", label: "curves" },
+        { id: "A5", state: "active", label: "formats" }
+      ]
+    },
+    {
+      caption: "Join within each field by '-', between fields by ',' → one string: 769,47-53-5-…,0-10-11,23-24-25,0. The ORDER is preserved — that's what makes it a library signature.",
+      beat: "neutral",
+      cells: [
+        { id: "B1", state: "warn", label: "769," },
+        { id: "B2", state: "warn", label: "47-53-…," },
+        { id: "B3", state: "warn", label: "0-10-11," },
+        { id: "B4", state: "warn", label: "23-24-25," },
+        { id: "B5", state: "warn", label: "0" }
+      ]
+    },
+    {
+      caption: "MD5 the whole string → ada70206e40642a3e4461f35503241d5. That 32-char hash IS the fingerprint the server looks up against its browser database.",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "ada70206" },
+        { id: "C2", state: "done", label: "e40642a3" },
+        { id: "C3", state: "done", label: "e4461f35" },
+        { id: "C4", state: "done", label: "503241d5" },
+        { id: "C5", state: "done", label: "✓" }
+      ]
+    }
+  ]}
+  caption="JA3 is mechanical: take five ordered lists of numbers, join them with hyphens and commas, MD5 the result. Same client → same 32-char hash, every time. The server keeps a table of (hash → browser) and reads you off it."
+/>
+
+```go
+package main
+
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// ja3 builds the JA3 string from the five ClientHello fields and MD5s it.
+// Order: SSLVersion,Ciphers,Extensions,EllipticCurves,ECPointFormats
+//   - fields joined by ","   - values within a field joined by "-"
+//   - all values are decimal uint16
+func ja3(version uint16, ciphers, extensions, curves, formats []uint16) (string, string) {
+	join := func(xs []uint16) string {
+		parts := make([]string, len(xs))
+		for i, x := range xs {
+			parts[i] = strconv.Itoa(int(x))
+		}
+		return strings.Join(parts, "-")
+	}
+	raw := strings.Join([]string{
+		strconv.Itoa(int(version)),
+		join(ciphers),
+		join(extensions),
+		join(curves),
+		join(formats),
+	}, ",")
+	sum := md5.Sum([]byte(raw))
+	return raw, hex.EncodeToString(sum[:])
+}
+
+func main() {
+	// The canonical Salesforce JA3 example (a TLS 1.2 client).
+	raw, fp := ja3(
+		769, // TLS 1.2
+		[]uint16{47, 53, 5, 10, 49161, 49162, 49171, 49172, 50, 56, 19, 4},
+		[]uint16{0, 10, 11},
+		[]uint16{23, 24, 25},
+		[]uint16{0},
+	)
+	fmt.Println("JA3 string:", raw)
+	fmt.Println("JA3 MD5:   ", fp) // ada70206e40642a3e4461f35503241d5
+}
+```
+
+<CodeWalk
+  title="Computing JA3 by hand"
+  steps={[
+    { lines: "12-18", note: "join turns a []uint16 into the hyphen-separated decimal list JA3 wants. [47,53,5] → \"47-53-5\". Each cipher/extension/curve is just its IANA number in decimal.", pose: "scribe", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "19-25", note: "The five fields, joined by commas in the fixed JA3 order: version, ciphers, extensions, curves, formats. This is the exact string a fingerprinting library reconstructs from your raw ClientHello bytes.", pose: "guard", role: "scientist", state: "ok", beat: "solution" },
+    { lines: "26-27", note: "MD5 the string, hex-encode → the 32-char fingerprint. MD5 is fine here: this isn't cryptography, it's a stable identifier. Speed and a fixed-width output are all that matter.", pose: "run", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "30-40", note: "The canonical example. The hash comes out ada70206e40642a3e4461f35503241d5 — byte-for-byte the value in Salesforce's spec. You just fingerprinted a TLS client in twenty lines of stdlib.", pose: "happy", role: "scientist", state: "done", beat: "solution" }
+  ]}
+  caption="JA3 has no magic: join five ordered number-lists with hyphens and commas, MD5 it. The whole anti-bot TLS layer rests on this twenty-line function — which is exactly why understanding it lets you defeat or defend it."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+func ja3(version uint16, ciphers, extensions, curves, formats []uint16) (string, string) {
+	join := func(xs []uint16) string {
+		parts := make([]string, len(xs))
+		for i, x := range xs {
+			parts[i] = strconv.Itoa(int(x))
+		}
+		return strings.Join(parts, "-")
+	}
+	raw := strings.Join([]string{
+		strconv.Itoa(int(version)),
+		join(ciphers),
+		join(extensions),
+		join(curves),
+		join(formats),
+	}, ",")
+	sum := md5.Sum([]byte(raw))
+	return raw, hex.EncodeToString(sum[:])
+}
+
+func main() {
+	raw, fp := ja3(
+		769,
+		[]uint16{47, 53, 5, 10, 49161, 49162, 49171, 49172, 50, 56, 19, 4},
+		[]uint16{0, 10, 11},
+		[]uint16{23, 24, 25},
+		[]uint16{0},
+	)
+	fmt.Println("JA3 string:", raw)
+	fmt.Println("JA3 MD5:   ", fp)
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Gotcha>
+**Order is everything.** JA3 hashes the cipher and extension lists *in the order the client sent them*. Two clients that support the identical set of ciphers but list them in a different order get **different** JA3 hashes. This is why you can't just configure Go's `crypto/tls` with "Chrome's cipher suites" — Go re-orders and re-shapes the ClientHello its own way. Matching the *set* isn't enough; you must match the *sequence*, byte for byte. Only a library that lets you emit a raw, ordered ClientHello (uTLS) can do that.
+</Gotcha>
+
+### GREASE — the randomness JA3 must ignore
+
+Chrome deliberately inserts **GREASE** values (Generate Random Extensions And Sustain Extensibility, RFC 8701) — reserved fake cipher/extension/curve IDs — into its ClientHello, in random slots, to keep servers from ossifying on a fixed set. If JA3 hashed those, Chrome's fingerprint would change every connection. So **JA3 strips GREASE first**. The GREASE values are the 16 patterns `0x0a0a, 0x1a1a, 0x2a2a … 0xfafa` — both bytes equal, low nibble `0xa`:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// isGREASE reports whether a uint16 is one of the 16 reserved GREASE values
+// (RFC 8701): 0x0a0a, 0x1a1a, ... 0xfafa. Pattern: the two bytes are equal
+// AND the low nibble of each is 0xa.
+func isGREASE(v uint16) bool {
+	return v&0x0f0f == 0x0a0a && byte(v>>8) == byte(v)
+}
+
+// stripGREASE removes GREASE values before fingerprinting — without this,
+// Chrome's random GREASE would change its JA3 every single connection.
+func stripGREASE(xs []uint16) []uint16 {
+	out := xs[:0:0]
+	for _, x := range xs {
+		if !isGREASE(x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func main() {
+	// A Chrome-like cipher list with two GREASE values injected (0x3a3a, 0x8a8a).
+	raw := []uint16{0x3a3a, 0x1301, 0x1302, 0x1303, 0x8a8a, 0xc02b, 0xc02f}
+	fmt.Printf("raw     (%d): %#x\n", len(raw), raw)
+	clean := stripGREASE(raw)
+	fmt.Printf("cleaned (%d): %#x\n", len(clean), clean)
+
+	for _, v := range []uint16{0x0a0a, 0x3a3a, 0xfafa, 0x1301, 0xc02b} {
+		fmt.Printf("  %#04x GREASE? %v\n", v, isGREASE(v))
+	}
+}
+```
+
+</GoPlayground>
+
+This is the first reason naive impersonation fails: a real browser *has* GREASE in its raw ClientHello, in random positions, and the fingerprinter strips it. Your forged ClientHello must include GREASE in browser-correct slots too, or a deeper inspection notices its absence.
+
+---
+
+## JA4 — the Modern Fingerprint
+
+JA3's weakness is exactly its strength: it depends on **order**. Attackers learned to randomize their cipher order ("cipher stunting") to get a fresh JA3 every connection and slip past hash blocklists. **JA4** (FoxIO, 2023) is the answer — and it's what modern anti-bot stacks increasingly use.
+
+<Define term="JA4 (TLS client)">
+**JA4** is a newer, more robust TLS-client fingerprint with a human-readable `a_b_c` structure. The **`a`** part is plaintext: protocol (`t`=TCP, `q`=QUIC), TLS version, SNI present (`d`) or not (`i`), a 2-digit cipher count, a 2-digit extension count, and the first ALPN value (e.g. `h2`). The **`b`** part is a 12-hex truncated **SHA-256** of the **sorted** cipher list. The **`c`** part is a truncated SHA-256 of the **sorted** extension list plus the signature algorithms. Two changes from JA3 matter most: it **sorts** ciphers and extensions (so reordering them no longer changes the hash — defeating cipher stunting and GREASE-shuffling), and it uses **SHA-256** instead of MD5. GREASE is removed before hashing, and signature algorithms are folded in for extra resolution.
+</Define>
+
+<Scene
+  title="JA4 vs JA3: sorting defeats the randomizer"
+  actors={[
+    { id: "ja3", label: "JA3 (ordered)", role: "scientist" },
+    { id: "ja4", label: "JA4 (sorted)", role: "guard" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "Connection 1: the client offers ciphers [1301, 1302, 1303]. JA3 hashes that order; JA4 sorts first.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "1301" },
+        { id: "A2", state: "active", label: "1302" },
+        { id: "A3", state: "active", label: "1303" }
+      ]
+    },
+    {
+      caption: "Connection 2: the SAME client shuffles its ciphers to [1303, 1301, 1302] (cipher stunting). JA3 now produces a DIFFERENT hash — its blocklist is evaded.",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "bad", label: "1303" },
+        { id: "B2", state: "bad", label: "1301" },
+        { id: "B3", state: "bad", label: "1302" }
+      ]
+    },
+    {
+      caption: "But JA4 SORTED both connections to [1301,1302,1303] before hashing — so both yield the SAME JA4. The shuffle bought nothing. That's why JA4 is harder to evade and why impersonation must now match a real browser's true cipher SET, not just spoof an order.",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "1301" },
+        { id: "C2", state: "done", label: "1302" },
+        { id: "C3", state: "done", label: "1303" }
+      ]
+    }
+  ]}
+  caption="JA3 hashes order, so shuffling order escapes it. JA4 sorts first, so shuffling changes nothing — the fingerprint tracks the client's true capability set. Modern impersonation has to be capability-accurate, not just order-accurate."
+/>
+
+Here is JA4's structure assembled in runnable Go — the plaintext `a` part plus the two sorted SHA-256 hashes:
+
+```go
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// hex2 lowercases each uint16 to a 4-char hex token, e.g. 0x1301 -> "1301".
+func hex2(xs []uint16) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = fmt.Sprintf("%04x", x)
+	}
+	return out
+}
+
+// sortedHash sorts the hex tokens, joins with ",", SHA-256s them, and returns
+// the first 12 hex chars — exactly how JA4 derives its `b` and `c` parts.
+// Sorting is the whole point: reordering the input can no longer change output.
+func sortedHash(tokens []string) string {
+	sort.Strings(tokens)
+	sum := sha256.Sum256([]byte(strings.Join(tokens, ",")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func main() {
+	// A TLS 1.3 client over TCP, SNI present, ALPN "h2".
+	ciphers := []uint16{0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030}
+	exts := []uint16{0x0000, 0x0017, 0x000a, 0x000b, 0x0010, 0x0023, 0x002b}
+
+	// JA4_a: t = TCP, 13 = TLS 1.3, d = SNI present, then 2-digit counts, then ALPN.
+	a := fmt.Sprintf("t13d%02d%02dh2", len(ciphers), len(exts))
+	b := sortedHash(hex2(ciphers)) // sorted cipher hash
+	c := sortedHash(hex2(exts))    // sorted extension (+ sig-alg) hash
+
+	fmt.Printf("JA4 = %s_%s_%s\n", a, b, c)
+
+	// Prove sort-invariance: shuffle the ciphers, hash again — same `b`.
+	shuffled := []uint16{0xc030, 0x1303, 0xc02b, 0x1301, 0xc02f, 0x1302, 0xc02c}
+	fmt.Println("cipher hash, original order:", sortedHash(hex2(ciphers)))
+	fmt.Println("cipher hash, shuffled order:", sortedHash(hex2(shuffled)))
+	fmt.Println("equal (shuffle defeated):  ", sortedHash(hex2(ciphers)) == sortedHash(hex2(shuffled)))
+}
+```
+
+<CodeWalk
+  title="Assembling a JA4 fingerprint"
+  steps={[
+    { lines: "19-23", note: "sortedHash is the heart of JA4: SORT the hex tokens, join, SHA-256, take 12 hex chars. The sort is what makes JA4 immune to reordering — the b and c parts depend only on the SET of ciphers/extensions, not their sequence.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "29", note: "JA4_a is human-readable: t13d = TCP, TLS 1.3, SNI present (d). Then %02d%02d = the two-digit cipher and extension counts, then the ALPN (h2). You can eyeball a JA4_a and know the protocol shape without any hashing.", pose: "scribe", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "30-33", note: "b = sorted cipher hash, c = sorted extension (+ signature-algorithm) hash. Three parts joined by underscores → the full JA4. SHA-256, not MD5 — a modernization that also widens the space.", pose: "run", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "35-38", note: "The proof: hash the ciphers, then hash a SHUFFLED copy. JA3 would differ; JA4's sorted hash is identical. The 'equal' line prints true — cipher stunting is dead against JA4.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="JA4 = a readable protocol summary + two SHA-256 hashes of SORTED lists. Sorting kills the order-shuffling evasion that beat JA3, which is exactly why impersonation must now reproduce a browser's genuine cipher and extension set."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+func hex2(xs []uint16) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = fmt.Sprintf("%04x", x)
+	}
+	return out
+}
+
+func sortedHash(tokens []string) string {
+	sort.Strings(tokens)
+	sum := sha256.Sum256([]byte(strings.Join(tokens, ",")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func main() {
+	ciphers := []uint16{0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030}
+	exts := []uint16{0x0000, 0x0017, 0x000a, 0x000b, 0x0010, 0x0023, 0x002b}
+
+	a := fmt.Sprintf("t13d%02d%02dh2", len(ciphers), len(exts))
+	b := sortedHash(hex2(ciphers))
+	c := sortedHash(hex2(exts))
+
+	fmt.Printf("JA4 = %s_%s_%s\n", a, b, c)
+
+	shuffled := []uint16{0xc030, 0x1303, 0xc02b, 0x1301, 0xc02f, 0x1302, 0xc02c}
+	fmt.Println("cipher hash, original order:", sortedHash(hex2(ciphers)))
+	fmt.Println("cipher hash, shuffled order:", sortedHash(hex2(shuffled)))
+	fmt.Println("equal (shuffle defeated):  ", sortedHash(hex2(ciphers)) == sortedHash(hex2(shuffled)))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Callout kind="note" title="JA4 is a family">
+JA4 by itself is the TLS-client fingerprint, but FoxIO defined a whole suite: **JA4S** (server response), **JA4H** (HTTP headers), **JA4L** (latency/location), **JA4X** (X.509 certs), and **JA4QUIC** for QUIC's Initial packet + ClientHello. The `surf` library advertises JA4QUIC support precisely because HTTP/3 over QUIC carries the ClientHello inside the QUIC Initial packet — a third fingerprint surface beyond TLS-over-TCP and HTTP/2.
+</Callout>
+
+---
+
+## Why Go Leaks
+
+Now the punchline you can feel. Go's `crypto/tls` builds a **specific, fixed** ClientHello — a particular cipher order, a particular extension set, no GREASE — that matches **no browser** and is identical across every Go program. Put Go's fingerprint next to Chrome's and the mismatch is glaring.
+
+<Scene
+  title="Go's crypto/tls ClientHello vs Chrome's — the instant tell"
+  actors={[
+    { id: "go", label: "Go crypto/tls", role: "hacker" },
+    { id: "cr", label: "real Chrome", role: "operator" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "GREASE: Chrome leads its cipher and extension lists with a random GREASE value. Go emits none. A fingerprinter that just checks 'is there GREASE?' already separates them.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "bad", label: "Go: no GREASE" },
+        { id: "A2", state: "idle", label: "" },
+        { id: "A3", state: "done", label: "Chrome: GREASE" },
+        { id: "A4", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Cipher order: Go's list and order are its own; Chrome's are Chrome's. Even where the sets overlap, the sequence differs — so JA3 differs, and JA4's sorted SET differs too.",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "bad", label: "Go order" },
+        { id: "B2", state: "idle", label: "≠" },
+        { id: "B3", state: "done", label: "Chrome order" },
+        { id: "B4", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Extensions: Chrome sends extensions Go doesn't (e.g. application_settings, compress_certificate, GREASE'd key shares) and in its own order. The extension-count digits in JA4_a alone won't match.",
+      beat: "problem",
+      cells: [
+        { id: "C1", state: "bad", label: "Go: N exts" },
+        { id: "C2", state: "idle", label: "≠" },
+        { id: "C3", state: "done", label: "Chrome: M exts" },
+        { id: "C4", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Result: Go's JA3/JA4 is a known, published constant. Anti-bot databases list it as 'Go-http-client'. No User-Agent string overrides a fingerprint that says 'Go' before your headers are even sent.",
+      beat: "problem",
+      cells: [
+        { id: "D1", state: "bad", label: "JA3: Go" },
+        { id: "D2", state: "idle", label: "" },
+        { id: "D3", state: "done", label: "JA3: Chrome" },
+        { id: "D4", state: "bad", label: "mismatch ✕" }
+      ]
+    }
+  ]}
+  caption="Go's crypto/tls ClientHello is honest and consistent — which is exactly the problem. No GREASE, its own cipher/extension order, a published constant fingerprint. Every Go program shares it, and every anti-bot vendor knows it."
+/>
+
+The fix is not configuration. `crypto/tls` does not expose the knobs — you cannot tell it "emit GREASE here, put this extension before that one, use Chrome's exact key-share group." Its `tls.Config` controls *policy* (min version, cert verification, ALPN), not the *byte layout* of the ClientHello. To change the layout you need a different library that hands you the ClientHello before it's serialized. That library is uTLS.
+
+---
+
+## uTLS — Forging the Hello
+
+**uTLS** (`github.com/refraction-networking/utls`) is a fork of `crypto/tls` whose entire reason to exist is letting you control the ClientHello. It still does real TLS — the handshake, key exchange, and encryption are the standard, audited `crypto/tls` machinery — but it **swaps in your chosen ClientHello before that machinery serializes and sends it.**
+
+<ExecTimeline
+  title="uTLS: forge the ClientHello, then hand off to real TLS"
+  lanes={[
+    { id: "app", label: "your code", role: "scribe" },
+    { id: "utls", label: "uTLS (UConn)", role: "mechanic" },
+    { id: "tls", label: "crypto/tls core", role: "guard" },
+    { id: "net", label: "the wire", role: "operator" }
+  ]}
+  steps={[
+    { lane: "app", kind: "run", label: "tls.UClient(conn, cfg, HelloChrome_Auto)", note: "You wrap a raw TCP conn in a uTLS UConn and pass a ClientHelloID — here HelloChrome_Auto, which 'parrots' the latest Chrome. (Or HelloFirefox_120, HelloSafari_16_0, HelloCustom, …)" },
+    { lane: "utls", kind: "run", label: "ApplyPreset → build Chrome's exact ClientHello", note: "uTLS materializes Chrome's precise ClientHello: its cipher order, its extension list and order, GREASE in the right slots, the right curves and key shares. This is a stored spec of real Chrome bytes, not Go's defaults.", beat: "solution" },
+    { lane: "utls", kind: "send", label: "hand the forged Hello to the TLS core", note: "uTLS injects this ClientHello where crypto/tls would have built its own. From here, the standard, audited handshake code takes over unchanged — uTLS only replaced the opening message." },
+    { lane: "net", kind: "send", label: "ClientHello on the wire = Chrome's", note: "What crosses the wire now hashes to Chrome's JA3/JA4. A passive fingerprinter sees Chrome. The TLS itself is still correct and secure — you forged the signature, not the cryptography.", beat: "solution" },
+    { lane: "tls", kind: "recv", label: "ServerHello → finish handshake normally", note: "The server responds; crypto/tls completes the handshake and opens the tunnel. Your HTTP — which still needs browser-correct headers and HTTP/2 settings (next section) — now flows inside a Chrome-fingerprinted connection." }
+  ]}
+  caption="uTLS doesn't reimplement TLS — it substitutes the ClientHello (from a stored browser spec) right before crypto/tls serializes it, then lets the real handshake proceed. You change the fingerprint without touching the cryptography."
+/>
+
+The mechanism, in uTLS's own API (this needs the external `utls` module, so it's shown illustratively, not as a runnable playground):
+
+```go
+// Requires github.com/refraction-networking/utls — illustrative, not a playground.
+package main
+
+import (
+	"net"
+
+	utls "github.com/refraction-networking/utls"
+)
+
+func dialChrome(addr, sni string) (*utls.UConn, error) {
+	tcp, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	// UClient wraps the TCP conn. HelloChrome_Auto = "parrot the latest Chrome".
+	// The config carries policy (ServerName for SNI); the ClientHelloID carries
+	// the byte layout. crypto/tls never builds its own Hello here.
+	uconn := utls.UClient(tcp, &utls.Config{ServerName: sni}, utls.HelloChrome_Auto)
+	if err := uconn.Handshake(); err != nil { // forged Hello goes out here
+		return nil, err
+	}
+	return uconn, nil // a real, secure TLS conn — fingerprinted as Chrome
+}
+
+// For exact control, use HelloCustom + a ClientHelloSpec you build (or one
+// captured from a real browser via utls.Fingerprinter), then uconn.ApplyPreset(spec).
+// The Roller cycles HelloIDs until one connects and reuses the winner — so you
+// don't suspiciously change fingerprints mid-session.
+```
+
+<Callout kind="pro" title="ClientHelloID vs ClientHelloSpec vs Fingerprinter">
+Three levels of control, increasing in precision: a **`ClientHelloID`** (`HelloChrome_Auto`, `HelloFirefox_120`) is a named preset uTLS maintains for a real browser version — easiest, and what you want 95% of the time. A **`ClientHelloSpec`** (with `HelloCustom` + `ApplyPreset`) is a hand-built struct of `CipherSuites`, `Extensions`, curves, ALPN — full manual control for a fingerprint uTLS doesn't ship. The **`Fingerprinter`** captures a real browser's raw ClientHello bytes and produces a `ClientHelloSpec` you can replay — copy a fingerprint you observed in the wild exactly. `tls-client` and `surf` are built on the first level, maintaining their own up-to-date preset library.
+</Callout>
+
+---
+
+## The HTTP/2 Fingerprint
+
+Forging the ClientHello defeats the TLS-layer fingerprint — but there's a second layer waiting, and it trips up most people. Once the tunnel is open and the client speaks HTTP/2, the **way it sets up the HTTP/2 connection** is itself a fingerprint: the **Akamai HTTP/2 fingerprint**.
+
+<Define term="HTTP/2 (Akamai) fingerprint">
+Akamai's HTTP/2 fingerprint (2017 white paper) identifies a client from how it opens an HTTP/2 connection, in four pipe-separated sections: **(1)** the **SETTINGS** frame parameters as `id:value` pairs joined by `;`; **(2)** the **WINDOW_UPDATE** increment on stream 0 (or `0` if none); **(3)** the **PRIORITY** frames as `streamID:exclusive:dep:weight` (or `0`); **(4)** the **pseudo-header order** as the letters `m`, `a`, `s`, `p` (`:method`, `:authority`, `:scheme`, `:path`). Browsers send distinctive, stable values here — Chrome's pseudo-header order is `m,a,s,p`; Go's `net/http2` sends a different SETTINGS frame and header order — so this fingerprints the client just like JA3 does at the TLS layer.
+</Define>
+
+<Scene
+  title="The HTTP/2 fingerprint: four sections, all client-chosen"
+  actors={[{ id: "c", label: "client", role: "operator" }]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "On connect, the client sends a SETTINGS frame. Chrome: 1:65536 (HEADER_TABLE_SIZE), 2:0 (ENABLE_PUSH off), 4:6291456 (INITIAL_WINDOW_SIZE), 6:262144 (MAX_HEADER_LIST_SIZE). The exact ids, values, AND order are the first section.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "1:65536" },
+        { id: "A2", state: "active", label: "2:0" },
+        { id: "A3", state: "active", label: "4:6291456" },
+        { id: "A4", state: "active", label: "6:262144" }
+      ]
+    },
+    {
+      caption: "Then a WINDOW_UPDATE (Chrome: 15663105) and PRIORITY frames (Chrome 144: none → 0). Sections two and three. Go's net/http2 sends different values here — instant divergence.",
+      beat: "neutral",
+      cells: [
+        { id: "B1", state: "warn", label: "WU 15663105" },
+        { id: "B2", state: "idle", label: "" },
+        { id: "B3", state: "warn", label: "PRIORITY 0" },
+        { id: "B4", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Each request carries four pseudo-headers. Their ORDER is the fourth section. Chrome: :method, :authority, :scheme, :path = m,a,s,p. Go's order differs. This alone separates a Go client from Chrome.",
+      beat: "problem",
+      cells: [
+        { id: "C1", state: "done", label: "m :method" },
+        { id: "C2", state: "done", label: "a :authority" },
+        { id: "C3", state: "done", label: "s :scheme" },
+        { id: "C4", state: "done", label: "p :path" }
+      ]
+    },
+    {
+      caption: "Joined: 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p. That's Chrome's full HTTP/2 fingerprint. To impersonate, you must reproduce all four sections — which is why tls-client exposes HeaderOrderKey and surf exposes HTTP2Settings().",
+      beat: "solution",
+      cells: [
+        { id: "D1", state: "done", label: "SETTINGS" },
+        { id: "D2", state: "done", label: "WU" },
+        { id: "D3", state: "done", label: "PRIORITY" },
+        { id: "D4", state: "done", label: "m,a,s,p" }
+      ]
+    }
+  ]}
+  caption="The HTTP/2 fingerprint is the connection's opening frames plus your pseudo-header order. A forged TLS ClientHello gets you a Chrome JA3; matching this gets you a Chrome HTTP/2 fingerprint too. Miss it and you're a 'Chrome' that opens HTTP/2 like a Go program — an obvious contradiction."
+/>
+
+You can parse a SETTINGS frame and emit the Akamai string from stdlib — the frame is a simple binary format (a 9-byte HTTP/2 frame header, then 6-byte `id:value` entries):
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"strings"
+)
+
+// HTTP/2 SETTINGS parameter names (RFC 9113).
+var settingName = map[uint16]string{
+	1: "HEADER_TABLE_SIZE", 2: "ENABLE_PUSH", 3: "MAX_CONCURRENT_STREAMS",
+	4: "INITIAL_WINDOW_SIZE", 5: "MAX_FRAME_SIZE", 6: "MAX_HEADER_LIST_SIZE",
+}
+
+// parseSettings reads an HTTP/2 SETTINGS frame's payload (6 bytes per entry:
+// 2-byte id, 4-byte value) and returns the Akamai first-section string:
+// "id:value;id:value;..." in the order sent.
+func parseSettings(payload []byte) string {
+	var parts []string
+	for i := 0; i+6 <= len(payload); i += 6 {
+		id := binary.BigEndian.Uint16(payload[i : i+2])
+		val := binary.BigEndian.Uint32(payload[i+2 : i+6])
+		parts = append(parts, fmt.Sprintf("%d:%d", id, val))
+	}
+	return strings.Join(parts, ";")
+}
+
+func main() {
+	// A Chrome-like SETTINGS payload: HEADER_TABLE_SIZE=65536, ENABLE_PUSH=0,
+	// INITIAL_WINDOW_SIZE=6291456, MAX_HEADER_LIST_SIZE=262144.
+	var payload []byte
+	put := func(id uint16, v uint32) {
+		b := make([]byte, 6)
+		binary.BigEndian.PutUint16(b[0:2], id)
+		binary.BigEndian.PutUint32(b[2:6], v)
+		payload = append(payload, b...)
+	}
+	put(1, 65536)
+	put(2, 0)
+	put(4, 6291456)
+	put(6, 262144)
+
+	settings := parseSettings(payload)
+	windowUpdate, priority, pseudoOrder := "15663105", "0", "m,a,s,p"
+	akamai := strings.Join([]string{settings, windowUpdate, priority, pseudoOrder}, "|")
+
+	fmt.Println("SETTINGS section:", settings)
+	for i := 0; i+6 <= len(payload); i += 6 {
+		id := binary.BigEndian.Uint16(payload[i : i+2])
+		val := binary.BigEndian.Uint32(payload[i+2 : i+6])
+		fmt.Printf("  %d (%s) = %d\n", id, settingName[id], val)
+	}
+	fmt.Println("\nAkamai HTTP/2 fingerprint:")
+	fmt.Println(" ", akamai)
+}
+```
+
+</GoPlayground>
+
+<Gotcha>
+Go's standard `golang.org/x/net/http2` sends its **own** SETTINGS frame and orders pseudo-headers its **own** way — neither matches any browser. So even with a perfectly forged TLS ClientHello (Chrome JA3), Go's stock HTTP/2 layer betrays you: a server sees "Chrome's TLS, Go's HTTP/2" — a combination no real Chrome produces, and a *stronger* bot signal than either layer alone. This is why `tls-client` ships a forked HTTP stack (`fhttp`) with `HeaderOrderKey` and `PHeaderOrderKey`, and `surf` exposes `HTTP2Settings()` — you have to control *both* layers or you've only solved half the fingerprint.
+</Gotcha>
+
+---
+
+## tls-client & surf
+
+Now it assembles. Both libraries do the same core job — emit a browser-accurate ClientHello *and* a browser-accurate HTTP/2 connection — over uTLS, but with different ergonomics.
+
+### bogdanfinn/tls-client — profiles + a forked HTTP stack
+
+`tls-client` pairs uTLS with **`fhttp`** (a fork of `net/http` that exposes header and pseudo-header ordering). You pick a **profile** — a maintained, versioned pairing of a uTLS ClientHello with the matching HTTP/2 settings — via functional options:
+
+```go
+// Requires github.com/bogdanfinn/tls-client — illustrative.
+package main
+
+import (
+	http "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
+)
+
+func newChromeClient() (tls_client.HttpClient, error) {
+	jar := tls_client.NewCookieJar()
+	opts := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithClientProfile(profiles.Chrome_133), // TLS + HTTP/2 fp together
+		tls_client.WithCookieJar(jar),
+		tls_client.WithNotFollowRedirects(),
+		// tls_client.WithProxyUrl("http://user:pass@host:port"),
+	}
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+}
+
+func main() {
+	client, _ := newChromeClient()
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	// fhttp's HeaderOrderKey controls the HTTP/2 pseudo + regular header order —
+	// the fourth section of the Akamai fingerprint.
+	req.Header = http.Header{
+		"accept":               {"text/html,application/xhtml+xml,*/*"},
+		"accept-language":      {"en-US,en;q=0.9"},
+		"user-agent":           {"Mozilla/5.0 (...) Chrome/133.0 Safari/537.36"},
+		http.HeaderOrderKey:    {"accept", "accept-language", "user-agent"},
+		http.PHeaderOrderKey:   {":method", ":authority", ":scheme", ":path"},
+	}
+	resp, _ := client.Do(req)
+	_ = resp
+}
+```
+
+<Callout kind="note" title="Why a 'profile' is one unit">
+`profiles.Chrome_133` is not just a TLS fingerprint — it bundles the uTLS ClientHello spec **and** the matching HTTP/2 settings (SETTINGS values, window update, header-priority behavior) for that exact Chrome version. That pairing is the point: as the earlier Gotcha showed, mixing Chrome's TLS with non-Chrome HTTP/2 is *more* suspicious than either alone. A profile keeps the two layers consistent, and the library maintainers update profiles as browsers ship new versions (`Chrome_144`, `Firefox_135`, `Safari_16_0`, `Okhttp4Android13`, …). Your job is to pick a current one, not to assemble the bytes by hand.
+</Callout>
+
+### enetx/surf — a fluent impersonation builder
+
+`surf` wraps the same uTLS foundation behind a fluent builder and an `Impersonate()` API that chains a platform with a browser, plus middleware, retries, and HTTP/3:
+
+```go
+// Requires github.com/enetx/surf — illustrative.
+package main
+
+import (
+	"time"
+
+	"github.com/enetx/surf"
+)
+
+func main() {
+	cli := surf.NewClient().
+		Builder().
+		Impersonate().Windows().Chrome(). // platform persona + browser TLS/H2 fp
+		Retry(3, 2*time.Second).
+		Session(). // shared cookie jar + connection reuse across requests
+		Build()
+
+	resp := cli.Get("https://example.com").Do()
+	if resp.IsOk() {
+		body := resp.Ok().Body.String()
+		_ = body
+	}
+	// .Impersonate().IOS().Firefox(), .RandomOS(), .HTTP2Settings()....Set(),
+	// .ForceHTTP3() (QUIC + JA4QUIC), .Std() to hand a fingerprinted *http.Client
+	// to a third-party library — all on the same builder.
+}
+```
+
+<UnderTheHood title="The full path of one impersonated request">
+
+When you fire an impersonated request through either library, here is everything that happens, top to bottom — now that you know each piece:
+
+1. **DNS + TCP** — resolve the host and open a raw TCP connection (optionally through a proxy via a `ContextDialer`).
+2. **Forged ClientHello** — uTLS materializes the chosen browser's exact ClientHello: GREASE in the right slots, the browser's cipher order, its extension list and order, its curves and key shares. This is what a passive **JA3/JA4** read sees — and it now says "Chrome", not "Go".
+3. **Real handshake** — the standard `crypto/tls`-derived core completes the TLS handshake and ALPN-negotiates `h2`. The cryptography is genuine and secure; only the advertised fingerprint was substituted.
+4. **HTTP/2 setup** — the forked HTTP stack sends the browser's **SETTINGS** frame, **WINDOW_UPDATE**, and priority behavior, so the **Akamai HTTP/2 fingerprint** matches too. The earlier "Chrome TLS + Go HTTP/2" contradiction is avoided because the profile pairs them.
+5. **Headers in browser order** — your regular headers and the **pseudo-header order** (`m,a,s,p`) are emitted exactly as the browser would, via `HeaderOrderKey` / `PHeaderOrderKey` (tls-client) or the builder's ordered headers (surf).
+6. **Response** — cookies land in the jar, redirects follow your policy, and the connection is pooled for reuse — reusing the *same* fingerprinted connection rather than re-handshaking with a fresh one.
+
+Every layer that could fingerprint you — TLS ClientHello, HTTP/2 connection setup, header order — is made to agree on one consistent browser identity. That consistency, not any single spoofed value, is what defeats (or, defensively, what you must detect to build) modern anti-bot fingerprinting.
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+You've seen the mechanisms. Now compute the fingerprints yourself — this is the knowledge that lets you build detection *or* understand impersonation.
+
+<Exercise n={1} title="JA3 from a ClientHello" level="easy">
+
+Write `JA3(version uint16, ciphers, exts, curves, formats []uint16) string` that returns the 32-char MD5 JA3 fingerprint. Verify it produces `ada70206e40642a3e4461f35503241d5` for the canonical input (version 769; ciphers `47-53-5-10-49161-49162-49171-49172-50-56-19-4`; exts `0-10-11`; curves `23-24-25`; formats `0`).
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+func JA3(version uint16, ciphers, exts, curves, formats []uint16) string {
+	dash := func(xs []uint16) string {
+		p := make([]string, len(xs))
+		for i, x := range xs {
+			p[i] = strconv.Itoa(int(x))
+		}
+		return strings.Join(p, "-")
+	}
+	raw := strconv.Itoa(int(version)) + "," + dash(ciphers) + "," +
+		dash(exts) + "," + dash(curves) + "," + dash(formats)
+	sum := md5.Sum([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func main() {
+	fp := JA3(769,
+		[]uint16{47, 53, 5, 10, 49161, 49162, 49171, 49172, 50, 56, 19, 4},
+		[]uint16{0, 10, 11}, []uint16{23, 24, 25}, []uint16{0})
+	fmt.Println(fp)
+	fmt.Println("matches canonical:", fp == "ada70206e40642a3e4461f35503241d5")
+}
+```
+
+The whole algorithm is string assembly + MD5. The exact byte-for-byte match against the published hash is your proof the field order and delimiters are right.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Strip GREASE before fingerprinting" level="easy">
+
+Write `IsGREASE(v uint16) bool` (the 16 values `0x0a0a…0xfafa`: both bytes equal, low nibble `0xa`) and `StripGREASE([]uint16) []uint16`. Show that a list with GREASE injected and the same list without it produce the *same* result after stripping.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func IsGREASE(v uint16) bool { return v&0x0f0f == 0x0a0a && byte(v>>8) == byte(v) }
+
+func StripGREASE(xs []uint16) []uint16 {
+	out := make([]uint16, 0, len(xs))
+	for _, x := range xs {
+		if !IsGREASE(x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func main() {
+	withG := []uint16{0x7a7a, 0x1301, 0x1302, 0xdada, 0x1303}
+	clean := []uint16{0x1301, 0x1302, 0x1303}
+	fmt.Println("stripped:", fmt.Sprint(StripGREASE(withG)) == fmt.Sprint(clean))
+	for _, v := range []uint16{0x0a0a, 0x7a7a, 0xfafa, 0x1301} {
+		fmt.Printf("%#04x GREASE %v\n", v, IsGREASE(v))
+	}
+}
+```
+
+GREASE is detected purely from the bit pattern — no table lookup. Stripping it first is why a browser's random GREASE doesn't change its fingerprint, and why your forged Hello must place GREASE in browser-correct slots.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="JA4 sorted cipher hash" level="medium">
+
+Write `JA4CipherHash(ciphers []uint16) string` that strips GREASE, formats each as 4-hex, **sorts**, joins with `,`, SHA-256s, and returns the first 12 hex chars. Prove that two shuffles of the same cipher set give the same hash (the property that beats cipher stunting).
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+func isGREASE(v uint16) bool { return v&0x0f0f == 0x0a0a && byte(v>>8) == byte(v) }
+
+func JA4CipherHash(ciphers []uint16) string {
+	var toks []string
+	for _, c := range ciphers {
+		if !isGREASE(c) {
+			toks = append(toks, fmt.Sprintf("%04x", c))
+		}
+	}
+	sort.Strings(toks)
+	sum := sha256.Sum256([]byte(strings.Join(toks, ",")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func main() {
+	a := []uint16{0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f}
+	b := []uint16{0xc02f, 0x1303, 0x1301, 0xc02b, 0x1302} // shuffled
+	fmt.Println(JA4CipherHash(a))
+	fmt.Println(JA4CipherHash(b))
+	fmt.Println("equal:", JA4CipherHash(a) == JA4CipherHash(b))
+}
+```
+
+The sort makes the hash depend on the *set*, not the *sequence* — so reordering (the trick that defeats JA3) does nothing to JA4.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Akamai HTTP/2 string" level="medium">
+
+Write `AkamaiH2(settings [][2]uint32, windowUpdate uint32, pseudoOrder []string) string` that builds the fingerprint `SETTINGS|WINDOW_UPDATE|PRIORITY|pseudo`, where `settings` is a list of `{id,value}`, PRIORITY is `0`, and `pseudoOrder` is letters like `["m","a","s","p"]`. Produce Chrome's `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func AkamaiH2(settings [][2]uint32, windowUpdate uint32, pseudoOrder []string) string {
+	var s []string
+	for _, kv := range settings {
+		s = append(s, fmt.Sprintf("%d:%d", kv[0], kv[1]))
+	}
+	return strings.Join([]string{
+		strings.Join(s, ";"),
+		fmt.Sprintf("%d", windowUpdate),
+		"0", // no standalone PRIORITY frames
+		strings.Join(pseudoOrder, ","),
+	}, "|")
+}
+
+func main() {
+	fp := AkamaiH2(
+		[][2]uint32{{1, 65536}, {2, 0}, {4, 6291456}, {6, 262144}},
+		15663105,
+		[]string{"m", "a", "s", "p"},
+	)
+	fmt.Println(fp)
+	fmt.Println("matches Chrome:", fp == "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p")
+}
+```
+
+Four pipe-separated sections, the SETTINGS in send-order. Reproduce this *and* the TLS ClientHello and you match a browser at both fingerprint layers.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Detect a fingerprint mismatch" level="hard">
+
+You're on the *defensive* side now. Write `Verdict(tlsJA3Browser, h2PseudoOrder string) string` that returns `"likely bot"` when the TLS fingerprint claims one browser but the HTTP/2 pseudo-header order doesn't match that browser's known order, and `"consistent"` otherwise. Use a small table: Chrome → `m,a,s,p`, Firefox → `m,p,a,s`. Test a Chrome-TLS client sending Go-like `m,a,s,p`-but-claiming-Firefox.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+// knownH2 maps a browser (as identified by its TLS fingerprint) to the
+// HTTP/2 pseudo-header order it MUST also use. A mismatch means the two
+// layers disagree — a classic impersonation tell.
+var knownH2 = map[string]string{
+	"chrome":  "m,a,s,p",
+	"firefox": "m,p,a,s",
+}
+
+func Verdict(tlsBrowser, h2PseudoOrder string) string {
+	want, ok := knownH2[tlsBrowser]
+	if !ok {
+		return "unknown browser"
+	}
+	if want != h2PseudoOrder {
+		return "likely bot" // TLS says one browser, HTTP/2 says another
+	}
+	return "consistent"
+}
+
+func main() {
+	// A real Chrome: TLS=chrome, H2 order=m,a,s,p → consistent.
+	fmt.Println("real chrome:  ", Verdict("chrome", "m,a,s,p"))
+	// A bot: forged Chrome TLS but its HTTP/2 layer orders like Chrome while
+	// the request CLAIMS Firefox elsewhere — the layers contradict.
+	fmt.Println("mismatched:   ", Verdict("firefox", "m,a,s,p"))
+}
+```
+
+The defensive insight that pays for this whole chapter: you don't catch a good impersonator with any single fingerprint — you catch them with **inconsistency across layers**. A forged TLS that doesn't match the HTTP/2 setup, or a User-Agent that doesn't match the JA4, is the seam. Build your detection on cross-layer agreement, not one magic value.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+Time to put it together — on the defensive side, where this knowledge does the most good.
+
+I've written a tiny fingerprint classifier with **two** bugs: its GREASE check is wrong (so a browser's random GREASE leaks into the fingerprint and makes it unstable), and its cross-layer consistency check is inverted (so it clears bots and flags real browsers). Fix both so a real Chrome is reported `consistent` and a Chrome-TLS / Firefox-claiming client is reported `likely bot`, with GREASE correctly stripped.
+
+Fully self-contained — no network, no external libraries, just the fingerprint math you built above.
+
+<Lab
+  title="Fix the fingerprint classifier"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Two bugs. (1) isGREASE is wrong — it must match the 16 values 0x0a0a..0xfafa (both bytes equal AND low nibble 0xa); fix the bit test so GREASE is stripped and a browser's fingerprint is stable. (2) verdict is inverted — it returns 'likely bot' when the layers MATCH; fix it to flag a bot only when the TLS-claimed browser's known pseudo-header order does NOT match the observed one. main is the self-check harness — do not edit it. It checks that GREASE strips correctly, a consistent Chrome is 'consistent', and a mismatched client is 'likely bot'. When all pass it prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+// BUG 1: this GREASE test is wrong — it never matches, so GREASE is NOT
+// stripped and the cipher hash changes every connection.
+// FIX: GREASE is the 16 values where both bytes are equal AND the low nibble
+// is 0xa, i.e. (v & 0x0f0f) == 0x0a0a && byte(v>>8) == byte(v).
+func isGREASE(v uint16) bool {
+	return v == 0x0a0a // FIX: only catches one of the sixteen GREASE values
+}
+
+func cipherHash(ciphers []uint16) string {
+	var toks []string
+	for _, c := range ciphers {
+		if !isGREASE(c) {
+			toks = append(toks, fmt.Sprintf("%04x", c))
+		}
+	}
+	sort.Strings(toks)
+	sum := sha256.Sum256([]byte(strings.Join(toks, ",")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+var knownH2 = map[string]string{"chrome": "m,a,s,p", "firefox": "m,p,a,s"}
+
+// BUG 2: the verdict is inverted — it flags a bot when the layers AGREE.
+// FIX: a bot is when the claimed browser's known order does NOT equal the
+// observed order.
+func verdict(tlsBrowser, h2Order string) string {
+	want, ok := knownH2[tlsBrowser]
+	if !ok {
+		return "unknown browser"
+	}
+	if want == h2Order { // FIX: should be != 
+		return "likely bot"
+	}
+	return "consistent"
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	allOK := true
+
+	// Check 1: GREASE must strip — two GREASE-injected lists of the same real
+	// ciphers must hash identically once GREASE is removed.
+	a := []uint16{0x7a7a, 0x1301, 0x1302, 0x1303}
+	b := []uint16{0x1301, 0xdada, 0x1302, 0x8a8a, 0x1303}
+	if cipherHash(a) != cipherHash(b) {
+		fmt.Println("FAIL check 1: GREASE not stripped — hashes differ")
+		allOK = false
+	}
+
+	// Check 2: a real Chrome (TLS=chrome, H2=m,a,s,p) is consistent.
+	if verdict("chrome", "m,a,s,p") != "consistent" {
+		fmt.Println("FAIL check 2: real Chrome flagged as bot")
+		allOK = false
+	}
+
+	// Check 3: TLS claims firefox but H2 order is Chrome's m,a,s,p → bot.
+	if verdict("firefox", "m,a,s,p") != "likely bot" {
+		fmt.Println("FAIL check 3: cross-layer mismatch not caught")
+		allOK = false
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main runs three in-process checks: GREASE-injected cipher lists hash identically after stripping, a consistent Chrome reads 'consistent', and a firefox-claiming / Chrome-ordered client reads 'likely bot'. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  hints={[
+    "Bug 1: replace `v == 0x0a0a` with `v&0x0f0f == 0x0a0a && byte(v>>8) == byte(v)`. That matches all sixteen GREASE values (0x0a0a, 0x1a1a, … 0xfafa), not just the first.",
+    "Bug 2: flip the comparison — `if want != h2Order { return \"likely bot\" }`. A bot is when the TLS-claimed browser's known pseudo-header order does NOT match what was observed.",
+    "Check 1 fails until GREASE strips: 0x7a7a, 0xdada, 0x8a8a must all be removed so both lists reduce to the same real ciphers before sorting and hashing.",
+  ]}
+  flag="GO{grease_stripped_and_layers_must_agree}"
+>
+
+Bug 1 makes the fingerprint unstable (GREASE leaks in); Bug 2 makes the detector worse than useless (it clears bots, flags users). Fix the bit test, flip the verdict, and you've built the core of a real cross-layer bot detector. Three checks. All must pass. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **The tell is below your headers.** A server fingerprints your TLS **ClientHello** — sent in the clear, before any HTTP — so no `User-Agent` or header order can fix a fingerprint that says "Go". The handshake's first message betrays the library that built it.
+- **JA3** joins five ClientHello fields (`version,ciphers,extensions,curves,formats`) with commas and hyphens and **MD5**s them. It captures the parameter *set and order*; **GREASE is stripped first** so a browser's random GREASE doesn't change its hash. You computed the canonical `ada70206…` yourself.
+- **JA4** is the modern answer: a readable `a_b_c` form with **sorted**, **SHA-256** cipher and extension hashes. Sorting defeats the order-shuffling ("cipher stunting") that evaded JA3, so impersonation must now match a browser's true capability set.
+- **Go's `crypto/tls` leaks** because its ClientHello is a fixed, GREASE-free, library-specific layout shared by every Go program and published in every anti-bot database. `tls.Config` tunes policy, not the ClientHello's bytes.
+- **uTLS forges the ClientHello** — it substitutes a stored browser spec (via a `ClientHelloID`, a custom `ClientHelloSpec`, or a captured `Fingerprinter` spec) right before the real, audited `crypto/tls` handshake runs. You change the fingerprint, not the cryptography.
+- **The HTTP/2 (Akamai) fingerprint** is a second layer: `SETTINGS|WINDOW_UPDATE|PRIORITY|pseudo-header-order`. Go's `net/http2` matches no browser, so a forged TLS with stock HTTP/2 is *more* suspicious — the two layers must agree.
+- **`tls-client`** pairs uTLS with the `fhttp` fork and ships versioned **profiles** (`profiles.Chrome_133`) that bundle the TLS and HTTP/2 fingerprints, plus `HeaderOrderKey`/`PHeaderOrderKey`. **`surf`** wraps the same foundation in a fluent `Impersonate().Windows().Chrome()` builder with middleware, retries, and HTTP/3/JA4QUIC.
+- **Defensively, the seam is inconsistency.** No single fingerprint catches a careful impersonator; **cross-layer disagreement** does — a TLS that claims Chrome but an HTTP/2 setup or header order that doesn't. Build detection on agreement across layers, not one magic value.
+
+</Recap>
+
+<Callout kind="note" title="Primary sources">
+Read the originals. **JA3:** github.com/salesforce/ja3 (the five-field MD5 algorithm + canonical example). **JA4:** github.com/FoxIO-LLC/ja4 (the sorted SHA-256 `a_b_c` format and the JA4 suite). **uTLS:** github.com/refraction-networking/utls (UClient, ClientHelloID, ClientHelloSpec, Fingerprinter, Roller). **HTTP/2 fingerprint:** Akamai's white paper "Passive Fingerprinting of HTTP/2 Clients" (Shuster & Segal, Black Hat EU 2017). **The libraries:** github.com/bogdanfinn/tls-client (profiles, fhttp, FFI bindings) and github.com/enetx/surf (the impersonation builder). **GREASE:** RFC 8701.
+</Callout>
+
+<Scoreboard
+  streak={12}
+  items={[
+    { label: "Quick check — where the fingerprint lives", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — JA3 from a ClientHello", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Strip GREASE", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — JA4 sorted cipher hash", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Akamai HTTP/2 string", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5 — Detect a fingerprint mismatch", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the fingerprint classifier", captured: false, points: 80 }}
+/>
+
+That's TLS fingerprinting, demystified to the byte. You can read a JA3 string like a sentence, compute a JA4 by hand, name every field in a ClientHello and say why it's there, explain exactly why a Go client is identified before it speaks, and trace an impersonated request through uTLS and the HTTP/2 layer end to end. You know what `tls-client` and `surf` actually do under their builders — and, more valuably, you know the seam a careful defender watches: not one fingerprint, but agreement across all of them. Whichever side of the wire you're on, you're no longer guessing. Go build something that sees clearly, sport.
+
