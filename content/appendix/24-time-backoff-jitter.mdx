@@ -1,0 +1,905 @@
+---
+title: "Time, Backoff & Jitter: Retrying Without Making It Worse"
+part: "appendix"
+order: 24
+type: "course"
+description: "The deep, source-grounded treatment of retry timing: measuring elapsed time with the monotonic clock (and the Go 1.23 timer GC change so retry loops don't leak), capped exponential backoff, the thundering herd, the full jitter taxonomy from the AWS backoff study (no jitter / full / equal / decorrelated) with the simulation result, retry budgets and retry amplification across tiers, context deadline propagation, and a production retry loop that combines decorrelated jitter, a deadline, a budget, and idempotency — every algorithm runnable in stdlib."
+prerequisites: ["reliability-patterns"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Deep Dive" title="Time, Backoff & Jitter: Retrying Without Making It Worse">
+
+Here's the thing, sport. A retry is the most dangerous line of code in your service, because it's the one that looks the most harmless. "The call failed? Just try again." And then the payment processor has a three-second hiccup, your 500 instances all notice at the same millisecond, they all wait the same backoff, they all retry at the same instant — and the gentle hiccup becomes a self-inflicted DDoS that keeps the processor down long after the original problem healed. You didn't recover from the outage. You *became* the outage.
+
+This chapter is the deep treatment of doing retries right — the timing math that turns a stampede into a drizzle. You've met the pieces before (the **time-clocks-timers** chapter for the clock, the **reliability-patterns** chapter for the basic retry loop); here we go all the way down. We'll measure elapsed time with the *monotonic* clock (and see why the Go 1.23 timer change means your retry loop no longer leaks), build capped exponential backoff, watch the thundering herd form, then work through the full **jitter taxonomy** from Amazon's canonical backoff study — no jitter, full jitter, equal jitter, decorrelated jitter — with the actual simulation result that tells you which to pick. Then the parts nobody teaches: **retry amplification** across tiers (why a 3× retry at four layers is 81× load), **retry budgets**, and **deadline propagation** so a retry never outlives the request that asked for it. Every algorithm is runnable stdlib Go. By the end you'll write a retry loop you'd trust with money.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Measuring Time Correctly", "Exponential Backoff", "The Thundering Herd", "The Jitter Taxonomy", "Retry Budgets & Amplification", "Deadline Propagation", "The Production Retry Loop"]} />
+
+## Measuring Time Correctly
+
+Before any backoff math, one rule: **measure elapsed time with the monotonic clock, never the wall clock.** Your backoff says "wait 200ms" — but if you compute that from `time.Now()` wall-clock readings and an NTP adjustment or a DST jump lands mid-retry, your "200ms" could become "minus four hours." Go's `time` package solves this *for you*, if you let it.
+
+<Define term="Monotonic clock reading">
+Every `time.Now()` in Go carries **two** readings: a **wall-clock** time (calendar date, adjustable by NTP/DST/manual changes) and a **monotonic** reading (nanoseconds from an arbitrary fixed start, only ever moving forward, never adjusted). When you subtract two `time.Time` values from the same process — `time.Since(start)` or `end.Sub(start)` — Go uses the **monotonic** readings, so the result is immune to wall-clock jumps. The catch: operations that *strip* the monotonic reading (`t.Round(0)`, `t.UTC()`, marshalling to JSON and back) leave you with wall-clock-only times, and subtracting *those* can go backward. **For retry timing, always subtract two raw `time.Now()` values** — never a deserialized timestamp.
+</Define>
+
+So a retry deadline check is just `time.Since(start) < budget` — correct across NTP steps because it's monotonic under the hood:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	start := time.Now() // carries a monotonic reading
+
+	// Simulate some work; in a retry loop this is the attempt + the backoff sleep.
+	time.Sleep(15 * time.Millisecond)
+
+	// time.Since subtracts monotonic readings — immune to wall-clock jumps.
+	elapsed := time.Since(start)
+	fmt.Printf("elapsed ≈ %v (monotonic, always forward)\n", elapsed.Round(time.Millisecond))
+
+	// The trap: strip the monotonic reading (e.g. .Round(0), or a JSON round-trip)
+	// and you're back to wall-clock subtraction, which CAN go backward.
+	wallOnly := start.Round(0) // Round(0) drops the monotonic reading
+	fmt.Printf("has monotonic? raw=%v  stripped=%v\n",
+		hasMono(start), hasMono(wallOnly))
+}
+
+// hasMono reports whether a Time still carries a monotonic reading. The standard
+// trick: a time with a monotonic reading prints with an "m=±..." suffix in its
+// String(), but the robust check is that t.Round(0) differs in internal state —
+// here we just compare the String forms for illustration.
+func hasMono(t time.Time) bool {
+	return t.String() != t.Round(0).String()
+}
+```
+
+</GoPlayground>
+
+### The Go 1.23 timer change — why your retry loop stopped leaking
+
+A retry loop sleeps between attempts. The naive way — `time.After(backoff)` inside a `select` — used to be a quiet memory leak: before Go 1.23, a `time.After` timer was **not** garbage-collected until it fired, so a loop that moved on early (context cancelled, success) left timers pinned until their full duration elapsed. Go 1.23 fixed this at the language level.
+
+<Callout kind="note" title="What Go 1.23 changed about Timer and Ticker (quoted)">
+From the Go 1.23 release notes, two changes — both active only when your `go.mod` declares `go 1.23.0` or later:
+
+> "**`Timer`s and `Ticker`s that are no longer referred to by the program become eligible for garbage collection immediately, even if their `Stop` methods have not been called.** Earlier versions of Go did not collect unstopped `Timer`s until after they had fired and never collected unstopped `Ticker`s."
+
+> "**The timer channel associated with a `Timer` or `Ticker` is now unbuffered, with capacity 0.** … Go now guarantees that for any call to a `Reset` or `Stop` method, no stale values prepared before that call will be sent or received after the call."
+
+The practical upshot for retry loops: `case <-time.After(backoff)` no longer leaks if you leave the `select` early, and after `Stop()`/`Reset()` you no longer have to drain the channel to avoid a stale tick. (The old behavior is still reachable via `GODEBUG=asynctimerchan=1`.) Since this course targets Go 1.26, you get the safe behavior by default — but on an older `go.mod`, prefer an explicit `timer := time.NewTimer(d); defer timer.Stop()`.
+</Callout>
+
+With time measured correctly, the math can begin.
+
+---
+
+## Exponential Backoff
+
+The first failure mode to kill: the immediate retry. If a downstream is failing because it's overwhelmed, retrying instantly makes it *more* overwhelmed. The fix is to wait longer after each failure — **exponentially** longer — with a ceiling.
+
+<Define term="Capped exponential backoff">
+**Exponential backoff** sets the wait before retry *n* to `base × 2ⁿ`: each failure doubles the delay, so a struggling downstream gets geometrically more breathing room. The **cap** (`min(cap, base × 2ⁿ)`) stops the delay growing without bound — without it, attempt 20 would wait `base × 2²⁰` ≈ a million × base. The canonical shape (from Amazon's backoff study) is `sleep = min(cap, base × 2ᵃᵗᵗᵉᵐᵖᵗ)`. Typical values: `base` = 100ms, `cap` = 10–30s. The cap matters because real retries also have an overall **deadline** — there's no point computing a 17-minute backoff for a request that dies in 30 seconds.
+</Define>
+
+<AlgoGrid
+  title="Capped exponential backoff: min(cap, base·2ⁿ), base=100ms cap=10s"
+  cells={["100", "200", "400", "800", "1600", "3200", "6400", "10000"]}
+  frames={[
+    { note: "Attempt 0 fails. Backoff = base·2⁰ = 100ms. Smallest wait — the downstream may have just blipped.", pointers: { n: 0 }, done: [] },
+    { note: "Each failure DOUBLES the wait: 100 → 200 → 400 → 800ms. The delay grows geometrically, giving an overwhelmed downstream exponentially more room with each attempt.", pointers: { n: 3 }, window: [0, 3], done: [0, 1, 2, 3] },
+    { note: "1600 → 3200 → 6400ms. Still doubling. Without a cap this would keep going: attempt 10 would be 102 seconds, attempt 20 over a day.", pointers: { n: 6 }, window: [0, 6], done: [0, 1, 2, 3, 4, 5, 6], beat: "problem" },
+    { note: "base·2⁷ = 12800ms, but the cap clamps it to 10000ms (10s). From here every attempt waits the cap. The cap is what keeps backoff compatible with a finite request deadline.", pointers: { n: 7 }, window: [0, 7], done: [0, 1, 2, 3, 4, 5, 6, 7], beat: "solution" }
+  ]}
+  caption="min(cap, base·2ⁿ): double each failure, clamp at the cap. The doubling gives a recovering downstream room fast; the cap keeps the delay finite so it fits inside the overall deadline. This is the schedule — but sent by a fleet, it's also a loaded gun (next section)."
+/>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"time"
+)
+
+// backoff returns the capped exponential delay for a given attempt (0-based).
+// sleep = min(cap, base * 2^attempt) — the canonical capped-exponential form.
+func backoff(attempt int, base, cap time.Duration) time.Duration {
+	d := float64(base) * math.Pow(2, float64(attempt))
+	if d > float64(cap) {
+		return cap
+	}
+	return time.Duration(d)
+}
+
+func main() {
+	base, cap := 100*time.Millisecond, 10*time.Second
+	for n := 0; n < 9; n++ {
+		fmt.Printf("attempt %d → wait %v\n", n, backoff(n, base, cap))
+	}
+}
+```
+
+This is correct, deterministic, and — across a fleet — **catastrophic**. Here's why.
+
+---
+
+## The Thundering Herd
+
+Exponential backoff fixes *one* client hammering a downstream. It does nothing about *many* clients hammering in unison — and in production you always have many.
+
+<Define term="Thundering herd (retry storm)">
+A **thundering herd** is when a large number of clients, having failed at nearly the same moment (a downstream restart, a brief network partition, a dependency timeout), all compute the **same** backoff delay and therefore all retry at the **same instant**. Pure exponential backoff makes this *worse*, not better: because the delay is deterministic, it perfectly synchronizes the fleet. The recovering downstream gets hit by a wall of simultaneous retries, fails again, and the herd re-synchronizes for the next wave. A 10% transient failure on a 500-instance fleet can become a sustained 100% failure — a self-sustaining retry storm that outlives the original fault.
+</Define>
+
+<Scene
+  title="Pure backoff synchronizes the herd; jitter scatters it"
+  actors={[
+    { id: "fleet", label: "500-instance fleet", role: "operator" },
+    { id: "down", label: "recovering downstream", role: "librarian" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "A downstream blips. All 500 instances fail at ~the same millisecond — their requests were in flight together.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "bad", label: "fail" }, { id: "A2", state: "bad", label: "fail" },
+        { id: "A3", state: "bad", label: "fail" }, { id: "A4", state: "bad", label: "fail" }
+      ]
+    },
+    {
+      caption: "Pure exponential backoff: every instance computes the SAME delay (200ms) from the SAME failure time → they all wake at the same instant.",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "warn", label: "wait 200" }, { id: "B2", state: "warn", label: "wait 200" },
+        { id: "B3", state: "warn", label: "wait 200" }, { id: "B4", state: "warn", label: "wait 200" }
+      ]
+    },
+    {
+      caption: "All 500 retries land in the SAME 1ms window. The downstream — just getting up — is flattened again. It fails, and the herd re-synchronizes for the next wave. A self-sustaining storm.",
+      beat: "problem",
+      cells: [
+        { id: "C1", state: "bad", label: "▌500 at once" }, { id: "C2", state: "bad", label: "▌" },
+        { id: "C3", state: "bad", label: "▌" }, { id: "C4", state: "bad", label: "💥 re-fail" }
+      ]
+    },
+    {
+      caption: "With JITTER, each instance picks a RANDOM delay in its backoff window. The same 500 retries now spread smoothly across the whole window — a drizzle the downstream can actually serve. The storm never forms.",
+      beat: "solution",
+      cells: [
+        { id: "D1", state: "done", label: "47ms" }, { id: "D2", state: "done", label: "181ms" },
+        { id: "D3", state: "done", label: "93ms" }, { id: "D4", state: "done", label: "✓ served" }
+      ]
+    }
+  ]}
+  caption="Determinism is the enemy here: identical backoff = synchronized retry = storm. Jitter — randomizing each client's delay within its window — is the cure. It trades a tiny bit of per-client latency for spreading the fleet's load from a spike into a flat line."
+/>
+
+The cure is **jitter**: don't wait *exactly* the backoff — wait a *random amount up to* (or around) it, so the fleet spreads out. But there's more than one way to add randomness, and the choice measurably matters.
+
+---
+
+## The Jitter Taxonomy
+
+This is the heart of the chapter. Amazon's well-known study *"Exponential Backoff And Jitter"* (Marc Brooker, AWS Architecture Blog) ran simulations of these strategies against a contended resource and measured both **total work** (number of calls) and **completion time**. Here are all four, with the exact formulas from that article.
+
+<Define term="The four backoff strategies (AWS backoff study)">
+Let `temp = min(cap, base × 2ᵃᵗᵗᵉᵐᵖᵗ)` be the capped exponential delay.
+- **No jitter:** `sleep = temp`. Deterministic — synchronizes the herd.
+- **Full jitter:** `sleep = random(0, temp)` — uniform across the *entire* window. Maximum spread; some retries fire almost immediately.
+- **Equal jitter:** `sleep = temp/2 + random(0, temp/2)` — half fixed, half random. Keeps a guaranteed minimum wait while still spreading.
+- **Decorrelated jitter:** `sleep = min(cap, random(base, previous_sleep × 3))` — *stateful*: each delay is randomized off the **previous** delay, letting it climb and wander instead of resetting. Self-tunes to contention.
+
+The study's result: **full jitter and decorrelated jitter perform best**; both massively cut client work and server load versus no-jitter. Equal jitter does slightly worse than full. Between the two winners, *"the 'Full Jitter' approach uses less work, but slightly more time."* Practical default: **full jitter** for simplicity, **decorrelated jitter** when you want the delay to adapt under sustained contention.
+</Define>
+
+<Scene
+  title="Four strategies, same backoff window — how each spreads the fleet"
+  actors={[{ id: "w", label: "the backoff window [0, temp]", role: "scientist" }]}
+  rows={4}
+  cols={5}
+  frames={[
+    {
+      caption: "No jitter: every client picks temp exactly. All retries pile on the right edge — one tall spike. This is the herd.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "idle", label: "" }, { id: "A2", state: "idle", label: "" }, { id: "A3", state: "idle", label: "" }, { id: "A4", state: "idle", label: "" }, { id: "A5", state: "bad", label: "▌▌▌▌▌" }
+      ]
+    },
+    {
+      caption: "Full jitter: random(0, temp). Retries spread UNIFORMLY across the whole window — the flattest distribution. Lowest server load; a few clients retry almost instantly. The study's lowest-work winner.",
+      beat: "solution",
+      cells: [
+        { id: "B1", state: "done", label: "▪" }, { id: "B2", state: "done", label: "▪" }, { id: "B3", state: "done", label: "▪" }, { id: "B4", state: "done", label: "▪" }, { id: "B5", state: "done", label: "▪" }
+      ]
+    },
+    {
+      caption: "Equal jitter: temp/2 + random(0, temp/2). A guaranteed minimum wait (left half empty) then spread across the right half. Less aggressive than full; slightly more work in the study.",
+      beat: "neutral",
+      cells: [
+        { id: "C1", state: "idle", label: "" }, { id: "C2", state: "idle", label: "" }, { id: "C3", state: "done", label: "▪" }, { id: "C4", state: "done", label: "▪" }, { id: "C5", state: "done", label: "▪" }
+      ]
+    },
+    {
+      caption: "Decorrelated jitter: random(base, prev·3), capped. Stateful — each delay wanders off the last, climbing under sustained contention instead of resetting. Spreads well AND adapts. The other study winner.",
+      beat: "solution",
+      cells: [
+        { id: "D1", state: "done", label: "▪" }, { id: "D2", state: "idle", label: "" }, { id: "D3", state: "done", label: "▪" }, { id: "D4", state: "done", label: "▪" }, { id: "D5", state: "done", label: "▪" }
+      ]
+    }
+  ]}
+  caption="Same window, four spreads. No jitter spikes; full jitter flattens completely; equal jitter keeps a floor; decorrelated wanders and climbs. The AWS study: full and decorrelated win — full does less work, decorrelated adapts. Equal trails both."
+/>
+
+All four, runnable, with a seeded RNG so you can see the spread deterministically:
+
+<CodeWalk
+  title="The four backoff strategies, in code"
+  steps={[
+    { lines: "13-15", note: "temp = min(cap, base·2ⁿ) — the shared capped-exponential delay every strategy starts from. The strategies differ only in how they randomize around temp.", pose: "scribe", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "18", note: "Full jitter: random(0, temp). Uniform across the whole window — maximum spread, the study's least-work strategy. One line.", pose: "guard", role: "scientist", state: "ok", beat: "solution" },
+    { lines: "21-22", note: "Equal jitter: temp/2 + random(0, temp/2). The temp/2 floor guarantees a minimum wait; the random half spreads the rest. Keeps clients from retrying TOO eagerly.", pose: "run", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "26-28", note: "Decorrelated jitter is STATEFUL: it takes the previous sleep and picks random(base, prev·3), capped. The delay climbs and wanders under sustained failure instead of resetting each attempt — it self-tunes to contention.", pose: "run", role: "scientist", state: "active", beat: "solution" },
+    { lines: "37-46", note: "Run each across 6 attempts with a seeded PCG rng (math/rand/v2). Watch full jitter scatter widely, equal jitter stay in the upper half, decorrelated wander off its own previous value. Same backoff window, four different fleet behaviors.", pose: "happy", role: "scientist", state: "done", beat: "solution" }
+  ]}
+  caption="Four strategies, one helper for temp. Full and equal are stateless functions of the attempt; decorrelated threads the previous delay through. The seeded rng makes the spread reproducible so you can study it — in production you'd use an unseeded source."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
+)
+
+// temp = min(cap, base * 2^attempt): the capped exponential delay.
+func temp(attempt int, base, cap time.Duration) time.Duration {
+	d := float64(base) * math.Pow(2, float64(attempt))
+	return time.Duration(math.Min(d, float64(cap)))
+}
+
+// fullJitter: random in [0, temp]. Maximum spread; least server work (AWS study).
+func fullJitter(r *rand.Rand, attempt int, base, cap time.Duration) time.Duration {
+	return time.Duration(r.Float64() * float64(temp(attempt, base, cap)))
+}
+
+// equalJitter: temp/2 + random in [0, temp/2]. Guaranteed floor, then spread.
+func equalJitter(r *rand.Rand, attempt int, base, cap time.Duration) time.Duration {
+	t := float64(temp(attempt, base, cap))
+	return time.Duration(t/2 + r.Float64()*t/2)
+}
+
+// decorrelatedJitter: random in [base, prev*3], capped. Stateful — climbs/wanders.
+func decorrelatedJitter(r *rand.Rand, prev, base, cap time.Duration) time.Duration {
+	hi := float64(prev) * 3
+	d := float64(base) + r.Float64()*(hi-float64(base))
+	return time.Duration(math.Min(d, float64(cap)))
+}
+
+func main() {
+	r := rand.New(rand.NewPCG(1, 2)) // seeded for reproducible output
+	base, cap := 100*time.Millisecond, 10*time.Second
+
+	fmt.Println("attempt  full      equal")
+	for n := 0; n < 6; n++ {
+		fmt.Printf("  %d    %6v   %6v\n", n,
+			fullJitter(r, n, base, cap).Round(time.Millisecond),
+			equalJitter(r, n, base, cap).Round(time.Millisecond))
+	}
+
+	fmt.Print("decorrelated: ")
+	prev := base
+	for i := 0; i < 6; i++ {
+		prev = decorrelatedJitter(r, prev, base, cap)
+		fmt.Printf("%v ", prev.Round(time.Millisecond))
+	}
+	fmt.Println()
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Gotcha>
+**Don't seed the RNG with the clock in production retry code, and don't share one `*rand.Rand` across goroutines without a lock.** If every instance seeds its jitter RNG with `time.Now().UnixNano()` at startup and they all start together (a fleet deploy), they can produce *correlated* jitter — partially re-synchronizing the herd you were trying to scatter. Prefer `math/rand/v2`'s top-level functions (`rand.Float64()`), which are automatically and independently seeded per process and safe for concurrent use, or give each goroutine its own `rand.New`. The whole point of jitter is decorrelation; a shared seed quietly undoes it.
+</Gotcha>
+
+---
+
+## Retry Budgets & Amplification
+
+Jitter fixes *timing*. It does nothing about *volume* — and volume is where retries get truly dangerous, because retries **multiply through tiers**.
+
+<Define term="Retry amplification">
+**Retry amplification** is the multiplicative growth of load when every layer of a call chain retries independently. If the API gateway retries 3×, and it calls a service that also retries 3×, which calls a database client that retries 3×, a single user request can become `3 × 3 × 3 = 27` database calls — and under a partial outage where everything is failing, that's 27× the load hitting the thing that's already struggling. Add a fourth tier and it's 81×. The defense is to **retry at only one layer** (usually the edge, or the layer closest to the fault) and to bound total retries with a **retry budget**.
+</Define>
+
+<Scene
+  title="Retry amplification: 3× per tier becomes 81× at the bottom"
+  actors={[{ id: "req", label: "1 user request", role: "operator" }]}
+  rows={4}
+  cols={4}
+  frames={[
+    {
+      caption: "One user request hits the gateway. The gateway retries up to 3× on failure.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "1 → gateway" }, { id: "A2", state: "idle", label: "" }, { id: "A3", state: "idle", label: "" }, { id: "A4", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Gateway calls the service, retrying 3×. The service ALSO retries 3× downstream. 3 × 3 = 9 calls reach tier 3.",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "warn", label: "3 → service" }, { id: "B2", state: "warn", label: "×3" }, { id: "B3", state: "idle", label: "" }, { id: "B4", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Tier 3 retries 3× into the database client, which retries 3× into the DB. Each layer multiplies: 3 × 3 × 3 × 3 = 81 DB calls — from ONE user request.",
+      beat: "problem",
+      cells: [
+        { id: "C1", state: "bad", label: "27 → db-client" }, { id: "C2", state: "bad", label: "81 → DB" }, { id: "C3", state: "bad", label: "💥" }, { id: "C4", state: "bad", label: "💥" }
+      ]
+    },
+    {
+      caption: "Fix: retry at ONE layer only (edge or closest-to-fault), pass failures straight up everywhere else, and cap total retries with a budget (e.g. retries ≤ 10% of requests). 81× collapses back toward 1×.",
+      beat: "solution",
+      cells: [
+        { id: "D1", state: "done", label: "retry @ edge only" }, { id: "D2", state: "done", label: "pass-through" }, { id: "D3", state: "done", label: "+ budget" }, { id: "D4", state: "done", label: "≈1×" }
+      ]
+    }
+  ]}
+  caption="Independent retries at N tiers multiply: 3^4 = 81× load at the bottom, exactly when the bottom is already failing. Retry at one layer, propagate failures elsewhere, and enforce a budget. Retries should be a small fraction of traffic, not a multiplier on it."
+/>
+
+A **retry budget** caps retries as a fraction of total requests over a window — so when *everything* is failing (and naive retries would double or triple total load at the worst possible time), retries are throttled to, say, 10% of traffic. This is exactly how gRPC's retry policy and resilience libraries bound the blast radius.
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// retryBudget allows retries only while they stay under a fraction of total
+// requests in the current window. When a downstream is broadly failing, this
+// throttles retries instead of letting them multiply load (gRPC uses this idea).
+type retryBudget struct {
+	requests int
+	retries  int
+	ratio    float64 // max retries as a fraction of requests, e.g. 0.10
+}
+
+func (b *retryBudget) onRequest() { b.requests++ }
+
+// canRetry reports whether one more retry stays within budget.
+func (b *retryBudget) canRetry() bool {
+	if float64(b.retries+1) > float64(b.requests)*b.ratio {
+		return false // budget exhausted — fail fast instead of amplifying
+	}
+	b.retries++
+	return true
+}
+
+func main() {
+	b := &retryBudget{ratio: 0.10} // retries may be at most 10% of requests
+
+	// 100 requests come in; we attempt to retry every one.
+	allowed, denied := 0, 0
+	for i := 0; i < 100; i++ {
+		b.onRequest()
+		if b.canRetry() {
+			allowed++
+		} else {
+			denied++
+		}
+	}
+	fmt.Printf("requests=%d  retries allowed=%d  denied=%d\n", b.requests, allowed, denied)
+	fmt.Println("→ under a broad outage, ~90% of retries are refused, capping amplification")
+}
+```
+
+</GoPlayground>
+
+---
+
+## Deadline Propagation
+
+The last piece: a retry must never outlive the request that asked for it. If the client gave you a 2-second deadline, computing a 10-second backoff is not just useless — it holds a goroutine and a connection hostage for 8 seconds after anyone stopped caring.
+
+<Define term="Deadline propagation">
+**Deadline propagation** means the overall time budget for a request travels *with* it through every layer (in Go, as a `context.Context` created by `context.WithTimeout`/`WithDeadline`), and every retry loop checks it. Before sleeping a backoff, you check whether the backoff would exceed the remaining budget (`time.Until(deadline)`); if so, you stop retrying *now* rather than sleeping past the deadline. Each individual attempt also gets its own derived per-attempt timeout, so one slow attempt can't consume the whole budget. The rule: **the retry loop ends at `min(max attempts, deadline)`, whichever comes first — and the backoff sleep is itself interruptible by the context.**
+</Define>
+
+<JourneyAnim
+  title="A deadline travels with the request and bounds the retries"
+  hops={[
+    { id: "client", label: "client (2s deadline)", role: "operator" },
+    { id: "loop", label: "retry loop", role: "captain" },
+    { id: "attempt", label: "each attempt", role: "scribe" },
+    { id: "ctx", label: "ctx.Done()", role: "guard" }
+  ]}
+  frames={[
+    { note: "Client calls with context.WithTimeout(ctx, 2s). That deadline is now attached to the context and flows into every layer below — no layer needs to be told the number; it reads ctx.", at: "client" },
+    { note: "The retry loop derives a per-attempt timeout (e.g. 500ms) from the parent ctx, so one slow attempt can't eat the whole 2s. Attempt 1 fails at ~500ms.", at: "loop", beat: "neutral" },
+    { note: "Before sleeping the backoff, the loop checks: would now + backoff exceed the deadline? And it sleeps via select { case <-time.After(backoff): case <-ctx.Done(): } so a cancellation interrupts the sleep instantly.", at: "attempt", beat: "neutral" },
+    { note: "Attempts 2 and 3 fail with jittered backoff between them. Total elapsed approaches 2s. The loop computes that the NEXT backoff would cross the deadline.", at: "loop", beat: "problem" },
+    { note: "ctx.Done() fires (or the deadline check trips). The loop returns ctx.Err() immediately — no sleeping past the deadline, no goroutine held hostage. The retry budget ended at the deadline, exactly as the client intended.", at: "ctx", beat: "solution" }
+  ]}
+  caption="The deadline is set once at the edge and propagates through context. Every retry checks remaining budget before backing off and sleeps on a select that ctx.Done() can interrupt. Retries end at min(maxAttempts, deadline) — never past what the caller asked for."
+/>
+
+---
+
+## The Production Retry Loop
+
+Everything assembles into one function: capped backoff + jitter + deadline awareness + an interruptible sleep + retry-only-idempotent. This is the loop you'd actually ship.
+
+<CodeWalk
+  title="A retry loop you'd trust with money"
+  steps={[
+    { lines: "13-17", note: "The signature takes a context (carrying the deadline), a max attempt count, and the operation. The op returns an error; a nil error means success. Only pass idempotent operations here — retrying a non-idempotent charge double-charges.", pose: "scribe", role: "captain", state: "active", beat: "neutral" },
+    { lines: "20-24", note: "Try the operation. On success, return immediately. On failure, remember the error — if we exhaust attempts or the deadline, this is what we return.", pose: "run", role: "captain", state: "active", beat: "neutral" },
+    { lines: "27-30", note: "Compute the jittered backoff (full jitter here). But before sleeping, check the deadline: if now + backoff is past ctx's deadline, there's no point sleeping — break and return.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "33-39", note: "Sleep on a select: time.After(backoff) OR ctx.Done(). A cancellation or deadline fires the second case and we return ctx.Err() INSTANTLY — no waiting out a backoff nobody's waiting for. This is the interruptible sleep.", pose: "run", role: "guard", state: "active", beat: "solution" },
+    { lines: "49-58", note: "Drive it: a flaky op that fails twice then succeeds, under a 2s deadline. It retries with jittered backoff and returns success on attempt 3 — or ctx.Err() if the deadline had hit first. Backoff, jitter, deadline, interruptibility — all in ~30 lines.", pose: "happy", role: "captain", state: "done", beat: "solution" }
+  ]}
+  caption="The whole discipline in one function: try, on failure compute jittered backoff, refuse to sleep past the deadline, sleep interruptibly on ctx.Done(), and only ever wrap idempotent work. This is the retry loop the rest of the chapter was building toward."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
+)
+
+// retry runs op with capped-exponential full-jitter backoff, bounded by both
+// maxAttempts AND ctx's deadline, sleeping interruptibly. op MUST be idempotent.
+func retry(ctx context.Context, maxAttempts int, base, cap time.Duration, op func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := op(); err == nil {
+			return nil // success
+		} else {
+			lastErr = err
+		}
+
+		// full jitter: random(0, min(cap, base*2^attempt))
+		t := math.Min(float64(base)*math.Pow(2, float64(attempt)), float64(cap))
+		backoff := time.Duration(rand.Float64() * t)
+
+		// don't sleep past the deadline — stop now if the backoff would exceed it
+		if dl, ok := ctx.Deadline(); ok && time.Now().Add(backoff).After(dl) {
+			break
+		}
+
+		// interruptible sleep: whichever fires first wins
+		select {
+		case <-time.After(backoff):
+			// slept the backoff; loop and retry
+		case <-ctx.Done():
+			return ctx.Err() // cancelled/deadline — return immediately
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("retry exhausted: %w", lastErr)
+	}
+	return errors.New("retry: no attempts made")
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	calls := 0
+	op := func() error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("transient failure %d", calls)
+		}
+		return nil // succeeds on the 3rd try
+	}
+
+	err := retry(ctx, 5, 50*time.Millisecond, time.Second, op)
+	fmt.Printf("after %d calls: err=%v\n", calls, err)
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Callout kind="pro" title="The retry checklist">
+Before you ship any retry, run this list: **(1)** Is the operation idempotent (or does it carry an idempotency key)? If not, *don't retry it blindly.* **(2)** Is there jitter? No jitter = herd. **(3)** Is there a cap on the backoff? **(4)** Is there an overall deadline, and does the loop stop at it? **(5)** Is the backoff sleep interruptible by `ctx.Done()`? **(6)** Is this the *only* layer retrying, or are you amplifying? **(7)** Is there a budget so a broad outage can't turn retries into a load multiplier? **(8)** Do you retry only *retryable* errors (a 400 won't get better; a 503 might)? Miss any one and your retry is a latent outage amplifier.
+</Callout>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Capped exponential backoff" level="easy">
+
+Write `backoff(attempt int, base, cap time.Duration) time.Duration` returning `min(cap, base·2^attempt)`. Verify attempt 0 = base, and that it clamps at cap once `base·2^attempt` exceeds it.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"time"
+)
+
+func backoff(attempt int, base, cap time.Duration) time.Duration {
+	d := float64(base) * math.Pow(2, float64(attempt))
+	if d > float64(cap) {
+		return cap
+	}
+	return time.Duration(d)
+}
+
+func main() {
+	base, cap := 100*time.Millisecond, 2*time.Second
+	for n := 0; n < 7; n++ {
+		fmt.Printf("attempt %d → %v\n", n, backoff(n, base, cap))
+	}
+	// 100ms,200,400,800,1600, then clamps to 2s, 2s
+}
+```
+
+The cap is what makes backoff compatible with a finite deadline — without it, a few attempts in you'd be scheduling waits longer than the request can live.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Full vs equal jitter" level="medium">
+
+Implement `fullJitter` and `equalJitter` over `temp = min(cap, base·2^attempt)`, taking a `*rand.Rand`. Run each 1000 times for a fixed attempt and print the min and max sample — full jitter's min should be near 0, equal jitter's min near temp/2.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
+)
+
+func temp(attempt int, base, cap time.Duration) float64 {
+	return math.Min(float64(base)*math.Pow(2, float64(attempt)), float64(cap))
+}
+func fullJitter(r *rand.Rand, t float64) time.Duration  { return time.Duration(r.Float64() * t) }
+func equalJitter(r *rand.Rand, t float64) time.Duration { return time.Duration(t/2 + r.Float64()*t/2) }
+
+func main() {
+	r := rand.New(rand.NewPCG(7, 9))
+	t := temp(4, 100*time.Millisecond, 10*time.Second) // 1600ms
+	stats := func(name string, f func(*rand.Rand, float64) time.Duration) {
+		lo, hi := time.Hour, time.Duration(0)
+		for i := 0; i < 1000; i++ {
+			d := f(r, t)
+			if d < lo {
+				lo = d
+			}
+			if d > hi {
+				hi = d
+			}
+		}
+		fmt.Printf("%-6s min=%v max=%v\n", name, lo.Round(time.Millisecond), hi.Round(time.Millisecond))
+	}
+	stats("full", fullJitter)   // min ≈ 0
+	stats("equal", equalJitter) // min ≈ 800ms (temp/2)
+}
+```
+
+Full jitter can fire almost immediately (min near 0); equal jitter guarantees a floor of temp/2. That floor is the trade-off — less aggressive spread, but no client retries *too* eagerly.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Decorrelated jitter walk" level="medium">
+
+Implement `decorrelated(r, prev, base, cap)` = `min(cap, random(base, prev·3))`. Starting from `prev = base`, iterate 10 times and show the delay wanders upward (off its own previous value) and clamps at cap.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
+)
+
+func decorrelated(r *rand.Rand, prev, base, cap time.Duration) time.Duration {
+	hi := float64(prev) * 3
+	d := float64(base) + r.Float64()*(hi-float64(base))
+	return time.Duration(math.Min(d, float64(cap)))
+}
+
+func main() {
+	r := rand.New(rand.NewPCG(3, 5))
+	base, cap := 100*time.Millisecond, 3*time.Second
+	prev := base
+	for i := 0; i < 10; i++ {
+		prev = decorrelated(r, prev, base, cap)
+		fmt.Printf("step %2d → %v\n", i, prev.Round(time.Millisecond))
+	}
+}
+```
+
+Each delay is computed from the *previous* one, so it climbs and wanders under sustained failure rather than resetting — self-tuning to how contended the resource is. That statefulness is what sets it apart from full/equal jitter.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Stop retrying at the deadline" level="hard">
+
+Write `retryUntil(ctx, base, cap, op)` that retries with full jitter but stops the moment the *next* backoff would exceed `ctx`'s deadline, returning `ctx.Err()` if it runs out of time. Drive it with an always-failing op under a 300ms deadline and show it returns a deadline error, not an infinite loop.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
+)
+
+func retryUntil(ctx context.Context, base, cap time.Duration, op func() error) error {
+	for attempt := 0; ; attempt++ {
+		if err := op(); err == nil {
+			return nil
+		}
+		t := math.Min(float64(base)*math.Pow(2, float64(attempt)), float64(cap))
+		backoff := time.Duration(rand.Float64() * t)
+		if dl, ok := ctx.Deadline(); ok && time.Now().Add(backoff).After(dl) {
+			return ctx.Err() // next backoff would cross the deadline — stop now
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	calls := 0
+	err := retryUntil(ctx, 20*time.Millisecond, time.Second, func() error {
+		calls++
+		return fmt.Errorf("still failing")
+	})
+	fmt.Printf("calls=%d err=%v\n", calls, err)
+}
+```
+
+The loop is unbounded in *attempts* but bounded in *time* — the deadline check and the `ctx.Done()` select guarantee it terminates at the budget. A retry that can't end at the deadline is a goroutine leak waiting to happen.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="A retry budget" level="medium">
+
+Model a token-style retry budget: allow a retry only if `retries+1 ≤ requests · ratio`. Feed it 200 requests all wanting to retry at `ratio = 0.2` and show ~40 are allowed and the rest denied (amplification capped).
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+type budget struct {
+	requests, retries int
+	ratio             float64
+}
+
+func (b *budget) request()       { b.requests++ }
+func (b *budget) canRetry() bool {
+	if float64(b.retries+1) > float64(b.requests)*b.ratio {
+		return false
+	}
+	b.retries++
+	return true
+}
+
+func main() {
+	b := &budget{ratio: 0.2}
+	allowed := 0
+	for i := 0; i < 200; i++ {
+		b.request()
+		if b.canRetry() {
+			allowed++
+		}
+	}
+	fmt.Printf("requests=%d retries allowed=%d (≈ ratio·requests=%.0f)\n",
+		b.requests, allowed, b.ratio*float64(b.requests))
+}
+```
+
+The budget converts "retry everything" into "retry at most 20% of traffic" — so a broad outage, where naive retries would *add* 100% load at the worst moment, instead adds at most 20%. This is the volume control jitter can't provide.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+I've written a fleet retry simulator with **two** bugs that together build a thundering herd: it uses **no jitter** (every client waits the exact backoff, synchronizing them) and it **never checks the deadline** (so clients retry forever, past the budget). Fix both so retries spread across the backoff window *and* stop at the deadline — turning a synchronized storm into a bounded drizzle.
+
+Self-contained — pure stdlib, no real network, deterministic with a seeded RNG.
+
+<Lab
+  title="Fix the retry storm"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Two bugs in the retry simulator. (1) nextBackoff returns the raw exponential delay with NO jitter, so all clients synchronize — change it to full jitter: random in [0, min(cap, base*2^attempt)] using the passed *rand.Rand. (2) the loop never stops at the deadline — add a check that breaks when elapsed (attempt*avgStep) would exceed the deadline budget. main is the self-check harness — do not edit it. It runs many simulated clients and checks that (a) their backoffs are spread (not all identical) and (b) every client stops by the deadline. When both hold it prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
+)
+
+// nextBackoff should return a JITTERED delay so clients don't synchronize.
+// BUG 1: it returns the raw exponential delay — every client gets the SAME
+// value for the same attempt, which is exactly the thundering herd.
+func nextBackoff(r *rand.Rand, attempt int, base, cap time.Duration) time.Duration {
+	t := math.Min(float64(base)*math.Pow(2, float64(attempt)), float64(cap))
+	return time.Duration(t) // FIX: full jitter → time.Duration(r.Float64() * t)
+}
+
+// simulateClient returns the backoff delays a client would use until it either
+// succeeds (never, here) or hits the deadline budget.
+// BUG 2: it ignores the deadline and always runs maxAttempts — clients retry
+// past the budget. FIX: break when the cumulative wait exceeds deadlineMs.
+func simulateClient(r *rand.Rand, maxAttempts int, base, cap time.Duration, deadlineMs float64) []time.Duration {
+	var delays []time.Duration
+	cumulative := 0.0
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		d := nextBackoff(r, attempt, base, cap)
+		// FIX: if cumulative+float64(d/time.Millisecond) > deadlineMs { break }
+		cumulative += float64(d / time.Millisecond)
+		delays = append(delays, d)
+	}
+	return delays
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	r := rand.New(rand.NewPCG(42, 1))
+	base, cap := 100*time.Millisecond, 5*time.Second
+	deadlineMs := 1500.0
+
+	allOK := true
+
+	// Check 1: backoffs must be SPREAD. Collect attempt-2 delay across 50 clients;
+	// if jitter works they won't all be identical.
+	seen := map[time.Duration]int{}
+	for c := 0; c < 50; c++ {
+		d := nextBackoff(r, 2, base, cap)
+		seen[d]++
+	}
+	if len(seen) < 10 { // no jitter → 1 distinct value
+		fmt.Printf("FAIL check 1: backoffs not spread (%d distinct values)\n", len(seen))
+		allOK = false
+	}
+
+	// Check 2: every client must stop by the deadline budget.
+	for c := 0; c < 50; c++ {
+		delays := simulateClient(r, 100, base, cap, deadlineMs)
+		total := 0.0
+		for _, d := range delays {
+			total += float64(d / time.Millisecond)
+		}
+		if total > deadlineMs+1 { // allow rounding slop
+			fmt.Printf("FAIL check 2: client ran %0.fms past the %0.fms deadline\n", total, deadlineMs)
+			allOK = false
+			break
+		}
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main runs 50 simulated clients and checks that attempt-2 backoffs are spread across many distinct values (jitter present) and that no client's cumulative wait exceeds the deadline budget. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  hints={[
+    "Bug 1: change nextBackoff's return to time.Duration(r.Float64() * t) — full jitter, a uniform random delay in [0, t]. Now 50 clients get 50 different values for the same attempt.",
+    "Bug 2: in simulateClient, before appending, add: if cumulative+float64(d/time.Millisecond) > deadlineMs { break }. That stops the client the moment the next backoff would cross the deadline.",
+    "Check 1 wants ≥10 distinct attempt-2 delays (jitter). Check 2 wants every client's summed delays ≤ deadlineMs. Both bugs must be fixed — jitter alone still runs past the deadline; the deadline check alone still synchronizes.",
+  ]}
+  flag="GO{jittered_and_deadline_bounded}"
+>
+
+Bug 1 builds the herd (no jitter → synchronized retries); Bug 2 lets clients hammer past the deadline (no budget → amplification). Fix the jitter, add the deadline check, and the storm becomes a bounded drizzle. Both checks must pass. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- **Measure elapsed time with the monotonic clock.** Subtracting two raw `time.Now()` values (`time.Since`) uses the monotonic reading and is immune to NTP/DST jumps; a deserialized or `Round(0)`'d timestamp has the monotonic reading stripped and can go backward. Never compute backoff from wall-clock-only times.
+- **Go 1.23 made timers safer for retry loops:** unstopped `Timer`s/`Ticker`s are GC'd immediately, and timer channels are unbuffered so `Stop`/`Reset` guarantee no stale value — `case <-time.After(d)` no longer leaks when you leave the `select` early (on `go.mod` ≥ 1.23.0; revert via `GODEBUG=asynctimerchan=1`).
+- **Capped exponential backoff** is `min(cap, base·2ⁿ)`: double each failure, clamp at the cap so the delay stays inside the request deadline.
+- **The thundering herd** is the failure mode of *pure* backoff: deterministic delays synchronize a fleet into simultaneous retries that flatten a recovering downstream. Jitter is the cure.
+- **The jitter taxonomy** (AWS backoff study): *no jitter* synchronizes; *full jitter* `random(0, temp)` spreads maximally and does the least work; *equal jitter* `temp/2 + random(0, temp/2)` keeps a floor; *decorrelated jitter* `min(cap, random(base, prev·3))` is stateful and self-tunes. The study's winners are **full and decorrelated** — full does less work, decorrelated adapts. Don't share/clock-seed the RNG or you re-correlate the herd.
+- **Retry amplification** multiplies load through tiers (3× at four layers = 81×, exactly when the bottom is failing). Retry at **one** layer, propagate failures elsewhere, and bound total retries with a **retry budget** (retries ≤ a fraction of requests).
+- **Propagate the deadline.** The request's `context` deadline flows to every layer; the retry loop checks remaining budget before backing off, sleeps on a `select` that `ctx.Done()` can interrupt, and ends at `min(maxAttempts, deadline)` — never sleeping past what the caller asked for.
+- **The production loop** combines all of it: try → on failure compute jittered capped backoff → refuse to sleep past the deadline → interruptible sleep on `ctx.Done()` → only ever wrap **idempotent** work. Run the 8-point retry checklist before shipping.
+
+</Recap>
+
+<Callout kind="note" title="Primary sources">
+**Backoff & jitter:** Marc Brooker, *"Exponential Backoff And Jitter"*, AWS Architecture Blog (the four strategies and the simulation comparing full/equal/decorrelated). **Monotonic clocks:** the `time` package docs (the "Monotonic Clocks" section) and the **time-clocks-timers** chapter of this course. **The Go 1.23 timer change:** the Go 1.23 release notes (`go.dev/doc/go1.23`, "Timer changes"). **Retry budgets:** the gRPC retry design (`grpc/proposal` A6) and resilience libraries that bound retries as a fraction of traffic. **The basic retry/circuit-breaker/rate-limit patterns:** the **reliability-patterns** chapter, which this deep dive extends.
+</Callout>
+
+<Scoreboard
+  streak={14}
+  items={[
+    { label: "Quick check — why pure backoff causes a storm", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Capped exponential backoff", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Full vs equal jitter", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Decorrelated jitter walk", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Stop retrying at the deadline", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5 — A retry budget", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the retry storm", captured: false, points: 80 }}
+/>
+
+That's retry timing, all the way down. You can measure elapsed time correctly under a moving clock, write capped exponential backoff, name and implement all four jitter strategies (and say which the AWS study picked and why), see the retry storm forming before it forms, bound load with a budget instead of amplifying it across tiers, and propagate a deadline so a retry never outlives its request. The retry loop you write now is the one that *calms* an outage instead of feeding it. That's the difference between a senior engineer and the one who took the site down trying to help. Go retry like you mean it, sport.
+
