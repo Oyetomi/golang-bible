@@ -19,7 +19,7 @@ type Tab = "goal" | "lab" | "exploit" | "report";
 type HackLabProps = {
   title: string;
   category?: string; // "Server-Side" | "Client-Side"
-  mode: "idor" | "xss" | "sqli" | "jwt";
+  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz";
   flag?: string;
 };
 
@@ -465,6 +465,212 @@ function JwtLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) =>
   );
 }
 
+/* ════════════════════════════════════════════
+   SSRF engine — an "import image from URL"
+   feature. The vulnerable build fetches any URL,
+   so 169.254.169.254 returns cloud IAM creds. The
+   guarded build blocks private/link-local IPs.
+   ════════════════════════════════════════════ */
+function SsrfLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  const [url, setUrl] = useState("http://169.254.169.254/latest/meta-data/iam/security-credentials/");
+  const [mode, setMode] = useState<"vuln" | "guard">("vuln");
+  const [resp, setResp] = useState<null | { ok: boolean; body: string }>(null);
+
+  const isMetadata = /169\.254\.169\.254/.test(url);
+  const isInternal = isMetadata || /127\.0\.0\.1|localhost|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\./.test(url);
+
+  const fetchIt = () => {
+    if (mode === "guard") {
+      if (isInternal) { setResp({ ok: false, body: "blocked: target resolves to a private/link-local address" }); return; }
+      setResp({ ok: true, body: "200 OK — fetched public image (allowed)" });
+      return;
+    }
+    if (isMetadata) {
+      onSolve(true);
+      setResp({ ok: true, body: `{\n  "AccessKeyId": "ASIA…LEAKED",\n  "SecretAccessKey": "wJalr…stolen",\n  "Token": "FQoGZ…",\n  "Expiration": "2026-01-01T00:00:00Z"\n}` });
+      return;
+    }
+    setResp({ ok: true, body: isInternal ? "200 OK — fetched an internal service" : "200 OK — fetched public image" });
+  };
+
+  return (
+    <div className="hl-ssrf">
+      <p className="hl-note">An "import image from URL" feature fetches a URL <em>server-side</em>. Point it at the cloud metadata endpoint and steal the instance's credentials — then switch to the guarded build and watch it refuse.</p>
+      <div className="hl-modeswitch">
+        <button className={mode === "vuln" ? "on" : ""} onClick={() => { setMode("vuln"); setResp(null); }}>Vulnerable (fetch any URL)</button>
+        <button className={mode === "guard" ? "on" : ""} onClick={() => { setMode("guard"); setResp(null); }}>Guarded (block private IPs)</button>
+      </div>
+      <div className="hl-reqbar">
+        <span className="hl-method">GET</span>
+        <input className="hl-input hl-wide" value={url} onChange={(e) => setUrl(e.target.value)} aria-label="url to fetch" />
+        <button className="hl-send" onClick={fetchIt}>Fetch</button>
+      </div>
+      {resp && <pre className={`hl-raw ${resp.ok && isMetadata && mode === "vuln" ? "hl-leak" : ""}`}>{resp.body}</pre>}
+      <div className="hl-status">
+        {solved ? <span className="hl-ok">✓ SSRF → cloud metadata: you made the server fetch 169.254.169.254 and exfiltrate its IAM credentials (the 2019 Capital One pattern). Switch to Guarded — the same URL is blocked because it resolves to a link-local address.</span>
+          : <span className="hl-todo">In Vulnerable mode, fetch the metadata URL to leak the credentials.</span>}
+      </div>
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════
+   Race engine — fire N parallel withdrawals at a
+   TOCTOU check-then-deduct. The vulnerable build
+   lets them all pass the check before any deducts
+   (balance goes negative); the locked build holds.
+   ════════════════════════════════════════════ */
+function RaceLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  const balance = 5;
+  const [n, setN] = useState(10);
+  const [mode, setMode] = useState<"vuln" | "lock">("vuln");
+  const [out, setOut] = useState<null | { ok: number; bal: number }>(null);
+
+  const fire = () => {
+    if (mode === "lock") {
+      // serialized: at most `balance` succeed, never negative
+      const ok = Math.min(n, balance);
+      setOut({ ok, bal: balance - ok });
+      return;
+    }
+    // TOCTOU: all N read balance>=1 before any deducts → all succeed
+    const ok = n;
+    const bal = balance - n;
+    setOut({ ok, bal });
+    if (ok > balance || bal < 0) onSolve(true);
+  };
+
+  return (
+    <div className="hl-race">
+      <p className="hl-note">An account holds <strong>{balance}</strong> coins. Each withdrawal checks <code>balance ≥ 1</code> then deducts 1 — two non-atomic steps. Fire many withdrawals <em>at once</em> and overrun the balance.</p>
+      <div className="hl-modeswitch">
+        <button className={mode === "vuln" ? "on" : ""} onClick={() => { setMode("vuln"); setOut(null); }}>Vulnerable (check-then-deduct)</button>
+        <button className={mode === "lock" ? "on" : ""} onClick={() => { setMode("lock"); setOut(null); }}>Locked (atomic)</button>
+      </div>
+      <label className="hl-flabel">Parallel withdrawals: {n}
+        <input type="range" min={1} max={20} value={n} onChange={(e) => setN(parseInt(e.target.value))} aria-label="parallel withdrawals" style={{ width: "100%" }} />
+      </label>
+      <button className="hl-send" onClick={fire}>Fire {n} requests simultaneously</button>
+      {out && (
+        <div className={`hl-result ${out.bal < 0 ? "bad" : "good"}`}>
+          {out.ok} withdrawals succeeded → balance = {out.bal}{out.bal < 0 ? " (overdrawn — money created from nothing!)" : ""}
+        </div>
+      )}
+      <div className="hl-status">
+        {solved ? <span className="hl-ok">✓ TOCTOU race exploited: all requests read balance ≥ 1 before any deduct committed, so more than {balance} succeeded and the balance went negative. Switch to Locked — the atomic critical section holds the line at exactly {balance}.</span>
+          : <span className="hl-todo">In Vulnerable mode, fire more than {balance} parallel withdrawals and drive the balance negative.</span>}
+      </div>
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════
+   Subdomain-takeover engine — a DNS table. Some
+   subdomains CNAME to deprovisioned services that
+   show a takeover fingerprint; claim one to control
+   a trusted origin.
+   ════════════════════════════════════════════ */
+type DnsRow = { sub: string; cname: string; body: string; dangling: boolean };
+const DNS_ROWS: DnsRow[] = [
+  { sub: "www", cname: "lb-prod.internal", body: "200 — live site", dangling: false },
+  { sub: "shop", cname: "shop123.herokuapp.com", body: "404 — No such app", dangling: true },
+  { sub: "api", cname: "api-gw.internal", body: "200 — API gateway", dangling: false },
+  { sub: "cdn", cname: "assets.s3.amazonaws.com", body: "NoSuchBucket", dangling: true },
+  { sub: "blog", cname: "ghpages.github.io", body: "200 — blog", dangling: false },
+];
+function TakeoverLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  const [claimed, setClaimed] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const claim = (r: DnsRow) => {
+    if (r.dangling) {
+      setClaimed(r.sub);
+      setMsg(`Claimed ${r.cname} — you now control https://${r.sub}.example.com, a TRUSTED origin. Cookie theft, phishing, and SSO/OAuth bypass are now possible.`);
+      onSolve(true);
+    } else {
+      setMsg(`${r.sub}.example.com points at a live, in-use service — you can't claim it.`);
+    }
+  };
+
+  return (
+    <div className="hl-takeover">
+      <p className="hl-note">Each subdomain CNAMEs to a third-party service. A <em>dangling</em> CNAME — one pointing at a deprovisioned resource — can be claimed by anyone. Find the takeover fingerprints and claim one.</p>
+      <table className="sql-table">
+        <thead><tr><th>subdomain</th><th>CNAME →</th><th>current response</th><th></th></tr></thead>
+        <tbody>
+          {DNS_ROWS.map((r) => (
+            <tr key={r.sub} className={claimed === r.sub ? "sql-row-scan" : ""}>
+              <td>{r.sub}.example.com</td>
+              <td><code>{r.cname}</code></td>
+              <td className={r.dangling ? "hl-fp" : ""}>{r.body}</td>
+              <td><button className="hl-rawtoggle" onClick={() => claim(r)}>claim</button></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {msg && <div className={`hl-result ${claimed ? "bad" : "good"}`}>{msg}</div>}
+      <div className="hl-status">
+        {solved ? <span className="hl-ok">✓ Subdomain takeover: the dangling CNAME (a 'No such app' / 'NoSuchBucket' fingerprint) pointed at a free third-party name you claimed — giving you a trusted *.example.com origin. Fix: remove DNS records as part of deprovisioning.</span>
+          : <span className="hl-todo">Claim a subdomain whose CNAME target returns a takeover fingerprint (e.g. "No such app", "NoSuchBucket").</span>}
+      </div>
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════
+   Authz-matrix engine — the three-lane replay.
+   Send each endpoint as the owner, a different
+   user, and unauthenticated; find the one that
+   serves another user's data (BYPASSED).
+   ════════════════════════════════════════════ */
+type AuthzEndpoint = { path: string; ownerOnly: boolean };
+const AUTHZ_EPS: AuthzEndpoint[] = [
+  { path: "/api/me", ownerOnly: true },          // properly scoped to caller
+  { path: "/api/orders/{id}", ownerOnly: false }, // BUG: no ownership check
+  { path: "/api/admin/users", ownerOnly: true },  // role-checked
+];
+function AuthzLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  const [ep, setEp] = useState(AUTHZ_EPS[0].path);
+  const [who, setWho] = useState<"owner" | "other" | "anon">("other");
+  const [verdict, setVerdict] = useState<null | { v: string; bad: boolean }>(null);
+
+  const send = () => {
+    const e = AUTHZ_EPS.find((x) => x.path === ep)!;
+    if (who === "owner") { setVerdict({ v: "200 — owner sees their own data (expected)", bad: false }); return; }
+    // other / anon
+    if (e.ownerOnly) { setVerdict({ v: who === "anon" ? "401 — unauthenticated, denied (ENFORCED)" : "403 — not your resource, denied (ENFORCED)", bad: false }); return; }
+    // the vulnerable endpoint: no ownership check → other user gets the owner's data
+    setVerdict({ v: `200 — returned ANOTHER user's data as ${who} (BYPASSED — IDOR)`, bad: true });
+    onSolve(true);
+  };
+
+  return (
+    <div className="hl-authz">
+      <p className="hl-note">The three-lane replay: send the <em>same</em> request as the owner, as a different user, and unauthenticated — only the identity changes. The endpoint that returns the owner's data to a stranger is broken.</p>
+      <div className="hl-jwt-fields">
+        <label className="hl-flabel">Endpoint
+          <select className="hl-input hl-wide" value={ep} onChange={(e) => { setEp(e.target.value); setVerdict(null); }} aria-label="endpoint">
+            {AUTHZ_EPS.map((x) => <option key={x.path}>{x.path}</option>)}
+          </select>
+        </label>
+        <label className="hl-flabel">Send as
+          <select className="hl-input hl-wide" value={who} onChange={(e) => { setWho(e.target.value as typeof who); setVerdict(null); }} aria-label="identity">
+            <option value="owner">owner (lane A)</option>
+            <option value="other">different user (lane B)</option>
+            <option value="anon">unauthenticated</option>
+          </select>
+        </label>
+      </div>
+      <button className="hl-send" onClick={send}>Replay request</button>
+      {verdict && <div className={`hl-result ${verdict.bad ? "bad" : "good"}`}>{verdict.v}</div>}
+      <div className="hl-status">
+        {solved ? <span className="hl-ok">✓ You found the BYPASSED endpoint: /api/orders/{"{id}"} returns another user's order to a different user — broken object-level authorization. The other two endpoints ENFORCE (403/401). This cross-identity replay is exactly how authz-replay tools and your CI two-user test find IDOR.</span>
+          : <span className="hl-todo">Replay each endpoint as a "different user" and find the one that returns data it shouldn't (BYPASSED).</span>}
+      </div>
+    </div>
+  );
+}
+
 /* ── scenario registry ─────────────────────── */
 type Scenario = {
   goal: ReactNode;
@@ -612,6 +818,134 @@ const SCENARIOS: Record<HackLabProps["mode"], Scenario> = {
         summary="The token verifier honors the alg header from the JWT itself, allowing the alg:none algorithm-bypass attack: an attacker forges a token with arbitrary claims and no valid signature."
         steps={["Capture a valid JWT.", 'Set the header to {"alg":"none"} and the payload to role=admin.', "Strip the signature and replay — the server accepts it as an admin."]}
         impact={<>Full authentication/authorization bypass — forge any identity or privilege. Fix: in golang-jwt's key function, assert <code>token.Method</code> equals your single expected algorithm and reject everything else; never read <code>kid</code>/<code>jwk</code>/<code>jku</code> as key sources.</>}
+      />
+    ),
+  },
+  ssrf: {
+    goal: (
+      <Goal
+        what="Server-Side Request Forgery (SSRF) makes the server fetch a URL you control. Pointed at a cloud VM's metadata endpoint (169.254.169.254), it returns the instance's IAM credentials — the highest-impact SSRF escalation."
+        example={<>An "import image from URL" feature fetches <code>http://169.254.169.254/latest/meta-data/iam/security-credentials/</code> and hands you the server's cloud keys.</>}
+        mission={[
+          "In the Lab tab (Vulnerable mode), point the fetcher at the metadata URL.",
+          "Read the leaked IAM credentials.",
+          "Switch to Guarded mode and watch the same URL get blocked.",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <SsrfLab key="ssrf" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="The vulnerable fetcher requests any URL with no validation. Cloud VMs expose credentials at the link-local 169.254.169.254, so the server fetches and returns them."
+        steps={[
+          <>Find a feature that fetches a user-supplied URL server-side.</>,
+          <>Point it at <code>http://169.254.169.254/latest/meta-data/iam/security-credentials/</code>.</>,
+          "Read the returned IAM access key, secret, and session token.",
+        ]}
+        bonus={<>The guarded build resolves the host and blocks private/loopback/link-local IPs. Deeper defenses: connect to the resolved IP (defeat DNS rebinding), block redirects, and enforce IMDSv2 (a PUT-token requirement most SSRF can't satisfy).</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="An SSRF in the image-import feature lets an attacker make the server request arbitrary URLs, including the cloud metadata endpoint, exposing the instance's IAM credentials."
+        steps={["Submit a URL to the image-import feature.", "Use http://169.254.169.254/latest/meta-data/iam/security-credentials/.", "Observe the server returns the instance's IAM credentials."]}
+        impact={<>Full cloud-account compromise via stolen IAM credentials (the 2019 Capital One breach pattern). Fix: allowlist fetch targets, resolve and block private/link-local IPs, disable redirects, and enforce IMDSv2.</>}
+      />
+    ),
+  },
+  race: {
+    goal: (
+      <Goal
+        what="A race condition (TOCTOU) exists when a check and the action depending on it are separate, non-atomic steps. Fire enough concurrent requests and many pass the check before any of them acts — overrunning a limit checked once per request."
+        example={<>A withdrawal checks <code>balance ≥ 1</code> then deducts 1. Fire 10 at once against a balance of 5 and all 10 read "5" before any deducts — the balance goes to −5.</>}
+        mission={[
+          "In the Lab tab (Vulnerable mode), fire more parallel withdrawals than the balance.",
+          "Watch the balance go negative — money created from nothing.",
+          "Switch to Locked mode and watch atomicity hold the line.",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <RaceLab key="race" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="The vulnerable handler reads the balance, checks it, then deducts — three steps with no lock. Concurrent requests interleave between the check and the deduct, so they all see the original balance and all succeed."
+        steps={[
+          <>Find an operation that checks a limit then mutates (withdrawal, coupon redemption, vote).</>,
+          "Send many identical requests simultaneously (Burp Intruder / a parallel script).",
+          "More requests succeed than the limit allows — the balance overruns.",
+        ]}
+        bonus={<>The fix is atomicity: a mutex, an atomic compare-and-swap, or a conditional DB UPDATE (<code>UPDATE accounts SET balance = balance - 1 WHERE id = $1 AND balance &gt;= 1</code>) that the database executes as one indivisible operation.</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="A TOCTOU race condition in the withdrawal endpoint allows overrunning the account balance by sending concurrent requests, resulting in a negative balance (funds created from nothing)."
+        steps={["Note an account balance.", "Send (balance + N) withdrawal requests in parallel.", "Observe more than `balance` succeed and the balance goes negative."]}
+        impact={<>Direct financial loss — an attacker withdraws more than they have. Fix: make check-and-deduct atomic (lock, atomic CAS, or a conditional UPDATE WHERE balance &gt;= amount).</>}
+      />
+    ),
+  },
+  takeover: {
+    goal: (
+      <Goal
+        what="A subdomain takeover happens when a DNS record (usually a CNAME) points a subdomain at a third-party service that has been deprovisioned — but the DNS record was never removed. Anyone can claim the now-free name and control a trusted subdomain."
+        example={<><code>shop.example.com</code> CNAMEs to <code>shop123.herokuapp.com</code>, but that app was deleted. The page shows "No such app" — claim that Heroku name and you own shop.example.com.</>}
+        mission={[
+          "In the Lab tab, scan the DNS table for takeover fingerprints (e.g. 'No such app', 'NoSuchBucket').",
+          "Claim a dangling subdomain.",
+          "Realize you now control a trusted *.example.com origin.",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <TakeoverLab key="takeover" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="Some subdomains CNAME to third-party services that no longer exist. Their 'not found' fingerprint (No such app / NoSuchBucket) reveals a name anyone can register — claiming it gives you content control over the trusted subdomain."
+        steps={[
+          "Enumerate subdomains and their CNAME targets.",
+          "Find ones returning a platform's 'unclaimed resource' fingerprint.",
+          "Register that resource on the platform — you now serve content from the subdomain.",
+        ]}
+        bonus={<>The trusted origin is the prize: phishing on a real subdomain, cookies scoped to *.example.com, CORS/CSP bypass, and SSO/OAuth flows that trust the subdomain. Fix: remove DNS records as part of deprovisioning; monitor for dangling CNAMEs.</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="A subdomain takeover exists where a CNAME points at a deprovisioned third-party resource. An attacker can register the resource and control content served from the trusted subdomain."
+        steps={["Identify a subdomain CNAME'd to a third-party service.", "Confirm the target returns an 'unclaimed resource' fingerprint.", "Register the resource and serve attacker content from the subdomain."]}
+        impact={<>Trusted-origin control: phishing, cookie theft, and authentication bypass against anything trusting *.example.com. Fix: delete DNS records when deprovisioning; continuously monitor for dangling records.</>}
+      />
+    ),
+  },
+  authz: {
+    goal: (
+      <Goal
+        what="Broken object-level authorization (BOLA/IDOR) is found by replaying the same request under different identities. If an endpoint returns the owner's data to a different user, it never checked ownership — only authentication."
+        example={<>Send <code>GET /api/orders/123</code> as the owner (200), then as a different logged-in user. If the second still returns order 123, that's the bug.</>}
+        mission={[
+          "In the Lab tab, replay each endpoint as a 'different user'.",
+          "Find the endpoint that returns data it shouldn't (BYPASSED).",
+          "Note the others correctly ENFORCE (403/401).",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <AuthzLab key="authz" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="The three-lane replay holds the request constant and varies only the identity. The vulnerable endpoint authorizes on authentication alone — any logged-in user can read any object."
+        steps={[
+          "Capture a request that returns your own object.",
+          "Replay it byte-for-byte with a different user's session.",
+          "If it still returns the original object, object-level authorization is missing.",
+        ]}
+        bonus={<>This is exactly what authz-replay tooling automates (owner / other-user / unauth lanes → BYPASSED / ENFORCED / UNCLEAR) and what your CI two-user test asserts. Fix: enforce ownership in the handler — <code>WHERE id = $id AND owner = $caller</code> — and return 404 for unauthorized ids.</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="An object-level authorization flaw (IDOR/BOLA) exists on /api/orders/{id}: the endpoint authenticates but never verifies the caller owns the requested object, so any user can read any order."
+        steps={["Authenticate as user A and request your own order.", "Replay the request as user B (different session).", "Observe user A's order is returned to user B."]}
+        impact={<>Any authenticated user reads every other user's data (PII, orders, payments). Fix: enforce per-object ownership in the handler; add the two-user negative test to CI for every resource type.</>}
       />
     ),
   },
