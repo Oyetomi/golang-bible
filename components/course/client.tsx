@@ -682,8 +682,18 @@ export function QuickCheck({
       </div>
       {done && (
         <div className={`qc-fb ${picked === answer ? "qc-ok" : "qc-no"}`}>
-          <strong>{picked === answer ? "Correct." : "Not quite."}</strong>{" "}
-          {explain}
+          <span className="qc-gopher" aria-hidden>
+            <Gopher
+              pose={picked === answer ? "happy" : "blocked"}
+              state={picked === answer ? "ok" : "warn"}
+              size={40}
+              role="scientist"
+              title={picked === answer ? "correct" : "not quite"}
+            />
+          </span>
+          <span className="qc-fb-text">
+            <strong>{picked === answer ? "Correct." : "Not quite."}</strong> {explain}
+          </span>
         </div>
       )}
     </div>

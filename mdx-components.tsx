@@ -1,6 +1,8 @@
 import * as S from "@/components/course/server";
 import * as C from "@/components/course/client";
 import * as A from "@/components/course/anim";
+import { HackLab } from "@/components/course/hacklab";
+import { PredictLab } from "@/components/course/predictlab";
 import { CodeWalk } from "@/components/course/CodeWalk";
 
 /* Single source of truth for the components available inside every chapter's
@@ -49,6 +51,8 @@ export const mdxComponents = {
   Solution: S.Solution,
   // Challenge + progress (placeholder contract → real runner/store on the site)
   Lab: C.Lab,
+  HackLab,
+  PredictLab,
   Scoreboard: C.Scoreboard,
 };
 
