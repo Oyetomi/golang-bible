@@ -19,7 +19,7 @@ type Tab = "goal" | "lab" | "exploit" | "report";
 type HackLabProps = {
   title: string;
   category?: string; // "Server-Side" | "Client-Side"
-  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz";
+  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz" | "cors";
   flag?: string;
 };
 
@@ -671,6 +671,74 @@ function AuthzLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) 
   );
 }
 
+/* ════════════════════════════════════════════
+   CORS engine — pick a server policy (reflect vs
+   allowlist) and a requesting origin; the lab
+   computes the response headers and the browser's
+   verdict (can this origin read the credentialed
+   response?). The reflect policy trusts everyone.
+   ════════════════════════════════════════════ */
+const CORS_ALLOWED = "https://app.example.com";
+function CorsLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  const [policy, setPolicy] = useState<"reflect" | "allowlist">("reflect");
+  const [origin, setOrigin] = useState("https://evil.attacker.com");
+  const [res, setRes] = useState<null | { acao: string; acac: string; canRead: boolean }>(null);
+
+  const send = () => {
+    let acao = "", acac = "";
+    if (policy === "reflect") {
+      acao = origin; acac = "true"; // reflects ANY origin + credentials (the bug)
+    } else if (origin === CORS_ALLOWED) {
+      acao = origin; acac = "true"; // exact-match allowlist
+    }
+    const canRead = acao === origin && acac === "true";
+    setRes({ acao, acac, canRead });
+    // "solved" = demonstrated the bug: a non-allowlisted origin reading under reflect
+    if (policy === "reflect" && origin !== CORS_ALLOWED && canRead) onSolve(true);
+  };
+
+  return (
+    <div className="hl-cors">
+      <p className="hl-note">
+        Your API returns authenticated data. A page on <strong>{origin || "…"}</strong> does
+        <code>fetch(api, {`{credentials:'include'}`})</code>. The server policy decides the
+        response headers — and the browser decides if that origin may <em>read</em> the response.
+      </p>
+      <div className="hl-modeswitch">
+        <button className={policy === "reflect" ? "on" : ""} onClick={() => { setPolicy("reflect"); setRes(null); }}>Vulnerable (reflect Origin)</button>
+        <button className={policy === "allowlist" ? "on" : ""} onClick={() => { setPolicy("allowlist"); setRes(null); }}>Safe (exact allowlist)</button>
+      </div>
+      <label className="hl-flabel">Requesting origin
+        <input className="hl-input hl-wide" value={origin} onChange={(e) => { setOrigin(e.target.value); setRes(null); }} aria-label="origin" />
+      </label>
+      <p className="hl-note" style={{ fontSize: 12 }}>Allowlisted origin: <code>{CORS_ALLOWED}</code>. Try it, then try an attacker origin.</p>
+      <button className="hl-send" onClick={send}>Send request</button>
+
+      {res && (
+        <>
+          <div className="hl-query">
+            <span className="hl-query-h">Response headers:</span>
+            <code>Access-Control-Allow-Origin: {res.acao || "(none)"}{"\n"}Access-Control-Allow-Credentials: {res.acac || "(none)"}</code>
+          </div>
+          <div className={`hl-result ${res.canRead ? "bad" : "good"}`}>
+            {res.canRead
+              ? `Browser verdict: ${origin} CAN read the credentialed response`
+              : `Browser verdict: ${origin} is BLOCKED from reading the response`}
+          </div>
+        </>
+      )}
+
+      <div className="hl-status">
+        {solved ? (
+          <span className="hl-ok">✓ CORS misconfiguration demonstrated: the reflect policy echoed an attacker origin into Access-Control-Allow-Origin with credentials, so the browser let it read the victim's authenticated data. Switch to the allowlist policy — the same attacker origin gets no ACAO and is blocked, while only the named origin is allowed.</span>
+        ) : (
+          <span className="hl-todo">In Vulnerable mode, send from a non-allowlisted origin (e.g. evil.attacker.com) and get the browser to allow the read.</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ── scenario registry ─────────────────────── */
 type Scenario = {
   goal: ReactNode;
@@ -946,6 +1014,38 @@ const SCENARIOS: Record<HackLabProps["mode"], Scenario> = {
         summary="An object-level authorization flaw (IDOR/BOLA) exists on /api/orders/{id}: the endpoint authenticates but never verifies the caller owns the requested object, so any user can read any order."
         steps={["Authenticate as user A and request your own order.", "Replay the request as user B (different session).", "Observe user A's order is returned to user B."]}
         impact={<>Any authenticated user reads every other user's data (PII, orders, payments). Fix: enforce per-object ownership in the handler; add the two-user negative test to CI for every resource type.</>}
+      />
+    ),
+  },
+  cors: {
+    goal: (
+      <Goal
+        what="A CORS misconfiguration lets a foreign website read your users' authenticated responses. The classic bug: the server reflects the request's Origin into Access-Control-Allow-Origin and sets Allow-Credentials: true — which means 'any origin, with the user's cookies'."
+        example={<>The server echoes <code>Origin: https://evil.com</code> straight back into <code>Access-Control-Allow-Origin</code> with credentials on — so evil.com's JavaScript can read the victim's account data.</>}
+        mission={[
+          "In the Lab tab (Vulnerable / reflect mode), send a request from an attacker origin.",
+          "Watch the browser allow that origin to read the credentialed response.",
+          "Switch to the allowlist policy and watch the same origin get blocked.",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <CorsLab key="cors" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="The vulnerable policy reflects whatever Origin the request carries into Access-Control-Allow-Origin and enables credentials — recreating the forbidden 'wildcard + credentials' by hand, so every origin is trusted with the user's session."
+        steps={[
+          <>Send a request with <code>Origin: https://evil.com</code> and check the response.</>,
+          <>The server echoes it: <code>Access-Control-Allow-Origin: https://evil.com</code> + <code>Allow-Credentials: true</code>.</>,
+          "An attacker page now reads the victim's authenticated response (inbox, tokens, account data).",
+        ]}
+        bonus={<>The fix is an exact-match allowlist: only a configured origin is echoed into Allow-Origin, and credentials are only enabled for it. Never reflect; never combine <code>*</code> with credentials; match the parsed host, not the raw string.</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="A CORS misconfiguration reflects the request Origin into Access-Control-Allow-Origin while allowing credentials, letting any origin read authenticated responses cross-origin."
+        steps={['Send a request with an arbitrary Origin header (e.g. https://evil.com).', "Observe the Origin is reflected into Access-Control-Allow-Origin with Allow-Credentials: true.", "Host a page on that origin that fetches the API with credentials and reads the response."]}
+        impact={<>Any website can read a logged-in user's authenticated data (the Zoho-ATO linchpin). Fix: exact-match origin allowlist, never reflect the Origin, never pair credentials with a wildcard.</>}
       />
     ),
   },
