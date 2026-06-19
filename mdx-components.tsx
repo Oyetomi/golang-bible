@@ -3,6 +3,7 @@ import * as C from "@/components/course/client";
 import * as A from "@/components/course/anim";
 import { HackLab } from "@/components/course/hacklab";
 import { PredictLab } from "@/components/course/predictlab";
+import { SpacedRecall } from "@/components/course/spacedrecall";
 import { CodeWalk } from "@/components/course/CodeWalk";
 
 /* Single source of truth for the components available inside every chapter's
@@ -53,6 +54,7 @@ export const mdxComponents = {
   Lab: C.Lab,
   HackLab,
   PredictLab,
+  SpacedRecall,
   Scoreboard: C.Scoreboard,
 };
 
