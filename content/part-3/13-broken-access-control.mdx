@@ -430,6 +430,132 @@ func main() {
 **A role check is not an ownership check, and an authenticated session is not consent to a sensitive change.** Two separate lessons from one bug. First: scope authorization to the *object*, not the *role* — `WHERE id = $target AND owner = $caller`, so a peer (even same-role) can't touch what isn't theirs. Second: gate credential/email/2FA changes on **re-authentication** (the current password, or a fresh step-up) — otherwise a stolen or shared session becomes a permanent account takeover. The password-change endpoint is the canonical place both rules must hold at once.
 </Gotcha>
 
+### Every ID is two tests: the IDOR → SQLi pivot
+
+Here's a move that separates hunters who find one bug from hunters who find two. When you see an ID in a request — a numeric `id`, a `uuid`, a slug — your instinct is to test it for **IDOR**: swap it, read someone else's object. Good. But that same identifier is almost always **fed into a database query** on the server, and if the server builds that query by *string concatenation*, the ID is also a **SQL injection** point. One parameter, two completely different bug classes. Most hunters test the first and walk past the second — *"never tested SQLi there"* is the most common reply under a UUID-SQLi writeup.
+
+<Scene
+  title="One parameter, two doors"
+  actors={[
+    { id: "h", label: "the ID parameter", role: "courier" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "A request carries an identifier: GET /api/dataapps/<uuid>. It looks machine-shaped, 'not user input' — so it gets tested for one thing, if at all.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "uuid = e1897307-…" }, { id: "A2", state: "idle", label: "" }, { id: "A3", state: "idle", label: "" }
+      ]
+    },
+    {
+      caption: "Door 1 — IDOR: swap the uuid for another object's. If the server returns it without an ownership check, that's the access-control bug.",
+      beat: "neutral",
+      cells: [
+        { id: "B1", state: "warn", label: "swap → other object" }, { id: "B2", state: "warn", label: "ownership check?" }, { id: "B3", state: "warn", label: "Door 1: IDOR" }
+      ]
+    },
+    {
+      caption: "Door 2 — SQLi: that uuid is concatenated into SELECT … WHERE uuid='<uuid>'. Inject ';SELECT SLEEP(10)-- - and the response hangs 10s. The clock confirms it. Same parameter, second bug.",
+      beat: "problem",
+      cells: [
+        { id: "C1", state: "bad", label: "uuid → SQL text" }, { id: "C2", state: "bad", label: "SLEEP(10) runs" }, { id: "C3", state: "bad", label: "Door 2: SQLi" }
+      ]
+    }
+  ]}
+  caption="An identifier is not one test — it is at least two. Test it for IDOR (swap it) AND for SQLi (inject it). The 'boring' machine-shaped value you'd skip is exactly where the second, higher-severity bug hides."
+/>
+
+<Callout kind="note" title="Real case — time-based blind SQLi in a Dataapps UUID">
+A disclosed writeup tested a UUID path param not just for IDOR but for injection: the request was `GET /api/v1/dataapps/<uuid>';SELECT SLEEP(10)-- -/exist`. The response came back `200 OK` — but took **10,740 ms**. No error, no leaked data, no visible difference in the body. The *only* signal was the clock: the database executed `SLEEP(10)`, so the UUID was being concatenated into SQL unparameterized. That's **time-based blind SQLi** — when the response gives you nothing to read, you make the database *wait*, and the delay is your yes/no oracle. The lesson the author flagged: *don't just test UUIDs for IDOR — they're often unparameterized DB inputs, which makes them prime SQLi candidates.*
+</Callout>
+
+The mechanism, runnable. A tiny model of a database that "executes" SQL text (sleeping if a `SLEEP(n)` token made it into the query) shows exactly why the vulnerable concatenated path is detectable by timing while the parameterized path is inert:
+
+<CodeWalk
+  title="Time-based blind SQLi — and why parameterization kills it"
+  steps={[
+    { lines: "12-19", note: "The model DB executes SQL TEXT. If a SLEEP(n) token is present in the text, it blocks for n units — exactly what MySQL/Postgres do. This is the oracle: no output needed, the delay itself is the signal.", pose: "scribe", role: "scientist", state: "active", beat: "neutral" },
+    { lines: "24-26", note: "VULNERABLE lookup: the id (a UUID path param) is concatenated straight into the SQL string. An injected ';SELECT SLEEP(10)-- - becomes part of the query the DB parses — so the DB sleeps, and the attacker sees the delay.", pose: "scribe", role: "hacker", state: "warn", beat: "problem" },
+    { lines: "31-34", note: "SAFE lookup: the SQL text is fixed with a ? placeholder and the id rides as a SEPARATE bound value. SLEEP can never enter the SQL text — it's compared as a literal string against the column. The injection is structurally impossible.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "37-45", note: "Run it: VULN + the inject payload sleeps (~the scaled SLEEP) → injection confirmed by timing; VULN benign is instant; SAFE is instant for BOTH the benign and the inject payload, because the payload is inert data. Same input, two outcomes, one decided by parameterization.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="Time-based blind SQLi turns the response clock into a truth oracle: make the DB sleep, watch the delay. Parameterization (the ? placeholder + bound value) sends the id as data the DB never parses as SQL — so the SLEEP is just a string, and the timing channel goes dead."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// A tiny model of a database. It "executes" SQL TEXT: if the text contains a
+// SLEEP(n) token, the DB blocks for n units — exactly how time-based blind SQLi
+// is detected (no output needed; the CLOCK is the oracle).
+func runSQL(sql string) time.Duration {
+	start := time.Now()
+	if i := strings.Index(sql, "SLEEP("); i >= 0 {
+		var n int
+		fmt.Sscanf(sql[i+6:], "%d", &n) // parse the number after SLEEP(
+		time.Sleep(time.Duration(n) * 100 * time.Millisecond) // scaled for the demo
+	}
+	return time.Since(start)
+}
+
+// VULNERABLE: the id (a UUID path param) is concatenated straight into the SQL
+// text. An injected SLEEP becomes part of the query → the DB sleeps.
+func lookupVuln(id string) time.Duration {
+	sql := "SELECT 1 FROM dataapps WHERE uuid = '" + id + "'"
+	return runSQL(sql)
+}
+
+// SAFE: parameterized. The SQL text is fixed with a ? placeholder; the id rides
+// as a SEPARATE bound value, never parsed as SQL. SLEEP can't enter the text.
+func lookupSafe(id string) time.Duration {
+	const sql = "SELECT 1 FROM dataapps WHERE uuid = ?"
+	_ = id // bound as a parameter; never concatenated into sql
+	return runSQL(sql)
+}
+
+func main() {
+	benign := "e1897307-cd4d-4c93-a407-8881273068d8"
+	inject := "e1897307';SELECT SLEEP(10)-- -" // the real payload (scaled)
+
+	fmt.Printf("VULN benign id: %v\n", lookupVuln(benign).Round(time.Millisecond))
+	fmt.Printf("VULN inject id: %v  <- DB slept: injection confirmed\n", lookupVuln(inject).Round(100*time.Millisecond))
+	fmt.Printf("SAFE benign id: %v\n", lookupSafe(benign).Round(time.Millisecond))
+	fmt.Printf("SAFE inject id: %v  <- no delay: payload is inert data\n", lookupSafe(inject).Round(time.Millisecond))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<PredictLab
+  prompt={"A UUID path param is concatenated into SELECT … WHERE uuid='<id>'. You send id = abc';SELECT SLEEP(10)-- - and the response returns 200 OK after 10,740 ms. What does the delay prove?"}
+  role={"scientist"}
+  code={`// server (vulnerable): id flows into SQL text
+sql := "SELECT 1 FROM dataapps WHERE uuid = '" + id + "'"
+// id = "abc';SELECT SLEEP(10)-- -"
+// → SELECT 1 FROM dataapps WHERE uuid = 'abc';SELECT SLEEP(10)-- -'
+db.Exec(sql) // the DB runs SLEEP(10) → response hangs ~10s`}
+  options={["The DB executed our injected SQL — confirmed SQL injection", "The server is just slow / under load", "The UUID was not found", "Nothing — 200 OK means it's safe"]}
+  answer={0}
+  output={`The DB executed our injected SQL — confirmed SQL injection`}
+  explain={"The ~10s delay matches our SLEEP(10) exactly, and it only appears with the injected payload — that's the DB running our SQL. This is time-based blind SQLi: the body reveals nothing (200 OK either way), so the response CLOCK is the oracle. A benign id returns instantly; the payload that sleeps proves the id reaches the query unparameterized."}
+/>
+
+<Gotcha>
+**Every identifier is at least two tests, and a 200 OK with no body change is not 'safe'.** First: don't retire an ID after the IDOR check — the same value is usually a DB input, so test it for injection too (string, time-based, boolean). Second: time-based blind SQLi is invisible in the response *body* — same status, same content — so the only tell is latency; a benign value returns fast, an injected `SLEEP(n)` returns after ~n. The Go defense is the same one rule the **sql-databases chapter** burns in: **parameterized queries only** (`?`/`$1` placeholders + bound values), never `fmt.Sprintf`/`+` into SQL — which sends the id as data the database never parses, closing both the injection and the timing channel at once.
+</Gotcha>
+
 ---
 
 ## The List Trap: Collection-Level Authorization
