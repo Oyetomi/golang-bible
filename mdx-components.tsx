@@ -4,6 +4,7 @@ import * as A from "@/components/course/anim";
 import { HackLab } from "@/components/course/hacklab";
 import { PredictLab } from "@/components/course/predictlab";
 import { SpacedRecall } from "@/components/course/spacedrecall";
+import { Golings } from "@/components/course/golings";
 import { CodeWalk } from "@/components/course/CodeWalk";
 
 /* Single source of truth for the components available inside every chapter's
@@ -55,6 +56,7 @@ export const mdxComponents = {
   HackLab,
   PredictLab,
   SpacedRecall,
+  Golings,
   Scoreboard: C.Scoreboard,
 };
 
