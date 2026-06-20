@@ -1,0 +1,595 @@
+---
+title: "Real-Time Go: WebSocket Hubs & Outbound Webhooks"
+part: "appendix"
+order: 30
+type: "course"
+description: "The producer side of real-time Go, built end to end: the WebSocket Hub pattern (one goroutine owning the client set; register/unregister/broadcast over channels; per-client send buffers and slow-client drop so one stalled connection can't block the fan-out; ping/pong keepalives) for pushing live events to many clients; and outbound webhooks (signing the payload with HMAC-SHA256, delivering with retries + exponential backoff + jitter, dead-lettering after exhaustion, and at-least-once delivery that forces the receiver to dedup). Complements the single-connection WebSocket section (ch19) and the inbound-webhook verification section (ch9). Every server-side piece runnable and verified."
+prerequisites: ["http-servers", "external-payment-systems"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Real-Time Systems" title="Real-Time Go: WebSocket Hubs & Outbound Webhooks">
+
+Here's the thing, sport. Your server knows something — a payment cleared, a price moved, a job finished — and *someone else needs to know now*. Not on their next poll. Now. There are two ways a Go server pushes an event out into the world, and this chapter builds **both**, properly.
+
+The first is the **WebSocket Hub**: a long-lived, full-duplex pipe to *many* connected clients — a live dashboard, a trading feed, a chat room — where your server fans one event out to thousands of browsers at once. You've seen a *single* WebSocket connection (the HTTP-servers chapter). That's not a real-time app; that's an echo. The real thing is the **Hub pattern** — one goroutine owning the whole client set, broadcasting over channels, and (the part everyone gets wrong) surviving the *one slow client* that would otherwise freeze the fan-out for everybody.
+
+The second is the **outbound webhook**: instead of holding a connection open, you `POST` the event to a URL the *other* system gave you — how Stripe tells your backend a charge succeeded, how GitHub tells your CI a push happened. You've seen the *receiving* end (the payments chapter — verify the signature, dedup). This is the **sending** end: sign the payload so the receiver can trust it, deliver it with retries and backoff because their server *will* be down sometimes, dead-letter it when it's down too long, and accept that "at-least-once" means *they* must dedup. We build a real delivery engine, runnable, verified. By the end you can push events both ways — the held-open pipe and the fire-and-confirm POST — and you'll know exactly which one a problem wants. Let's build, sport.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Two Ways to Push", "The WebSocket Hub", "Slow Clients", "Ping/Pong & Lifecycle", "Outbound Webhooks", "Signing", "Retries & Dead-Letters", "At-Least-Once"]} />
+
+<SpacedRecall
+  role={"courier"}
+  items={[
+    {
+      from: "HTTP servers (part 1, ch19)",
+      q: "A WebSocket starts as an HTTP request that does what?",
+      options: ["stays plain HTTP", "Upgrades (101 Switching Protocols) to a full-duplex connection", "redirects", "closes immediately"],
+      answer: 1,
+      tie: "The Hub here begins exactly there — Accept/Upgrade each connection to a *websocket.Conn, then hand it to the hub. This chapter is what you build AFTER the upgrade: the fan-out to many of them."
+    },
+    {
+      from: "Concurrency (part 1, ch4)",
+      q: "A non-blocking channel send is written as…?",
+      options: ["ch <- v", "select { case ch <- v: ... default: ... }", "go ch <- v", "close(ch)"],
+      answer: 1,
+      tie: "That select-with-default is the heart of slow-client handling: try to queue a message to a client, and if its buffer is full, hit default and DROP it — so one stalled client can't block the broadcast to everyone else."
+    },
+    {
+      from: "External payment systems (part 3, ch9)",
+      q: "An inbound webhook's signature is verified by recomputing…?",
+      options: ["a JWT", "HMAC-SHA256 of the raw body with the shared secret, compared in constant time", "the TLS cert", "a UUID"],
+      answer: 1,
+      tie: "You verified inbound webhooks there. Here you're on the OTHER side — the SENDER computing that same HMAC over the payload so the receiver can trust it. Same math, producing instead of checking."
+    }
+  ]}
+/>
+
+## Two Ways to Push
+
+Both patterns solve the same problem — *get an event from my server to someone else, promptly* — but they make opposite trade-offs, and picking the wrong one is a design smell you'll feel for months.
+
+<Define term="Server push: WebSocket vs webhook">
+A server has two fundamental ways to **push** an event outward. A **WebSocket** holds a single TCP connection **open** between your server and a connected client (typically a browser) and sends frames over it in both directions, for as long as the connection lives — ideal when the *client is online now* and wants a *stream* of low-latency updates (a live feed, a chat, a dashboard). An **outbound webhook** keeps **no** connection: when an event happens, your server makes a brand-new HTTP `POST` to a URL another *server* registered in advance, then hangs up — ideal for *server-to-server* notifications where the recipient may be offline, behind a queue, or processing asynchronously (a payment processor telling your backend a charge cleared). The rule of thumb: **WebSocket when a user's screen needs live updates; webhook when another system needs to be notified of an event.** One is a held-open pipe to a present client; the other is a fire-and-retry message to an absent server.
+</Define>
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="WebSocket — held-open pipe">Full-duplex, low-latency, client usually a browser that's **online right now**. You pay for it with a long-lived goroutine + connection per client and the work of fanning out to all of them. Best for: live dashboards, chat, trading, collaborative editing, presence.</ConceptCard>
+  <ConceptCard label="Webhook — fire-and-confirm POST">No held connection; a fresh `POST` per event to a URL the recipient gave you. The recipient may be **offline** — so you sign, retry, and dead-letter. Best for: server-to-server events (payment cleared, build finished, row changed) consumed asynchronously.</ConceptCard>
+  <ConceptCard label="What this chapter adds">The **producer** side of both. You've met a single WebSocket connection (ch19) and inbound webhook *verification* (ch9). Here: the **Hub** that broadcasts to many, and the **delivery engine** that sends webhooks reliably.</ConceptCard>
+  <ConceptCard label="The shared discipline">Both fan an event out to consumers you don't control, so both must survive a *bad consumer*: the WebSocket Hub drops the slow client; the webhook sender retries then dead-letters the down receiver. Never let one bad consumer break delivery for the rest.</ConceptCard>
+</ConceptGrid>
+
+<Scene
+  title="Same event, two push models"
+  actors={[
+    { id: "srv", label: "your server", role: "operator" },
+    { id: "c", label: "consumers", role: "courier" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "An event happens: payment.succeeded. Two audiences need it — the user's open dashboard (a browser), and a partner's backend (a server).",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "event fires" }, { id: "A2", state: "idle", label: "" }, { id: "A3", state: "idle", label: "two audiences" }
+      ]
+    },
+    {
+      caption: "WebSocket: the dashboard already holds an open connection. The Hub broadcasts the event down every live socket — instantly, no request needed.",
+      beat: "solution",
+      cells: [
+        { id: "B1", state: "done", label: "Hub broadcast" }, { id: "B2", state: "done", label: "→ open sockets" }, { id: "B3", state: "done", label: "browsers update live" }
+      ]
+    },
+    {
+      caption: "Webhook: the partner's backend isn't connected. Your server POSTs the signed event to their URL — and if they're down, retries with backoff, then dead-letters.",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "POST signed event" }, { id: "C2", state: "warn", label: "retry if down" }, { id: "C3", state: "done", label: "partner notified" }
+      ]
+    }
+  ]}
+  caption="One event, two delivery models: a held-open WebSocket to the present browser, a retrying POST to the absent server. This chapter builds both producers."
+/>
+
+---
+
+## The WebSocket Hub
+
+A single WebSocket connection is easy. The *app* is the hard part: when an event fires, every connected client must get it — and clients connect and disconnect constantly. The answer is the **Hub**: one goroutine that owns the entire set of clients, so the set is mutated from exactly one place and needs no lock.
+
+<Define term="The Hub pattern">
+The **Hub pattern** is the canonical Go design for broadcasting to many WebSocket clients. A single **hub goroutine** owns a `map` of connected clients and `select`s over three channels: **register** (a new client joined), **unregister** (a client left), and **broadcast** (an event to send to everyone). Because only the hub goroutine ever touches the client map, there is **no mutex** — concurrency is handled by *communication*, not shared memory (the Go proverb). Each client gets its own buffered **send channel**; the hub writes a broadcast into every client's send channel, and a per-client writer goroutine drains that channel to the socket. This cleanly separates *who is connected* (the hub's job) from *writing bytes to one socket* (each client's job), and it's the structure under essentially every Go chat/live-feed/dashboard server.
+</Define>
+
+<ExecTimeline
+  title="One event, fanned out through the hub"
+  lanes={[
+    { id: "app", label: "app", role: "operator" },
+    { id: "hub", label: "hub goroutine", role: "captain" },
+    { id: "cli", label: "client writers", role: "courier" }
+  ]}
+  steps={[
+    { lane: "cli", kind: "send", label: "client connects → register", note: "A browser upgrades to WebSocket; the handler builds a client (with its own buffered send channel) and sends it on hub.register." },
+    { lane: "hub", kind: "recv", label: "hub adds it to the set", note: "The hub goroutine receives the register and adds the client to its map. Only the hub touches the map — no lock anywhere." },
+    { lane: "app", kind: "run", label: "event fires → hub.broadcast", note: "Something happens (a trade, a message). The app sends the payload on hub.broadcast — it doesn't know or care who's connected." },
+    { lane: "hub", kind: "send", label: "loop: try each client's send chan", note: "The hub iterates its clients and does a NON-BLOCKING send into each client's buffered channel. Fast clients receive it; a full (slow) client is skipped — covered next section.", beat: "neutral" },
+    { lane: "cli", kind: "recv", label: "each writer drains → socket", note: "Each client's writer goroutine reads from its send channel and writes the frame to its WebSocket. One slow socket only backs up its OWN channel, not the hub." },
+    { lane: "cli", kind: "done", label: "disconnect → unregister", note: "When a client's read fails or it closes, the handler sends it on hub.unregister; the hub deletes it and closes its send channel, ending the writer goroutine.", beat: "solution" }
+  ]}
+  caption="The hub owns the set and decides WHO; each client writer owns one socket and does the WRITING. An event flows app → hub → every client's channel → every socket, with no shared-memory locking."
+/>
+
+Here is the whole hub, runnable. We model the sockets with channels (so it runs anywhere, no network) — but the structure is exactly what you'd wire to real `*websocket.Conn` writers:
+
+<CodeWalk
+  title="The Hub, line by line"
+  steps={[
+    { lines: "11-25", note: "A client is an id plus its OWN buffered send channel. The Hub holds three channels (register/unregister/broadcast) and the client set. The set is a plain map with no mutex — because only the hub goroutine will touch it.", pose: "scribe", role: "captain", state: "active", beat: "neutral" },
+    { lines: "36-41", note: "register/unregister: the hub adds or removes a client from its map. On unregister it also CLOSES the client's send channel — which ends that client's writer goroutine cleanly (a range over a closed channel stops).", pose: "guard", role: "captain", state: "ok", beat: "neutral" },
+    { lines: "42-49", note: "broadcast: the hub loops every client and does a NON-BLOCKING send (select with default). A fast client's buffer accepts the message; a full buffer hits default and the message is dropped for THAT client only — the hub never blocks. This one detail is what keeps a slow client from freezing everyone.", pose: "run", role: "captain", state: "warn", beat: "problem" },
+    { lines: "75-83", note: "Three clients register; the app broadcasts three events. The two fast clients (buffered, drained) receive all three; the slow client (unbuffered, never drained until the end) gets its sends dropped — the hub kept going. Fan-out works, and one bad client didn't break it.", pose: "happy", role: "captain", state: "done", beat: "solution" }
+  ]}
+  caption="One goroutine owns the set (no lock); each client has its own buffered channel; broadcast is a non-blocking send so the slow client is dropped, not waited on. That's the production hub."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+)
+
+// A client is one connected socket: an id and its OWN buffered send channel.
+// If that channel fills up, the client is too slow and we drop messages to it.
+type client struct {
+	id   int
+	send chan string
+}
+
+// The Hub owns the client set. Only the hub goroutine touches `clients`,
+// so there is NO mutex — coordination is by channels, not shared memory.
+type Hub struct {
+	register   chan *client
+	unregister chan *client
+	broadcast  chan string
+	clients    map[*client]bool
+}
+
+func newHub() *Hub {
+	return &Hub{
+		register:   make(chan *client),
+		unregister: make(chan *client),
+		broadcast:  make(chan string),
+		clients:    make(map[*client]bool),
+	}
+}
+
+func (h *Hub) run(done chan struct{}) {
+	for {
+		select {
+		case c := <-h.register:
+			h.clients[c] = true
+		case c := <-h.unregister:
+			if h.clients[c] {
+				delete(h.clients, c)
+				close(c.send) // ends this client's writer goroutine
+			}
+		case msg := <-h.broadcast:
+			for c := range h.clients {
+				select {
+				case c.send <- msg: // fast client: queued
+				default: // buffer full → slow client → drop (never block the hub)
+				}
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
+func main() {
+	h := newHub()
+	done := make(chan struct{})
+	go h.run(done)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got := map[int][]string{}
+
+	fast1 := &client{id: 1, send: make(chan string, 8)}
+	fast2 := &client{id: 2, send: make(chan string, 8)}
+	slow := &client{id: 3, send: make(chan string)} // unbuffered, undrained → drops
+
+	for _, c := range []*client{fast1, fast2} {
+		wg.Add(1)
+		go func(c *client) {
+			defer wg.Done()
+			for m := range c.send { // ends when the hub closes c.send
+				mu.Lock()
+				got[c.id] = append(got[c.id], m)
+				mu.Unlock()
+			}
+		}(c)
+	}
+
+	h.register <- fast1
+	h.register <- fast2
+	h.register <- slow
+	for i := 1; i <= 3; i++ {
+		h.broadcast <- fmt.Sprintf("event-%d", i)
+	}
+	h.unregister <- fast1
+	h.unregister <- fast2
+	h.unregister <- slow
+	close(done)
+	wg.Wait()
+
+	for _, id := range []int{1, 2} {
+		sort.Strings(got[id])
+		fmt.Printf("fast client %d received: %v\n", id, got[id])
+	}
+	fmt.Printf("slow client 3 received: %d msgs (dropped to protect the hub)\n", len(got[3]))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## Slow Clients
+
+That non-blocking send is not a detail — it's the entire reason a hub survives production. Get it wrong and a single phone on a flaky connection takes down your broadcast for *every* user.
+
+<Gotcha>
+**A blocking broadcast lets one slow client freeze everyone.** The naive hub writes `c.send <- msg` directly in the broadcast loop. The moment one client's buffer fills — a mobile client on bad cell signal, a paused browser tab, a debugger-stopped connection — that send *blocks the hub goroutine*. And because the hub is the single goroutine handling register/unregister/broadcast for **all** clients, a block there freezes the whole system: no one gets messages, no one can connect or disconnect. The fix is the `select { case c.send <- msg: default: }` — a **non-blocking** send that drops the message (or, in production, disconnects the client after N drops) rather than waiting. You give each client a buffered channel for normal bursts, and you treat a *full* buffer as the signal "this client can't keep up — protect everyone else from it." Backpressure handled at the slowest consumer, never propagated up to the hub.
+</Gotcha>
+
+<PredictLab
+  prompt={"A client's send channel has capacity 1 and already holds a message. The hub does a non-blocking send of a second message. What prints?"}
+  role={"captain"}
+  code={`send := make(chan string, 1)
+send <- "msg-1"          // buffer (cap 1) now full
+select {
+case send <- "msg-2":    // try to queue the next broadcast
+    fmt.Println("queued")
+default:
+    fmt.Println("dropped")
+}`}
+  options={["queued", "dropped", "deadlock", "panic"]}
+  answer={1}
+  output={`dropped`}
+  explain={"The buffer is full, so the send case can't proceed — and because there's a default, the select takes it immediately instead of blocking: it prints 'dropped'. That's exactly how the hub protects itself: a slow client's full buffer means the broadcast is dropped for THAT client, while the hub keeps serving everyone else. Remove the default and the hub would block here forever."}
+/>
+
+<QuickCheck
+  question="Why does the hub give each client its OWN buffered send channel instead of writing straight to the socket in the broadcast loop?"
+  options={[
+    "To save memory",
+    "So a slow socket only backs up its own channel — the hub and other clients are never blocked by it",
+    "Because sockets can't be written from a map",
+    "To avoid using goroutines"
+  ]}
+  answer={1}
+  explain="Each client's buffered channel + its own writer goroutine isolates slow I/O: writing to a slow socket blocks only that client's writer, and its buffer absorbs short bursts. The hub does a quick non-blocking channel send and moves on. Without per-client channels, one slow socket write in the broadcast loop would stall the fan-out to everyone."
+/>
+
+---
+
+## Ping/Pong & Lifecycle
+
+A WebSocket can sit open for hours. Two things will bite you: connections that die silently (no FIN packet — the client's laptop just slept), and writes that block forever on a stuck socket. Keepalives and deadlines handle both.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Ping/pong keepalive">The server periodically sends a **ping** frame; a healthy client auto-replies **pong**. No pong within a deadline → the connection is dead (silently dropped, asleep, gone), so you close it and `unregister`. Without this, dead connections accumulate as zombie goroutines forever. `coder/websocket` and `gorilla/websocket` both expose this.</ConceptCard>
+  <ConceptCard label="Write deadlines">After the HTTP upgrade, `net/http`'s `WriteTimeout` no longer applies — the connection was **hijacked** out of its control (you saw this in ch19). So *you* set a deadline on every write (a context timeout, e.g. 5–10s). A slow client that can't accept a write is closed instead of pinning its writer goroutine until the TCP stack gives up minutes later.</ConceptCard>
+  <ConceptCard label="Clean unregister">Every exit path — read error, failed ping, write deadline, server shutdown — must funnel to `hub.unregister`, which deletes the client and closes its send channel. That close is what ends the writer goroutine (a `range` over a closed channel returns). Miss it and you leak a goroutine per dead connection.</ConceptCard>
+  <ConceptCard label="Bounded everything">A long-lived endpoint is a Slowloris target: cap the message size, set read/write deadlines, and limit connections per IP. The same hardening the HTTP-servers chapter applies to requests, applied to *connections that never end*.</ConceptCard>
+</ConceptGrid>
+
+<Callout kind="pro" title="The two-goroutine-per-connection shape">
+In a real hub, each connection runs **two** goroutines: a **reader** (`for { read frame; handle or unregister on error }`) and a **writer** (`for msg := range client.send { set write deadline; write frame }`), plus a ticker in the writer that sends periodic pings. The hub never writes to a socket directly — it only writes to `client.send`, and the writer goroutine owns the actual socket write *and* the deadline. This is why the hub stays fast: its job is set-management and a non-blocking channel send, never blocking I/O. The reader's only hub interaction is sending itself on `unregister` when the connection dies.
+</Callout>
+
+---
+
+## Outbound Webhooks
+
+Switch models. The recipient isn't a browser holding a connection — it's another company's server, and it gave you a URL. When your event fires, you `POST` to that URL. Simple in the happy path; the entire engineering is in the failure path, because **their server will be down sometimes and you must not lose the event.**
+
+<Define term="Outbound webhook delivery">
+An **outbound webhook** is your server notifying another *server* of an event by making an HTTP `POST` to a URL that server **registered with you in advance**, carrying the event as a JSON body. Unlike a WebSocket there is no persistent connection: each event is a fresh, independent request. Because the receiver is an external system you don't control — it may be deploying, overloaded, or briefly offline — reliable delivery is not "send and forget." It requires four things: **signing** the payload (so the receiver can verify it really came from you and wasn't tampered with), **retrying** on failure with backoff (their `503` is usually transient), **dead-lettering** after you exhaust retries (so a permanently-down receiver doesn't block or lose everything), and accepting **at-least-once** semantics (a retry after a network timeout may deliver twice, so the receiver must dedup). A production webhook sender is a small reliable-delivery system, not a single `http.Post`.
+</Define>
+
+<Scene
+  title="The webhook delivery lifecycle"
+  actors={[
+    { id: "s", label: "your sender", role: "operator" },
+    { id: "r", label: "receiver", role: "courier" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "Event fires. The sender builds the JSON body, signs it (HMAC-SHA256 over the raw bytes), and POSTs to the receiver's registered URL with the signature header.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "sign(body)" }, { id: "A2", state: "active", label: "POST + X-Signature" }, { id: "A3", state: "idle", label: "→ receiver URL" }
+      ]
+    },
+    {
+      caption: "Receiver returns 503 (deploying / overloaded). Transient. The sender waits — exponential backoff + jitter — and retries. Attempt 2 also 503. Wait longer, retry again.",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "bad", label: "503" }, { id: "B2", state: "warn", label: "backoff + jitter" }, { id: "B3", state: "warn", label: "retry…" }
+      ]
+    },
+    {
+      caption: "Attempt 3 returns 2xx — delivered. (If it had stayed down past max attempts, the event goes to a DEAD-LETTER queue for later replay, never silently lost.)",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "2xx ✓" }, { id: "C2", state: "done", label: "delivered" }, { id: "C3", state: "done", label: "else → dead-letter" }
+      ]
+    }
+  ]}
+  caption="Sign, POST, and on failure back off and retry — then dead-letter if the receiver stays down. The happy path is one POST; the engineering is everything that happens when it fails."
+/>
+
+---
+
+## Signing
+
+The receiver needs to know the POST *really* came from you and wasn't forged or modified in transit. You don't share a password on every request — you **sign** the payload with a shared secret, and they recompute the signature to check it. (This is the exact mechanism you *verified* on the inbound side in the payments chapter — now you're the one producing it.)
+
+<Define term="HMAC payload signing">
+**HMAC signing** proves a webhook's authenticity and integrity without sending the secret. You and the receiver share a secret out of band (when they register the webhook). For each delivery you compute **`HMAC-SHA256(secret, rawBody)`** and send it in a header (e.g. `X-Signature: sha256=…`). The receiver recomputes the same HMAC over the **exact raw bytes** it received and compares — using a **constant-time** comparison (`hmac.Equal`) to avoid timing attacks. If they match, the body is authentic (only someone with the secret could produce that MAC) and untampered (any change to the body changes the MAC). Two non-negotiables: sign the **raw bytes**, not a re-serialized struct (re-marshaling can reorder keys and break the signature), and compare in constant time. Real providers sign a provider-specific string (Stripe signs `timestamp + "." + body` and you check the timestamp to stop replay); always follow the documented canonicalization byte-for-byte.
+</Define>
+
+---
+
+## Retries & Dead-Letters
+
+Now the delivery engine itself — the part that turns "POST once and hope" into reliable delivery. We send the signed payload, retry transient failures with backoff, and give up into a dead-letter queue after a bounded number of attempts.
+
+<CodeWalk
+  title="The delivery engine — sign, POST, retry, dead-letter"
+  steps={[
+    { lines: "16-20", note: "sign: HMAC-SHA256 over the raw body, hex-encoded, provider-style prefix. This is the producer side of the verification you did inbound — the receiver recomputes exactly this and compares in constant time.", pose: "scribe", role: "guard", state: "active", beat: "neutral" },
+    { lines: "24-40", note: "deliver: the retry loop. Each attempt builds a fresh request with the signature header and a stable X-Webhook-Id, POSTs, and on a 2xx returns success with the attempt count. A non-2xx (or network error) falls through to the next attempt — where a real system would sleep backoff(attempt)+jitter first.", pose: "run", role: "operator", state: "warn", beat: "problem" },
+    { lines: "41-42", note: "Exhaustion: if every attempt failed, deliver returns ok=false. That's the dead-letter signal — the caller parks the event in a queue for later replay or alerting, so a long-down receiver never silently loses the event.", pose: "blocked", role: "operator", state: "warn", beat: "problem" },
+    { lines: "62-66", note: "A receiver that fails twice (503) then succeeds: delivered on attempt 3 — the transient-failure case retries exist for. A permanently-down receiver: ok=false after max attempts → dead-letter. And a wrong-secret signature never matches: tampering is rejected. The engine holds at every path.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="Sign every payload, retry the transient failures with backoff, and dead-letter after a bounded number of attempts. That's the difference between a webhook that loses events under load and one that doesn't."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+)
+
+// sign computes the provider-style HMAC-SHA256 of the raw body. The receiver
+// recomputes it with the shared secret and compares in constant time.
+func sign(secret, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// deliver POSTs the signed payload, retrying on non-2xx up to maxAttempts.
+// A real sender sleeps backoff(attempt) + jitter between tries.
+func deliver(url string, secret, body []byte, maxAttempts int) (int, bool) {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Signature", sign(secret, body))
+		req.Header.Set("X-Webhook-Id", "evt_123") // stable id → receiver dedups
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode/100 == 2 {
+				return attempt, true
+			}
+		}
+		// else: sleep backoff(attempt)+jitter, then retry
+	}
+	return maxAttempts, false // exhausted → dead-letter queue
+}
+
+func main() {
+	secret := []byte("whsec_test")
+	body := []byte(`{"event":"payment.succeeded","amount":5000}`)
+
+	// flaky receiver: verifies the signature, fails twice (503), then succeeds.
+	var hits int
+	recv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		raw, _ := io.ReadAll(r.Body)
+		if !hmac.Equal([]byte(r.Header.Get("X-Signature")), []byte(sign(secret, raw))) {
+			w.WriteHeader(http.StatusUnauthorized) // bad signature → reject
+			return
+		}
+		if hits < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable) // transient
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer recv.Close()
+	attempts, ok := deliver(recv.URL, secret, body, 5)
+	fmt.Printf("flaky receiver: ok=%v after %d attempts\n", ok, attempts)
+
+	// permanently-down receiver: exhausts retries → dead-letter.
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer down.Close()
+	a2, ok2 := deliver(down.URL, secret, body, 3)
+	fmt.Printf("down receiver:  ok=%v after %d attempts → dead-letter\n", ok2, a2)
+
+	// a signature from the wrong secret never matches.
+	fmt.Printf("tampered signature accepted? %v\n",
+		hmac.Equal([]byte(sign([]byte("wrong"), body)), []byte(sign(secret, body))))
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Callout kind="warn" title="Backoff needs jitter — the reliability chapter">
+The retry loop above just says "sleep backoff(attempt)". Get that backoff wrong and you build a self-inflicted outage: if every sender retries on the *same* exponential schedule, a receiver that blips comes back to a synchronized **thundering herd** — every pending webhook from every sender hitting it at the identical instant, knocking it back down. The fix is **exponential backoff *plus jitter*** (randomize each delay) so retries spread out instead of resonating. This is exactly the time/backoff/jitter material — reuse it here; a webhook sender is one of its highest-value applications.
+</Callout>
+
+---
+
+## At-Least-Once
+
+The last truth about webhooks, and the one that surprises people: **you cannot guarantee exactly-once delivery, so you guarantee at-least-once and make the receiver dedup.** This is the same lesson as idempotency in distributed systems, applied to your delivery engine.
+
+<Define term="At-least-once delivery and receiver dedup">
+**At-least-once** means every event is delivered *one or more* times — never zero, possibly twice. It's unavoidable: if your `POST` times out, you don't know whether the receiver processed it before the network dropped the response, so you must retry — and if it *had* succeeded, that retry is a duplicate. You can't tell the two cases apart, so you choose at-least-once (retry, risk a dupe) over at-most-once (don't retry, risk a loss) — losing a "payment succeeded" event is far worse than processing it twice. The contract that makes this safe is a **stable event id** (e.g. `X-Webhook-Id: evt_123`) sent identically on every retry of the same event. The receiver records processed ids and **ignores** any it has already seen, so a duplicate delivery is a no-op. You provide the stable id and the retries; the receiver provides the dedup. (You implemented the *receiver's* side — store-and-check the id — in the inbound-webhook section; this is why the sender must keep the id constant across retries.)
+</Define>
+
+<Gotcha>
+**Exactly-once is a fantasy; at-least-once + idempotency is the real system.** Don't try to make delivery exactly-once — across a network it's provably impossible, and code that claims it is hiding a bug. Instead: the **sender** retries (accepting it may double-deliver) and sends a **stable event id** on every attempt of the same event; the **receiver** dedups on that id (process once, ignore repeats). The same id must survive every retry — generate it when the event is *created*, not per attempt, or each retry looks like a new event and dedup fails. This is the idempotency-key pattern from the distributed-systems and payments chapters, now spanning the gap between your sender and someone else's receiver.
+</Gotcha>
+
+---
+
+## The Lab
+
+I've written a webhook sender that builds the payload and POSTs it — but **forgets to sign it**. The receiver verifies the signature on every request and rejects anything unsigned with a `401`, so every delivery fails. Add the one line that signs the payload (`sign(secret, body)` into the `X-Signature` header) so the receiver accepts it.
+
+Self-contained — `httptest`, no real network.
+
+<Lab
+  title="Sign the outbound webhook"
+  archetype="fix-it"
+  difficulty="guided"
+  points={70}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="The deliver function POSTs the webhook body but never signs it, so the verifying receiver rejects every request with 401. Fix it: set the X-Signature header to sign(secret, body) before sending the request. The sign() helper and the receiver are written for you — do not edit main or the receiver. When the signature is correct, the receiver returns 200 and the program prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+)
+
+var secret = []byte("whsec_test")
+
+// sign — the helper you need. HMAC-SHA256 of the raw body, hex-encoded.
+func sign(secret, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// BUG: this POSTs the body but never signs it → the receiver rejects it (401).
+func deliver(url string, body []byte) bool {
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// FIX: sign the payload so the receiver can verify it:
+	// req.Header.Set("X-Signature", sign(secret, body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode/100 == 2
+}
+
+// ── receiver + checks: do not edit. ──
+func main() {
+	recv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		// verify the signature in constant time
+		if !hmac.Equal([]byte(r.Header.Get("X-Signature")), []byte(sign(secret, raw))) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer recv.Close()
+
+	if deliver(recv.URL, []byte(\`{"event":"payment.succeeded"}\`)) {
+		fmt.Println("ALL CHECKS PASS")
+	} else {
+		fmt.Println("FAIL: receiver rejected the webhook (missing/bad signature)")
+	}
+}`}
+  verifier="main POSTs a webhook to a receiver that verifies the HMAC signature and returns 401 for anything unsigned. The flag unlocks when deliver sets X-Signature to sign(secret, body), the receiver returns 200, and the program prints ALL CHECKS PASS."
+  hints={[
+    "The receiver recomputes sign(secret, rawBody) and compares it to the X-Signature header. Your deliver never sets that header, so the comparison fails and you get 401.",
+    "Uncomment the fix: req.Header.Set(\"X-Signature\", sign(secret, body)) — set it before http.DefaultClient.Do(req).",
+    "sign(secret, body) over the SAME bytes you send in the body is what the receiver recomputes. Sign the raw body you POST, not a re-serialized copy.",
+  ]}
+  flag="GO{hmac_sign_every_webhook}"
+>
+
+The receiver verifies `HMAC-SHA256(secret, rawBody)` on every request and 401s anything that doesn't match — so an unsigned POST is rejected. Set `X-Signature` to `sign(secret, body)` before sending, and the receiver accepts it. That one header is what lets a receiver trust a webhook came from you and wasn't tampered with. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- A server **pushes** events two ways: a **WebSocket** (held-open, full-duplex pipe to a client that's online *now* — live feeds, chat, dashboards) and an **outbound webhook** (a fresh, retrying `POST` to another *server's* URL — server-to-server event notifications). Pick WebSocket when a screen needs live updates, webhook when a system needs to be notified.
+- The **WebSocket Hub** is one goroutine owning the client set, `select`ing over **register / unregister / broadcast** — so the set is mutated from one place with **no mutex** (communicate, don't share). Each client has its **own buffered send channel** drained by its own writer goroutine.
+- The broadcast must be a **non-blocking** send (`select { case c.send <- m: default: }`): a slow client's full buffer means the message is **dropped for that client**, never blocking the hub — otherwise one stalled connection freezes everyone.
+- Long-lived connections need **ping/pong** keepalives (detect silently-dead clients) and **write deadlines** (after the upgrade, `net/http`'s `WriteTimeout` is gone — the connection was hijacked), and every exit path must funnel to **unregister** (which closes `send` and ends the writer goroutine) or you leak goroutines.
+- An **outbound webhook** sender is a small reliable-delivery system: **sign** the raw payload (`HMAC-SHA256(secret, body)` → `X-Signature`), **retry** transient failures with **exponential backoff + jitter** (no jitter → thundering herd), and **dead-letter** after exhausting attempts so a down receiver never silently loses events.
+- Delivery is **at-least-once**, never exactly-once (a timed-out `POST` must be retried, risking a duplicate). Send a **stable event id** on every retry of the same event; the **receiver dedups** on it. Generate the id when the event is created, not per attempt.
+- Both producers must survive a **bad consumer** without breaking delivery for the rest: the Hub drops the slow client; the sender retries-then-dead-letters the down receiver.
+
+</Recap>
+
+<Callout kind="note" title="Sources">
+**WebSockets:** RFC 6455 (the WebSocket protocol); `coder/websocket` (context-aware, the chapter's pick) and the older `gorilla/websocket`; the hub pattern is the Go community's canonical chat-server design. **The upgrade/hijack mechanics** are in the **http-servers chapter** (ch19), which builds a single connection — this chapter is the fan-out. **Webhooks:** the **external-payment-systems chapter** (ch9) builds the *inbound* side (verify the HMAC, dedup, replay-protect) — this chapter is the *outbound* sender. **Backoff + jitter** is the time/backoff/jitter appendix; **at-least-once + idempotency** is the idempotency-exactly-once and distributed-systems chapters. Provider specifics (Stripe's signed `timestamp.body`, GitHub's `X-Hub-Signature-256`) follow each provider's documented canonicalization. Every Go snippet here was run and verified.
+</Callout>
+
+<Scoreboard
+  streak={20}
+  items={[
+    { label: "Predict — non-blocking send on a full buffer", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — why per-client send channels", kind: "quiz", points: 10, done: false },
+    { label: "Read — the Hub, line by line", kind: "exercise", points: 15, done: false },
+    { label: "Read — the delivery engine", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Sign the outbound webhook", captured: false, points: 70 }}
+/>
+
+That's the producer side of real-time Go, both halves. You can build a **WebSocket Hub** that fans one event out to thousands of clients without a mutex and without one slow phone freezing the room, and an **outbound webhook** sender that signs every payload, retries through a receiver's bad afternoon, dead-letters what it can't deliver, and leans on the receiver to dedup. Held-open pipe or retrying POST — you now know which one a problem is asking for, and how to build it so a single bad consumer never takes the rest down with it. Go push some events, sport.
+
