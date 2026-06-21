@@ -262,6 +262,139 @@ A path is not one endpoint — it's one endpoint *per method*. The same URL can 
 
 ---
 
+## The Recon Pipeline: `anew`, Liveness & the Outlier Hunt
+
+Watch any experienced hunter do live recon and you'll notice it's not a tool — it's a **Unix pipeline**. Domains flow through a chain of small programs, each doing one thing, joined by `|`, with results appended to flat files you grep later. And here's the part for *this* book: the canonical toolkit for this — `assetfinder`, `httprobe`, `anew`, `fff`, `meg`, `gf`, `waybackurls`, `unfurl` — is almost entirely written in **Go** (mostly by one person, [tomnomnom](https://github.com/tomnomnom)). They're small, fast, composable Go binaries: exactly the philosophy the rest of this course teaches, pointed at recon. Let's build the *mechanism* of the two that change how you work.
+
+### `anew` — the diffing pipeline
+
+The workflow problem: you enumerate subdomains with *several* tools (`assetfinder`, `findomain`, `subfinder`, CT logs) because each finds things the others miss, and you re-run them over time. You don't want to re-process the thousands you already have — you want *only the new ones* each run, so you can pipe just those into the next stage (liveness, fetching). That's **`anew`**: it reads lines, appends only the ones not already in your file, and **prints only what was new**.
+
+<Define term="anew (append-new, the diffing primitive)">
+**`anew`** reads lines from stdin and appends each one to a file **only if that line isn't already in the file** — and crucially, it **prints to stdout only the lines that were new**. It's `tee -a` that de-duplicates and reports the delta. This one behavior is what makes the recon pipeline *incremental*: `assetfinder example.com | anew domains.txt` adds any newly-discovered domains to `domains.txt` and emits just those, so you can chain `| httprobe | anew live.txt` and **only probe the domains you hadn't seen before**. Re-run the same tool an hour later and `anew` emits nothing (everything's known); run a *different* tool and it emits only that tool's unique finds. It turns a pile of overlapping tool outputs into a clean, growing, no-duplicates dataset — and tells you exactly what each run discovered.
+</Define>
+
+It's about fifteen lines of Go, and seeing it makes the whole pipeline click:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// anew: append each incoming line to the known set only if it's new, and return
+// just the new lines — the delta you pipe into the next stage of the pipeline.
+func anew(known map[string]bool, incoming []string) []string {
+	var added []string
+	for _, line := range incoming {
+		line = strings.TrimSpace(line)
+		if line == "" || known[line] {
+			continue // already have it → don't re-emit, don't re-process
+		}
+		known[line] = true
+		added = append(added, line)
+	}
+	return added
+}
+
+func main() {
+	// the running set so far (e.g. from a previous assetfinder run)
+	known := map[string]bool{"shop.example.com": true, "api.example.com": true}
+
+	// a second tool (findomain) reports its finds — only the NEW ones come out
+	fromFindomain := []string{"api.example.com", "staging.example.com", "shop.example.com", "admin.example.com"}
+	fmt.Println("new this run:", anew(known, fromFindomain)) // [staging admin]
+
+	// re-run the same input → nothing new (the pipeline is incremental)
+	fmt.Println("re-run:      ", anew(known, fromFindomain)) // []
+}
+```
+
+</GoPlayground>
+
+<Callout kind="pro" title="The pipeline, end to end">
+The shape of a real subdomain-to-surface run, every stage a small Go tool joined by pipes:
+`assetfinder --subs-only example.com | anew domains.txt | httprobe -c 80 | anew live.txt | fff -d 50 -o out/`
+— enumerate, keep only new domains, probe which are alive (concurrency 80), keep only newly-live hosts, fetch the root page of each into `out/`. Add `findomain example.com | anew domains.txt | …` and you fold a second tool's unique finds into the *same* incremental flow. **`httprobe`** answers "what's actually listening on 80/443?" (a domain in DNS isn't a live web server); a common wrapper prefers the HTTPS result so you don't double-process `http://` and `https://` of the same host. **`fff`** fetches a list of URLs you already have and saves each response's body + headers to disk; **`meg`** is the other side — it sprays *one path* (say `/.git/config`) across *thousands* of hosts at once for content discovery at scale. Reach for `fff` when you have URLs and want their contents; reach for `meg` when you have hosts and want to test one endpoint across all of them.
+</Callout>
+
+### The outlier hunt — find the host that's *different*
+
+Once you've fetched the root of every host, you have a pile of response headers — thousands of them. The naive move is to read them all. The expert move is to **find the host that doesn't look like the others**. Big organizations run configuration management, so their fleet is *consistent* — the same `Server`, the same `X-Powered-By`, the same custom headers everywhere. A host with a header almost nothing else has is a host built **differently** — maybe outside the standard build pipeline, maybe an acquisition, maybe a one-off someone stood up and forgot. That inconsistency is a strong signal: it's where the non-standard, less-reviewed, **more-likely-vulnerable** service lives.
+
+<Define term="The inconsistency heuristic">
+In a large, well-managed target, **consistency is the norm and inconsistency is the lead**. Configuration management and a standard SDLC make most hosts look identical — same headers, same framework fingerprints, same error pages. So instead of auditing every host, you **hunt the outlier**: the host with a response header (or server banner, or error format) that appears on *only one* host out of thousands. That singular host was probably built outside the standard process — a forgotten side project, an acquired company's infra, a quick internal tool — which means it's likely had *less* security review than the flagship app. The technique is mechanical: collect a feature (e.g. every response header name) across all hosts, count occurrences, and surface the ones with a count of **one**. The rare feature points at the interesting host.
+</Define>
+
+The mechanism is a frequency count — surface the headers that appear exactly once:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+)
+
+// rareHeaders surfaces header names that appear on only ONE host — the outlier
+// signal: a host unlike all the others is where the non-standard (and often
+// less-reviewed) service lives.
+func rareHeaders(hostHeaders map[string][]string) []string {
+	count := map[string]int{}    // header name → how many hosts send it
+	where := map[string]string{} // header name → the (last) host that sent it
+	for host, headers := range hostHeaders {
+		for _, h := range headers {
+			count[h]++
+			where[h] = host
+		}
+	}
+	var rare []string
+	for h, n := range count {
+		if n == 1 {
+			rare = append(rare, fmt.Sprintf("%s — only on %s", h, where[h]))
+		}
+	}
+	sort.Strings(rare)
+	return rare
+}
+
+func main() {
+	// the fleet is consistent (Server, CF-Ray, X-Shop-Id everywhere) — except one.
+	hosts := map[string][]string{
+		"www.example.com":  {"Server", "CF-Ray", "X-Shop-Id"},
+		"api.example.com":  {"Server", "CF-Ray", "X-Shop-Id"},
+		"cdn.example.com":  {"Server", "CF-Ray", "X-Shop-Id"},
+		"docs.example.com": {"Server", "Server-Timing", "X-Powered-By"}, // the odd one out
+	}
+	for _, line := range rareHeaders(hosts) {
+		fmt.Println("outlier:", line)
+	}
+}
+```
+
+</GoPlayground>
+
+<Gotcha>
+**Recon is a search for signal in noise, and the signal is usually the exception, not the rule.** Don't try to read every header, every host, every endpoint — you'll drown. Build mechanical filters that surface what *stands out*: the header on one host, the subdomain that doesn't match the naming convention, the JS file that's different from its siblings, the endpoint that responds when its neighbors `404`. The same `anew` trick that dedupes domains also diffs *anything* line-based (sort a feature, find the singletons). The hunter's edge isn't running more tools — it's the filters and the instinct for "that one's not like the others," because the inconsistent thing was built outside the process that secured everything else.
+</Gotcha>
+
+### Going back in time, and into the source
+
+Two more high-yield sources the pipeline feeds:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Old JavaScript via the Wayback Machine">`waybackurls` / `gau` pull every URL the archive has ever seen for a domain — including **historical versions** of JS bundles. An old `site.js` from 2018 often references **API endpoints that were removed from the current app but are still live on the server** (and unmonitored). Filter the archive output to `.js`, fetch the old versions (`fff`, 200-only), and grep them for endpoints and keys. Removed-in-the-UI ≠ removed-on-the-server.</ConceptCard>
+  <ConceptCard label="GitHub history via `git dump`">Find repos that mention the target, clone them, and run a **`git dump`** (extract every object in `.git` to plain files — *every file that ever existed in the history*, not just the current tree). A secret or internal URL deleted in a later commit is still sitting in an old object. Grep the dumped history for in-scope URLs (filter with an `inscope` tool) and credentials. The current `HEAD` is the tip of an iceberg; the history is the rest.</ConceptCard>
+</ConceptGrid>
+
+---
+
 ## Mining JavaScript
 
 The richest source of *hidden* surface is the target's own JavaScript. Modern single-page apps ship their entire API map, route table, feature flags, and — too often — secrets in the JS bundle. Hunters download every `.js`, then grep it for endpoints and keys. A route that exists only in client code is surface the docs and the sitemap will never show.
