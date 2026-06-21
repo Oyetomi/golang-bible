@@ -577,6 +577,156 @@ Supply a path to a file server and watch a **vulnerable** (string-check) server 
   flag="GO{os_root_confines_the_open}"
 />
 
+### XXE — and why Go's stdlib is mostly immune
+
+<Define term="XXE (XML External Entity injection)">
+**XXE** abuses a feature of XML: a document can declare **entities** in its `DOCTYPE`, and an *external* entity (`<!ENTITY xxe SYSTEM "file:///etc/passwd">`) tells the parser to fetch and inline an external resource. On a parser that resolves external entities, referencing `&xxe;` in the body makes the parser **read a local file** (arbitrary file disclosure), **make a request to an internal URL** (SSRF), or expand entities recursively until memory is exhausted (the "billion laughs" denial-of-service). XXE is a classic high-severity bug in XML-heavy ecosystems (Java, .NET) where parsers historically resolved external entities by default.
+</Define>
+
+Here's the good news for Go: **the standard library's `encoding/xml` does not resolve external entities at all.** It doesn't fetch external DTDs, and an undefined entity reference is simply an error. The classic file-read payload doesn't leak anything — it fails to parse. Watch:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/xml"
+	"fmt"
+	"strings"
+)
+
+type Order struct {
+	Item string `xml:"item"`
+}
+
+func main() {
+	// Classic XXE: declare an external entity that reads a local file, then
+	// reference &xxe; in the body. On a vulnerable parser this leaks the file.
+	payload := `<?xml version="1.0"?>
+<!DOCTYPE order [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+<order><item>&xxe;</item></order>`
+
+	var o Order
+	err := xml.Unmarshal([]byte(payload), &o)
+	fmt.Printf("err:   %v\n", err)        // encoding/xml refuses the entity
+	fmt.Printf("item:  %q\n", o.Item)      // empty — nothing leaked
+	fmt.Printf("leaked file? %v\n", strings.Contains(o.Item, "root:"))
+}
+```
+
+</GoPlayground>
+
+<Gotcha>
+**Go's `encoding/xml` is near-immune to XXE — but "near" is doing work, so don't get complacent.** The stdlib never resolves external entities (`&xxe;` is an undefined-entity *error*, not a file read) and never fetches external DTDs, so the classic file-disclosure/SSRF payloads simply fail to parse. The risks that remain: **(1)** third-party XML libraries (some C-binding parsers like libxml2 wrappers *do* resolve entities — check the library, not just "Go"); **(2)** if you hand-roll entity expansion or pass XML to an external tool/parser, you reintroduce the danger; and **(3)** internal entity expansion can still be a DoS vector if you accept untrusted XML at scale. The defense is the same baseline rule: prefer the stdlib parser, treat XML input as hostile, and if you must use a third-party parser, explicitly disable external entities and DTD fetching. When you can, prefer JSON — fewer footguns.
+</Gotcha>
+
+### NoSQL injection — operators where you expected a string
+
+SQL isn't the only query language you can inject into. Document databases (MongoDB and friends) take **query objects**, and if user input flows into that object as *structure* rather than a *value*, an attacker can smuggle in a **query operator** — bypassing authentication without ever knowing a password.
+
+<Define term="NoSQL injection (operator injection)">
+**NoSQL injection** abuses the fact that a document-database query is itself a **structured object**, where keys like `$ne`, `$gt`, `$where`, or `$regex` are *operators*. A login that builds its filter from user input — `{username: <input>, password: <input>}` — is safe only if each input is a plain **value**. But if the client can supply an **object** where a string was expected — e.g. JSON `{"username":"admin","password":{"$ne":null}}` — the `password` field becomes the operator `$ne: null` ("password is not null"), which matches the admin's real password and **logs the attacker in without it**. The root cause in Go is **decoding untrusted input into a free-form type** (`map[string]any` / `bson.M`) that can hold an operator object; the fix is to decode into a **typed struct** whose fields are plain strings, so an operator object can't fit and the request is rejected before it ever reaches the database.
+</Define>
+
+<CodeWalk
+  title="NoSQL auth bypass — and the typed-struct fix"
+  steps={[
+    { lines: "16-37", note: "VULNERABLE: decode the login body into a free-form map[string]any. The password field can therefore hold an OBJECT — and the {\"$ne\": null} operator is honored as 'password != null', which matches the admin and returns true with no password.", pose: "scribe", role: "hacker", state: "warn", beat: "problem" },
+    { lines: "41-56", note: "SAFE: decode into a typed struct whose Password is a string. The {\"$ne\":null} object can't unmarshal into a string — json.Unmarshal errors, and the login is rejected before any query runs. An operator literally cannot enter where a string is expected.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "59-67", note: "The verdict: VULN with the operator payload returns true (bypass). SAFE rejects the same payload (false), accepts the correct password (true), and rejects a wrong one (false). Same inputs — the typed boundary is the whole difference.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="The bug is decoding untrusted JSON into a shape that can hold an operator (map[string]any / bson.M). Decode into a typed struct and the operator object can't fit a string field — the injection is rejected at the boundary, before the database."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// A toy document auth check: it matches if the filter's fields equal the user's
+// values — UNLESS a field is an operator object like {"$ne": null}, which a
+// document database interprets as a query operator ("not equal to null").
+type user struct{ Username, Password string }
+
+var db = []user{{"admin", "s3cret-admin-pw"}}
+
+// VULNERABLE: decode untrusted login JSON into a free-form map. An operator
+// object slips into the filter and is honored as a query operator.
+func loginVuln(body []byte) bool {
+	var filter map[string]any
+	json.Unmarshal(body, &filter)
+	for _, u := range db {
+		if uname, _ := filter["username"].(string); uname != u.Username {
+			continue
+		}
+		switch pw := filter["password"].(type) {
+		case string:
+			if pw == u.Password {
+				return true
+			}
+		case map[string]any:
+			if _, ok := pw["$ne"]; ok { // {"$ne": null} → "password != null"
+				return true // bypass — matched without knowing the password
+			}
+		}
+	}
+	return false
+}
+
+// SAFE: decode into a TYPED struct. Password is a string, so an operator object
+// can't unmarshal into it — the request is rejected before any query.
+type creds struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func loginSafe(body []byte) bool {
+	var c creds
+	if err := json.Unmarshal(body, &c); err != nil {
+		return false // {"$ne":null} is an object, not a string → error
+	}
+	for _, u := range db {
+		if c.Username == u.Username && c.Password == u.Password {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	inject := []byte(`{"username":"admin","password":{"$ne":null}}`)
+	good := []byte(`{"username":"admin","password":"s3cret-admin-pw"}`)
+	wrong := []byte(`{"username":"admin","password":"guess"}`)
+
+	fmt.Println("VULN inject (bypass):", loginVuln(inject)) // true — bypass
+	fmt.Println("SAFE inject (bypass):", loginSafe(inject)) // false — rejected
+	fmt.Println("SAFE correct pw:     ", loginSafe(good))   // true
+	fmt.Println("SAFE wrong pw:       ", loginSafe(wrong))  // false
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<QuickCheck
+  question={'In Go, what makes a MongoDB login resistant to the {"$ne": null} operator-injection bypass?'}
+  options={[
+    "Using bson.M to build the filter from the decoded request",
+    "Decoding the request into a typed struct with string fields, so an operator object can't fit",
+    "Escaping the dollar sign in the password",
+    "Adding a rate limiter"
+  ]}
+  answer={1}
+  explain={'The bypass works only if user input can become an operator OBJECT in the query. Decode into a typed struct whose Password is a string and {"$ne":null} fails to unmarshal — the request is rejected before it reaches the database. Building the filter from a free-form map[string]any/bson.M is exactly what lets the operator through; the typed boundary is the fix (and never pass raw user maps into a query).'}
+/>
+
 ## SSRF
 
 <Define term="SSRF (Server-Side Request Forgery)">
