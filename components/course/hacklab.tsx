@@ -19,7 +19,7 @@ type Tab = "goal" | "lab" | "exploit" | "report";
 type HackLabProps = {
   title: string;
   category?: string; // "Server-Side" | "Client-Side"
-  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz" | "cors";
+  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz" | "cors" | "traversal";
   flag?: string;
 };
 
@@ -739,6 +739,134 @@ function CorsLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) =
   );
 }
 
+/* ════════════════════════════════════════════
+   Path-traversal engine — a modeled filesystem.
+   The web root holds public files; a symlink
+   inside it points OUT to a secret dir. Pick a
+   server policy (lexical Clean+HasPrefix vs
+   os.Root) and a request path; see what each
+   serves. The string check leaks via the symlink;
+   os.Root confines every open.
+   ════════════════════════════════════════════ */
+const TRAV_FS: Record<string, string> = {
+  "/web/index.html": "PUBLIC PAGE",
+  "/web/app.js": "console.log('hi')",
+  "/secret/passwd": "root:x:0:0:TOP SECRET",
+  "/secret/.env": "DB_PASSWORD=hunter2",
+};
+// "link" inside /web points OUT to /secret (a planted symlink).
+const TRAV_SYMLINK = { from: "/web/link", to: "/secret" };
+const TRAV_ROOT = "/web";
+
+function cleanPath(p: string): string {
+  // minimal lexical clean: resolve . and .. segments
+  const segs = (TRAV_ROOT + "/" + p).split("/");
+  const out: string[] = [];
+  for (const s of segs) {
+    if (s === "" || s === ".") continue;
+    if (s === "..") out.pop();
+    else out.push(s);
+  }
+  return "/" + out.join("/");
+}
+
+function resolveSymlink(path: string): string {
+  if (path === TRAV_SYMLINK.from || path.startsWith(TRAV_SYMLINK.from + "/")) {
+    return TRAV_SYMLINK.to + path.slice(TRAV_SYMLINK.from.length);
+  }
+  return path;
+}
+
+function TraversalLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  const [policy, setPolicy] = useState<"lexical" | "osroot">("lexical");
+  const [path, setPath] = useState("../secret/passwd");
+  const [res, setRes] = useState<null | { served: string | null; reason: string; leaked: boolean }>(null);
+
+  const send = () => {
+    const cleaned = cleanPath(path);
+    let served: string | null = null;
+    let reason = "";
+    let leaked = false;
+
+    if (policy === "lexical") {
+      // Clean + HasPrefix: lexical check on the cleaned STRING, then open
+      // (following symlinks). Passes if the cleaned path is under /web.
+      if (!cleaned.startsWith(TRAV_ROOT + "/") && cleaned !== TRAV_ROOT) {
+        reason = "403 — cleaned path escapes root (lexical check caught ../)";
+      } else {
+        const real = resolveSymlink(cleaned); // the OS follows the symlink
+        served = TRAV_FS[real] ?? null;
+        if (served === null) reason = "404 — no such file";
+        else {
+          leaked = !real.startsWith(TRAV_ROOT + "/"); // physically outside root
+          reason = leaked
+            ? "200 — served, but the symlink escaped to " + real + " (LEAK)"
+            : "200 — served (inside root)";
+        }
+      }
+    } else {
+      // os.Root: confinement enforced at open time, symlinks resolved + checked.
+      const real = resolveSymlink(cleaned);
+      if (!cleaned.startsWith(TRAV_ROOT + "/") && cleaned !== TRAV_ROOT) {
+        reason = "error — path escapes from parent (os.Root blocked ../)";
+      } else if (!real.startsWith(TRAV_ROOT + "/")) {
+        reason = "error — path escapes from parent (os.Root resolved the symlink)";
+      } else {
+        served = TRAV_FS[real] ?? null;
+        reason = served === null ? "404 — no such file" : "200 — served (confined to root)";
+      }
+    }
+
+    setRes({ served, reason, leaked });
+    if (policy === "lexical" && leaked) onSolve(true);
+  };
+
+  return (
+    <div className="hl-trav">
+      <p className="hl-note">
+        File server rooted at <code>{TRAV_ROOT}</code>. A symlink <code>/web/link → /secret</code> sits
+        inside the root. Request a path and see what each policy serves. Try
+        <code>../secret/passwd</code>, then the symlink trick <code>link/passwd</code>.
+      </p>
+      <div className="hl-modeswitch">
+        <button className={policy === "lexical" ? "on" : ""} onClick={() => { setPolicy("lexical"); setRes(null); }}>Vulnerable (Clean + HasPrefix)</button>
+        <button className={policy === "osroot" ? "on" : ""} onClick={() => { setPolicy("osroot"); setRes(null); }}>Safe (os.Root)</button>
+      </div>
+      <label className="hl-flabel">GET path
+        <input className="hl-input hl-wide" value={path} onChange={(e) => { setPath(e.target.value); setRes(null); }} aria-label="request path" />
+      </label>
+      <p className="hl-note" style={{ fontSize: 12 }}>
+        Public: <code>index.html</code>, <code>app.js</code>. Secret (outside root): <code>passwd</code>, <code>.env</code>.
+      </p>
+      <button className="hl-send" onClick={send}>Request file</button>
+
+      {res && (
+        <>
+          <div className="hl-query">
+            <span className="hl-query-h">Server response:</span>
+            <code>{res.reason}{res.served !== null ? "\n\n" + res.served : ""}</code>
+          </div>
+          <div className={`hl-result ${res.leaked ? "bad" : res.served && res.reason.includes("inside root") || res.reason.includes("confined") ? "good" : "good"}`}>
+            {res.leaked
+              ? "Secret file served from OUTSIDE the root — path traversal succeeded."
+              : res.reason.startsWith("error") || res.reason.startsWith("403")
+                ? "Blocked — the request never escaped the root."
+                : "Served a legitimate in-root file."}
+          </div>
+        </>
+      )}
+
+      <div className="hl-status">
+        {solved ? (
+          <span className="hl-ok">✓ Path traversal demonstrated: under the lexical Clean+HasPrefix policy, the request resolved through the planted symlink to a file OUTSIDE the web root — the string check passed because the cleaned path still started with /web, but the OS followed the link out. Switch to os.Root: the same request errors with &quot;path escapes from parent,&quot; because confinement is enforced at open time, symlinks included.</span>
+        ) : (
+          <span className="hl-todo">In Vulnerable mode, get a secret file served from outside the root. Hint: <code>../secret/passwd</code> is caught lexically — but <code>link/passwd</code> rides the symlink past the string check.</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ── scenario registry ─────────────────────── */
 type Scenario = {
   goal: ReactNode;
@@ -1046,6 +1174,38 @@ const SCENARIOS: Record<HackLabProps["mode"], Scenario> = {
         summary="A CORS misconfiguration reflects the request Origin into Access-Control-Allow-Origin while allowing credentials, letting any origin read authenticated responses cross-origin."
         steps={['Send a request with an arbitrary Origin header (e.g. https://evil.com).', "Observe the Origin is reflected into Access-Control-Allow-Origin with Allow-Credentials: true.", "Host a page on that origin that fetches the API with credentials and reads the response."]}
         impact={<>Any website can read a logged-in user's authenticated data (the Zoho-ATO linchpin). Fix: exact-match origin allowlist, never reflect the Origin, never pair credentials with a wildcard.</>}
+      />
+    ),
+  },
+  traversal: {
+    goal: (
+      <Goal
+        what="Path traversal lets an attacker read files OUTSIDE the intended directory by supplying ../ (or riding a symlink) in a file path. A lexical Clean + HasPrefix check stops literal ../ but is fooled by a symlink inside the root pointing out — the string passes, the OS follows the link."
+        example={<>A file server rooted at <code>/web</code> with a symlink <code>/web/link → /secret</code>. Requesting <code>link/passwd</code> cleans to <code>/web/link/passwd</code> (starts with /web → passes), then the OS reads <code>/secret/passwd</code>.</>}
+        mission={[
+          "In the Lab tab (Vulnerable / Clean+HasPrefix), request ../secret/passwd and watch the lexical check catch it.",
+          "Then request link/passwd — the symlink rides past the string check and leaks the secret.",
+          "Switch to the os.Root policy and watch the same request get blocked at open time.",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <TraversalLab key="traversal" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="The vulnerable server validates the cleaned path STRING (Clean + HasPrefix), then opens the file — following symlinks. A link planted inside the root pointing outside it passes the string check and leaks files from anywhere on disk."
+        steps={[
+          <>Literal traversal <code>../secret/passwd</code> cleans to <code>/secret/passwd</code> — fails HasPrefix, blocked. The lexical check works for this.</>,
+          <>But <code>link/passwd</code> cleans to <code>/web/link/passwd</code> — it starts with <code>/web</code>, so HasPrefix PASSES.</>,
+          <>The OS then follows <code>/web/link</code> out to <code>/secret</code> and serves <code>/secret/passwd</code> — the secret leaks.</>,
+        ]}
+        bonus={<>The fix is <code>os.Root</code> (Go 1.24): open the directory once into a confined handle and every <code>Open</code> is enforced by the OS to stay inside it — resolving symlinks and rejecting escapes. No string comparison, no TOCTOU gap.</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="A path-traversal vulnerability: the file server's lexical Clean + HasPrefix containment check is bypassed by a symlink inside the web root that points outside it, leaking arbitrary files."
+        steps={["Identify a file-serving endpoint that takes a user-supplied path.", "Confirm literal ../ is blocked by the containment check.", "Find or plant a symlink inside the root and request a path through it (e.g. link/passwd) to read files outside the root."]}
+        impact={<>Arbitrary file read outside the intended directory (secrets, /etc/passwd, .env). Fix: serve through os.Root (Go 1.24), which confines every open at the OS level and resolves symlinks safely — never a lexical string check alone.</>}
       />
     ),
   },

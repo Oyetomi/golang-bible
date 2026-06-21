@@ -420,6 +420,163 @@ Step 3 is the critical one. `filepath.Join("/data/receipts", "../../etc/passwd")
   explain="Without the trailing slash, a HasPrefix check against /data/receipts would also match /data/receipts-other/, allowing traversal into a sibling directory. Appending the separator enforces that the clean path is inside the directory, not merely a sibling that shares a prefix."
 />
 
+#### Why `Clean` + `HasPrefix` is not the end of the story
+
+The `Join` + `Clean` + `HasPrefix` idiom stops the *lexical* attack — literal `../` in the input. But it is a **string check on the path text**, and the filesystem does things the string can't see. The biggest blind spot is **symlinks**: if an attacker (or a careless deploy) can place a symbolic link *inside* your root that points *outside* it, the cleaned path `/data/receipts/link/passwd` still starts with `/data/receipts/` — it passes `HasPrefix` — and then the OS happily follows the link out to `/etc/passwd`. The check looked at the path; the kernel followed the link. (Case-insensitive filesystems and Unicode normalization can bite the same way: the bytes you compared aren't the bytes the OS resolves.)
+
+<Gotcha>
+**`filepath.Clean` + `HasPrefix` is a *lexical* defense, and the filesystem is not lexical.** It correctly rejects literal `../` traversal, so it's far better than nothing — but it validates the path *string*, then opens the file in a separate step, and a symlink inside the root subverts everything in between (a TOCTOU-flavored gap). The robust, Go-native fix is **`os.Root`** (Go 1.24): you open the directory *once* into a confined handle, and every `Open`/`Create`/`Stat` on that handle is enforced **by the OS** to stay inside it — traversal *and* symlink escapes return an error, no string comparison required. Use `os.Root` whenever you open user-named files; keep `Clean`+`HasPrefix` only as a portable fallback on toolchains older than 1.24.
+</Gotcha>
+
+#### The robust fix: `os.Root` (Go 1.24)
+
+`os.OpenRoot(dir)` returns an `*os.Root` — a directory handle that **confines** every subsequent file operation to that directory tree. The confinement is enforced at the system-call level (`openat2` with `RESOLVE_BENEATH` on Linux), so it sees through `../`, absolute paths, *and* symlinks that a string check cannot. Watch the difference on the exact attack the string check misses — a symlink planted inside the root:
+
+<CodeWalk
+  title="Symlink escape: the string check leaks, os.Root blocks"
+  steps={[
+    { lines: "13-19", note: "openOld is the textbook Clean + HasPrefix check — purely lexical. It compares the cleaned path STRING against the root, then opens the file in a separate step.", pose: "scribe", role: "scribe", state: "active", beat: "neutral" },
+    { lines: "24-33", note: "openRoot uses os.OpenRoot to get a confined handle, then r.Open(name). Every open through r is OS-enforced to stay inside root — it resolves symlinks and rejects any that escape.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "48-48", note: "The setup plants a symlink 'link' INSIDE web/ pointing OUT to the secret dir — a real-world misconfig (an unpacked archive, a shared upload dir, a careless admin).", pose: "scribe", role: "hacker", state: "warn", beat: "problem" },
+    { lines: "50-53", note: "The verdict. For 'link/passwd' the cleaned path is /web/link/passwd — it starts with the root, so Clean+HasPrefix PASSES and leaks TOP SECRET through the symlink. os.Root resolves the link, sees it escapes, and errors. Same input, one leaks, one holds.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="The lexical check passes a path that physically escapes via a symlink; os.Root enforces containment at the OS level and blocks it. This is why os.Root — not a string comparison — is the modern Go answer to path traversal."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// Clean+HasPrefix is LEXICAL: it checks the path string, not what the OS does
+// when it follows a symlink. A link inside root pointing out passes the check.
+func openOld(root, name string) (string, error) {
+	clean := filepath.Clean(filepath.Join(root, name))
+	if !strings.HasPrefix(clean, root+string(filepath.Separator)) {
+		return "", errors.New("403: escapes root")
+	}
+	b, err := os.ReadFile(clean)
+	return strings.TrimSpace(string(b)), err
+}
+
+// os.Root (Go 1.24) confines every Open to the directory at the OS level and
+// resolves symlinks safely — an escaping path errors.
+func openRoot(root, name string) (string, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	f, err := r.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	buf := make([]byte, 64)
+	n, _ := f.Read(buf)
+	return strings.TrimSpace(string(buf[:n])), nil
+}
+
+func main() {
+	base, _ := os.MkdirTemp("", "demo")
+	root := filepath.Join(base, "web")
+	secret := filepath.Join(base, "secret")
+	os.MkdirAll(root, 0o755)
+	os.MkdirAll(secret, 0o755)
+	os.WriteFile(filepath.Join(root, "index.html"), []byte("PUBLIC PAGE"), 0o644)
+	os.WriteFile(filepath.Join(secret, "passwd"), []byte("TOP SECRET"), 0o644)
+	os.Symlink(secret, filepath.Join(root, "link")) // link inside web/ → out to secret/
+
+	o, _ := openOld(root, "link/passwd")
+	r, er := openRoot(root, "link/passwd")
+	fmt.Printf("Clean+HasPrefix → %q  <- LEAKED via symlink\n", o)
+	fmt.Printf("os.Root         → %q (blocked: %v)\n", r, er != nil)
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+For an HTTP file server, the same idea applies: don't hand-roll `os.Open` on a user path — serve from an `os.Root`, or use `http.FileServerFS(os.DirFS(dir))` / `http.FileServer(http.Dir(dir))`, which normalize and confine for you. The **file-servers chapter** covers the serving side; the rule there and here is identical — never let a user-supplied name reach a bare `os.Open`.
+
+#### Zip Slip: the same bug, hiding in archive extraction
+
+Path traversal isn't only about *reading* files from a request — it bites just as hard when you **extract an archive** (zip, tar) whose *entry names* you don't control. An entry named `../../etc/cron.d/evil` written by a naive extractor lands **outside** your extraction directory — overwriting system files or planting a payload. This class has a name, **Zip Slip**, and a long CVE trail across languages. The fix is exactly the same as above: validate each entry, or — cleaner — extract through an `os.Root` so an escaping entry simply errors.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// A malicious archive's entry names — one tries to escape with ../.
+var entries = []struct{ name, body string }{
+	{"readme.txt", "hello"},
+	{"../escaped.txt", "PWNED"}, // Zip Slip
+}
+
+func main() {
+	base, _ := os.MkdirTemp("", "zs")
+
+	// NAIVE: filepath.Join(dest, entryName) + write. The ../ escapes dest.
+	naive := filepath.Join(base, "naive")
+	os.MkdirAll(naive, 0o755)
+	for _, e := range entries {
+		t := filepath.Join(naive, e.name)
+		os.MkdirAll(filepath.Dir(t), 0o755)
+		os.WriteFile(t, []byte(e.body), 0o644)
+	}
+	_, err := os.Stat(filepath.Join(base, "escaped.txt")) // sibling of naive/ — OUTSIDE
+	fmt.Println("NAIVE: malicious file written outside dest?", err == nil)
+
+	// SAFE: extract through os.Root — every Create is confined to dest.
+	safe := filepath.Join(base, "safe")
+	os.MkdirAll(safe, 0o755)
+	r, _ := os.OpenRoot(safe)
+	defer r.Close()
+	for _, e := range entries {
+		f, err := r.Create(e.name)
+		if err != nil {
+			fmt.Printf("SAFE (os.Root): blocked entry %q\n", e.name)
+			continue
+		}
+		f.WriteString(e.body)
+		f.Close()
+	}
+}
+```
+
+</GoPlayground>
+
+<Gotcha>
+**Never trust an archive entry name — it's attacker-controlled input, exactly like a URL path.** A naive `filepath.Join(dest, entry.Name)` extractor is a Zip Slip waiting to happen: `../` (or an absolute path, or a symlink entry) escapes `dest` and writes wherever the attacker points. Extract through an **`os.Root`** (`r.Create(entry.Name)` errors on any escape), or if you must validate by hand, reject entries whose cleaned `Join(dest, name)` doesn't stay under `dest` *and* reject symlink/absolute entries outright. The same `os.Root` that hardens file *reads* hardens archive *writes*.
+</Gotcha>
+
+### Try it: a path-traversal lab
+
+Supply a path to a file server and watch a **vulnerable** (string-check) server and a **safe** (`os.Root`) server resolve it differently — including the symlink trick that defeats the lexical check. (In-browser; the filesystem is modeled.)
+
+<HackLab
+  title="Path Traversal Lab"
+  category="Server-Side"
+  mode="traversal"
+  flag="GO{os_root_confines_the_open}"
+/>
+
 ## SSRF
 
 <Define term="SSRF (Server-Side Request Forgery)">
