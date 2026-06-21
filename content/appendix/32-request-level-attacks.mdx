@@ -1,0 +1,444 @@
+---
+title: "Request-Level Attacks: Smuggling, Host Header & Cache Poisoning"
+part: "appendix"
+order: 32
+type: "course"
+description: "The PortSwigger-class attacks that exploit how proxies, caches, and origin servers DISAGREE about a single HTTP request — explained from the bytes up, Go-grounded. HTTP request smuggling (CL.TE / TE.CL desync, and an empirical look at how strictly Go's net/http parses ambiguous Content-Length / Transfer-Encoding so a Go origin doesn't disagree with itself); Host header attacks (password-reset poisoning, routing and cache off a forgeable r.Host, with the allowlist/configured-base-URL fix); and web cache poisoning (reflecting an unkeyed input like X-Forwarded-Host into a cached response that's then served to every victim). Every server-side behavior runnable and verified."
+prerequisites: ["application-security-baseline"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Web Security Academy" title="Request-Level Attacks: Smuggling, Host Header & Cache Poisoning">
+
+Here's the thing, sport. Most vulnerabilities live *inside* a request — a bad parameter, a missing check. This chapter is about a stranger class: bugs that live in the **request itself**, in how the machines along its path *disagree* about what it even is. A modern web request passes through a chain — CDN, load balancer, reverse proxy, your Go server — and each one re-parses it. When two of them read the **same bytes differently**, an attacker slips into the gap. That's the whole family: **request smuggling** (the front-end and back-end disagree where one request *ends* and the next begins), **Host header attacks** (your server trusts a header the client controls to decide *who it is*), and **web cache poisoning** (a shared cache stores one attacker's poisoned response and serves it to *everyone*).
+
+These are PortSwigger Web Security Academy signature topics, and they reward understanding HTTP at the byte level — which is exactly where Go is interesting. We'll *empirically* test how strictly Go's `net/http` parses ambiguous `Content-Length`/`Transfer-Encoding` (the answer is reassuring, and precise), then build the Host-header and cache-poisoning bugs and their fixes, every server-side behavior runnable and verified. By the end you'll see a request not as a blob but as bytes that several machines must agree on — and you'll know where they stop agreeing. Let's get into the gaps, sport.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Disagreement", "Request Smuggling", "Why Go Resists It", "Host Header Attacks", "Web Cache Poisoning", "Defenses"]} />
+
+<SpacedRecall
+  role={"detective"}
+  items={[
+    {
+      from: "HTTP servers (part 1, ch19)",
+      q: "A Go handler reads the request's Host with…?",
+      options: ["r.URL.Host", "r.Host", "r.Header.Get(\"Server\")", "r.RemoteAddr"],
+      answer: 1,
+      tie: "Host header attacks abuse exactly this value. r.Host is set from the client's Host header (or HTTP/2 :authority) — forgeable — so anything you build from it (reset links, cache keys, routing) is attacker-influenced until you validate it."
+    },
+    {
+      from: "CORS (appendix)",
+      q: "When a response varies by a request header, caches must be told with…?",
+      options: ["Cache-Control: no-store", "Vary: <header>", "ETag", "Set-Cookie"],
+      answer: 1,
+      tie: "Web cache poisoning is the dark side of caching headers: if a response reflects an input the cache DOESN'T include in its key, one poisoned response gets served to everyone. Vary (and careful cache keys) is part of the defense."
+    },
+    {
+      from: "Application security baseline (part 2, ch14)",
+      q: "The safe default for any client-supplied input is to treat it as…?",
+      options: ["trusted", "hostile until validated", "empty", "already escaped"],
+      answer: 1,
+      tie: "Every attack here is one input trusted too far: the request's framing headers, the Host header, an X-Forwarded-Host. Same baseline rule — validate against an allowlist, never reflect the raw value."
+    }
+  ]}
+/>
+
+## The Disagreement
+
+Every attack in this chapter has the same shape: **two machines parse one request differently.** Name that shape and the whole family clicks into place.
+
+<Define term="Parser disagreement (the request-level bug pattern)">
+A request travels through a **chain** of HTTP intermediaries — CDN, load balancer, reverse proxy, application server — and **each one re-parses the raw bytes**. They're *supposed* to agree, because they all implement the same HTTP spec. A **request-level attack** exploits a case where two of them **disagree**: they read the same bytes and reach different conclusions about where a request ends (**smuggling**), which site it's for (**Host header**), or what may be cached and reused (**cache poisoning**). The attacker crafts bytes that are *ambiguous* — valid to read one way by the front-end and another way by the back-end — and lives in the gap. The defense theme is equally consistent: **eliminate the ambiguity** (strict, identical parsing everywhere) and **never trust a request-controlled value** (framing headers, `Host`, forwarded headers) for a security decision without validating it.
+</Define>
+
+<Scene
+  title="One request, a chain of parsers — and a gap"
+  actors={[
+    { id: "atk", label: "attacker", role: "thief" },
+    { id: "chain", label: "proxy → Go origin", role: "operator" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "A request passes through a front-end (CDN/proxy) and a back-end (your Go server). Normally both agree on exactly what it is.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "request bytes" }, { id: "A2", state: "idle", label: "front-end parses" }, { id: "A3", state: "idle", label: "back-end parses" }
+      ]
+    },
+    {
+      caption: "The attacker sends AMBIGUOUS bytes — e.g. both a Content-Length and a Transfer-Encoding. The front-end honors one; the back-end honors the other.",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "bad", label: "CL says 6 bytes" }, { id: "B2", state: "warn", label: "front-end: uses CL" }, { id: "B3", state: "bad", label: "back-end: uses TE" }
+      ]
+    },
+    {
+      caption: "Now they disagree where the request ends. Leftover bytes get prepended to the NEXT victim's request — that's smuggling. The same disagreement principle drives host-header and cache bugs.",
+      beat: "problem",
+      cells: [
+        { id: "C1", state: "bad", label: "leftover bytes" }, { id: "C2", state: "bad", label: "→ prepend to victim" }, { id: "C3", state: "bad", label: "desync / poison" }
+      ]
+    }
+  ]}
+  caption="The bug isn't in one machine — it's in the disagreement between two. Craft bytes that parse two ways, and the gap between the parsers becomes the exploit."
+/>
+
+---
+
+## Request Smuggling
+
+The canonical disagreement is over a request's **length**. HTTP/1.1 gives two ways to say how long a body is — `Content-Length` (a byte count) and `Transfer-Encoding: chunked` (length-prefixed chunks). Send *both*, contradictorily, and you've handed the front-end and back-end a choice to disagree on.
+
+<Define term="HTTP request smuggling (CL.TE / TE.CL)">
+**HTTP request smuggling** desynchronizes a front-end proxy and a back-end server by making them disagree about where one request ends and the next begins. The body length of an HTTP/1.1 request can be declared by **`Content-Length`** (CL) or **`Transfer-Encoding: chunked`** (TE). If a request includes **both**, the two servers may resolve the conflict differently: in **CL.TE**, the front-end uses Content-Length while the back-end uses Transfer-Encoding; in **TE.CL**, the reverse. Either way, one server thinks the request ended where the other thinks it's still going — so bytes the attacker placed after the "end" get **prepended to the next request** on that shared connection. That smuggled prefix can poison another user's request: stealing their session, bypassing front-end security rules, or routing them to attacker content. The root cause is *ambiguous framing tolerated by at least one parser*; the cure is for every hop to parse identically and **reject** ambiguity rather than guess.
+</Define>
+
+<Callout kind="warn" title="Why this is a desync, not a single-server bug">
+Smuggling needs **two** parsers and a **reused** connection. Front-ends keep a pool of keep-alive connections to the back-end and pipeline many users' requests over them. If the front-end forwards what it thinks is one complete request but the back-end thinks the request ended earlier, the attacker's leftover bytes sit at the *front* of the buffer — and the **next** request to arrive (a real victim's) gets those bytes glued onto it. That's why the victim, not the attacker, is the one whose request is corrupted. A single server parsing consistently can't smuggle against itself; the bug is born in the gap between the front-end and the back-end.
+</Callout>
+
+---
+
+## Why Go Resists It
+
+So where does a Go server sit in this? The reassuring, *precise* answer: Go's `net/http` is strict and deterministic about ambiguous framing — which means a Go **origin** doesn't disagree with itself, and is a hard back-end to desync. Don't take my word for it — let's send raw ambiguous requests down a TCP socket to a real Go server and watch how it responds.
+
+<CodeWalk
+  title="How strictly does Go's net/http parse ambiguous framing? (measured)"
+  steps={[
+    { lines: "13-16", note: "A plain Go origin server. We'll bypass http.Client and speak raw HTTP/1.1 over a TCP socket so we can send deliberately ambiguous requests a normal client would never produce.", pose: "scribe", role: "operator", state: "active", beat: "neutral" },
+    { lines: "19-27", note: "send dials the server, writes raw request bytes, and reads back just the status line — so we can see exactly how Go judged each ambiguous request.", pose: "run", role: "operator", state: "active", beat: "neutral" },
+    { lines: "31-32", note: "Content-Length AND Transfer-Encoding together. Per RFC 7230, when both are present Go uses Transfer-Encoding and IGNORES Content-Length — it doesn't guess or split the difference. Result: 200, parsed as chunked. Deterministic, spec-correct.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "33-36", note: "Two Content-Length headers, and an obfuscated Transfer-Encoding. Go REJECTS both: duplicate/conflicting Content-Length → 400 Bad Request; an unrecognized Transfer-Encoding → 501 Not Implemented (it never silently falls back to Content-Length). No ambiguity survives.", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "37-38", note: "The control: a clean, unambiguous request → 200. So Go accepts the well-formed case and rejects the ambiguous ones — exactly the strict behavior that makes a Go origin a poor smuggling target.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="Measured, not assumed: Go follows TE-over-CL per spec, 400s duplicate Content-Length, and 501s an unknown Transfer-Encoding. A Go origin parses ambiguity consistently — so the desync has to come from a non-strict hop in front of it, not from Go."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"time"
+)
+
+func main() {
+	// A plain Go origin server.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	host := "Host: " + addr + "\r\n"
+
+	send := func(label, raw string) {
+		conn, _ := net.Dial("tcp", addr)
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		fmt.Fprint(conn, raw)
+		status, _ := bufio.NewReader(conn).ReadString('\n')
+		fmt.Printf("%-32s → %s\n", label, strings.TrimSpace(status))
+	}
+
+	// Smuggling needs two parsers to DISAGREE about where a request ends.
+	// Watch how strictly Go's net/http handles each ambiguous case:
+	send("Content-Length + Transfer-Encoding",
+		"POST / HTTP/1.1\r\n"+host+"Content-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nX")
+	send("duplicate Content-Length",
+		"POST / HTTP/1.1\r\n"+host+"Content-Length: 6\r\nContent-Length: 5\r\n\r\nhello")
+	send("obfuscated Transfer-Encoding",
+		"POST / HTTP/1.1\r\n"+host+"Transfer-Encoding: xchunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n")
+	send("clean request (control)",
+		"POST / HTTP/1.1\r\n"+host+"Content-Length: 5\r\n\r\nhello")
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+<Gotcha>
+**A strict Go origin is not the same as a safe deployment.** Go follows TE-over-CL, rejects duplicate `Content-Length` (400), and rejects unknown `Transfer-Encoding` (501) — so it parses ambiguity *consistently*, which is exactly what a back-end needs to resist smuggling. But smuggling lives in the **disagreement** between hops, so your safety also depends on the front-end. If a CDN/proxy ahead of Go is *less* strict — say it honors `Content-Length` while Go honors `Transfer-Encoding` — the two disagree and the desync happens regardless of how clean Go is. The robust fixes are architectural: prefer **HTTP/2 end-to-end** (its length framing is unambiguous, killing the CL/TE class), ensure **every hop parses identically and rejects ambiguity**, and avoid reusing a single back-end connection across different users where you can. Go gives you a strong back-end; the chain has to be strict too.
+</Gotcha>
+
+<QuickCheck
+  question="Go's net/http receives a request with both Content-Length: 6 and Transfer-Encoding: chunked. What does it do?"
+  options={[
+    "Rejects it with 400 immediately",
+    "Uses Transfer-Encoding (chunked) and ignores Content-Length, per RFC 7230",
+    "Uses Content-Length and ignores Transfer-Encoding",
+    "Picks whichever appears first"
+  ]}
+  answer={1}
+  explain="Measured above: Go follows RFC 7230 §3.3.3 — when both are present, Transfer-Encoding wins and Content-Length is dropped (r.TransferEncoding is [chunked], the chunked body is parsed). It's deterministic, not a guess. (Duplicate Content-Length is a different case — that Go rejects with 400; an unknown Transfer-Encoding it rejects with 501.) A consistent choice is what makes Go a poor smuggling back-end."
+/>
+
+---
+
+## Host Header Attacks
+
+Next disagreement: not about *length*, but about *identity*. Your server often needs to know "what host am I serving right now?" to build absolute URLs or route. The only source for that is the `Host` header — which the **client** sends and can set to anything.
+
+<Define term="Host header injection / poisoning">
+The HTTP **`Host`** header tells a server which virtual host a request is for; in Go it surfaces as **`r.Host`** (from the `Host` header, or the `:authority` pseudo-header on HTTP/2). It is **client-controlled** — an attacker can send any value. A **Host header attack** exploits code that *trusts* `r.Host` for a security-relevant decision. The classic is **password-reset poisoning**: the reset email builds its link from `r.Host`, so an attacker triggering a reset for a victim — with `Host: evil.attacker.com` — causes the victim's email to contain a link to the attacker's domain carrying the **real reset token**; when the victim clicks, the token leaks. The same trust enables cache-key confusion, routing bypasses, and SSRF-via-routing. The fix is to **never derive security-relevant values from `r.Host` unchecked**: validate it against an **allowlist** of expected hosts, or build absolute URLs from a **configured base URL** held in server config, not from the request.
+</Define>
+
+<CodeWalk
+  title="Password-reset poisoning — and the allowlist fix"
+  steps={[
+    { lines: "10-14", note: "VULNERABLE: the reset link is built from r.Host. Whatever Host the attacker sends becomes the domain in the victim's reset email — carrying the real token to the attacker's server.", pose: "scribe", role: "hacker", state: "warn", beat: "problem" },
+    { lines: "16-24", note: "SAFE: validate r.Host against an allowlist of hosts you actually serve. An unexpected Host (evil.attacker.com) is rejected outright — the link is never built from it. (Even better: build the URL from a configured base, ignoring r.Host entirely.)", pose: "guard", role: "guard", state: "ok", beat: "solution" },
+    { lines: "28-34", note: "The attacker sends Host: evil.attacker.com. VULN emits a reset link pointing at the attacker's domain (token leaks on click). SAFE returns 400 — the poisoned host never reaches the email. Same request, one leaks the token, one refuses.", pose: "happy", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="The reset link is a security boundary: build it from a value the attacker controls (r.Host) and you mail the victim a token-stealing link. Validate the Host against an allowlist — or build the URL from server config — and the poison is rejected."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// VULNERABLE: builds the password-reset link from the client-controlled Host.
+func resetVuln(w http.ResponseWriter, r *http.Request) {
+	link := "https://" + r.Host + "/reset?token=SECRET123"
+	fmt.Fprint(w, link)
+}
+
+var allowedHosts = map[string]bool{"app.example.com": true}
+
+// SAFE: validate Host against an allowlist before using it (or build the URL
+// from a configured base URL and ignore r.Host entirely).
+func resetSafe(w http.ResponseWriter, r *http.Request) {
+	if !allowedHosts[r.Host] {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, "400 bad host")
+		return
+	}
+	link := "https://" + r.Host + "/reset?token=SECRET123"
+	fmt.Fprint(w, link)
+}
+
+func main() {
+	// Attacker triggers a reset with a forged Host header.
+	req := httptest.NewRequest("POST", "/reset", nil)
+	req.Host = "evil.attacker.com"
+
+	wv := httptest.NewRecorder()
+	resetVuln(wv, req)
+	fmt.Println("VULN link in victim email:", wv.Body.String())
+
+	ws := httptest.NewRecorder()
+	resetSafe(ws, req)
+	fmt.Printf("SAFE response: %d %s\n", ws.Code, ws.Body.String())
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+---
+
+## Web Cache Poisoning
+
+The third disagreement is about *reuse*. A shared cache stores a response under a **key** (usually method + path + a few headers) and serves it to everyone who asks for that key. If the response depends on an input the cache **doesn't** include in its key, an attacker can save a poisoned response once and have it served to every later visitor.
+
+<Define term="Web cache poisoning (unkeyed input)">
+A **web cache** speeds things up by storing a response under a **cache key** — typically the request method and URL path, plus a small set of headers — and replaying it for every subsequent request with the same key. A **keyed** input is part of that key (different value → different cache entry); an **unkeyed** input is *not* (the cache ignores it). **Web cache poisoning** happens when a response **reflects an unkeyed input** into its body: the attacker sends a request whose unkeyed header (say `X-Forwarded-Host: evil.attacker.com`) gets reflected into, e.g., a `<script src>`, the cache stores that poisoned response under the *normal* key, and **every later victim** requesting that path is served the attacker's version — a stored, cache-amplified XSS/redirect affecting everyone. The defenses: don't reflect request inputs into cacheable responses at all; if a response legitimately varies by a header, include it in the cache key (and announce it with **`Vary`**); and don't honor forwarded headers you don't actually use.
+</Define>
+
+<CodeWalk
+  title="Poisoning a shared cache with an unkeyed header"
+  steps={[
+    { lines: "11-16", note: "render reflects X-Forwarded-Host into a <script src>. That header is attacker-controlled — and, crucially, the cache won't key on it. Reflecting any request input into a cacheable response is the root mistake.", pose: "scribe", role: "hacker", state: "warn", beat: "problem" },
+    { lines: "27-34", note: "The cache key is just method+path ('GET /home') — X-Forwarded-Host is UNKEYED. The attacker primes the cache: their request with X-Forwarded-Host: evil reflects into the response, which is stored under the normal key.", pose: "run", role: "thief", state: "bad", beat: "problem" },
+    { lines: "38-40", note: "A normal victim requests /home with no special headers. They get the CACHED poisoned response — a script tag pointing at the attacker's domain. One poisoning request, served to everyone until the entry expires.", pose: "blocked", role: "courier", state: "bad", beat: "problem" },
+    { lines: "42-42", note: "The verdict: the victim's page loads attacker-controlled script from the shared cache. Fix: don't reflect unkeyed inputs; key (and Vary) on anything a response legitimately depends on; drop forwarded headers you don't use.", pose: "guard", role: "guard", state: "done", beat: "solution" }
+  ]}
+  caption="The cache faithfully serves what it stored — so if a poisoned response gets stored under a normal key, every visitor gets poisoned. The bug is reflecting an input the cache doesn't key on; the fix is to not reflect it, or to key on it."
+>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// render builds the page. BUG: it reflects X-Forwarded-Host (attacker-controlled
+// AND unkeyed by the cache) into a <script src> — a poisoning primitive.
+func render(r *http.Request) string {
+	host := r.Host
+	if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
+		host = xfh
+	}
+	return `<script src="https://` + host + `/app.js"></script>`
+}
+
+// A trivial shared cache keyed only on method+path (X-Forwarded-Host is unkeyed).
+type cache struct{ store map[string]string }
+
+func (c *cache) get(k string) (string, bool) { v, ok := c.store[k]; return v, ok }
+func (c *cache) set(k, v string)             { c.store[k] = v }
+
+func main() {
+	c := &cache{store: map[string]string{}}
+	const key = "GET /home" // the cache key — note: no X-Forwarded-Host in it
+
+	// 1) Attacker primes the cache with a poisoned response.
+	atk := httptest.NewRequest("GET", "/home", nil)
+	atk.Host = "app.example.com"
+	atk.Header.Set("X-Forwarded-Host", "evil.attacker.com")
+	if _, ok := c.get(key); !ok {
+		c.set(key, render(atk)) // poisoned response stored under the NORMAL key
+	}
+
+	// 2) A normal victim requests /home — no special headers.
+	victim := httptest.NewRequest("GET", "/home", nil)
+	victim.Host = "app.example.com"
+	cached, _ := c.get(key)
+	fmt.Println("victim is served from cache:")
+	fmt.Println(" ", cached)
+}
+```
+
+</GoPlayground>
+
+</CodeWalk>
+
+### Try it: a request-level attack lab
+
+Pick an attack and a server policy, send a crafted request, and watch the front-end/back-end (or cache) react. (In-browser; the chain is modeled.)
+
+<HackLab
+  title="Request-Level Attack Lab"
+  category="Server-Side"
+  mode="reqsmuggle"
+  flag="GO{strict_parsing_kills_the_desync}"
+/>
+
+---
+
+## Defenses
+
+The three attacks share one cure and a few specifics. Internalize the pattern and you defend the whole class.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Smuggling — kill the ambiguity">Prefer **HTTP/2 end-to-end** (unambiguous length framing eliminates the CL/TE class). Ensure **every hop parses identically and rejects ambiguity** — Go's origin already 400s duplicate `Content-Length` and 501s unknown `Transfer-Encoding`; demand the same strictness from your CDN/proxy. Avoid sharing one back-end connection across different users where feasible.</ConceptCard>
+  <ConceptCard label="Host header — don't trust r.Host">Build absolute URLs (reset links, redirects, canonical links) from a **configured base URL** in server config, *not* from `r.Host`. Where you must use the request's host, validate it against an **allowlist** of expected hosts and reject the rest. Treat `X-Forwarded-Host`/`X-Forwarded-For` as untrusted unless set by a proxy *you* control.</ConceptCard>
+  <ConceptCard label="Cache poisoning — don't reflect unkeyed input">Never reflect a request input into a **cacheable** response. If a response legitimately varies by a header, include that header in the **cache key** and announce it with **`Vary`**. Strip forwarded headers your app doesn't use so a cache can't be tricked into keying (or not keying) on them.</ConceptCard>
+  <ConceptCard label="The unifying rule">Every one is a request-controlled value trusted too far across a parser boundary. **Make parsers agree, and validate request-derived values before any security decision** — framing headers, `Host`, forwarded headers, cache keys. Same discipline as the rest of the security baseline, applied to the request envelope itself.</ConceptCard>
+</ConceptGrid>
+
+---
+
+## The Lab
+
+I've written a password-reset handler that builds the reset link from `r.Host` — the poisoning bug. A test harness sends a request with `Host: evil.attacker.com` (the attack) and a request with the legitimate host, and checks that the evil host is **rejected** while the legitimate one still works. Fix the handler to validate `r.Host` against the `allowedHosts` allowlist.
+
+Self-contained — `httptest`, no real network.
+
+<Lab
+  title="Stop the password-reset poisoning"
+  archetype="fix-it"
+  difficulty="guided"
+  points={70}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="resetLink builds a password-reset URL from r.Host with no validation, so an attacker's forged Host header (evil.attacker.com) ends up in the victim's reset link. Fix it: reject any r.Host that isn't in the allowedHosts allowlist (return an empty string for a bad host) before building the link. main is the self-check harness — do not edit it. It sends the attack host and the legitimate host and prints ALL CHECKS PASS when the bad host is rejected and the good host still works."
+  starter={`package main
+
+import (
+	"fmt"
+	"net/http/httptest"
+)
+
+var allowedHosts = map[string]bool{"app.example.com": true}
+
+// resetLink builds the password-reset URL for a request.
+// BUG: it trusts r.Host with no validation, so a forged Host header
+// (evil.attacker.com) ends up in the victim's reset email.
+func resetLink(host string) string {
+	// FIX: reject a host that isn't in allowedHosts (return "") before using it.
+	return "https://" + host + "/reset?token=SECRET123"
+}
+
+// ── checks: do not edit. ──
+func main() {
+	allOK := true
+
+	// the legitimate host must still produce a link
+	good := resetLink("app.example.com")
+	if good != "https://app.example.com/reset?token=SECRET123" {
+		fmt.Println("FAIL: legitimate host should still work, got:", good)
+		allOK = false
+	}
+
+	// the forged host must be rejected (empty link)
+	evil := resetLink("evil.attacker.com")
+	if evil != "" {
+		fmt.Println("FAIL: forged host was accepted, link leaked:", evil)
+		allOK = false
+	}
+
+	// (httptest import kept for realism; r.Host is what feeds resetLink)
+	_ = httptest.NewRequest
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main calls resetLink with the legitimate host (must build the link) and the attacker host (must return an empty string). The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  hints={[
+    "The host comes from the client and is forgeable. Guard the top of resetLink: if !allowedHosts[host] { return \"\" }.",
+    "With that guard, app.example.com (in the allowlist) builds the link, and evil.attacker.com returns \"\" — exactly what the two checks require.",
+    "In a real handler you'd read host from r.Host and return a 400 for a bad host; even better, build the URL from a configured base URL instead of the request's host at all.",
+  ]}
+  flag="GO{validate_host_against_allowlist}"
+>
+
+The reset link is a security boundary — built from `r.Host`, it lets an attacker's forged Host header carry the real token to their domain. Reject any host not in `allowedHosts` (return `""`) and the poison never reaches the victim's email, while the legitimate host still works. Get the flag.
+
+</Lab>
+
+---
+
+<Recap>
+
+- Request-level attacks exploit **parser disagreement**: a request crosses a chain of intermediaries (CDN, proxy, Go origin) that each re-parse it, and the attacker crafts bytes that two of them read differently.
+- **Request smuggling** is a disagreement about a request's **length**: send both `Content-Length` and `Transfer-Encoding` (or duplicates), and a CL.TE/TE.CL desync prepends the attacker's leftover bytes to the *next* user's request on a shared connection.
+- Measured, not assumed: Go's `net/http` is **strict and deterministic** — it follows `Transfer-Encoding` over `Content-Length` per RFC 7230, **400s** duplicate `Content-Length`, and **501s** an unknown `Transfer-Encoding`. A Go origin parses ambiguity consistently, so it's a poor smuggling back-end — but smuggling lives in the *gap between hops*, so the front-end must be strict too (and HTTP/2 end-to-end removes the class).
+- **Host header attacks** trust `r.Host` (client-controlled) for a security decision. The classic is **password-reset poisoning** — the reset link built from a forged `Host` mails the victim a token-stealing link. Fix: validate `r.Host` against an **allowlist**, or build URLs from a **configured base URL**.
+- **Web cache poisoning** reflects an **unkeyed** input (e.g. `X-Forwarded-Host`) into a cacheable response; the poisoned response is stored under the normal key and served to **every** later victim. Fix: don't reflect request inputs into cacheable responses; key (and `Vary`) on anything a response depends on; drop forwarded headers you don't use.
+- The unifying rule: **make every parser agree, and validate any request-derived value before a security decision** — framing headers, `Host`, forwarded headers, cache keys.
+
+</Recap>
+
+<Callout kind="note" title="Sources">
+**The attacks:** the PortSwigger Web Security Academy is the canonical reference for HTTP request smuggling, Host header attacks, and web cache poisoning (with free interactive labs for each — a great place to drill these hands-on after this chapter). **HTTP framing:** RFC 7230 §3.3.3 (message body length; the `Transfer-Encoding`-over-`Content-Length` precedence and the rejection rules) and RFC 9110/9112. **Go:** the `net/http` parsing behavior shown here was *measured* against a running server (Go follows TE over CL, 400s duplicate `Content-Length`, 501s unknown `Transfer-Encoding`) — not taken from memory. The Host-header and cache-poisoning defenses build on the **application-security-baseline** chapter (hostile input by default) and the caching-headers material in the **file-servers** and **CORS** chapters (`Vary`, cache keys). Every Go snippet here was run and verified.
+</Callout>
+
+That's the request-level family — smuggling, Host header, cache poisoning — and the one idea under all three: an HTTP request is bytes that several machines must agree on, and the attack lives wherever they stop agreeing. You can now read a request as a thing being parsed *repeatedly* down a chain, spot where a value the client controls feeds a decision it shouldn't, and say precisely how strict Go is at the back-end (strict — you measured it) and why that still isn't the whole story. Go make your parsers agree, sport.

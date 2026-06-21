@@ -19,7 +19,7 @@ type Tab = "goal" | "lab" | "exploit" | "report";
 type HackLabProps = {
   title: string;
   category?: string; // "Server-Side" | "Client-Side"
-  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz" | "cors" | "traversal";
+  mode: "idor" | "xss" | "sqli" | "jwt" | "ssrf" | "race" | "takeover" | "authz" | "cors" | "traversal" | "reqsmuggle";
   flag?: string;
 };
 
@@ -867,6 +867,90 @@ function TraversalLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boole
   );
 }
 
+/* ════════════════════════════════════════════
+   Request-level engine — model a front-end proxy
+   + a Go back-end. Pick how the front-end parses
+   an ambiguous CL+TE request (CL vs TE) and craft
+   a request; if the front-end and back-end (Go,
+   which follows TE) DISAGREE, the leftover bytes
+   smuggle onto the next request. A strict front-end
+   (reject ambiguity) kills the desync.
+   ════════════════════════════════════════════ */
+function ReqSmuggleLab({ solved, onSolve }: { solved: boolean; onSolve: (v: boolean) => void }) {
+  // The Go back-end always follows Transfer-Encoding over Content-Length (measured).
+  const [frontend, setFrontend] = useState<"cl" | "te" | "strict">("cl");
+  const [headers, setHeaders] = useState<{ cl: boolean; te: boolean }>({ cl: true, te: true });
+  const [res, setRes] = useState<null | { desync: boolean; detail: string }>(null);
+
+  const send = () => {
+    const both = headers.cl && headers.te;
+    let desync = false;
+    let detail = "";
+
+    if (frontend === "strict") {
+      if (both) {
+        detail = "Front-end is STRICT: it rejects the ambiguous CL+TE request (400) before forwarding. No desync.";
+      } else {
+        detail = "Single framing header — unambiguous. Front-end and back-end agree. No desync.";
+      }
+    } else if (!both) {
+      detail = "Only one framing header — both parsers agree on the length. No desync.";
+    } else {
+      // both CL and TE present, lenient front-end
+      const backendUses = "TE"; // Go origin: measured to follow Transfer-Encoding
+      const frontendUses = frontend === "cl" ? "CL" : "TE";
+      if (frontendUses !== backendUses) {
+        desync = true;
+        detail =
+          "DESYNC: front-end uses " + frontendUses + ", Go back-end uses " + backendUses +
+          ". They disagree where the request ends — leftover bytes smuggle onto the NEXT user's request.";
+      } else {
+        detail =
+          "Front-end and back-end both use " + backendUses + " — they agree, so no desync (even with both headers present).";
+      }
+    }
+
+    setRes({ desync, detail });
+    if (desync) onSolve(true);
+  };
+
+  return (
+    <div className="hl-smug">
+      <p className="hl-note">
+        A request crosses a <strong>front-end proxy</strong> then your <strong>Go back-end</strong> (which follows
+        <code>Transfer-Encoding</code> over <code>Content-Length</code> — measured). Craft an ambiguous request and
+        pick how the front-end parses it. A <em>disagreement</em> = smuggling.
+      </p>
+
+      <div className="hl-smug-headers">
+        <span>Request framing headers:</span>
+        <label><input type="checkbox" checked={headers.cl} onChange={(e) => { setHeaders((h) => ({ ...h, cl: e.target.checked })); setRes(null); }} /> Content-Length</label>
+        <label><input type="checkbox" checked={headers.te} onChange={(e) => { setHeaders((h) => ({ ...h, te: e.target.checked })); setRes(null); }} /> Transfer-Encoding: chunked</label>
+      </div>
+
+      <div className="hl-modeswitch">
+        <button className={frontend === "cl" ? "on" : ""} onClick={() => { setFrontend("cl"); setRes(null); }}>Front-end: uses Content-Length</button>
+        <button className={frontend === "te" ? "on" : ""} onClick={() => { setFrontend("te"); setRes(null); }}>Front-end: uses Transfer-Encoding</button>
+        <button className={frontend === "strict" ? "on" : ""} onClick={() => { setFrontend("strict"); setRes(null); }}>Front-end: strict (reject ambiguity)</button>
+      </div>
+
+      <button className="hl-send" onClick={send}>Send request down the chain</button>
+
+      {res && (
+        <div className={`hl-result ${res.desync ? "bad" : "good"}`}>{res.detail}</div>
+      )}
+
+      <div className="hl-status">
+        {solved ? (
+          <span className="hl-ok">✓ Smuggling demonstrated: with BOTH Content-Length and Transfer-Encoding present and a lenient front-end that parses the length DIFFERENTLY from the Go back-end, the two desync — and the attacker&apos;s leftover bytes prepend to the next victim&apos;s request. Switch the front-end to &quot;strict (reject ambiguity)&quot;: it 400s the ambiguous request and the desync is gone. The cure is identical strict parsing at every hop (and HTTP/2 end-to-end).</span>
+        ) : (
+          <span className="hl-todo">Make the front-end and back-end disagree. Hint: include BOTH framing headers, and set the front-end to use Content-Length (the Go back-end uses Transfer-Encoding).</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ── scenario registry ─────────────────────── */
 type Scenario = {
   goal: ReactNode;
@@ -1206,6 +1290,38 @@ const SCENARIOS: Record<HackLabProps["mode"], Scenario> = {
         summary="A path-traversal vulnerability: the file server's lexical Clean + HasPrefix containment check is bypassed by a symlink inside the web root that points outside it, leaking arbitrary files."
         steps={["Identify a file-serving endpoint that takes a user-supplied path.", "Confirm literal ../ is blocked by the containment check.", "Find or plant a symlink inside the root and request a path through it (e.g. link/passwd) to read files outside the root."]}
         impact={<>Arbitrary file read outside the intended directory (secrets, /etc/passwd, .env). Fix: serve through os.Root (Go 1.24), which confines every open at the OS level and resolves symlinks safely — never a lexical string check alone.</>}
+      />
+    ),
+  },
+  reqsmuggle: {
+    goal: (
+      <Goal
+        what="HTTP request smuggling desyncs a front-end proxy and a back-end server by making them DISAGREE about where a request ends. HTTP/1.1 declares body length two ways — Content-Length and Transfer-Encoding: chunked — and if a request has both, two servers may resolve the conflict differently (CL.TE / TE.CL). The leftover bytes prepend to the next user's request."
+        example={<>A request with both <code>Content-Length: 6</code> and <code>Transfer-Encoding: chunked</code>: a lenient front-end honors Content-Length while the Go back-end honors Transfer-Encoding — they disagree, and the desync smuggles bytes onto the next victim.</>}
+        mission={[
+          "In the Lab tab, include BOTH framing headers on the request.",
+          "Set the front-end to parse the length differently from the Go back-end (which uses Transfer-Encoding).",
+          "Watch them desync — then switch the front-end to strict and watch the desync vanish.",
+        ]}
+      />
+    ),
+    lab: (solved, setSolved) => <ReqSmuggleLab key="reqsmuggle" solved={solved} onSolve={setSolved} />,
+    exploit: (
+      <Exploit
+        summary="Smuggling needs two parsers that disagree about a request's length, plus a reused keep-alive connection. With both Content-Length and Transfer-Encoding present, a front-end that honors one and a back-end that honors the other split the byte stream at different points — the attacker's trailing bytes become the prefix of the next request."
+        steps={[
+          <>Send a request carrying both <code>Content-Length</code> and <code>Transfer-Encoding: chunked</code>.</>,
+          <>The front-end forwards what IT thinks is one request; the Go back-end (following TE) thinks it ended earlier.</>,
+          "The leftover bytes sit at the front of the shared connection buffer and prepend to the NEXT user's request — corrupting it.",
+        ]}
+        bonus={<>The cure is to remove the ambiguity: every hop must parse identically and reject ambiguous framing (Go already 400s duplicate Content-Length and 501s unknown Transfer-Encoding), and HTTP/2 end-to-end eliminates the CL/TE class entirely.</>}
+      />
+    ),
+    report: (solved, flag) => (
+      <Report solved={solved} flag={flag}
+        summary="An HTTP request smuggling (desync) vulnerability: a front-end proxy and the back-end server resolve an ambiguous Content-Length / Transfer-Encoding request differently, letting an attacker prepend bytes to other users' requests."
+        steps={["Send a request with both Content-Length and Transfer-Encoding: chunked.", "Confirm the front-end and back-end disagree on the body length (timing or a smuggled prefix appearing on a second request).", "Use the desync to prepend a malicious prefix to a victim's request on the shared connection."]}
+        impact={<>Bypass front-end security controls, capture other users' requests/sessions, or route victims to attacker content. Fix: strict identical parsing at every hop (reject ambiguous framing), and prefer HTTP/2 end-to-end which removes the CL/TE ambiguity.</>}
       />
     ),
   },
