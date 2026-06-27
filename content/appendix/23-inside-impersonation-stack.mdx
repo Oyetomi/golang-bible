@@ -3,7 +3,7 @@ title: "Inside the Impersonation Stack: uTLS, tls-client & surf"
 part: "appendix"
 order: 23
 type: "course"
-description: "The source code, line by line: the TLSExtension interface (Len/Read/writeToUConn) every uTLS extension implements, how SupportedCurvesExtension serializes to exact wire bytes, the real Chrome ClientHelloSpec explained extension by extension, the build pipeline (buildHandshakeState → applyPresetByID → ApplyConfig → MarshalClientHello), extension shuffling, tls-client's ClientProfile struct that bundles the TLS and HTTP/2 fingerprints, and surf's Impersonate/applyVariant — with runnable stdlib re-implementations that emit genuine ClientHello bytes."
+description: "The source code, line by line: the TLSExtension interface (Len/Read/writeToUConn) every uTLS extension implements, how SupportedCurvesExtension serializes to exact wire bytes, the real Chrome ClientHelloSpec explained extension by extension, the build pipeline (buildHandshakeState → applyPresetByID → ApplyConfig → MarshalClientHello), extension shuffling, tls-client's ClientProfile struct that bundles the TLS and HTTP/2 fingerprints, surf's Impersonate/applyVariant, and the 2024–2025 post-quantum update (X25519MLKEM768 hybrid key share, Chrome 131+/Go 1.24) that makes a stale profile detectable — with runnable stdlib re-implementations that emit genuine ClientHello bytes."
 prerequisites: ["tls-fingerprinting-impersonation"]
 heavy: true
 ---
@@ -302,6 +302,113 @@ ClientHelloSpec{
 <Gotcha>
 **This is why you can't hand-roll Chrome from `crypto/tls`.** Look at that list: GREASE bookends, ALPS, compress_certificate, a speculative GREASE'd key share, GREASE'd ECH, computed padding — `crypto/tls` emits *none* of these and exposes no API to add them. Matching Chrome means emitting this exact ordered set with the right GREASE slots — which is the entire reason uTLS maintains a hand-built spec per browser version, updated as Chrome ships changes. The spec *is* the fingerprint, in source form.
 </Gotcha>
+
+### The 2024–2025 update: a post-quantum key share
+
+The spec above is **pre-2023 Chrome** — read it for shape, but a current browser's `key_share` no longer looks like that. The fingerprint is a moving target, and the biggest recent move is **post-quantum cryptography**. Here is the *current* Chrome key-exchange surface, taken from `bogdanfinn/utls v1.7.7-barnius`'s `Chrome_146` profile (the default in `tls-client v1.15.1`):
+
+```go
+// Current Chrome (bogdanfinn/utls Chrome_146) — the post-quantum key share.
+&SupportedCurvesExtension{Curves: []CurveID{
+	GREASE_PLACEHOLDER,
+	X25519MLKEM768, // ← NEW (CurveID 4588 / 0x11ec): the hybrid PQ group, FIRST
+	X25519,
+	CurveP256,
+	CurveP384,
+}},
+// ...
+&KeyShareExtension{KeyShares: []KeyShare{
+	{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}},
+	{Group: X25519MLKEM768}, // ← NEW: a ~1.2 KB ML-KEM-768 + X25519 hybrid share
+	{Group: X25519},
+}},
+```
+
+<Define term="X25519MLKEM768 (hybrid post-quantum key exchange)">
+**X25519MLKEM768** is a *hybrid* key-exchange group: it runs classical **X25519** and the post-quantum **ML-KEM-768** (the NIST-standardized successor to Kyber-768, FIPS 203) **side by side** and mixes both shared secrets, so the connection is safe unless *both* are broken. It exists to defeat **"harvest now, decrypt later"** — an adversary recording today's TLS traffic to decrypt once a quantum computer arrives. Chrome shipped the pre-standard draft (`X25519Kyber768Draft00`, group `25497`/`0x6399`) around **Chrome 116** (Aug 2023), then switched to the standardized `X25519MLKEM768` (group `4588`/`0x11ec`) around **Chrome 131** (late 2024); **Go 1.24** made it the `crypto/tls` default too. The fingerprint consequences are concrete: the new group changes the JA3 *supported_groups* field (and JA4), and the ~1.2 KB ML-KEM share makes the `ClientHello` large enough to **split across two TLS records** — itself a browser-ish signal. A spoofing profile that still offers only `X25519` is now a *tell*: it looks like a Chrome from 2023.
+</Define>
+
+This is the accuracy trap with any impersonation library: **a profile is correct only for the moment it was captured.** Watch a single field — the supported-groups list — decide a JA3, across three Chrome eras:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// JA3 supported_groups codes (decimal, as they appear on the wire).
+const (
+	X25519              = 29    // 0x001d
+	P256                = 23    // 0x0017
+	P384                = 24    // 0x0018
+	X25519Kyber768Draft = 25497 // 0x6399 — Chrome ~116..130 (pre-standard PQ)
+	X25519MLKEM768      = 4588  // 0x11ec — Chrome 131+ (standardized ML-KEM hybrid)
+)
+
+func isGREASE(v int) bool { return (v&0x0f0f) == 0x0a0a && (v>>8) == (v&0xff) }
+
+// ja3Curves builds the JA3 EllipticCurves field: dash-joined decimal group ids
+// with GREASE stripped (JA3 ignores GREASE).
+func ja3Curves(groups []int) string {
+	var out []string
+	for _, g := range groups {
+		if isGREASE(g) {
+			continue
+		}
+		out = append(out, strconv.Itoa(g))
+	}
+	return strings.Join(out, "-")
+}
+
+// ja3Hash assembles a minimal JA3 (fixed cipher/ext/pointformat, varying curves)
+// and returns its MD5 — what a JA3 block- or allow-list matches on.
+func ja3Hash(curves string) string {
+	const fixed = "771,4865-4866-4867,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-21"
+	ja3 := fixed + "," + curves + ",0"
+	sum := md5.Sum([]byte(ja3))
+	return hex.EncodeToString(sum[:])
+}
+
+func main() {
+	const grease = 0x0a0a
+	eras := []struct {
+		name   string
+		groups []int
+	}{
+		{"pre-PQ Chrome (<=115) — X25519 only", []int{grease, X25519, P256, P384}},
+		{"Kyber-draft Chrome (116-130)", []int{grease, X25519Kyber768Draft, X25519, P256, P384}},
+		{"current Chrome (131+/146) — ML-KEM hybrid", []int{grease, X25519MLKEM768, X25519, P256, P384}},
+	}
+
+	var current string
+	for _, e := range eras {
+		c := ja3Curves(e.groups)
+		current = ja3Hash(c)
+		fmt.Printf("%-44s curves=%-18s JA3=%s\n", e.name, c, current)
+	}
+
+	fmt.Println()
+	// A detector that knows what TODAY's Chrome offers flags a "Chrome" whose
+	// group list lacks the post-quantum hybrid — a stale impersonation profile.
+	stale := ja3Hash(ja3Curves([]int{grease, X25519, P256, P384}))
+	fmt.Printf("server expects current Chrome JA3 = %s\n", current)
+	fmt.Printf("stale profile presents JA3        = %s\n", stale)
+	if stale != current {
+		fmt.Println("=> MISMATCH: a profile without X25519MLKEM768 no longer looks like real Chrome")
+	}
+}
+```
+
+</GoPlayground>
+
+Three eras, three different JA3 hashes from one field. That is why `tls-client` and `surf` ship *versioned* profiles (`Chrome_133`, `Chrome_144`, `Chrome_146`, …) and bump them as Chrome ships: an impersonation that was perfect last year is a fingerprint of "last year's Chrome" today, and the post-quantum key share is the current dividing line.
 
 ---
 
@@ -1027,11 +1134,12 @@ Bug 1 corrupts every length downstream (a malformed ClientHello a server rejects
 - **`ShuffleChromeTLSExtensions`** randomizes the *middle* of Chrome's extension order per connection (GREASE first, padding/PSK last stay fixed) — Chrome's own anti-ossification, and the deepest reason JA4 sorts before hashing.
 - **`tls-client`'s `ClientProfile`** bundles the uTLS `ClientHelloID` (TLS fingerprint) with the HTTP/2 `settings`, `settingsOrder`, `connectionFlow`, `pseudoHeaderOrder`, and `priorities` (Akamai fingerprint) in one struct — so picking `profiles.Chrome_133` gives a consistent identity at both layers. **`surf`'s `applyVariant`** does the same job through a fluent builder: OS persona → Variant → set HelloSpec/HelloID + ConfigureH2/H3 + ordered headers.
 - **Anywhere order is fingerprinted, the source carries an explicit order slice** (`settingsOrder`, ordered header maps) because Go's native map can't preserve it — a recurring tell when you read this kind of code.
+- **A profile is only correct for the moment it was captured.** Current Chrome (`bogdanfinn/utls` `Chrome_146`) ships a **post-quantum** hybrid key share, **X25519MLKEM768** (group `4588`/`0x11ec`) — added to stable ~Chrome 131 and the `crypto/tls` default since **Go 1.24**. It changes JA3/JA4 and can split the `ClientHello` across two records; a profile still offering only `X25519` fingerprints as a 2023 Chrome. Versioned profiles exist precisely because the target keeps moving.
 
 </Recap>
 
 <Callout kind="note" title="Primary sources (the actual files)">
-Read the real code. **uTLS:** `u_tls_extensions.go` (the `TLSExtension` interface, `SupportedCurvesExtension`, `UtlsGREASEExtension`), `u_parrots.go` (the per-browser `ClientHelloSpec` definitions, `ShuffleChromeTLSExtensions`), `u_conn.go` (`buildHandshakeState`, `ApplyConfig`, `MarshalClientHello`) — github.com/refraction-networking/utls. **tls-client:** `profiles/profiles.go` (the `ClientProfile` struct and `NewClientProfile`) — github.com/bogdanfinn/tls-client. **surf:** `impersonate.go` (the `Impersonate` type, `applyVariant`) — github.com/enetx/surf. The code quoted in this chapter is from those files; the runnable examples are faithful stdlib re-implementations of the same algorithms.
+Read the real code. **uTLS:** `u_tls_extensions.go` (the `TLSExtension` interface, `SupportedCurvesExtension`, `UtlsGREASEExtension`), `u_parrots.go` (the per-browser `ClientHelloSpec` definitions, `ShuffleChromeTLSExtensions`), `u_conn.go` (`buildHandshakeState`, `ApplyConfig`, `MarshalClientHello`) — github.com/refraction-networking/utls. **tls-client:** `profiles/profiles.go` (the `ClientProfile` struct and `NewClientProfile`) and `profiles/internal_browser_profiles.go` (the literal `Chrome_146` spec, post-quantum key share and all) — github.com/bogdanfinn/tls-client `v1.15.1`, which uses the `github.com/bogdanfinn/utls v1.7.7-barnius` fork and `bogdanfinn/fhttp` for the HTTP layer. **surf:** `impersonate.go` (the `Impersonate` type, `applyVariant`) — github.com/enetx/surf. The code quoted in this chapter is from those files; the runnable examples are faithful stdlib re-implementations of the same algorithms.
 </Callout>
 
 <Scoreboard
