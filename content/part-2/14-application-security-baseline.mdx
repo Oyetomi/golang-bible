@@ -3,7 +3,7 @@ title: "Application Security Baseline"
 part: 2
 order: 14
 type: "course"
-description: "Hostile input by default; the injection family (SQL, command, path traversal); SSRF; XSS and html/template auto-escaping; TLS and security headers; secrets out of logs; and supply-chain scanning with govulncheck."
+description: "Hostile input by default; the allocation-bomb DoS (bounding untrusted length/offset fields, grounded in the 2026 x/image OOM CVEs); the injection family (SQL, command, path traversal); SSRF; XSS and html/template auto-escaping; TLS and security headers; secrets out of logs; and supply-chain scanning with govulncheck."
 prerequisites: ["background-jobs-scheduling"]
 ---
 
@@ -197,6 +197,107 @@ The regex is an allow-list: it specifies the *exact* shape a promo code can take
   answer={1}
   explain="Deny-lists rot over time as attackers discover variants not in the list. An allow-list only passes inputs that match a known-good specification, so a variant the attacker crafted is rejected by default, not by a rule you haven't written yet."
 />
+
+### The allocation bomb: when a length field is the weapon
+
+<Define term="Allocation-bomb DoS (untrusted length → unbounded allocation)" since="Application Security Baseline (Part 2)">
+A **length-prefixed** or **offset-based** format lets the input declare how big something is — an image dimension, a table-entry count, a file offset. If a parser **allocates that much before checking it against how much data actually arrived**, a handful of bytes can demand gigabytes: `make([]byte, n)` where `n` is attacker-controlled. The process OOM-kills itself. `http.MaxBytesReader` — the body ceiling from *Input is Hostile* above — **can't see this**: it caps the bytes read off the wire, but the runaway `make` happens *inside the decoder*, driven by a header field the body limit never inspects. Every parser of an untrusted binary format needs its **own** ceiling.
+</Define>
+
+This is not hypothetical, and it is not confined to code you wrote — it lives in Go's own extended standard library. In March 2026 a fuzzing campaign against `golang.org/x/image` produced **CVE-2026-33809**: an **8-byte** TIFF file crashes any Go process that decodes it. The bytes are a valid little-endian TIFF header followed by an IFD offset of `0xFFFFFFFF`:
+
+```text
+\x49\x49\x2a\x00\xff\xff\xff\xff
+  I   I   42(magic)  IFD offset = 0xFFFFFFFF
+```
+
+When `tiff.Decode` reads through the non-`io.ReaderAt` path (a plain `io.Reader`), its internal `buffer.fill` grew toward that 4 GB offset in one `make`, allocating ~4 GB of zeroes to service 8 bytes of input — an instant OOM. The earlier hardening for this package (`safeReadAt`, added for **CVE-2022-41727**) didn't cover the IFD-offset read, so a *distinct* code path stayed vulnerable — a reminder that a fix guards the line it touches, not the whole bug class. Every released version through v0.37.0 was affected, and 945+ downstream packages pull it in — anything that decodes a user-supplied image (avatar upload, chat attachment, CI thumbnailer). The sibling **CVE-2026-33812** is the same shape in `x/image/font/sfnt`: two `uint16` class counts read from a font file, multiplied unchecked (`65535 × 65535 × 2 ≈ 8 GiB`) and handed straight to an allocation.
+
+The cure is the discipline this whole section keeps circling back to: **never allocate on a promise; allocate on delivery.** The real patch stopped trusting the offset and grew the buffer in bounded 10 MB chunks, reading real bytes with `io.ReadFull` so memory can never outrun the input. Here is the same bug and the same fix in miniature — a length-prefixed decoder:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+)
+
+// A toy length-prefixed decoder: read a 4-byte big-endian length, then read
+// that many bytes. Same shape as the x/image TIFF OOM (CVE-2026-33809): a size
+// field from untrusted input drives an allocation.
+
+// VULN: trust the length field and allocate it up front.
+func readVuln(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	buf := make([]byte, n) // <- 4 bytes of input can demand a ~4 GB allocation
+	io.ReadFull(r, buf)
+	return buf, nil
+}
+
+const maxSize = 10 << 20 // 10 MB hard ceiling, mirroring tiff's chunked fill
+
+// SAFE: never allocate more than the input can actually supply. Cap the claim
+// against a ceiling, then read incrementally — memory tracks real bytes.
+func readSafe(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint32(hdr[:]))
+	if n > maxSize {
+		return nil, errors.New("declared length exceeds ceiling")
+	}
+	buf, err := io.ReadAll(io.LimitReader(r, int64(n)))
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) != n {
+		return nil, errors.New("declared length exceeds actual input")
+	}
+	return buf, nil
+}
+
+func main() {
+	// 4-byte hostile header: claims 0xFFFFFFFF but carries no payload.
+	hostile := string([]byte{0xff, 0xff, 0xff, 0xff})
+	n := binary.BigEndian.Uint32([]byte(hostile))
+	fmt.Printf("hostile header demands %d bytes (~%d MB) from a 4-byte input\n", n, n>>20)
+
+	_, err := readSafe(strings.NewReader(hostile))
+	fmt.Printf("readSafe(hostile):  rejected -> %v\n", err)
+
+	// readVuln works fine on honest input...
+	legit := string([]byte{0, 0, 0, 5}) + "hello"
+	ov, _ := readVuln(strings.NewReader(legit))
+	fmt.Printf("readVuln(legit):    %q\n", ov)
+	// ...but on the hostile header it runs make([]byte, 0xFFFFFFFF) -> ~4 GB -> OOM.
+	// We don't run that here; readSafe is why we never have to.
+
+	out, err := readSafe(strings.NewReader(legit))
+	fmt.Printf("readSafe(legit):    %q err=%v\n", out, err)
+}
+```
+
+</GoPlayground>
+
+The safe path caps the declared length against a ceiling **and** reads incrementally through `io.LimitReader`, so the buffer grows to match bytes that actually arrive — 4 hostile bytes get rejected, not honored. Two rules generalize past this one format:
+
+- **Bound every size derived from input** against a hard maximum *and* against the bytes remaining, before it reaches `make`. A count, a length, an offset, a dimension, a repetition factor — each is a potential multiplier.
+- **This is precisely the bug class native fuzzing finds.** The `x/image` CVEs came out of *grammar-aware* fuzzing — structurally valid files with adversarial field values, not random bytes. `go test -fuzz` (the **testing** chapter, Part 1) does exactly this against your own decoders; a fuzz target asserting "decoding untrusted input must not panic or allocate unbounded" turns this whole class into a permanent regression test.
+
+<Callout kind="pro" title="Real case — golang.org/x/image, 2026">
+**CVE-2026-33809** (`x/image/tiff`, the 8-byte OOM) and **CVE-2026-33812** (`x/image/font/sfnt`, GPOS class-count OOM), found by grammar-fuzzing and fixed by growing/allocating against real input — [golang/image@23ae9ed](https://github.com/golang/image/commit/23ae9ed) (chunked `fill`) and [854c274](https://github.com/golang/image/commit/854c274) (bounds-check before allocating). Both crash on *decode of untrusted input*; both affected every version through v0.37.0. Update `golang.org/x/image` (`go get -u`), and `govulncheck` (see *Supply-Chain Scanning* below) will flag the vulnerable versions still in your build. Write-up: Andy Gill (ZephrFish), *[Autonomous Vulnerability Hunting with MCP](https://blog.zsec.uk/bullyingllms/)* (2026).
+</Callout>
 
 ## The Injection Family
 
@@ -1700,6 +1801,7 @@ The vulnerable handler is live and observable. No exploit steps needed — just 
 <Recap>
 
 - **Input is hostile.** Use `http.MaxBytesReader` + `dec.DisallowUnknownFields()` for every JSON endpoint. Validate at the boundary with allow-lists, normalize before you validate.
+- **Never allocate on a promise — allocate on delivery.** A length/offset/count field from untrusted input must be bounded against a ceiling *and* the bytes actually present before it reaches `make` — a body limit can't see a decoder-internal size field. This is the `x/image` OOM class (**CVE-2026-33809/33812**), and native fuzzing (`go test -fuzz`) is what surfaces it.
 - **SQL injection** is closed by parameterized queries — never `fmt.Sprintf` into a query string. The databases chapter gave you this; here it's a security control.
 - **Command injection** is closed by `exec.Command(binary, arg1, arg2)` — never a shell string with user input.
 - **Path traversal** is closed by `filepath.Clean` + `strings.HasPrefix(clean, root+"/")`. Both steps are required; neither is sufficient alone.
