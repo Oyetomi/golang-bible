@@ -3,7 +3,7 @@ title: "The Model Context Protocol (MCP) in Go"
 part: 2
 order: 19
 type: "course"
-description: "MCP from first principles: JSON-RPC 2.0 over stdio and Streamable HTTP, the initialize handshake and capability negotiation, exposing tools, resources and prompts, building a server and client by hand with the stdlib, then the official go-sdk — grounded in giving an AI assistant safe, typed, auditable access to the Meridian ledger."
+description: "MCP from first principles: JSON-RPC 2.0 over stdio and Streamable HTTP, the initialize handshake and capability negotiation, exposing tools, resources and prompts, building a server and client by hand with the stdlib, then the official go-sdk, and a security close on the two confused deputies — prompt injection at the tool boundary, and the OAuth-proxy/DCR account-takeover (CVE-2026-27124, why PKCE can't save you) at the auth boundary — grounded in giving an AI assistant safe, typed, auditable access to the Meridian ledger."
 prerequisites: ["grpc-service-communication"]
 ---
 
@@ -717,6 +717,99 @@ A **confused deputy** is a privileged program tricked into misusing its authorit
   explain="You cannot rely on the model refusing — injection defeats that. The server is a deputy: it must check that THIS end user is authorized for the requested data, every call, regardless of what the model 'decided'. Authorization at the tool boundary is the control; descriptions and transport choice are not."
 />
 
+### The other confused deputy: the OAuth proxy itself
+
+The deputy above is confused at the *tool* boundary — the model tricks the server into misusing its ledger credentials. There is a second one a layer down, at the *auth* boundary: the very "OAuth 2.1" the network-surface card told you to bolt on can itself become the confused deputy. This is not hypothetical. It is the [**Confused Deputy Problem** in the MCP security spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices), and it has shipped — `CVE-2026-27124` (High) was exactly this bug in a widely-used MCP framework's OAuth proxy.
+
+Here is the shape. An MCP server rarely runs its own identity provider; it acts as an **OAuth proxy** in front of a real upstream SSO so a tool can call the third-party API *as you*. To let clients like Claude Desktop bootstrap without out-of-band setup, the proxy turns on **Dynamic Client Registration (DCR)** — anyone can `POST /register` a `redirect_uri`. But the proxy is a *single* client to the upstream: it holds **one fixed `client_id`**, and each DCR "registration" is really just a `redirect_uri` stored behind that shared client. The upstream cannot tell the registrations apart — they are all `mcp-proxy`. So the proxy's own consent check is the *only* thing standing between a victim's login and an attacker's callback.
+
+Now the trap. Once a victim has logged in through the proxy once, the upstream sets a **consent cookie** for `mcp-proxy`. An attacker registers `redirect_uri: attacker.example` via open DCR, then sends the victim one link to the proxy's own `/authorize`. The browser rides that cookie: the upstream sees its own client, finds the cookie, **skips the consent screen**, and mints a real code for the victim's account. The proxy receives it and — if it never checks *whether this user approved this client* — redirects it straight to `attacker.example`. One click, no phishing page, no look-alike domain: the victim authenticated on the real SSO with real MFA, which is exactly what makes the stolen token real. (The OAuth mechanics — the code flow and exact `redirect_uri` matching — are in the **OAuth/OIDC chapter** (ch35).)
+
+**And PKCE cannot save you here.** PKCE (ch35) defends a *client* whose code is intercepted by a third party: the interceptor never saw the `code_verifier`, so the stolen code is dead. But in this attack the attacker *is* the registered client. It picks the verifier, hashes it into the `code_challenge` it sends, and presents that same verifier at the token exchange — it owns both halves. The victim never touches the challenge, the verifier, or the code; they are the *authentication material*, not a participant in the handshake. PKCE works exactly as specified and proves nothing about consent. The missing control is not a stronger secret — it is the proxy asking "do you approve *this* client?" and binding the answer to the `redirect_uri` before it ever forwards you upstream.
+
+That binding is the whole fix. Record a per-user, per-client consent decision on the proxy's *own* screen, and refuse to deliver a code unless the callback matches a decision this user actually made:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// The MCP proxy sits in front of ONE real upstream SSO with a single fixed
+// client_id. Dynamic Client Registration lets anyone register a redirect_uri
+// behind that shared client, and the upstream — seeing its own cookie — skips
+// consent. So the proxy's own consent + redirect_uri check is the ONLY thing
+// between a victim's login and an attacker's callback.
+
+type pendingAuth struct {
+	userID      string // filled in after the victim authenticates upstream
+	clientRegID string // which DCR registration initiated this flow
+	redirectURI string // the redirect_uri that registration asked for
+	code        string // the code the upstream SSO minted for userID
+}
+
+// consent records a per-user, per-client decision the user made on the
+// PROXY's OWN screen — not the upstream's cookie-skipped one.
+type consent struct{ userID, clientRegID, redirectURI string }
+
+// deliverVuln re-delivers the code to whatever redirect_uri the registration
+// carried. No check that THIS user approved THIS client. Confused deputy.
+func deliverVuln(p pendingAuth) (string, bool) {
+	return p.redirectURI + "?code=" + p.code, true
+}
+
+// deliverSafe delivers only if the user granted consent to this client on the
+// proxy's own screen, AND the redirect_uri exactly matches the one bound at
+// consent time. A mid-flight redirect_uri swap fails the lookup.
+func deliverSafe(p pendingAuth, granted map[consent]bool) (string, bool) {
+	c := consent{p.userID, p.clientRegID, p.redirectURI}
+	if !granted[c] {
+		return "", false
+	}
+	return p.redirectURI + "?code=" + p.code, true
+}
+
+func main() {
+	// The victim only ever approved the legitimate client on the proxy's own
+	// consent screen — codes for it go to the app's own callback.
+	granted := map[consent]bool{
+		{userID: "victim", clientRegID: "legit-app", redirectURI: "https://app.example/cb"}: true,
+	}
+
+	// Attacker used open DCR to register attacker.example behind the shared
+	// client, then baited the victim through the REAL SSO. The victim logged
+	// in for real; the upstream minted a real code for "victim".
+	attack := pendingAuth{"victim", "attacker-reg", "https://attacker.example/cb", "REAL-SSO-CODE"}
+	// The legitimate client the victim actually approved.
+	legit := pendingAuth{"victim", "legit-app", "https://app.example/cb", "REAL-SSO-CODE"}
+
+	locV, okV := deliverVuln(attack)
+	fmt.Printf("vulnerable proxy      -> deliver=%v  %s   <- victim's code lands at attacker\n", okV, locV)
+
+	_, okA := deliverSafe(attack, granted)
+	fmt.Printf("consent-gated (attack)-> deliver=%v  (victim never consented to attacker-reg)   <- refused\n", okA)
+
+	locL, okL := deliverSafe(legit, granted)
+	fmt.Printf("consent-gated (legit) -> deliver=%v  %s   <- the client the user approved\n", okL, locL)
+}
+```
+
+</GoPlayground>
+
+The vulnerable proxy hands the victim's real code to `attacker.example`; the consent-gated proxy refuses the attacker's registration because no `(victim, attacker-reg, …)` decision exists, while still delivering to the client the victim actually approved. The differentiator is one record the upstream cookie can never forge.
+
+<Callout kind="pro" title="Real case — the MCP OAuth-proxy confused deputy (CVE-2026-27124, 2026)">
+The MCP security spec forbids this outright: a proxy using a static upstream `client_id` **MUST** obtain user consent for **each** dynamically-registered client before forwarding upstream. In practice that means four **MUST**s: (1) a **per-client consent screen owned by the proxy**, shown before the upstream redirect and displaying the client name and the exact `redirect_uri` from the *registration record* (never a query parameter); (2) **exact `redirect_uri` matching**, rejecting any mid-flight change between authorize and callback; (3) a server-side, one-shot **`state`** bound to the consent decision (you cannot set the consent cookie until the user clicks Approve, or an attacker's crafted request gets the same cookie); (4) the consent cookie under the **`__Host-`** prefix with `Secure`, `HttpOnly`, `SameSite=Lax`. Sources: the [MCP Security Best Practices — Confused Deputy Problem](https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices), the [PrefectHQ/fastmcp advisory `GHSA-rww4-4w9c-7733`](https://github.com/PrefectHQ/fastmcp/security/advisories/GHSA-rww4-4w9c-7733) (CVE-2026-27124), and the [full-account-takeover write-up](https://hackt.us/full-account-takeover-on-an-mcp-oauth-proxy-why-pkce-can-t-save-you.md).
+</Callout>
+
+<QuickCheck
+  question="An MCP OAuth proxy uses a static upstream client_id, allows open Dynamic Client Registration, and enforces S256 PKCE at its token endpoint. An attacker registers redirect_uri: attacker.example and sends a victim one /authorize link. Why does PKCE not stop the code from reaching the attacker?"
+  options={["PKCE is bypassed by the S256-to-plain downgrade", "The attacker is the registered client — it chose the verifier and the challenge, so PKCE has nothing to say about consent", "The upstream SSO strips the code_challenge on redirect", "PKCE only works over stdio, not Streamable HTTP"]}
+  answer={1}
+  explain="PKCE defends a client whose code is intercepted by a third party. Here the attacker IS the client: it picks the code_verifier, sends its own code_challenge, and presents the matching verifier at exchange — both halves are its own. The victim is only the authentication material. The control that stops the attack is a per-client consent decision owned by the proxy and bound to the redirect_uri, not a stronger PKCE secret."
+/>
+
 ---
 
 ## Exercises
@@ -1087,7 +1180,7 @@ You now understand MCP from the wire up:
 - **Two transports:** **stdio** for local subprocesses (zero network, OS isolation) and **Streamable HTTP** for remote servers (one endpoint, optional SSE upgrade; it replaced HTTP+SSE). Same messages, different framing.
 - **The official `go-sdk`** shrinks a server to `NewServer` + `AddTool` (reflecting your typed input into a JSON Schema) + `Run`, and a client to `Connect` + `CallTool` — with all the protocol invariants enforced for you.
 - **Protocol error vs tool error:** a bad method/params is a JSON-RPC `error` (`-32601`, `-32602`, `-32002`); a valid call that fails in the domain is a normal `result` with `isError: true`. Never conflate them.
-- **Security:** the model is not your trust boundary. Validate every argument as hostile input, authorize against the *real end user* (confused-deputy defense), gate mutations behind human-in-the-loop, and lock down the HTTP surface (OAuth 2.1, `Origin` checks, TLS).
+- **Security:** the model is not your trust boundary. Validate every argument as hostile input, authorize against the *real end user* (tool-layer confused-deputy defense), gate mutations behind human-in-the-loop, and lock down the HTTP surface (OAuth 2.1, `Origin` checks, TLS). And the OAuth proxy is a *second* confused deputy: a static upstream `client_id` + open DCR + a skipped consent screen lets an attacker's `redirect_uri` steal a real code (`CVE-2026-27124`) — **PKCE can't save you** because the attacker is the client, so bind a per-client consent decision to the `redirect_uri`.
 
 </Recap>
 
