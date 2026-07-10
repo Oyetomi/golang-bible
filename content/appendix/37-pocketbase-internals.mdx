@@ -1,0 +1,1517 @@
+---
+title: "Inside PocketBase: How a One-Binary Backend Is Engineered"
+part: "appendix"
+order: 37
+type: "course"
+description: "The engineering of PocketBase from the source up: how one Go binary embeds SQLite (modernc, no CGO), a Svelte-free dashboard (embed.FS), and a whole REST+realtime backend; why it runs two connection pools against one SQLite file (concurrent readers + a single serialized writer) with WAL and a database-is-locked retry loop; the generic hook.Hook[T] chain built as reversed continuation closures; the net/http 1.22 ServeMux router wrapper; how user-defined collections compile to real SQL tables via a Field interface and CREATE/ALTER TABLE DDL; the fexpr filter DSL that compiles API-rule strings into parameterized dbx WHERE clauses (and why it's injection-safe); the SSE realtime broker that access-checks every record against each subscriber's rule; the goja JS VM pool behind pb_hooks; and the origin story (Gani Georgiev, Presentator, the v0.23 framework rewrite). Every mechanism is a runnable, Go 1.26 stdlib re-implementation."
+prerequisites: ["sql-databases", "http-servers"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Source Deep Dive" title="Inside PocketBase: How a One-Binary Backend Is Engineered">
+
+Here's the thing, sport. Most "backends" are a sprawling mess — a Postgres box, a Redis box, an API container, a websocket service, a migration runner, three YAML files, and a Kubernetes cluster to babysit the whole circus. **PocketBase** is *one file*. You download a single binary, run it, and you have a REST API, a realtime subscription server, an admin dashboard, file storage, auth with OAuth2, a migration system, and an embedded database — all inside one process, no dependencies to install.
+
+That's not magic. That's *engineering*, and unusually good engineering at that. One person — Gani Georgiev — built the core, and the whole thing is small enough that you and I can read it end to end and understand every decision. So that's what we're doing. Not "how to use PocketBase" (the docs do that). We're opening the hood: **how it embeds SQLite without CGO, why it runs two database pools against one file, how the hook system is really just a stack of reversed closures, how an API filter string becomes a safe SQL `WHERE` clause, and how 10,000 realtime clients get served off a $4 VPS.** By the end you won't just use it — you could *rebuild the skeleton yourself*. And you'll steal three or four patterns for your own Go services. That's the point.
+
+</HeroCard>
+
+<Callout kind="note" title="What this chapter is (and isn't)">
+This is an **internals** chapter: we read the real, open-source PocketBase source (Go 1.25 module, links in the sources callout below) and rebuild its load-bearing patterns as runnable Go 1.26 stdlib programs so you can verify the behavior yourself. It is not a "getting started" tutorial and not a security-testing chapter — PocketBase is the *subject*, and the goal is engineering understanding you can carry into your own backends.
+</Callout>
+
+<ChapterTabs tabs={["Why One Binary", "Embedding SQLite & the UI", "Two Pools, One File", "The Hook Chain", "The Router", "Collections Are Real Tables", "The Filter DSL", "Realtime Broadcast", "The JS VM Pool", "The Whole Picture"]} />
+
+<Callout kind="pro" title="Sources (read the real code)">
+Everything quoted here is from the public repo at **github.com/pocketbase/pocketbase** (this chapter tracks the July 2026 `master`, module `go 1.25`). Load-bearing files: `pocketbase.go` (launcher), `core/base.go` + `core/db_connect.go` + `core/db_builder.go` + `core/db_retry.go` (the DB layer), `tools/hook/hook.go` (the hook chain), `tools/router/router.go` (the router), `tools/search/filter.go` (the filter DSL, built on `github.com/ganigeorgiev/fexpr`), `apis/realtime.go` + `tools/subscriptions/*` (SSE realtime), `plugins/jsvm/jsvm.go` (the goja pool), `ui/embed.go` (the dashboard embed). Origin details are from `pocketbase.io/faq` and discussion #4254.
+</Callout>
+
+## Why One Binary
+
+Before a single line of code, understand the *thesis*. PocketBase makes one bet that shapes every internal decision: **most applications do not need a distributed system, and the complexity of running one is pure cost.** The FAQ says it plainly — "Most of the time, you may not need the complexity of managing a fleet of machines and services." So PocketBase scales *vertically* (a bigger single box), not *horizontally* (more boxes), and it commits to that so hard that it uses an embedded database and refuses to support networked ones.
+
+<Define term="Vertical vs. horizontal scaling">
+**Vertical scaling** means making one machine more powerful (more CPU, RAM, faster disk) and running your whole app on it. **Horizontal scaling** means running many machines behind a load balancer and coordinating state between them (a shared Postgres, a Redis cache, sticky sessions, distributed locks). Horizontal scaling is how you survive *beyond* one big machine — but it introduces network partitions, consistency problems, and a mountain of operational work (covered in Part 2's replication/sharding/consensus chapters). PocketBase's bet is that a surprising number of real apps fit comfortably on one box, so paying the horizontal-scaling tax up front is a mistake.
+</Define>
+
+Is the bet real? The author runs **Presentator** (his design-feedback app, the project PocketBase was originally built *for*) on PocketBase on a single **Hetzner CAX11** — 2 ARM cores, 4 GB RAM, about **€4.55/month** for the server. On that box: ~573K records across 10 collections, ~17K users, a 130 MB SQLite file, peaks of ~9,600 requests/hour, CPU under 20%, memory 200–600 MB. The FAQ claims the same class of box serves **10,000+ persistent realtime connections**. That's the whole argument, made with numbers: one cheap machine, one process, real production load.
+
+<Scene
+  title="The backend, before and after PocketBase"
+  actors={[
+    { id: "dev", label: "you", role: "operator" },
+    { id: "infra", label: "infrastructure", role: "captain" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "The conventional backend: your app code is one box among many. A Postgres server, a Redis cache, a websocket service, an object store, a migration job — each is a process to deploy, secure, back up, and pay for.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "warn", label: "API server" }, { id: "A2", state: "warn", label: "Postgres" }, { id: "A3", state: "warn", label: "Redis" },
+        { id: "B1", state: "warn", label: "websocket svc" }, { id: "B2", state: "warn", label: "object store" }, { id: "B3", state: "warn", label: "migrations job" }
+      ]
+    },
+    {
+      caption: "PocketBase: one binary. SQLite is embedded IN the process (no server), the dashboard is embedded IN the binary, realtime + files + migrations are all just code paths in the same executable. One file to deploy, one thing to back up.",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "one binary" }, { id: "C2", state: "done", label: "embedded SQLite" }, { id: "C3", state: "done", label: "embedded UI" },
+        { id: "D1", state: "done", label: "realtime (SSE)" }, { id: "D2", state: "done", label: "local files/S3" }, { id: "D3", state: "done", label: "migrations built in" }
+      ]
+    }
+  ]}
+  caption="The core engineering decision: collapse the fleet into one process. Everything downstream — two DB pools, the hook chain, the embedded UI — exists to make that one process do the work of six."
+/>
+
+<Callout kind="note" title="Who built it, and why that matters">
+PocketBase was created by **Gani Georgiev** as the backend for his other open-source project, **Presentator** — the very first feature requests were driven by "what does Presentator v3 need." The FAQ is blunt: *"PocketBase is neither a startup, nor a business. There is no paid team or company behind it."* That constraint is *why* the codebase is readable: a solo maintainer with limited time optimizes ferociously for simplicity and small scope. There's a public roadmap toward 1.0 but "no fixed ETAs." When you read the source and think "this is unusually tidy for a backend framework," that's the one-author discipline showing.
+</Callout>
+
+<QuickCheck
+  question={"What is PocketBase's core scaling bet?"}
+  options={["Auto-shard across many nodes", "Scale one machine vertically and embed everything in one process", "Use Postgres with read replicas", "Serverless functions on demand"]}
+  answer={1}
+  explain="PocketBase deliberately targets a single server: embedded SQLite, embedded UI, and all services (REST, realtime, files, migrations) inside one binary. The FAQ argues most apps never need a fleet, so it refuses to support networked databases and scales up, not out."
+/>
+
+---
+
+## Embedding SQLite & the UI
+
+Two things make PocketBase "one file": the **database engine is compiled into the binary** (there's no separate DB server to connect to), and the **admin dashboard is compiled into the binary** (there's no separate static-file server or CDN). Both use a Go feature that's central to the whole design.
+
+### SQLite with no C compiler
+
+The classic Go SQLite driver, `mattn/go-sqlite3`, wraps the C SQLite library via **cgo** — which means you need a C toolchain to build, and cross-compilation becomes painful. PocketBase's default is **`modernc.org/sqlite`**: SQLite's C source *transpiled to pure Go*. No cgo, no C compiler, trivial cross-compilation (`GOOS=linux GOARCH=arm64 go build` just works, which is how a Mac laptop produces the ARM binary that runs on that Hetzner box).
+
+<Define term="cgo">
+**cgo** is Go's foreign-function interface for calling C code. It's powerful but costly: you need a C compiler present at build time, cross-compilation requires a cross C toolchain, builds are slower, and each Go↔C call has overhead and sits outside the Go scheduler's view. `modernc.org/sqlite` sidesteps all of it by being *actual Go* — SQLite's amalgamation mechanically translated to Go source — so `CGO_ENABLED=0` builds produce one static binary with zero external `.so`/`.dll` dependencies.
+</Define>
+
+The connection setup is where the real engineering shows. PocketBase doesn't just open the file — it opens it with a carefully chosen set of **PRAGMAs** passed as query parameters. Here's the actual `core/db_connect.go`:
+
+```go
+// From pocketbase/core/db_connect.go (build tag: !no_default_driver)
+func DefaultDBConnect(dbPath string) (*dbx.DB, error) {
+	// Note: the busy_timeout pragma must be first because
+	// the connection needs to be set to block on busy before WAL mode
+	// is set in case it hasn't been already set by another connection.
+	pragmas := "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)" +
+		"&_pragma=journal_size_limit(200000000)&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-32000)"
+
+	return dbx.Open("sqlite", dbPath+pragmas)
+}
+```
+
+Every one of those PRAGMAs is a deliberate decision. Let's name them:
+
+<ConceptGrid cols={3}>
+<ConceptCard label="journal_mode(WAL)">
+**Write-Ahead Logging.** Instead of writing changes to a rollback journal (which blocks readers), SQLite appends changes to a `-wal` file. Readers see the last committed snapshot while a writer appends — so **readers don't block the writer and the writer doesn't block readers.** This is the single most important pragma for concurrency; without it SQLite serializes almost everything.
+</ConceptCard>
+<ConceptCard label="busy_timeout(10000)">
+When a connection can't get a lock, wait up to **10 seconds** retrying instead of failing instantly with `SQLITE_BUSY`. Set *first* (the comment says so) because it must be active before WAL is negotiated.
+</ConceptCard>
+<ConceptCard label="synchronous(NORMAL)">
+In WAL mode, `NORMAL` fsyncs at checkpoints, not every commit — much faster writes, and still safe against app crashes (only a full OS/power crash mid-checkpoint risks the last transaction). The standard WAL tuning.
+</ConceptCard>
+<ConceptCard label="foreign_keys(ON)">
+SQLite ships with FK enforcement **off** by default (legacy). PocketBase turns it on per-connection so relations actually constrain.
+</ConceptCard>
+<ConceptCard label="cache_size(-32000)">
+Negative = kibibytes, so **~32 MB** of page cache per connection instead of the tiny default. More hot pages in RAM = fewer disk reads.
+</ConceptCard>
+<Gotcha>
+⚠ PRAGMAs are **per-connection**, not per-database. Every connection in every pool must set them or you get inconsistent behavior (e.g. one connection enforcing FKs, another not). That's why the pragma string lives in the *connect* function — it runs for each physical connection the pool opens.
+</Gotcha>
+</ConceptGrid>
+
+<UnderTheHood title="What `journal_mode(WAL)` actually buys a single-file DB">
+Rollback-journal mode (SQLite's historical default) takes a write lock that **excludes all readers** for the duration of a write transaction, and a read lock that blocks writers. On a busy backend that's a serialization disaster. WAL flips the model: the main database file is a stable snapshot, and a writer *appends* new page versions to a separate `-wal` file. A reader picks the most recent commit it can see and reads consistently from that point (this is MVCC-like snapshot isolation). The consequences that shape PocketBase's whole DB layer: (1) **many readers + one writer run concurrently**; (2) there is still only **one writer at a time** — WAL doesn't give you concurrent writers; (3) the `-wal` file grows until a **checkpoint** folds it back into the main file (hence `journal_size_limit` capping it at ~200 MB, and why the author does manual `WAL` checkpoints before backups). Point (2) is the fact the next section is entirely built around. As of `modernc.org/sqlite` v1.52 (SQLite 3.53.x) this is all pure-Go, so it holds identically on a CGO-free build.
+</UnderTheHood>
+
+### The dashboard, baked into the binary
+
+The second half of "one file": the admin UI. PocketBase's dashboard is a client-side app (historically Svelte; as of v0.37 rebuilt on the author's own tiny "Shablon" library, still bundled with Vite into static files under `ui/dist`). Those static files are pulled *into the Go binary* at compile time with `//go:embed`:
+
+```go
+// From pocketbase/ui/embed.go (build tag: !no_ui)
+package ui
+
+import (
+	"embed"
+	"io/fs"
+)
+
+//go:embed all:dist
+var distDir embed.FS
+
+// DistDirFS is the embedded dist directory (with the "dist" prefix stripped).
+var DistDirFS, _ = fs.Sub(distDir, "dist")
+```
+
+<Define term="//go:embed (Go 1.16+)">
+`//go:embed` is a compiler directive that reads files from disk *at build time* and stores their bytes inside the compiled binary, exposed as a `string`, `[]byte`, or an `embed.FS` (a read-only in-memory filesystem implementing `fs.FS`). `all:dist` means "embed everything under `dist`, including files starting with `.` or `_`." At runtime you serve it with `http.FileServerFS(ui.DistDirFS)` — no files on disk, no separate web server. This is *the* feature that lets a Go program ship its own frontend.
+</Define>
+
+Notice the **build tags**: `//go:build !no_ui` on the embed file and `!no_default_driver` on the SQLite connect. If you build with `-tags no_ui` the dashboard bytes are excluded (smaller binary, headless deployment); with `-tags no_default_driver` you can plug in a *different* SQLite driver (libsql/Turso, sqlcipher, or the cgo `mattn` driver) via a custom `DBConnect`. So "one binary" is the default, but the seams to slim or re-wire it are deliberate.
+
+<ExecTimeline
+  title="What `go build` folds into the one binary"
+  lanes={[
+    { id: "src", label: "source inputs", role: "operator" },
+    { id: "build", label: "go build", role: "captain" },
+    { id: "bin", label: "the binary", role: "courier" }
+  ]}
+  steps={[
+    { lane: "src", kind: "run", label: "Go packages", note: "core/, apis/, tools/ — the actual backend logic compiled to machine code." },
+    { lane: "src", kind: "run", label: "modernc SQLite (Go)", note: "SQLite transpiled to pure Go, compiled in like any other package — no C, no external .so." },
+    { lane: "src", kind: "spawn", label: "ui/dist static files", note: "//go:embed all:dist reads the built dashboard files off disk AT BUILD TIME into an embed.FS." },
+    { lane: "build", kind: "run", label: "link everything", note: "CGO_ENABLED=0 → one statically linked executable, cross-compilable to any GOOS/GOARCH." },
+    { lane: "bin", kind: "done", label: "single portable file", note: "Copy it to a bare server, run it. DB engine, dashboard, and API are all inside. Nothing to install." , beat: "solution" }
+  ]}
+  caption="Three very different inputs — Go logic, a Go-transpiled DB engine, and a pre-built JS dashboard — all end up inside one linked executable. That's the whole 'portable backend' promise, mechanically."
+/>
+
+<QuickCheck
+  question={"Why does PocketBase default to modernc.org/sqlite instead of mattn/go-sqlite3?"}
+  options={["It's faster at every query", "It's pure Go — no cgo, so CGO_ENABLED=0 static builds and trivial cross-compilation", "It supports Postgres syntax", "It has no license"]}
+  answer={1}
+  explain="modernc.org/sqlite is SQLite transpiled to Go, so it needs no C compiler. That gives one static binary and painless cross-compilation (build the ARM Hetzner binary from a Mac), which is essential to the 'copy one file and run' model. mattn/go-sqlite3 is cgo and stays available behind a build tag."
+/>
+
+---
+
+## Two Pools, One File
+
+Here's the cleverest piece of the whole DB layer, and it falls straight out of the WAL fact from earlier: **WAL gives you many concurrent readers but only ever one writer.** So PocketBase opens the *same SQLite file twice*, with two connection pools tuned for the two roles.
+
+Look at the real `core/base.go` initialization:
+
+```go
+// From pocketbase/core/base.go — initDataDB (abridged)
+func (app *BaseApp) initDataDB() error {
+	dbPath := filepath.Join(app.DataDir(), "data.db")
+
+	// Pool #1: CONCURRENT — for reads. Many connections.
+	concurrentDB, err := app.config.DBConnect(dbPath)
+	// ...
+	concurrentDB.DB().SetMaxOpenConns(app.config.DataMaxOpenConns) // default 120
+	concurrentDB.DB().SetMaxIdleConns(app.config.DataMaxIdleConns) // default 15
+	concurrentDB.DB().SetConnMaxIdleTime(3 * time.Minute)
+
+	// Pool #2: NONCONCURRENT — for writes. Exactly ONE connection.
+	nonconcurrentDB, err := app.config.DBConnect(dbPath)
+	// ...
+	nonconcurrentDB.DB().SetMaxOpenConns(1) // <-- the whole trick
+	nonconcurrentDB.DB().SetMaxIdleConns(1)
+	nonconcurrentDB.DB().SetConnMaxIdleTime(3 * time.Minute)
+
+	app.concurrentDB = concurrentDB
+	app.nonconcurrentDB = nonconcurrentDB
+	return nil
+}
+```
+
+The defaults are declared right there in `base.go`: `DefaultDataMaxOpenConns = 120`, `DefaultDataMaxIdleConns = 15`. So one pool can open up to **120 parallel read connections**, and the other is capped at **exactly one** write connection.
+
+<Define term="database/sql connection pool">
+Go's `database/sql.DB` is not a single connection — it's a **pool** of them. `SetMaxOpenConns(n)` caps how many physical connections can be open at once; when all are busy, further queries **block** until one frees up. So `SetMaxOpenConns(1)` turns a pool into a **serialization gate**: only one operation touches the DB through that pool at a time, and the rest queue. PocketBase uses that intentionally as an application-level write lock.
+</Define>
+
+Why does capping writes at one connection *help*? Because SQLite already only allows one writer — if you let 120 connections all try to write, 119 of them collide on the SQLite write lock and get `SQLITE_BUSY` errors that you then have to retry. By funneling **all writes through a single connection**, PocketBase makes the writes queue up *inside Go* (cheap, orderly) instead of *fighting inside SQLite* (expensive, error-prone). Reads, which WAL allows to run concurrently, get the big 120-connection pool.
+
+Now — how does a query know which pool to use? PocketBase wraps both in a `dualDBBuilder` that **routes by operation type**: `SELECT` → concurrent pool, everything else (`INSERT`/`UPDATE`/`DELETE`/DDL) → the single-writer pool. From the doc comment on `DB()`: *"it automatically routes the SELECT queries to the underlying concurrent db pool and everything else to the nonconcurrent one."* The real `core/db_builder.go` is literally a method-by-method demultiplexer:
+
+```go
+// From pocketbase/core/db_builder.go — the router (abridged)
+type dualDBBuilder struct {
+	concurrentDB    dbx.Builder // reads
+	nonconcurrentDB dbx.Builder // writes
+}
+
+func (b *dualDBBuilder) Select(cols ...string) *dbx.SelectQuery {
+	return b.concurrentDB.Select(cols...) // read → concurrent
+}
+func (b *dualDBBuilder) Insert(table string, cols dbx.Params) *dbx.Query {
+	return b.nonconcurrentDB.Insert(table, cols) // write → single writer
+}
+func (b *dualDBBuilder) Update(table string, cols dbx.Params, where dbx.Expression) *dbx.Query {
+	return b.nonconcurrentDB.Update(table, cols, where) // write → single writer
+}
+// ...Delete, CreateTable, RenameColumn, etc. all → nonconcurrentDB
+```
+
+<ExecTimeline
+  title="Two writes and a read hit the same file"
+  lanes={[
+    { id: "r", label: "read pool (≤120)", role: "courier" },
+    { id: "w", label: "write pool (=1)", role: "captain" },
+    { id: "db", label: "SQLite (WAL)", role: "operator" }
+  ]}
+  steps={[
+    { lane: "r", kind: "run", label: "SELECT balance (client A)", note: "Routed to the concurrent pool. WAL lets it read the last committed snapshot with no lock contention." },
+    { lane: "w", kind: "send", label: "UPDATE balance (client B)", note: "Routed to the single-writer pool. It holds the one write connection and appends to the -wal file." },
+    { lane: "w", kind: "block", label: "UPDATE balance (client C) waits", note: "Client C's write is ALSO routed to the one-connection pool — so it blocks IN GO, queued behind B. No SQLITE_BUSY, no collision." },
+    { lane: "db", kind: "run", label: "B commits", note: "B's transaction finishes; the write connection frees." },
+    { lane: "w", kind: "send", label: "C proceeds", note: "The pool hands the single connection to C. Writes were serialized cleanly by the pool, not by SQLite throwing errors." },
+    { lane: "r", kind: "done", label: "read never blocked", note: "Throughout, client A's read ran concurrently against the WAL snapshot. Readers and the one writer coexist.", beat: "solution" }
+  ]}
+  caption="The dual pool turns SQLite's 'one writer' limit from a source of errors into an orderly in-Go queue, while reads run wide and concurrent. This is the heart of PocketBase's DB engineering."
+/>
+
+But queuing can't cover *every* case — a long-running read transaction, a checkpoint, or another process can still momentarily lock the file. So there's a second layer of defense: an **automatic retry loop** on the plain-text SQLite lock errors. This is the real `core/db_retry.go`, and it's a lovely little piece of pragmatism:
+
+```go
+// From pocketbase/core/db_retry.go
+var defaultRetryIntervals = []int{50, 100, 150, 200, 300, 400, 500, 700, 1000} // ms
+const defaultMaxLockRetries = 12
+
+func baseLockRetry(op func(attempt int) error, maxRetries int) error {
+	attempt := 1
+
+Retry:
+	err := op(attempt)
+
+	if err != nil && attempt <= maxRetries {
+		errStr := err.Error()
+		// checked against plain text because codes vary between drivers
+		if strings.Contains(errStr, "database is locked") ||
+			strings.Contains(errStr, "table is locked") {
+			time.Sleep(getDefaultRetryInterval(attempt)) // back off
+			attempt++
+			goto Retry
+		}
+	}
+
+	return err
+}
+```
+
+<Callout kind="pro" title="Yes, that's a real goto — and it's the right call">
+Go keeps `goto` in the language precisely for tight loops like this, and the standard library uses it too. Here it expresses "retry from the top after backing off" more directly than a `for` with a `continue`. Note the other pragmatic choice: it matches the error by **substring** (`"database is locked"`) rather than a typed error or code, *because the code differs between SQLite drivers* (`modernc` vs `mattn` vs libsql). Ugly? A little. Correct and driver-portable? Completely. This is what production Go looks like when it meets a real-world constraint — the comment even says why.
+</Callout>
+
+Let's make the pool-as-write-lock idea concrete and *runnable*. This models the dual-pool routing with two channels standing in for the two pools — a buffered channel of capacity 120 (reads) and capacity 1 (the single writer) — and shows writes serializing while reads fly:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// A pool modeled as a buffered channel of "slots". Acquiring a slot = getting
+// a connection; the buffer size is the max open connections.
+type pool struct{ slots chan struct{} }
+
+func newPool(size int) *pool {
+	p := &pool{slots: make(chan struct{}, size)}
+	for range size {
+		p.slots <- struct{}{}
+	}
+	return p
+}
+func (p *pool) do(work func()) {
+	c := <-p.slots       // acquire (blocks if none free)
+	defer func() { p.slots <- c }() // release
+	work()
+}
+
+func main() {
+	readPool := newPool(120) // concurrent readers
+	writePool := newPool(1)  // the single serialized writer
+
+	var maxWriters int64 // peak concurrent writers we ever observe
+	var cur int64
+
+	var wg sync.WaitGroup
+	// 5 writers all routed to the 1-slot pool: they must serialize.
+	for range 5 {
+		wg.Go(func() {
+			writePool.do(func() {
+				n := atomic.AddInt64(&cur, 1)
+				for { // track the peak
+					m := atomic.LoadInt64(&maxWriters)
+					if n <= m || atomic.CompareAndSwapInt64(&maxWriters, m, n) {
+						break
+					}
+				}
+				time.Sleep(5 * time.Millisecond) // simulate a write
+				atomic.AddInt64(&cur, -1)
+			})
+		})
+	}
+	// 50 readers routed to the 120-slot pool: they run wide.
+	for range 50 {
+		wg.Go(func() { readPool.do(func() { time.Sleep(time.Millisecond) }) })
+	}
+	wg.Wait()
+
+	fmt.Println("peak concurrent writers:", maxWriters, "(must be 1)")
+	if maxWriters == 1 {
+		fmt.Println("writes serialized through the single-connection pool ✓")
+	}
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={"Why cap the write pool at SetMaxOpenConns(1)?"}
+  options={["SQLite can't open two files", "To save memory", "SQLite allows only one writer at a time, so serializing writes in Go's pool avoids SQLITE_BUSY collisions", "Because reads are slower than writes"]}
+  answer={2}
+  explain="WAL permits many concurrent readers but exactly one writer. Letting many connections write causes lock collisions (SQLITE_BUSY) that must be retried. Funneling all writes through one connection makes them queue cheaply inside Go instead of fighting inside SQLite; reads still use the big 120-connection pool."
+/>
+
+---
+
+## The Hook Chain
+
+Everything extensible in PocketBase — "run my code before a record is created," "after a user logs in," "when the app boots" — flows through one generic type: `hook.Hook[T]`. Understanding it unlocks the entire event model, and it's a genuinely elegant use of Go generics + closures.
+
+A hook is a list of handlers, and each handler must call `e.Next()` to pass control down the chain (exactly like `net/http` middleware). The surprising part is *how* `Trigger` builds that chain. Here's the real `tools/hook/hook.go`:
+
+```go
+// From pocketbase/tools/hook/hook.go — the core of Trigger (abridged)
+func (h *Hook[T]) Trigger(event T, oneOffHandlerFuncs ...func(T) error) error {
+	h.mu.RLock()
+	handlers := make([]func(T) error, 0, len(h.handlers)+len(oneOffHandlerFuncs))
+	for _, handler := range h.handlers {
+		handlers = append(handlers, handler.Func)
+	}
+	handlers = append(handlers, oneOffHandlerFuncs...)
+	h.mu.RUnlock()
+
+	event.setNextFunc(nil) // reset in case the event is reused
+
+	// Build the chain BACKWARDS: wrap each handler so calling e.Next()
+	// runs the NEXT one, restoring the previous next-func afterwards.
+	for i := len(handlers) - 1; i >= 0; i-- {
+		i := i
+		old := event.nextFunc()
+		event.setNextFunc(func() error {
+			event.setNextFunc(old)
+			return handlers[i](event)
+		})
+	}
+
+	return event.Next() // kick off handler[0]
+}
+```
+
+<Define term="Continuation / e.Next()">
+A **continuation** is "the rest of the work, captured as something callable." Here, `event.Next()` *is* the continuation: calling it runs the next handler in the chain. Each handler decides whether to call `Next()` (proceed), skip it (short-circuit — e.g. an auth guard that rejects), or wrap it (do work, call `Next()`, then do more after — e.g. start a transaction, `Next()`, commit). This is the same shape as `net/http` middleware (`next.ServeHTTP`) and the router chain we'll see next — one idea reused everywhere in the codebase.
+</Define>
+
+Read the loop carefully, because it's doing something subtle. It walks the handlers **back to front**. At each step it captures the *current* `next` function as `old`, then installs a new `next` that, when called, (a) restores `old` and (b) runs `handlers[i]`. When the loop finishes, `event.Next` points at `handlers[0]`; calling it runs handler 0, whose own `e.Next()` now points at handler 1, and so on. It's a hand-rolled linked list of closures — the same result as deeply nesting `h0(h1(h2(...)))`, built iteratively.
+
+<UnderTheHood title="Why build it backwards instead of an index counter?">
+The obvious alternative is to store an integer index on the event and have `Next()` do `i++; return handlers[i](event)`. The closure approach is chosen because it makes each handler's `Next` a **self-contained continuation** with no shared mutable counter to get wrong under re-entrancy, and — critically — it restores `old` on the way, so the *same event can be safely re-triggered* and nested hooks compose. Note also the concurrency care: `Trigger` copies the handler slice under an `RLock` and releases the lock **before** executing anything. Handlers can run for a long time (DB calls, network) and can even add/remove other handlers; running them while holding the lock would deadlock or serialize the whole app. Snapshot-then-release is the same pattern you'd use for any "iterate a mutable collection while its elements might mutate it" problem. The `Hook[T]` mutex is a plain `sync.RWMutex`, and `Bind`/`Unbind` take the write lock; the observable invariant is that a `Trigger` sees a consistent snapshot of handlers as of when it started.
+</UnderTheHood>
+
+There's a second layer worth seeing: **tagged hooks**. Record hooks fire for *all* collections, but you usually want "only for the `posts` collection." `TaggedHook` wraps a handler so it only runs if the event's tags match — and it does it by *composing another closure* around your function. From `tools/hook/tagged.go`:
+
+```go
+// From pocketbase/tools/hook/tagged.go
+func (h *TaggedHook[T]) BindFunc(fn func(e T) error) string {
+	return h.mainHook.BindFunc(func(e T) error {
+		if h.CanTriggerOn(e.Tags()) { // tags match? run the real handler.
+			return fn(e)
+		}
+		return e.Next() // no match → skip straight to the next handler
+	})
+}
+```
+
+Notice the elegance: a non-matching tagged handler doesn't error or stop the chain — it just calls `e.Next()`, becoming a transparent pass-through. Same continuation idea, one level up.
+
+Let's rebuild the whole chain in miniature so you can *watch* the ordering, short-circuiting, and wrap-around behavior. This is a faithful, runnable model of `hook.Hook[T].Trigger`:
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// event carries a mutable "next" continuation, exactly like hook.Event.
+type event struct {
+	next   func() error
+	Amount int
+	Log    []string
+}
+
+func (e *event) Next() error {
+	if e.next == nil {
+		return nil // end of chain
+	}
+	return e.next()
+}
+
+type handler func(e *event) error
+
+// trigger builds the chain backwards, the same way PocketBase does.
+func trigger(e *event, handlers ...handler) error {
+	e.next = nil
+	for i := len(handlers) - 1; i >= 0; i-- {
+		old := e.next
+		e.next = func() error {
+			e.next = old
+			return handlers[i](e)
+		}
+	}
+	return e.Next()
+}
+
+func main() {
+	e := &event{Amount: 100}
+
+	err := trigger(e,
+		// handler 0: a "middleware" that wraps the rest (before + after).
+		func(e *event) error {
+			e.Log = append(e.Log, "tx begin")
+			if err := e.Next(); err != nil { // run the rest of the chain
+				return err
+			}
+			e.Log = append(e.Log, "tx commit")
+			return nil
+		},
+		// handler 1: a guard that short-circuits on bad input.
+		func(e *event) error {
+			if e.Amount <= 0 {
+				return fmt.Errorf("amount must be positive")
+			}
+			e.Log = append(e.Log, "validated")
+			return e.Next()
+		},
+		// handler 2: the terminal "do the work" step.
+		func(e *event) error {
+			e.Log = append(e.Log, fmt.Sprintf("charged %d", e.Amount))
+			return e.Next() // next is nil → chain ends cleanly
+		},
+	)
+
+	fmt.Println("err:", err)
+	for i, s := range e.Log {
+		fmt.Printf("%d. %s\n", i+1, s)
+	}
+	// Expected order: tx begin, validated, charged 100, tx commit.
+}
+```
+
+</GoPlayground>
+
+Run it, then flip `Amount` to `0` and watch handler 1 short-circuit — "tx commit" never prints because the guard returns an error before `Next()` reaches the terminal step. That's precisely how a PocketBase `OnRecordCreate` guard rejects a bad write while a transaction-wrapping hook rolls back.
+
+<Callout kind="warn" title="The #1 hook bug: forgetting e.Next()">
+If a handler *doesn't* call `e.Next()` and doesn't return an error, the chain silently stops — later handlers (including PocketBase's own built-in persistence handler) never run. The bootstrap code even logs a warning for exactly this: *"OnBootstrap hook didn't fail but the app is still not bootstrapped - maybe missing e.Next()?"* When someone says "my hook runs but the record doesn't save," this is almost always why.
+</Callout>
+
+<QuickCheck
+  question={"In the hook chain, what does calling e.Next() do?"}
+  options={["Returns the next handler's ID", "Runs the next handler in the chain (the continuation); skipping it short-circuits the chain", "Commits the database transaction", "Unregisters the current handler"]}
+  answer={1}
+  explain="e.Next() is the continuation — it invokes the next handler. A handler that omits Next() stops the chain (later handlers, including built-in persistence, don't run); one that wraps Next() can do before/after work like begin/commit. Same model as net/http middleware."
+/>
+
+---
+
+## The Router
+
+PocketBase used to embed the `echo` framework. In the v0.23 rewrite it dropped that dependency and built a thin router **on top of the standard library's `net/http.ServeMux`**, using the pattern-matching enhancements that landed in **Go 1.22** (method-aware patterns like `"GET /api/collections/{name}"` with path wildcards). This is a great case study in "how much router do you actually need."
+
+<Define term="net/http.ServeMux (Go 1.22+)">
+`ServeMux` is Go's built-in HTTP request multiplexer. Since **Go 1.22** its patterns understand **methods** (`"POST /users"`), **path wildcards** (`"/users/{id}"`, readable via `r.PathValue("id")`), and **precedence** (more specific patterns win). Before 1.22 you needed a third-party router (gorilla/mux, chi, echo) for any of that; now the stdlib covers the common cases, which is exactly why PocketBase could delete `echo`.
+</Define>
+
+PocketBase's `Router[T]` is generic over an event type and adds three things `ServeMux` lacks: **route groups** (shared path prefixes), **middleware** (the same hook-chain idea), and a per-request **event object**. Its `BuildMux()` flattens all the groups into a plain `*http.ServeMux`. Two details from the real `tools/router/router.go` are worth quoting because they're instructive:
+
+```go
+// From pocketbase/tools/router/router.go — BuildMux (abridged)
+func (r *Router[T]) BuildMux() (http.Handler, error) {
+	// ServeMux's built-in NotFoundHandler can't run our group middlewares,
+	// so we register an explicit catch-all "/" route to funnel 404s
+	// through the same middleware chain.  (golang/go issue #65648)
+	if !r.HasRoute("", "/") {
+		r.Route("", "/", func(e T) error {
+			return NewNotFoundError("", nil)
+		})
+	}
+
+	mux := http.NewServeMux()
+	if err := r.loadMux(mux, r.RouterGroup, nil); err != nil {
+		return nil, err
+	}
+	return mux, nil
+}
+```
+
+That comment is the whole lesson of building on a minimal core: you get 90% for free, then you engineer around the sharp edges (here, that stdlib's built-in 404 handler bypasses your middleware, so you register an explicit `"/"` catch-all to route not-founds through the same chain). When each route is registered, the group and route middlewares are collected into a `hook.Hook[T]` — **the same hook chain from the last section** — and executed per request. One primitive, reused: the event model, the middleware, and the route handlers are all `hook.Hook[T]`.
+
+Here's a runnable miniature showing the Go 1.22 method+wildcard routing and a middleware chain, so the "thin wrapper over ServeMux" claim is concrete:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// middleware is the same "call next to proceed" shape as the hook chain.
+func logging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Printf("→ %s %s\n", r.Method, r.URL.Path)
+		next.ServeHTTP(w, r) // the continuation
+	})
+}
+
+func main() {
+	mux := http.NewServeMux()
+
+	// Go 1.22+: method-aware pattern with a path wildcard.
+	mux.HandleFunc("GET /api/collections/{name}/records/{id}", func(w http.ResponseWriter, r *http.Request) {
+		// r.PathValue reads the wildcards — no third-party router needed.
+		fmt.Fprintf(w, "collection=%s id=%s",
+			r.PathValue("name"), r.PathValue("id"))
+	})
+
+	handler := logging(mux) // wrap the whole mux in middleware
+
+	// Drive it in-memory with httptest (no real socket).
+	req := httptest.NewRequest("GET", "/api/collections/posts/records/abc123", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	fmt.Println("status:", rec.Code)
+	fmt.Println("body:  ", rec.Body.String())
+
+	// A method mismatch: ServeMux itself returns 405 for us.
+	req2 := httptest.NewRequest("DELETE", "/api/collections/posts/records/abc123", nil)
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	fmt.Println("DELETE status:", rec2.Code, "(405 = method not allowed, from ServeMux)")
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="The takeaway for your own services">
+You very likely don't need a router dependency anymore. Since Go 1.22, `ServeMux` handles methods, path wildcards, and precedence; wrapping it for groups + middleware is ~300 lines (that's literally all `tools/router` is). PocketBase deleting `echo` in favor of the stdlib is a signal: reach for the standard library first, add a dependency only when it earns its keep. That's the Bible's whole "justify every dependency" rule, demonstrated by a real project shedding one.
+</Callout>
+
+---
+
+## Collections Are Real Tables
+
+A backend-as-a-service lets users invent data models at *runtime* — a `posts` collection today, a `comments` collection tomorrow, each with fields they define in the dashboard. The lazy way to implement that is to store everything as generic key-value rows or a JSON blob per record. PocketBase does something braver and far better: **every collection is a real SQL table, and every field is a real column.** Edit the schema in the dashboard and PocketBase runs actual `ALTER TABLE` DDL.
+
+<Define term="EAV (Entity-Attribute-Value) — and why PocketBase refuses it">
+**EAV** stores dynamic data as rows of `(entity_id, attribute_name, value)` in one giant generic table — the classic trick for faking a dynamic schema. It queries terribly (every field read is a self-join), types nothing, and can't use real indexes. The "one JSON `data` column per record" variant is EAV's lazier cousin with the same costs. PocketBase rejects both: if users define structure, hand the *database* that structure — real columns, real types, real indexes — so the full SQL toolbox (`WHERE title LIKE …`, real `ORDER BY`, true pagination and counts) keeps working at native speed. That single decision is *why* the filter DSL in the next section can compile to a real `WHERE` clause instead of scanning in Go.
+</Define>
+
+The machinery has two halves. First, a **`Field` interface** — each field type (`text`, `number`, `bool`, `date`, `relation`, `file`, `json`, … over a dozen of them in `core/field_*.go`) implements it. The load-bearing method is `ColumnType`, which returns the field's **SQL column definition**:
+
+```go
+// From pocketbase/core/field.go — the Field interface (abridged)
+type Field interface {
+	Type() string                                  // "text", "number", ...
+	ColumnType(app App) string                     // the DB column definition
+	PrepareValue(record *Record, raw any) (any, error) // normalize raw input → Go value
+	ValidateValue(ctx context.Context, app App, record *Record) error
+	ValidateSettings(ctx context.Context, app App, collection *Collection) error
+	// ...identity getters/setters trimmed...
+}
+```
+
+Each field type answers `ColumnType` with a literal SQL fragment — these are the *real* strings from the source:
+
+<ConceptGrid cols={3}>
+<ConceptCard label="TextField">
+`TEXT DEFAULT '' NOT NULL` (a useful zero value — empty string, never NULL).
+</ConceptCard>
+<ConceptCard label="NumberField">
+`NUMERIC DEFAULT 0 NOT NULL`.
+</ConceptCard>
+<ConceptCard label="BoolField">
+`BOOLEAN DEFAULT FALSE NOT NULL`.
+</ConceptCard>
+<ConceptCard label="DateField">
+`TEXT DEFAULT '' NOT NULL` — datetimes stored as **sortable UTC strings**, so `ORDER BY` and range filters just work.
+</ConceptCard>
+<ConceptCard label="RelationField (multi)">
+`JSON DEFAULT '[]' NOT NULL` — the deliberate exception: an array of foreign ids, kept queryable via SQLite's JSON functions.
+</ConceptCard>
+<Gotcha>
+⚠ Adding a new field *type* to PocketBase means implementing this one interface — nothing else in the system changes. Small interface, huge leverage: the same design move as the `TLSExtension` interface in the impersonation chapter.
+</Gotcha>
+</ConceptGrid>
+
+Second half: **`SyncRecordTableSchema`** (`core/collection_record_table_sync.go`). When a collection is saved, PocketBase diffs the old definition against the new one and emits DDL **inside one transaction**: `CREATE TABLE` for a new collection, `RENAME TABLE` if the name changed, `DROP COLUMN` for removed fields, `ADD COLUMN` (using that field's `ColumnType`) for new ones. Renames use a **two-step temp-name dance** — rename to a random temporary name first, then to the final name — which sidesteps ambiguity when a rename chain collides (swapping `a`↔`b`), at the admitted cost of "always doing 1 more rename." Collection definitions live in a `_collections` system table and are **cached in memory** at bootstrap (`ReloadCachedCollections`), so the hot request path never re-queries the schema.
+
+<ExecTimeline
+  title="Dashboard: add a 'due' date field to a 'tasks' collection"
+  lanes={[
+    { id: "api", label: "collections API", role: "operator" },
+    { id: "sync", label: "SyncRecordTableSchema", role: "captain" },
+    { id: "db", label: "SQLite (write pool)", role: "courier" }
+  ]}
+  steps={[
+    { lane: "api", kind: "run", label: "save Collection model", note: "The dashboard PATCHes the collection. Validation runs (legal field names? no system-field collisions?), then OnCollectionUpdate hooks fire — schema changes travel the SAME hook chain as everything else." },
+    { lane: "sync", kind: "run", label: "diff old vs new fields", note: "Old collection (from the in-memory cache) vs new: one added field 'due', no renames, no drops — all computed from the two Go models, no DB introspection." },
+    { lane: "db", kind: "send", label: "ALTER TABLE tasks ADD COLUMN due", note: "due's DateField.ColumnType() returns TEXT DEFAULT '' NOT NULL. The DDL runs through the 1-connection write pool, inside the surrounding transaction." },
+    { lane: "sync", kind: "run", label: "sync indexes", note: "Collection-defined indexes are diffed and (re)created as real CREATE INDEX statements. Real columns → real indexes → the query planner works for you." },
+    { lane: "db", kind: "done", label: "commit + refresh cache", note: "The transaction commits and the cached collection store refreshes. Every future record query, API rule, and realtime check reads the new schema from memory.", beat: "solution" }
+  ]}
+  caption="Runtime-dynamic schema, but never schemaless: the user's model edits compile to honest DDL on real tables, and the source of truth is cached in RAM."
+/>
+
+Let's make the field→column→`CREATE TABLE` idea runnable. This models a tiny field registry where each field type reports its `ColumnType`, and a collection assembles them into a real `CREATE TABLE` statement — exactly `SyncRecordTableSchema`'s core move:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Field is the shrunk-down version of PocketBase's Field interface:
+// the essential job is "what SQL column am I?"
+type Field interface {
+	Name() string
+	ColumnType() string
+}
+
+type TextField struct{ name string }
+func (f TextField) Name() string       { return f.name }
+func (f TextField) ColumnType() string { return "TEXT DEFAULT '' NOT NULL" }
+
+type NumberField struct{ name string }
+func (f NumberField) Name() string       { return f.name }
+func (f NumberField) ColumnType() string { return "NUMERIC DEFAULT 0 NOT NULL" }
+
+type BoolField struct{ name string }
+func (f BoolField) Name() string       { return f.name }
+func (f BoolField) ColumnType() string { return "BOOLEAN DEFAULT FALSE NOT NULL" }
+
+// createTableSQL is SyncRecordTableSchema's core: assemble each field's
+// ColumnType into one CREATE TABLE. Every collection has a system id column.
+func createTableSQL(collection string, fields []Field) string {
+	cols := []string{"id TEXT PRIMARY KEY"}
+	for _, f := range fields {
+		cols = append(cols, fmt.Sprintf("%s %s", f.Name(), f.ColumnType()))
+	}
+	return fmt.Sprintf("CREATE TABLE %s (\n  %s\n);",
+		collection, strings.Join(cols, ",\n  "))
+}
+
+func main() {
+	// A "tasks" collection defined at runtime, like a dashboard user would.
+	fields := []Field{
+		TextField{"title"},
+		BoolField{"done"},
+		NumberField{"priority"},
+	}
+	fmt.Println(createTableSQL("tasks", fields))
+
+	// Adding a field type = implementing the interface; createTableSQL is untouched.
+}
+```
+
+</GoPlayground>
+
+<Gotcha>
+⚠ The price of real tables: schema changes are **online DDL on a live database**. SQLite's `ALTER TABLE` is limited (part of why the temp-rename dance exists), and a `DROP COLUMN` is irreversible data loss the instant the transaction commits. PocketBase mitigates with confirmation UI and the **`migratecmd` plugin**, which writes a Go/JS migration file for every dashboard schema change in dev mode — so schema edits become reviewable, replayable code in `pb_migrations/`. If you ever build a dynamic-schema system, steal exactly that: **the GUI writes migrations, humans review them.**
+</Gotcha>
+
+<QuickCheck
+  question={"How does PocketBase store a user-defined collection's data?"}
+  options={["As JSON blobs in one generic table", "As EAV (entity-attribute-value) rows", "As a real SQL table with a real typed column per field, created/altered via DDL", "In separate SQLite files per collection"]}
+  answer={2}
+  explain="Each field type implements ColumnType() returning a real SQL column definition (e.g. TEXT DEFAULT '' NOT NULL), and SyncRecordTableSchema emits CREATE/ALTER TABLE DDL to build real tables. That's what lets the filter DSL compile to a genuine WHERE clause with real indexes — impossible with EAV or JSON blobs."
+/>
+
+---
+
+## The Filter DSL
+
+Here's a hard problem PocketBase solves beautifully. The API lets clients send filter strings like `?filter=(status='active' && created > '2026-01-01')`, and **collection access rules** are stored as strings like `@request.auth.id != "" && author = @request.auth.id`. Both must become SQL `WHERE` clauses — *safely*, without SQL injection. How do you turn arbitrary user-supplied filter text into a parameterized query?
+
+The answer is a proper little compiler. PocketBase uses **`fexpr`** (also by Gani Georgiev) to **parse** the filter string into an expression tree, then walks that tree to **build** a `dbx` expression with **placeholder parameters** — never string-concatenating user values into SQL.
+
+<Define term="Parameterized query (and why it stops injection)">
+A **parameterized query** sends the SQL *structure* and the *values* to the database separately: `WHERE status = {:p0}` plus a bound value `{"p0": "active"}`. The value is never parsed as SQL — it can contain quotes, `OR 1=1`, `DROP TABLE`, anything, and it's still treated as an opaque string literal. **SQL injection** happens only when you build SQL by string concatenation (`"WHERE status = '" + userInput + "'"`), letting the input escape the quotes and become code. PocketBase's filter compiler *only ever* emits placeholders for values, which is what makes accepting raw filter strings from the internet safe.
+</Define>
+
+The real `tools/search/filter.go` does two smart things. First, it **caches parsed expressions** so the same filter string isn't re-parsed on every request:
+
+```go
+// From pocketbase/tools/search/filter.go
+// A concurrent-safe store caching previously parsed filter expressions.
+var parsedFilterData = store.New(make(map[string][]fexpr.ExprGroup, 50))
+```
+
+Second — and this is the security-critical part — when it builds the SQL expression, **every value from the filter becomes a generated placeholder parameter**, and identifiers (field names) are validated by a `FieldResolver` against the collection's real schema. A field the collection doesn't have can't be referenced; a value can't break out of its binding. Let's build a faithful miniature: a tiny filter compiler that tokenizes `field op value` clauses joined by `&&`, resolves field names against an allowlist, and emits a parameterized `WHERE` — exactly the shape of what PocketBase does (minus fexpr's full grammar):
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// resolver: only these fields exist on the collection. Anything else is rejected
+// — this is PocketBase's FieldResolver guarding against arbitrary column access.
+var allowedFields = map[string]bool{"status": true, "author": true, "views": true}
+
+type clause struct{ field, op, value string }
+
+// compile turns "status = 'active' && views > 100" into a parameterized WHERE.
+func compile(filter string) (string, map[string]any, error) {
+	params := map[string]any{}
+	var sqlParts []string
+	pi := 0
+
+	for _, raw := range strings.Split(filter, "&&") {
+		c, err := parseClause(strings.TrimSpace(raw))
+		if err != nil {
+			return "", nil, err
+		}
+		if !allowedFields[c.field] {
+			// reject unknown identifiers — no injecting arbitrary column names
+			return "", nil, fmt.Errorf("unknown field %q", c.field)
+		}
+		ph := "p" + strconv.Itoa(pi) // generated placeholder name
+		pi++
+		// STRUCTURE uses the placeholder; the VALUE is bound separately.
+		sqlParts = append(sqlParts, fmt.Sprintf("%s %s {:%s}", c.field, c.op, ph))
+		params[ph] = coerce(c.value)
+	}
+	return strings.Join(sqlParts, " AND "), params, nil
+}
+
+func parseClause(s string) (clause, error) {
+	for _, op := range []string{">=", "<=", "!=", "=", ">", "<"} {
+		if i := strings.Index(s, op); i > 0 {
+			return clause{
+				field: strings.TrimSpace(s[:i]),
+				op:    op,
+				value: strings.TrimSpace(s[i+len(op):]),
+			}, nil
+		}
+	}
+	return clause{}, fmt.Errorf("cannot parse clause %q", s)
+}
+
+func coerce(v string) any {
+	v = strings.Trim(v, "'\"")        // strip quotes → plain string value
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return v
+}
+
+func main() {
+	// A normal filter compiles to placeholders — no value ever enters the SQL text.
+	where, params, err := compile("status = 'active' && views > 100")
+	fmt.Println("WHERE:", where)
+	fmt.Println("params:", params)
+	fmt.Println("err:", err)
+
+	// An injection attempt: the malicious payload becomes a BOUND VALUE, harmless.
+	where2, params2, _ := compile("status = 'active'' OR 1=1 --'")
+	fmt.Println("\ninjection attempt →")
+	fmt.Println("WHERE:", where2)     // structure unchanged: status = {:p0}
+	fmt.Println("params:", params2)   // the whole payload sits inside p0 as data
+
+	// Referencing a column that doesn't exist is rejected outright.
+	_, _, err3 := compile("secret_admin_flag = 1")
+	fmt.Println("\nunknown field →", err3)
+}
+```
+
+</GoPlayground>
+
+The injection attempt is the money shot: the payload `'active'' OR 1=1 --` doesn't change the query *structure* at all — it lands inside `p0` as an inert string value. And `secret_admin_flag` is rejected because it's not in the resolver's allowlist. That's the two-part defense PocketBase actually ships: **values are always placeholders, identifiers are always schema-validated.**
+
+<UnderTheHood title="Where the API rule and the client filter meet">
+When you list records, PocketBase compiles *two* filters and `AND`s them: the collection's stored **List Rule** (e.g. `@request.auth.id = author`) and the client's **?filter=** query param. Both go through the same `FilterData.BuildExpr` → both become parameterized `dbx` expressions → both are combined with `query.AndWhere(...)` (you can see this in `apis/record_crud.go`). The consequence is a clean security property: **a client can never widen its own access by crafting a filter**, because its filter is `AND`-ed *under* the server's rule — the rule's `WHERE` is always applied. Macros like `@request.auth.id` and `@collection.x` are resolved by the field resolver into safe joined subqueries, not string-spliced. This is how one expression compiler serves both "user search" and "row-level security" with the same injection-safe machinery.
+</UnderTheHood>
+
+<Callout kind="warn" title="Security-track sidebar: the rules ARE the wall">
+If you ever audit a PocketBase app (yours, or an in-scope target on a program), the API rules *are* the access-control layer — the Broken Access Control chapter's lens applies directly. The classic misconfigurations: a rule left as `""` (public) on a collection holding private data; a `listRule` that checks ownership but a `viewRule` that doesn't (an IDOR by direct-id fetch); rules that trust `@request.body` fields the client controls; and forgetting that **a superuser token bypasses every rule and hidden-field flag**. The engine itself has held up well precisely *because* it compiles to parameterized SQL instead of concatenating strings — the bugs live in the rules developers write, not in the compiler.
+</Callout>
+
+<QuickCheck
+  question={"How does PocketBase accept raw filter strings from clients without SQL injection?"}
+  options={["It regex-escapes quotes", "It blocks the word SELECT", "It parses filters into an expression tree and emits parameterized placeholders for all values, validating field names against the schema", "It runs filters in a sandbox VM"]}
+  answer={2}
+  explain="Values always become bound placeholder parameters (never concatenated into SQL text), so a payload like ' OR 1=1 -- is treated as an inert string. Field identifiers are checked against the collection schema via a FieldResolver. The client filter is also AND-ed under the server's access rule, so it can't widen access."
+/>
+
+---
+
+## Realtime Broadcast
+
+PocketBase's realtime is **Server-Sent Events (SSE)**, not WebSockets. That's a deliberate simplicity choice: SSE is just a long-lived HTTP response with `Content-Type: text/event-stream` that the server keeps writing to — no upgrade handshake, no separate protocol, works through every proxy, and it's one-directional (server→client), which is all a "your data changed" feed needs. The client subscribes/unsubscribes over normal HTTP requests.
+
+<Define term="Server-Sent Events (SSE)">
+**SSE** is a browser standard (`EventSource`) for server→client streaming over a single kept-open HTTP response. The server sets `Content-Type: text/event-stream`, then writes messages formatted as `id: ...\ndata: ...\n\n` and **flushes** after each one. The connection stays open; the browser auto-reconnects if it drops. Compared to WebSockets it's simpler (plain HTTP, no upgrade), text-only, and one-way — a perfect fit for "notify subscribers that a record changed." The realtime chapter (appendix ch30) contrasts SSE, WebSockets, and webhooks in depth.
+</Define>
+
+The connection handler (`apis/realtime.go`) is a clean piece of long-lived-connection engineering. It disables the server's write deadline for this one response, sets the SSE headers (including `X-Accel-Buffering: no` so nginx doesn't buffer the stream), registers a client with the **broker**, then blocks in a `select` loop over three things: the client's message channel, an **idle timer** (5 min), and a **max-lifetime timer** (30 min):
+
+```go
+// From pocketbase/apis/realtime.go — the connection loop (abridged)
+e.Response.Header().Set("Content-Type", "text/event-stream")
+e.Response.Header().Set("Cache-Control", "no-store")
+e.Response.Header().Set("X-Accel-Buffering", "no") // don't let nginx buffer
+
+// ...register client with the broker...
+
+maxTimer := time.NewTimer(ce.MaxTimeout)   // 30 min — bound resource lifetime
+idleTimer := time.NewTimer(ce.IdleTimeout) // 5 min — reap forgotten connections
+defer maxTimer.Stop()
+defer idleTimer.Stop()
+
+for {
+	select {
+	case <-maxTimer.C:
+		cancelRequest() // hard cap so connections don't accumulate forever
+	case <-idleTimer.C:
+		cancelRequest() // no activity → drop it
+	case msg, ok := <-ce.Client.Channel(): // a broadcast arrived for this client
+		if !ok {
+			return nil // channel closed → client discarded, end handler
+		}
+		// ...write msg as SSE and Flush()...
+	}
+}
+```
+
+<Callout kind="pro" title="Why the two timers matter at 10,000 connections">
+The FAQ's headline number — 10k+ persistent connections on a cheap box — is only safe because of those timers. A **max-lifetime timer** (30 min) guarantees no connection lives forever, so leaked/zombie clients are periodically forced to reconnect and the runtime can reclaim their goroutines and buffers (the comment literally says "to allow the GC to run more regularly"). An **idle timer** (5 min) reaps clients that vanished without a clean close (laptop lid shut, mobile network dropped). Without these, a long-running SSE server slowly accretes dead connections until it falls over. This is the unglamorous engineering that makes the impressive number real.
+</Callout>
+
+Now the interesting part: when a record changes, *who gets notified?* Not everyone. Each subscriber has an access rule, and PocketBase **re-checks that rule against the changed record for every subscriber** before sending. The real `realtimeBroadcastRecord` (in `apis/realtime.go`) chunks the clients and fans out across goroutines with an `errgroup`, and for each client it builds a mock `RequestInfo` (carrying that client's auth record) and calls `realtimeCanAccessRecord(...)` with the collection's `ViewRule`/`ListRule`. If the rule fails, that client is silently skipped:
+
+```go
+// From pocketbase/apis/realtime.go — realtimeBroadcastRecord (heavily abridged)
+chunks := app.SubscriptionsBroker().ChunkedClients(clientsChunkSize)
+group := new(errgroup.Group)
+
+for _, chunk := range chunks {
+	group.Go(func() error {
+		for _, client := range chunk {
+			clientAuth, _ := client.Get(RealtimeClientAuthKey).(*core.Record)
+			requestInfo := &core.RequestInfo{
+				Context: core.RequestInfoContextRealtime,
+				Method:  "GET",
+				Auth:    clientAuth, // THIS subscriber's identity
+			}
+			// re-run the SAME access rule engine as the REST API:
+			if !realtimeCanAccessRecord(app, record, requestInfo, rule) {
+				continue // not allowed to see it → don't send
+			}
+			// ...enrich a clean record copy and client.Send(message)...
+		}
+		return nil
+	})
+}
+```
+
+<UnderTheHood title="One access model, enforced in two places">
+This is the deep design win. The *same* collection access rules (compiled by the *same* filter DSL from the last section) gate both the REST API **and** the realtime stream. There is no separate "realtime permissions" system to keep in sync — a rule like `@request.auth.id = author` means "you can only see your own rows" whether you `GET /api/collections/notes/records` or subscribe to `notes` over SSE. The broadcast path builds a synthetic `RequestInfo` per subscriber precisely so it can reuse the REST access checker verbatim. The cost is that broadcasting is O(subscribers × rules), which is why clients are **chunked** and processed across an `errgroup` of goroutines — but *within* a chunk the checks run sequentially, on purpose, so each access check sees a consistent DB state for the record. This is a textbook example of "don't build the security model twice."
+</UnderTheHood>
+
+<ExecTimeline
+  title="A record is updated — who gets the SSE?"
+  lanes={[
+    { id: "w", label: "write path", role: "operator" },
+    { id: "b", label: "broker fan-out", role: "captain" },
+    { id: "c", label: "subscribers", role: "courier" }
+  ]}
+  steps={[
+    { lane: "w", kind: "run", label: "UPDATE note #7 commits", note: "A record save finishes; an after-write hook triggers realtimeBroadcastRecord for note #7." },
+    { lane: "b", kind: "spawn", label: "chunk clients, errgroup", note: "The broker splits all subscribers into chunks; each chunk is processed on its own goroutine for parallel fan-out." },
+    { lane: "b", kind: "run", label: "per client: re-check the rule", note: "For each subscriber, build a mock RequestInfo with THAT client's auth, run the collection ViewRule against note #7." },
+    { lane: "c", kind: "recv", label: "author of #7: rule passes", note: "The subscriber who owns note #7 satisfies '@request.auth.id = author' → gets a clean, enriched copy on its channel.", beat: "solution" },
+    { lane: "c", kind: "block", label: "other users: rule fails → skipped", note: "A different user's auth fails the rule for note #7, so they are silently skipped — never told the record exists." },
+    { lane: "c", kind: "done", label: "SSE written + flushed", note: "The connection loop reads the message off the client channel, writes it as text/event-stream, and flushes to the socket." }
+  ]}
+  caption="Realtime isn't a dumb broadcast — every subscriber's access rule is re-evaluated against the changed record, reusing the exact REST access engine. Row-level security holds over SSE too."
+/>
+
+<QuickCheck
+  question={"Before sending a changed record to an SSE subscriber, what does PocketBase do?"}
+  options={["Sends to everyone subscribed to the collection", "Re-evaluates the collection's access rule against that record using the subscriber's auth, skipping those who fail", "Checks only that the user is logged in", "Encrypts the payload per user"]}
+  answer={1}
+  explain="realtimeBroadcastRecord builds a synthetic RequestInfo carrying each subscriber's auth record and runs the same access-rule engine used by the REST API. Subscribers whose rule fails are silently skipped, so row-level security applies to realtime exactly as it does to REST — one access model, enforced in both places."
+/>
+
+---
+
+## The JS VM Pool
+
+Not everyone extending PocketBase writes Go. The `jsvm` plugin lets you drop `*.pb.js` files into a `pb_hooks/` directory and write hooks in JavaScript — `onRecordCreate((e) => { ... })`. Under the hood that's **goja**, a pure-Go JavaScript interpreter (no V8, no cgo — consistent with the whole no-cgo philosophy). But JS interpreters have a problem: a `goja.Runtime` is **not safe for concurrent use**, and creating one per request is expensive. PocketBase solves this the classic way — a **pool of pre-warmed runtimes**.
+
+<Define term="Object pool (sync.Pool-style)">
+An **object pool** keeps a set of expensive-to-create objects alive and hands them out on demand, returning them for reuse instead of allocating fresh each time. It's the right pattern when (a) creating the object is costly (a JS runtime must parse and load all its bindings) and (b) the object can't be shared concurrently (so each in-flight request needs its own). PocketBase pre-warms `HooksPoolSize` goja runtimes at startup; a hook execution borrows one, runs, and returns it — so a burst of requests reuses warm runtimes instead of paying construction cost each time.
+</Define>
+
+The real `plugins/jsvm/jsvm.go` builds this pool. `HooksPoolSize` controls how many runtimes are pre-created; each gets the full set of PocketBase bindings installed once (`sharedBinds`), then sits ready. It also watches the `pb_hooks` directory with **fsnotify** and reloads on change (dev ergonomics). The engineering point is the concurrency boundary:
+
+<ExecTimeline
+  title="A JS hook fires under concurrent load"
+  lanes={[
+    { id: "req", label: "requests", role: "operator" },
+    { id: "pool", label: "goja runtime pool", role: "captain" },
+    { id: "js", label: "your pb_hooks JS", role: "courier" }
+  ]}
+  steps={[
+    { lane: "pool", kind: "spawn", label: "startup: pre-warm N runtimes", note: "HooksPoolSize goja.Runtime instances are created once, each with all PocketBase bindings installed. Warm and waiting." },
+    { lane: "req", kind: "run", label: "two requests hit a JS hook", note: "Two concurrent record creates each need to run the onRecordCreate JS handler." },
+    { lane: "pool", kind: "send", label: "each borrows its own runtime", note: "Each request pulls a DISTINCT runtime from the pool — never sharing one, because goja.Runtime isn't concurrency-safe." },
+    { lane: "js", kind: "run", label: "JS runs in isolation", note: "Each handler executes in its own runtime; no shared interpreter state, no data race between the two requests." },
+    { lane: "pool", kind: "recv", label: "return runtime to pool", note: "When the handler finishes, its runtime goes back to the pool, warm, ready for the next request. No re-construction cost.", beat: "solution" }
+  ]}
+  caption="The pool turns an unsharable, expensive resource (a JS interpreter) into a safe, cheap-to-reuse one — the same reasoning as a DB connection pool, applied to runtimes."
+/>
+
+Here's a runnable model of exactly that pattern — a pool of "runtimes" (each with per-runtime state to prove isolation), borrowed and returned under concurrent load, showing the pool never hands the same runtime to two goroutines at once:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// runtime stands in for a goja.Runtime: expensive to build, not concurrency-safe.
+type runtime struct {
+	id     int
+	inUse  atomic.Bool // trips if two goroutines ever hold it at once
+	execed int64
+}
+
+type pool struct {
+	free chan *runtime
+}
+
+func newPool(size int) *pool {
+	p := &pool{free: make(chan *runtime, size)}
+	for i := range size {
+		p.free <- &runtime{id: i} // pre-warm each runtime once
+	}
+	return p
+}
+
+func main() {
+	const poolSize = 4
+	p := newPool(poolSize)
+
+	var raceDetected atomic.Bool
+	var totalRuns atomic.Int64
+
+	var wg sync.WaitGroup
+	for range 40 { // 40 concurrent "JS hook" executions, only 4 runtimes
+		wg.Go(func() {
+			r := <-p.free // borrow (blocks if all 4 are busy)
+			if !r.inUse.CompareAndSwap(false, true) {
+				raceDetected.Store(true) // someone else already had it!
+			}
+			r.execed++
+			totalRuns.Add(1)
+			time.Sleep(time.Millisecond) // simulate running the JS handler
+			r.inUse.Store(false)
+			p.free <- r // return to pool, warm
+		})
+	}
+	wg.Wait()
+
+	fmt.Println("total hook executions:", totalRuns.Load())
+	fmt.Println("pool size:", poolSize)
+	if raceDetected.Load() {
+		fmt.Println("RACE: a runtime was shared concurrently ✗")
+	} else {
+		fmt.Println("no runtime was ever shared concurrently ✓")
+	}
+}
+```
+
+</GoPlayground>
+
+<Callout kind="note" title="Run it with -race to feel the guarantee">
+The `inUse` flag is a canary: if the pool ever handed the same runtime to two goroutines, the `CompareAndSwap` would fail and `raceDetected` would trip. It never does — the buffered channel only holds `poolSize` runtimes, so at most 4 are ever "out" at once, and the 40 executions queue for a free one. That's exactly how the real jsvm pool protects goja's non-concurrency-safe runtimes: the pool *is* the mutual exclusion.
+</Callout>
+
+<QuickCheck
+  question={"Why does the jsvm plugin pool goja runtimes instead of creating one per request?"}
+  options={["To share JS state between requests", "Because a goja.Runtime isn't concurrency-safe and is expensive to build, so it pre-warms a set and reuses them", "To run JavaScript in parallel on one runtime", "goja requires exactly one runtime per process"]}
+  answer={1}
+  explain="A goja.Runtime can't be used by two goroutines at once and constructing one (with all bindings) is costly. A pool pre-warms HooksPoolSize runtimes; each request borrows a distinct one and returns it, giving isolation without per-request construction cost — the same reasoning as a DB connection pool."
+/>
+
+---
+
+## The Whole Picture
+
+Step back and look at what we found. Every subsystem is the **same handful of ideas** applied to different problems:
+
+<ConceptGrid cols={2}>
+<ConceptCard label="Embed everything">
+`//go:embed` for the UI, modernc SQLite compiled in for the DB. One `go build`, one file, `CGO_ENABLED=0`, cross-compiles anywhere. Build tags (`no_ui`, `no_default_driver`) carve out the seams.
+</ConceptCard>
+<ConceptCard label="Pools tame scarce resources">
+The single-writer DB pool serializes writes; the 120-connection pool runs reads wide; the goja pool reuses unsharable JS runtimes. Same reasoning — a channel/pool as a gate — three times.
+</ConceptCard>
+<ConceptCard label="One chain primitive">
+`hook.Hook[T]` (reversed continuation closures) *is* the event system, *is* the router middleware, *is* the request lifecycle. Learn `e.Next()` once, understand all of it.
+</ConceptCard>
+<ConceptCard label="One access model">
+The fexpr filter compiler turns rule strings into parameterized SQL, and the *same* engine gates REST reads, REST writes, and realtime broadcasts. Security is defined once and enforced everywhere.
+</ConceptCard>
+<ConceptCard label="Stand on the stdlib">
+`net/http.ServeMux` (Go 1.22) replaced `echo`. `database/sql` pools, `time.Timer`, `sync`, `errgroup`, SSE over plain HTTP. Dependencies are justified, not defaulted.
+</ConceptCard>
+<Gotcha>
+⚠ The flip side of the single-server bet: **there is no built-in horizontal scale-out.** Two PocketBase processes can't share one SQLite file safely for writes. When you outgrow one big box, you're migrating — that's the deliberate ceiling in exchange for the radical simplicity below it.
+</Gotcha>
+</ConceptGrid>
+
+<Callout kind="note" title="What to steal for your own Go backend">
+You don't have to use PocketBase to profit from reading it. Take these home: (1) embed your frontend with `//go:embed` and ship one binary; (2) if you use SQLite, run WAL + a single-writer pool + a lock-retry loop; (3) build middleware/event chains as continuation closures, not framework magic; (4) never concatenate user input into SQL — compile filters to placeholders with a field allowlist; (5) reach for `net/http.ServeMux` before adding a router dependency; (6) pool anything expensive-and-unsharable. Six patterns, one small codebase.
+</Callout>
+
+## Exercises
+
+<Exercise n={1} title="Route by operation, like dualDBBuilder" level="easy">
+Write a `route(sql string) string` function that returns `"WRITE"` if the trimmed, upper-cased SQL starts with `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, or `DROP`, and `"READ"` otherwise (e.g. `SELECT`). This is the essence of how PocketBase picks the write pool vs. the read pool.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func route(sql string) string {
+	s := strings.ToUpper(strings.TrimSpace(sql))
+	for _, w := range []string{"INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"} {
+		if strings.HasPrefix(s, w) {
+			return "WRITE"
+		}
+	}
+	return "READ"
+}
+
+func main() {
+	fmt.Println(route("select * from posts")) // READ
+	fmt.Println(route("  UPDATE posts SET x=1")) // WRITE
+	fmt.Println(route("DELETE FROM logs"))       // WRITE
+}
+```
+
+PocketBase's real `dualDBBuilder` doesn't parse SQL text — it routes at the *builder method* level (`Select` → read pool, `Insert`/`Update`/`Delete` → write pool), which is cleaner because the operation is known before any SQL string exists. This exercise is the same decision made one layer lower.
+
+</Solution>
+</Exercise>
+
+<Exercise n={2} title="A minimal hook chain" level="medium">
+Implement `Chain(handlers ...func(next func()))` that runs handlers in order, where each handler receives a `next` function it must call to continue. Build the chain so that calling the returned function runs handler 0, whose `next` runs handler 1, and so on. Prove that a handler which *doesn't* call `next` stops the chain.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func Chain(handlers ...func(next func())) func() {
+	var run func(i int) func()
+	run = func(i int) func() {
+		return func() {
+			if i >= len(handlers) {
+				return
+			}
+			handlers[i](run(i + 1)) // pass the NEXT handler as `next`
+		}
+	}
+	return run(0)
+}
+
+func main() {
+	log := []string{}
+	Chain(
+		func(next func()) { log = append(log, "A before"); next(); log = append(log, "A after") },
+		func(next func()) { log = append(log, "B"); next() },
+		func(next func()) { log = append(log, "C (stops here)") /* no next() */ },
+		func(next func()) { log = append(log, "D never runs"); next() },
+	)()
+	fmt.Println(log) // [A before B C (stops here) A after]
+}
+```
+
+Handler C omits `next()`, so D never runs — exactly the "forgot `e.Next()`" bug from the chapter. PocketBase builds the chain *iteratively backwards* (mutating the event's `next` field) rather than *recursively* like this; both produce the same nesting, but the iterative form avoids stack depth proportional to the handler count and lets the event be re-triggered.
+
+</Solution>
+</Exercise>
+
+<Exercise n={3} title="Injection-safe filter compiler" level="medium">
+Extend the chapter's `compile` idea: write `buildWhere(pairs map[string]any, allowed map[string]bool) (string, map[string]any, error)` that turns a map of `field → value` into a parameterized `WHERE ... AND ...` string plus a params map, rejecting any field not in `allowed`. Values must never appear in the SQL text.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+func buildWhere(pairs map[string]any, allowed map[string]bool) (string, map[string]any, error) {
+	fields := make([]string, 0, len(pairs))
+	for f := range pairs {
+		fields = append(fields, f)
+	}
+	sort.Strings(fields) // deterministic output
+
+	var parts []string
+	params := map[string]any{}
+	for i, f := range fields {
+		if !allowed[f] {
+			return "", nil, fmt.Errorf("unknown field %q", f)
+		}
+		ph := "p" + strconv.Itoa(i)
+		parts = append(parts, fmt.Sprintf("%s = {:%s}", f, ph))
+		params[ph] = pairs[f] // value bound separately — never in the SQL
+	}
+	return strings.Join(parts, " AND "), params, nil
+}
+
+func main() {
+	allowed := map[string]bool{"status": true, "author": true}
+	where, params, err := buildWhere(
+		map[string]any{"status": "active", "author": "u1' OR 1=1 --"}, allowed)
+	fmt.Println("WHERE:", where)   // author = {:p0} AND status = {:p1}
+	fmt.Println("params:", params) // the injection payload is inert data in p0
+	fmt.Println("err:", err)
+
+	_, _, err2 := buildWhere(map[string]any{"is_admin": true}, allowed)
+	fmt.Println("rejected:", err2)
+}
+```
+
+The malicious `author` value lands inside a bound parameter, so the query structure is untouched. This is PocketBase's `FieldResolver` + placeholder approach in miniature — the two-part defense of validating identifiers and binding values.
+
+</Solution>
+</Exercise>
+
+<Exercise n={4} title="Bound a connection's lifetime with two timers" level="hard">
+Model the SSE connection loop: write `serve(work <-chan int, idle, max time.Duration) (received int, reason string)` that loops in a `select`, returning when `max` elapses (`reason="max"`), when `idle` elapses with no message (`reason="idle"`), or when `work` closes (`reason="closed"`). Every message received must **reset** the idle timer. Return how many messages were received.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func serve(work <-chan int, idle, max time.Duration) (int, string) {
+	maxTimer := time.NewTimer(max)
+	idleTimer := time.NewTimer(idle)
+	defer maxTimer.Stop()
+	defer idleTimer.Stop()
+
+	received := 0
+	for {
+		select {
+		case <-maxTimer.C:
+			return received, "max"
+		case <-idleTimer.C:
+			return received, "idle"
+		case _, ok := <-work:
+			if !ok {
+				return received, "closed"
+			}
+			received++
+			// reset idle timer on activity (drain if it already fired)
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idle)
+		}
+	}
+}
+
+func main() {
+	ch := make(chan int)
+	go func() {
+		for i := range 3 {
+			ch <- i
+			time.Sleep(20 * time.Millisecond) // active — under idle window
+		}
+		close(ch) // clean close
+	}()
+	n, reason := serve(ch, 50*time.Millisecond, time.Second)
+	fmt.Printf("received=%d reason=%s\n", n, reason) // received=3 reason=closed
+}
+```
+
+The `Stop()`-then-drain-then-`Reset()` dance is the correct way to reuse a `time.Timer` — a naked `Reset` on an already-fired timer can leave a stale value in the channel. PocketBase's real loop uses the same two-timer structure (`maxTimer`/`idleTimer`) to guarantee no SSE connection lives forever and idle ones are reaped, which is what keeps 10k connections stable.
+
+</Solution>
+</Exercise>
+
+<Exercise n={5} title="A pre-warmed resource pool" level="hard">
+Write a generic `Pool[T]` with `New(size int, make func() T) *Pool[T]`, `Borrow() T` (blocks if empty), and `Return(T)`. Then use it to prove that with a pool of size 3 and 30 concurrent borrowers, at most 3 are ever active at once. This is the goja-runtime pool pattern, generalized.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type Pool[T any] struct{ free chan T }
+
+func New[T any](size int, factory func() T) *Pool[T] {
+	p := &Pool[T]{free: make(chan T, size)}
+	for range size {
+		p.free <- factory() // pre-warm
+	}
+	return p
+}
+
+func (p *Pool[T]) Borrow() T  { return <-p.free }
+func (p *Pool[T]) Return(v T) { p.free <- v }
+
+func main() {
+	p := New(3, func() *int { return new(int) })
+
+	var active, peak atomic.Int64
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Go(func() {
+			r := p.Borrow()
+			n := active.Add(1)
+			for { // record peak
+				old := peak.Load()
+				if n <= old || peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			*r++
+			time.Sleep(time.Millisecond)
+			active.Add(-1)
+			p.Return(r)
+		})
+	}
+	wg.Wait()
+	fmt.Println("peak concurrent borrowers:", peak.Load(), "(pool size 3)")
+}
+```
+
+A buffered channel *is* a pool: pre-fill it with `size` items, `Borrow` receives (blocking when empty), `Return` sends back. `peak` never exceeds 3. PocketBase's jsvm pool is this idea with `T = *goja.Runtime` and a `make` that installs all the JS bindings — the borrow/return bounds concurrency to the pool size, protecting the non-concurrency-safe runtimes.
+
+</Solution>
+</Exercise>
+
+<Recap>
+
+- **The thesis:** PocketBase bets most apps fit on one server, so it embeds *everything* in one Go binary and scales vertically. Real proof: Presentator runs ~573K records / ~17K users on a €4.55/month Hetzner box.
+- **One file:** `modernc.org/sqlite` (SQLite transpiled to Go, no cgo) compiles the DB engine into the binary; `//go:embed all:dist` bakes the dashboard in. `CGO_ENABLED=0` builds cross-compile anywhere; build tags (`no_ui`, `no_default_driver`) expose the seams.
+- **Two pools, one file:** WAL allows many readers but one writer. PocketBase opens the file twice — a 120-connection read pool and a **1-connection write pool** — and `dualDBBuilder` routes `SELECT`→reads, everything else→the single writer, so writes queue in Go instead of colliding as `SQLITE_BUSY`. A substring-matching **lock-retry loop** (`goto Retry`, backoff) mops up the rest.
+- **The hook chain:** `hook.Hook[T].Trigger` builds a chain of **reversed continuation closures**; each handler calls `e.Next()` to proceed. The same primitive is the event system *and* the router middleware. Forgetting `e.Next()` silently stops the chain.
+- **The router:** a ~300-line wrapper over Go 1.22's `net/http.ServeMux` (method + wildcard patterns) that added groups + middleware and let PocketBase delete `echo`.
+- **Collections are real tables:** each field type implements a `Field` interface whose `ColumnType` returns a real SQL column definition; `SyncRecordTableSchema` diffs collections and emits `CREATE`/`ALTER TABLE` DDL in one transaction (with a temp-rename dance for column renames). Never EAV, never JSON-blob — real columns so real indexes and a real `WHERE` clause work.
+- **The filter DSL:** `fexpr` parses filter/rule strings into a tree, then emits **parameterized placeholders** for all values and **schema-validates field names** — injection-safe by construction. The same engine gates REST reads/writes *and* realtime, and client filters are `AND`-ed under the server rule so they can't widen access.
+- **Realtime:** SSE (plain long-lived HTTP), a broker of clients, idle (5 min) + max-lifetime (30 min) timers to keep 10k connections stable, and a per-subscriber **access-rule re-check** on every broadcast — row-level security over SSE.
+- **The JS VM pool:** goja (pure-Go JS) runtimes pre-warmed into a pool because they're expensive and not concurrency-safe — the DB-connection-pool idea applied to interpreters.
+
+</Recap>
+
+<Lab
+  title="Fix PocketBase's dual-pool write serializer"
+  archetype="fix-it"
+  difficulty="guided"
+  points={90}
+  hintCost={20}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="A miniature of PocketBase's dual-DB router is wired wrong: writes are being sent to the concurrent (many-connection) pool instead of the single-writer pool, so concurrent writes are NOT serialized. Fix routeAndRun so that write operations go through the 1-slot write pool (serializing them) while reads use the wide read pool. main is the self-check harness — do not edit it. It runs many concurrent writes and reads and prints ALL CHECKS PASS only when the peak concurrent writers is exactly 1 and reads still ran in parallel."
+  starter={`package main
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// pool models a database/sql pool as a channel of connection slots.
+type pool struct{ slots chan struct{} }
+
+func newPool(size int) *pool {
+	p := &pool{slots: make(chan struct{}, size)}
+	for i := 0; i < size; i++ {
+		p.slots <- struct{}{}
+	}
+	return p
+}
+
+func (p *pool) do(work func()) {
+	c := <-p.slots
+	defer func() { p.slots <- c }()
+	work()
+}
+
+// The two pools, exactly like PocketBase: reads wide, writes serialized.
+var (
+	readPool  = newPool(50) // concurrent readers
+	writePool = newPool(1)  // single writer
+)
+
+func isWrite(sql string) bool {
+	s := strings.ToUpper(strings.TrimSpace(sql))
+	for _, w := range []string{"INSERT", "UPDATE", "DELETE"} {
+		if strings.HasPrefix(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// routeAndRun sends the operation to the correct pool.
+// BUG: it currently sends EVERYTHING to readPool, so writes are not serialized.
+// FIX: route writes (isWrite == true) to writePool, reads to readPool.
+func routeAndRun(sql string, work func()) {
+	readPool.do(work) // <-- wrong for writes
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	var curWriters, peakWriters int64
+	var curReaders, peakReaders int64
+
+	track := func(cur, peak *int64, delta int64) {
+		n := atomic.AddInt64(cur, delta)
+		if delta > 0 {
+			for {
+				p := atomic.LoadInt64(peak)
+				if n <= p || atomic.CompareAndSwapInt64(peak, p, n) {
+					break
+				}
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			routeAndRun("UPDATE accounts SET bal = bal - 1", func() {
+				track(&curWriters, &peakWriters, 1)
+				time.Sleep(3 * time.Millisecond)
+				track(&curWriters, &peakWriters, -1)
+			})
+		}()
+	}
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			routeAndRun("SELECT bal FROM accounts", func() {
+				track(&curReaders, &peakReaders, 1)
+				time.Sleep(3 * time.Millisecond)
+				track(&curReaders, &peakReaders, -1)
+			})
+		}()
+	}
+	wg.Wait()
+
+	ok := true
+	if peakWriters != 1 {
+		fmt.Printf("FAIL: peak concurrent writers = %d, want 1 (writes must serialize through writePool)\n", peakWriters)
+		ok = false
+	}
+	if peakReaders < 2 {
+		fmt.Printf("FAIL: peak concurrent readers = %d, want >=2 (reads must run in parallel)\n", peakReaders)
+		ok = false
+	}
+	if ok {
+		fmt.Println("peak writers:", peakWriters, "peak readers:", peakReaders)
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main launches 20 concurrent writes and 40 concurrent reads through routeAndRun and tracks the peak simultaneous writers and readers. The flag unlocks only when the program builds clean and prints ALL CHECKS PASS, which requires peak writers == 1 (writes serialized via the 1-slot writePool) AND peak readers >= 2 (reads ran in parallel via readPool)."
+  hints={[
+    "The fix is one branch in routeAndRun: if isWrite(sql) { writePool.do(work) } else { readPool.do(work) }.",
+    "writePool was built with newPool(1), so its single slot forces writers to queue one at a time — that's the whole point of the write pool. readPool has 50 slots, so reads run concurrently.",
+    "This mirrors PocketBase's dualDBBuilder: Insert/Update/Delete go to nonconcurrentDB (SetMaxOpenConns(1)); Select goes to concurrentDB. Routing by operation is the entire mechanism.",
+  ]}
+  flag="GO{writes_serialize_reads_run_wide}"
+>
+
+The dual-pool router is misrouting writes to the wide read pool, so 20 concurrent balance updates all run at once — exactly the `SQLITE_BUSY` collision the design exists to prevent. Fix `routeAndRun` to send writes through the single-slot `writePool` and reads through `readPool`. When peak writers is 1 and reads still run in parallel, the books balance and the flag is yours.
+
+</Lab>
+
+<Scoreboard
+  streak={7}
+  items={[
+    { label: "Named the one-binary/vertical-scaling thesis", kind: "concept", points: 10, done: true },
+    { label: "Explained modernc SQLite + //go:embed (no cgo, one file)", kind: "concept", points: 15, done: true },
+    { label: "Understood two pools / one file + WAL + lock-retry", kind: "mechanism", points: 20, done: true },
+    { label: "Rebuilt the reversed-closure hook chain", kind: "mechanism", points: 20, done: true },
+    { label: "Traced the injection-safe filter compiler", kind: "security", points: 20, done: true },
+    { label: "Explained SSE broadcast with per-subscriber rule checks", kind: "mechanism", points: 15, done: true },
+    { label: "Fixed the dual-pool write serializer", kind: "lab", points: 90, done: false },
+  ]}
+  flag={{ label: "GO{writes_serialize_reads_run_wide}", captured: false, points: 90 }}
+/>
+
+Now you've seen the machine with its panels off, sport. One binary, one file, a handful of ideas used with discipline — that's not a lucky accident, that's an engineer who refused to add a single thing he didn't need. Go build something that clean. It won't be *me*-clean… but aim for it anyway.
