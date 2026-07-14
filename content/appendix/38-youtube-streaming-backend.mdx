@@ -1,0 +1,1173 @@
+---
+title: "Reverse-Engineering YouTube: Building a Streaming Backend in Go"
+part: "appendix"
+order: 38
+type: "course"
+description: "How LuanRT's YouTube stack actually works, rebuilt from the wire up in Go. Why YouTube has no public streaming API and third-party clients must speak its internal one (InnerTube): the JSON /youtubei/v1/player call, the client context that impersonates a real app, and the streamingData it returns. Why stream URLs are locked behind two ciphers extracted from YouTube's obfuscated base.js — the signature transform and the n throttle param — and what happens if you skip them. The proprietary UMP wire format (a custom varint plus typed length-delimited parts) and a from-scratch Go reader for it. The SABR streaming protocol: a protobuf VideoPlaybackAbrRequest POST, a streamed UMP response of MEDIA_HEADER/MEDIA/MEDIA_END parts, and the adaptive control loop that drives it. Why ytc-bridge (the CORS-bypass browser extension) exists only because browsers are sandboxed — and why a Go backend deletes that whole layer. How kira and SimpMusic consume it. Every mechanism is a runnable, stdlib-only Go re-implementation."
+prerequisites: ["http-servers", "grpc-service-communication", "tls-fingerprinting-impersonation"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Source Deep Dive" title="Reverse-Engineering YouTube: Building a Streaming Backend in Go">
+
+Here's the thing, sport. You open a YouTube video, bytes arrive, a picture appears. Looks simple. It is not simple. There is **no public API** that hands you a video file — none. Every third-party client you've ever admired (FreeTube, NewPipe, GrayJay, **SimpMusic**) gets its video the same way: by pretending to *be* the YouTube app, talking to YouTube's private internal API, and then decoding a proprietary streaming protocol that no off-the-shelf video player understands.
+
+One person mapped most of that maze in public: **LuanRT**. His **YouTube.js** speaks the internal API; his **googlevideo** library implements the streaming protocol (UMP/SABR); **ytc-bridge** is the browser-sandbox escape hatch; and **kira** is a reference player that stitches it all together. `maxrave-dev`'s **SimpMusic** is the real, shipping app that consumes this whole world.
+
+We're not going to *use* those libraries. We're going to **open them up**, understand every load-bearing decision, and rebuild the core in Go — the language you'd actually pick for a headless streaming backend, because it has no browser sandbox to fight and it eats concurrent byte streams for breakfast. By the end you'll understand: how to impersonate a client, why stream URLs are encrypted and how deciphering works, how to parse the UMP wire format byte-by-byte, and how the SABR request/response loop drives adaptive playback. Then you could build the server that does all of it and hands a dumb client clean bytes. That's the point.
+
+</HeroCard>
+
+<Callout kind="warn" title="Scope, legality, and honesty">
+This is an **engineering internals** chapter. We study a widely-documented, open-source reverse-engineering effort to teach protocol design, binary parsing, and client impersonation in Go — skills that transfer to *any* private API you're authorized to integrate with. Interacting with YouTube outside its Terms of Service is your responsibility, not this chapter's endorsement; treat the running code here as a lab model, not a scraping toolkit. Two pieces of the real stack — **PoToken/BotGuard attestation** and the exact **signature/n transforms** — are deliberately adversarial anti-bot measures that shift constantly. We explain *how they work and where they sit*, honestly, without shipping a bypass. The runnable Go here is stdlib-only and never touches YouTube.
+</Callout>
+
+<Callout kind="pro" title="Sources (read the real code)">
+Everything is grounded in the public repos: **github.com/LuanRT/YouTube.js** (the InnerTube client — `src/core/Session.ts`, `src/core/Player.ts`, `src/core/Actions.ts`), **github.com/LuanRT/googlevideo** (the streaming protocol — `src/core/UmpReader.ts`, `src/core/SabrStream.ts`, `src/core/SabrUmpProcessor.ts`, and the `.proto` files under `protos/video_streaming/`), **github.com/LuanRT/ytc-bridge** (`rules.json`, `src/background.ts`), **github.com/LuanRT/kira** (the reference player), and **github.com/maxrave-dev/SimpMusic** (the shipping app, module `:kotlinYtmusicScraper`). Client versions and part IDs quoted here are from those repos as of July 2026.
+</Callout>
+
+<ChapterTabs tabs={["The Problem: No Public API", "InnerTube: The Hidden API", "Deciphering the Player", "UMP: The Wire Format", "SABR: The Streaming Loop", "The Browser Tax", "Assembling a Go Backend"]} />
+
+## The Problem: No Public API
+
+Start with the thing nobody tells you. YouTube's official "Data API" can list videos, read titles, and manage playlists — but it will **never** give you a playable media URL. The bytes that make up the actual video are served by a separate fleet of servers (`*.googlevideo.com`) and gated by a private protocol that YouTube's own web player and mobile apps use internally. That internal system is nicknamed **InnerTube**.
+
+<Define term="Internal (private) API">
+An API a company builds for **its own apps** to talk to its servers, never published or documented for outsiders. There's no contract, no versioning promise, and no permission — it can change any day. Reverse-engineering one means watching what the official app sends and replaying it faithfully. YouTube's internal API is called **InnerTube**; the media servers behind it are `googlevideo.com`.
+</Define>
+
+So every alternative client faces the same four-part obstacle course, and each part is a distinct engineering problem we'll solve in Go:
+
+<Scene
+  title="What stands between you and the video bytes"
+  actors={[
+    { id: "client", label: "your client", role: "operator" },
+    { id: "yt", label: "YouTube", role: "captain" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "The naïve mental model: 'ask for the video, get the video.' There is no such endpoint. Four locked doors sit in the way, and skipping any one gets you an error, a throttle, or a ban.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "warn", label: "1. speak InnerTube" },
+        { id: "A2", state: "warn", label: "2. decipher URL" },
+        { id: "A3", state: "warn", label: "3. attest (PoToken)" },
+        { id: "A4", state: "warn", label: "4. decode UMP/SABR" },
+        { id: "B1", state: "idle", label: "impersonate app" },
+        { id: "B2", state: "idle", label: "run YT's JS" },
+        { id: "B3", state: "idle", label: "prove not a bot" },
+        { id: "B4", state: "idle", label: "parse binary stream" }
+      ]
+    },
+    {
+      caption: "Rebuilt in Go, each door is a small, testable module: an HTTP+JSON client, a JS-transform runner, an attestation shim, and a binary protocol reader. That's the whole chapter — one door per section.",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "net/http + json" },
+        { id: "C2", state: "done", label: "decipher module" },
+        { id: "C3", state: "done", label: "attestation shim" },
+        { id: "C4", state: "done", label: "UMP/SABR reader" },
+        { id: "D1", state: "done", label: "context struct" },
+        { id: "D2", state: "done", label: "transform ops" },
+        { id: "D3", state: "done", label: "token cache" },
+        { id: "D4", state: "done", label: "segment loop" }
+      ]
+    }
+  ]}
+  caption="Four locked doors — impersonation, deciphering, attestation, protocol decoding — and their Go counterparts. We open them left to right."
+/>
+
+<Callout kind="note" title="Why Go for this, specifically">
+LuanRT's libraries are TypeScript because they must run **in a browser** (and Node/Deno). That single fact causes half their complexity: browsers sandbox network requests (hence ytc-bridge), and JavaScript is the only language guaranteed present to run YouTube's own scripts. A **server** has none of those constraints. In Go you set any HTTP header you like, stream gigabytes without buffering the DOM, run thousands of concurrent downloads on a handful of OS threads, and ship one static binary. The trade: Go can't *natively* run YouTube's JavaScript, so the deciphering/attestation step needs a JS engine or a ported transform — the one place the browser stack has it easier. We'll be honest about that seam when we reach it.
+</Callout>
+
+<QuickCheck
+  question={"Why can't you just call YouTube's official Data API to download a video?"}
+  options={[
+    "The Data API is paid and requires a credit card",
+    "The Data API exposes metadata and management, never a playable media URL — the actual bytes are served by a separate, private protocol (InnerTube/googlevideo)",
+    "You can, but only for videos you uploaded",
+    "The Data API only works from inside Google's network"
+  ]}
+  answer={1}
+  explain="The public Data API is deliberately scoped to metadata and account operations. Playable media lives behind the internal InnerTube API and the googlevideo servers, which use a private, undocumented protocol. That gap is the entire reason projects like YouTube.js exist."
+/>
+
+## InnerTube: The Hidden API
+
+Door one. Everything starts with a single POST to InnerTube's `player` endpoint. It's plain HTTPS with a **JSON body** — no gRPC, no exotic transport. The trick isn't the transport; it's convincing the server you're a *real client* by sending the exact **context** its own apps send.
+
+<Define term="Client context">
+A block of identity fields every InnerTube request carries: which app you claim to be (`clientName` like `WEB` or `WEB_REMIX`), its `clientVersion`, language/region (`hl`/`gl`), and a `visitorData` blob that ties requests together. YouTube branches its behavior on these — different clients get different formats, different ciphers, sometimes no cipher at all. **Choosing the client is a strategic decision, not boilerplate.**
+</Define>
+
+Here is the shape YouTube.js sends (`src/core/Session.ts` builds `context.client`; `src/utils/Constants.ts` holds the versions — `WEB` was `2.20260623.01.00`, YouTube Music's `WEB_REMIX` was `1.20250219.01.00` in July 2026). Let's build the *exact* request body in Go and marshal it, so you can see every field that matters.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+// The context YouTube's own web player sends on every InnerTube call.
+// Field names/casing must match YouTube's JSON exactly — hence the tags.
+type Client struct {
+	ClientName    string `json:"clientName"`    // "WEB", "WEB_REMIX" (YT Music), "ANDROID"...
+	ClientVersion string `json:"clientVersion"` // must be a currently-valid version string
+	HL            string `json:"hl"`            // UI language, e.g. "en"
+	GL            string `json:"gl"`            // country, e.g. "US"
+	VisitorData   string `json:"visitorData,omitempty"`
+}
+
+type Context struct {
+	Client Client `json:"client"`
+}
+
+type ContentPlaybackContext struct {
+	// The player's signature timestamp, extracted from base.js (next section).
+	// Wrong/missing value => YouTube may refuse to return usable formats.
+	SignatureTimestamp int `json:"signatureTimestamp"`
+}
+
+type PlaybackContext struct {
+	ContentPlaybackContext ContentPlaybackContext `json:"contentPlaybackContext"`
+}
+
+type PlayerRequest struct {
+	Context         Context         `json:"context"`
+	VideoID         string          `json:"videoId"`
+	PlaybackContext PlaybackContext `json:"playbackContext"`
+	ContentCheckOK  bool            `json:"contentCheckOk"`
+	RacyCheckOK     bool            `json:"racyCheckOk"`
+}
+
+func main() {
+	body := PlayerRequest{
+		Context: Context{Client: Client{
+			ClientName:    "WEB",
+			ClientVersion: "2.20260623.01.00",
+			HL:            "en",
+			GL:            "US",
+			VisitorData:   "Cgt...redacted...",
+		}},
+		VideoID:         "dQw4w9WgXcQ",
+		PlaybackContext: PlaybackContext{ContentPlaybackContext{SignatureTimestamp: 20073}},
+		ContentCheckOK:  true,
+		RacyCheckOK:     true,
+	}
+
+	raw, _ := json.MarshalIndent(body, "", "  ")
+
+	// Build the request exactly as InnerTube expects it (we don't send it here).
+	const endpoint = "https://www.youtube.com/youtubei/v1/player"
+	req, _ := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Youtube-Client-Name", "1") // WEB == 1
+	req.Header.Set("X-Youtube-Client-Version", "2.20260623.01.00")
+	req.Header.Set("X-Goog-Visitor-Id", "Cgt...redacted...")
+	req.Header.Set("User-Agent", "Mozilla/5.0 ... Chrome/126 ...")
+
+	fmt.Println("POST", endpoint)
+	for k, v := range req.Header {
+		fmt.Printf("  %s: %s\n", k, v[0])
+	}
+	fmt.Println("\nbody:")
+	fmt.Println(string(raw))
+}
+```
+
+</GoPlayground>
+
+That JSON body and those headers **are** the impersonation. Nothing more exotic is happening at this layer: match the client the server expects, send a valid `videoId`, and it answers.
+
+<UnderTheHood title="What comes back — and the three fields that unlock streaming">
+The response is a big JSON object (`IPlayerResponse` in YouTube.js). Three regions matter for streaming:
+
+1. **`streamingData.adaptiveFormats[]`** — one entry per quality/codec (video-only and audio-only tracks, DASH-style). Each has an `itag` (YouTube's numeric format id), `mimeType`, `bitrate`, `contentLength`, and either a plain `url` **or** a `signatureCipher` string that must be deciphered (door two).
+2. **`streamingData.serverAbrStreamingUrl`** — the endpoint you POST to for **SABR** streaming (door four). This URL itself carries an `n` parameter that must be deciphered.
+3. **`playerConfig.mediaCommonConfig.mediaUstreamerRequestConfig.videoPlaybackUstreamerConfig`** — an opaque base64 blob you must echo back verbatim inside every SABR request. Think of it as a signed "you're allowed to stream this" ticket.
+
+The downloader example in `googlevideo` (`examples/downloader/utils/sabr-stream-factory.ts`) reads exactly these three and hands them to a `SabrStream`. Miss any one and streaming fails.
+</UnderTheHood>
+
+<Define term="itag">
+YouTube's integer id for a specific **format** — a fixed combination of container, codec, resolution, and bitrate. `itag` 140 is `m4a` AAC audio; `137` is 1080p H.264 video; `251` is Opus audio in WebM. A modern "adaptive" stream is **two** itags played together: one video-only, one audio-only, muxed by the player. You pick itags by reading `adaptiveFormats`.
+</Define>
+
+<Callout kind="pro" title="Client choice is a superpower (and SimpMusic's trick)">
+Different `clientName` values behave very differently. Historically the `ANDROID` and `iOS` clients returned stream URLs that needed **no** signature deciphering — a huge shortcut — while `WEB` always required it. YouTube Music clients like **SimpMusic** send `WEB_REMIX` to get the music-app catalog and behavior. Picking the right client for the job (and rotating when one gets restricted) is core strategy in every serious client. YouTube.js exposes this as `Innertube.create({ client_type })`; in your Go backend it's just a different `clientName`/`clientVersion` pair in the struct above.
+</Callout>
+
+<ExecTimeline
+  title="One InnerTube /player round-trip"
+  lanes={[
+    { id: "app", label: "your Go client", role: "operator" },
+    { id: "yt", label: "youtubei/v1/player", role: "captain" }
+  ]}
+  steps={[
+    { lane: "app", kind: "run", label: "build context", note: "Fill clientName/clientVersion/hl/gl + visitorData + the player's signatureTimestamp." },
+    { lane: "app", kind: "send", label: "POST JSON + headers", note: "X-Youtube-Client-Name/Version and X-Goog-Visitor-Id must match the context." },
+    { lane: "yt", kind: "run", label: "validate client", note: "Server checks the context looks like a real, current client; branches format/cipher behavior on it." },
+    { lane: "yt", kind: "send", label: "playerResponse JSON", note: "adaptiveFormats + serverAbrStreamingUrl + videoPlaybackUstreamerConfig + videoDetails." },
+    { lane: "app", kind: "run", label: "extract 3 fields", note: "The two URLs (still ciphered) and the ustreamer config ticket." },
+    { lane: "app", kind: "done", label: "ready to decipher", note: "Everything to stream is in hand — but the URLs are locked. On to door two.", beat: "solution" }
+  ]}
+  caption="A single JSON POST returns everything needed to stream — provided your client context is convincing and you deal with the ciphers next."
+/>
+
+<QuickCheck
+  question={"What is the videoPlaybackUstreamerConfig used for?"}
+  options={[
+    "It's the deciphered video URL",
+    "It's a logging field you can omit",
+    "It's an opaque authorization blob from the player response that you must echo back verbatim in every SABR streaming request",
+    "It's the user's account token"
+  ]}
+  answer={2}
+  explain="The ustreamer config is an opaque, server-issued ticket delivered in playerConfig. SabrStream.buildRequestBody base64-decodes it and includes it in the VideoPlaybackAbrRequest. Omit it and the streaming server rejects you."
+/>
+
+## Deciphering the Player
+
+Door two, and the one that trips up most newcomers. Many stream URLs don't arrive ready to use. They arrive **locked** by two separate mechanisms, both implemented in a giant obfuscated JavaScript file YouTube ships called `base.js`.
+
+<Define term="base.js (the player script)">
+The minified JavaScript that runs YouTube's web player, served from `/s/player/<playerId>/player_ias.vflset/en_US/base.js`. Buried inside it are two functions YouTube changes frequently: one that **unscrambles the stream signature** and one that **transforms the `n` parameter**. To play a WEB stream you must find those functions in the script and run them. This is the anti-scraping front line — the code is deliberately obfuscated and rotated.
+</Define>
+
+Two locks, two jobs:
+
+<ConceptGrid cols={2}>
+<ConceptCard label="Lock 1 — the signature cipher">
+Some formats come as a `signatureCipher` string: `s=<scrambled>&sp=sig&url=<base>`. The `s` value is a scrambled signature. You run it through the player's signature function (a fixed sequence of reverse/swap/splice steps), then attach the result to the URL as the `sp` parameter (usually `sig`). Wrong signature → HTTP 403.
+</ConceptCard>
+<ConceptCard label="Lock 2 — the n throttle param">
+Every stream URL has an `n=<token>` query param. If you send it unchanged, YouTube **throttles** you to a crawl (think dial-up). The player's `nsig` function transforms `n` into a new value that unlocks full speed. Wrong `n` → the download still "works" but takes forever.
+</ConceptCard>
+<Gotcha>⚠ Skipping the `n` transform doesn't error — it *silently throttles*. Beginners often think their code works ("it downloads!") without realizing they're getting 40 KB/s. Always transform `n`.</Gotcha>
+</ConceptGrid>
+
+<Callout kind="note" title="How YouTube.js actually extracts the functions (the clever part)">
+YouTube.js does **not** run the whole 2 MB `base.js`. In `src/core/Player.ts` it downloads the script, then uses a static analyzer (`JsAnalyzer` + `JsExtractor`) to locate just the `nsig` and signature functions **and every helper they depend on**, and stitches those into a tiny standalone script. It also scrapes the `signatureTimestamp` (the value you saw in the InnerTube context). Then `Platform.shim.eval` runs that minimal script in a JS engine to transform `n` and `s`. Extracting a minimal function slice instead of executing the whole player is what makes it fast and portable.
+</Callout>
+
+So what do those transforms actually *do*? They're not real cryptography — they're **reversible string surgery**: reverse the characters, swap two positions, splice off a prefix. The obfuscation is in *finding* the recipe, not in the math. Here's a faithful Go model of the *kind* of operations the signature function performs, so the mechanism is concrete. (The real recipe changes daily and lives in `base.js`; this is the shape, not a live key.)
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// The three primitive operations every YouTube signature/n transform is built from.
+// The real base.js defines a shuffled table of these and calls them in a
+// script-specific order. Recover the order and you've "deciphered" the player.
+func reverse(a []rune) []rune {
+	for i, j := 0, len(a)-1; i < j; i, j = i+1, j-1 {
+		a[i], a[j] = a[j], a[i]
+	}
+	return a
+}
+
+func swap(a []rune, b int) []rune {
+	b %= len(a)
+	a[0], a[b] = a[b], a[0] // swap position 0 with position b
+	return a
+}
+
+func splice(a []rune, b int) []rune {
+	return a[b:] // drop the first b characters
+}
+
+// A transform is just an ordered list of ops — exactly what the extractor recovers.
+type op struct {
+	fn  func([]rune, int) []rune
+	arg int
+}
+
+func decipher(sig string, recipe []op) string {
+	a := []rune(sig)
+	for _, o := range recipe {
+		a = o.fn(a, o.arg)
+	}
+	return string(a)
+}
+
+func main() {
+	scrambled := "AveryLongScrambledSignatureFromYouTube"
+
+	// A plausible recipe: reverse, swap(0<->3), drop 2, swap(0<->5).
+	// reverse ignores its arg; we pass 0.
+	recipe := []op{
+		{func(a []rune, _ int) []rune { return reverse(a) }, 0},
+		{swap, 3},
+		{splice, 2},
+		{swap, 5},
+	}
+
+	fmt.Println("scrambled :", scrambled)
+	fmt.Println("deciphered:", decipher(scrambled, recipe))
+	fmt.Println("\nThe secret was never math — it was the ORDER of ops, hidden in base.js.")
+}
+```
+
+</GoPlayground>
+
+<Define term="Signature timestamp (sts)">
+An integer version-stamp baked into `base.js` (YouTube.js scrapes it in `Player.ts`). You send it back in the InnerTube `contentPlaybackContext.signatureTimestamp`. It tells the server which player/cipher generation you're using, so the signatures you produce line up with what it expects. Mismatched `sts` can yield unplayable formats.
+</Define>
+
+<UnderTheHood title="Where Go has to compromise: running someone else's JavaScript">
+This is the one place the browser stack has it easier than Go. The signature/n recipes live in JavaScript and change constantly, so hard-coding them (like the model above) rots fast. Real Go clients handle door two one of three ways:
+
+1. **Embed a JS engine.** Use a pure-Go interpreter such as `dop251/goja` (the same engine PocketBase uses for `pb_hooks`) to run the extracted transform functions. No cgo, ships in the binary — but you must still *extract* the functions from `base.js` (regex/AST scraping, exactly what `JsExtractor` does).
+2. **Shell out to Node.** Spawn a Node/Deno process to run the extracted script. Simplest, but adds a runtime dependency — the thing Go people usually try to avoid.
+3. **Port the transforms.** Re-implement the current recipe in Go (like the model) and update it when YouTube rotates the player. Fastest at runtime, highest maintenance.
+
+Most production Go clients pick option 1: **goja**. It's the pragmatic middle — one binary, no external runtime, and it survives player rotations as long as your extractor keeps finding the functions. This is why the `grpc-service-communication` chapter's protobuf skills and a scripting engine both show up in a "download a video" project: real integrations are polyglot at the seams.
+</UnderTheHood>
+
+<QuickCheck
+  question={"You download a WEB stream but ignore the n parameter transform. What happens?"}
+  options={[
+    "HTTP 403 immediately",
+    "The video is corrupted",
+    "It downloads correctly but is silently throttled to a very slow speed",
+    "Nothing — n is optional"
+  ]}
+  answer={2}
+  explain="A wrong/absent signature gives you 403. A wrong/absent n transform is nastier: the request succeeds but YouTube throttles the connection to a crawl. It looks like it works, which is exactly why people miss it."
+/>
+
+## UMP: The Wire Format
+
+Doors three and four are where LuanRT's `googlevideo` earns its reputation, and where Go shines. Once you have a deciphered streaming URL, the bytes don't come back as a plain MP4. They come back as **UMP** — a custom binary container YouTube invented, which no standard video player understands. Before we can talk about the SABR *protocol*, we have to parse the UMP *format* it rides on. This is the most self-contained, rebuildable piece of the whole stack, so we'll do it properly in Go.
+
+<Define term="UMP (Ultra/Universal Media Protocol)">
+YouTube's proprietary framing for media responses. A UMP body is a flat sequence of **parts**, each one `[part-type][part-size][payload]`, where type and size are written with a **custom variable-length integer** (not protobuf's varint — a different scheme). Part types are a fixed enum: `MEDIA_HEADER` (20), `MEDIA` (21), `MEDIA_END` (22), plus control parts. `googlevideo`'s `UmpReader` decodes this stream; we'll rebuild it.
+</Define>
+
+First, the atom everything is built from: UMP's variable-length integer. The **first byte's high bits** tell you how many bytes the number occupies — a self-describing length prefix. This is `readVarInt` in `src/core/UmpReader.ts`, and it's beautifully compact:
+
+<Scene
+  title="How one UMP varint encodes its own length"
+  actors={[{ id: "b", label: "first byte value", role: "operator" }]}
+  rows={1}
+  cols={5}
+  frames={[
+    {
+      caption: "The first byte does double duty: its magnitude picks the length. < 128 → the whole number fits in this 1 byte. 128–191 → 2 bytes. 192–223 → 3 bytes. 224–239 → 4 bytes. ≥ 240 → 5 bytes. No separate length field needed.",
+      beat: "problem",
+      cells: [
+        { id: "V1", state: "done", label: "<128 → 1B" },
+        { id: "V2", state: "active", label: "<192 → 2B" },
+        { id: "V3", state: "active", label: "<224 → 3B" },
+        { id: "V4", state: "active", label: "<240 → 4B" },
+        { id: "V5", state: "warn", label: "else → 5B" }
+      ]
+    },
+    {
+      caption: "For the 2-byte case the value is (b1 & 0x3f) + 64·b2: the low 6 bits of the first byte carry data, the rest signalled the length. Every length has its own mask/multiplier. Decode it and you know exactly where the payload begins.",
+      beat: "solution",
+      cells: [
+        { id: "W1", state: "done", label: "mask low bits" },
+        { id: "W2", state: "done", label: "+ 64·b2" },
+        { id: "W3", state: "done", label: "= value" },
+        { id: "W4", state: "idle", label: "payload next" },
+        { id: "W5", state: "idle", label: "→ read size" }
+      ]
+    }
+  ]}
+  caption="UMP's varint is length-self-describing: the first byte's magnitude is both a length tag and the high-order data bits. Compact, but you must get the masks exactly right."
+/>
+
+Here's the reader in Go — the varint decoder plus the part loop that walks a whole UMP body and yields typed parts. This is a faithful, runnable port of `UmpReader` over a simple contiguous buffer (the real one handles chunked, streamed buffers; same logic).
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// UMP part-type ids (from googlevideo's ump_part_id.proto).
+const (
+	partMediaHeader = 20
+	partMedia       = 21
+	partMediaEnd    = 22
+)
+
+// readVarint decodes UMP's custom variable-length integer at buf[off].
+// The first byte's magnitude selects the length; each length has its own
+// mask + multiplier. Returns the value and the number of bytes consumed.
+func readVarint(buf []byte, off int) (val, n int) {
+	b1 := int(buf[off])
+	switch {
+	case b1 < 128: // 1 byte
+		return b1, 1
+	case b1 < 192: // 2 bytes
+		b2 := int(buf[off+1])
+		return (b1 & 0x3f) + 64*b2, 2
+	case b1 < 224: // 3 bytes
+		b2, b3 := int(buf[off+1]), int(buf[off+2])
+		return (b1 & 0x1f) + 32*(b2+256*b3), 3
+	case b1 < 240: // 4 bytes
+		b2, b3, b4 := int(buf[off+1]), int(buf[off+2]), int(buf[off+3])
+		return (b1 & 0x0f) + 16*(b2+256*(b3+256*b4)), 4
+	default: // 5 bytes: low nibble unused, next 4 bytes are a little-endian uint32
+		b2, b3 := int(buf[off+1]), int(buf[off+2])
+		b4, b5 := int(buf[off+3]), int(buf[off+4])
+		return b2 + 256*(b3+256*(b4+256*b5)), 5
+	}
+}
+
+type Part struct {
+	Type    int
+	Payload []byte
+}
+
+// parseUMP walks a full UMP body: each part is [type][size][payload bytes].
+func parseUMP(buf []byte) []Part {
+	var parts []Part
+	off := 0
+	for off < len(buf) {
+		partType, n1 := readVarint(buf, off)
+		off += n1
+		size, n2 := readVarint(buf, off)
+		off += n2
+		payload := buf[off : off+size]
+		off += size
+		parts = append(parts, Part{Type: partType, Payload: payload})
+	}
+	return parts
+}
+
+func name(t int) string {
+	switch t {
+	case partMediaHeader:
+		return "MEDIA_HEADER"
+	case partMedia:
+		return "MEDIA"
+	case partMediaEnd:
+		return "MEDIA_END"
+	}
+	return fmt.Sprintf("type-%d", t)
+}
+
+func main() {
+	// A tiny hand-built UMP body: a MEDIA_HEADER (5-byte payload), then a
+	// MEDIA part (first payload byte is the header id, rest is data).
+	body := []byte{
+		20, 5, 'h', 'd', 'r', 0x01, 0x02, // MEDIA_HEADER, size 5
+		21, 4, 0x00, 0xAA, 0xBB, 0xCC, //     MEDIA, size 4 (headerId=0, +3 data bytes)
+		22, 1, 0x00, //                        MEDIA_END, size 1 (headerId=0)
+	}
+
+	for _, p := range parseUMP(body) {
+		fmt.Printf("%-13s size=%d payload=% x\n", name(p.Type), len(p.Payload), p.Payload)
+	}
+}
+```
+
+</GoPlayground>
+
+Notice the small but critical detail in `MEDIA` and `MEDIA_END`: the **first payload byte is a header id** linking the chunk back to the `MEDIA_HEADER` that described it (`SabrUmpProcessor.handleMedia` does `part.data.getUint8(0)` then treats the rest as bytes). One response can interleave multiple segments (audio *and* video), each tagged by header id — the reader demuxes them by that byte.
+
+<UnderTheHood title="Why a custom container at all? Streaming, interleaving, and control-in-band">
+Standard adaptive streaming (DASH/HLS) fetches each segment as its own HTTP request with byte ranges. YouTube's SABR does something different: **one long POST** whose response streams *many* segments — audio and video interleaved — plus **control messages** in the same channel. UMP is what makes that possible:
+
+- **Framing over a stream.** Because each part is length-prefixed, a reader can process parts as bytes arrive, without knowing the total size up front. `googlevideo`'s `CompositeBuffer` even stitches partial network chunks together and re-parses when more data lands.
+- **Interleaving.** The header-id byte lets audio and video segments share one response and get sorted out on the client.
+- **In-band control.** Not every part is media. `NEXT_REQUEST_POLICY` (35), `SABR_REDIRECT` (43), `SABR_ERROR` (44), `STREAM_PROTECTION_STATUS` (58), and `SNACKBAR_MESSAGE` (67) ride the same stream, letting the server steer the client mid-download. That's the SABR protocol layered on top of the UMP format — next section.
+
+This is a genuinely good design for adaptive delivery, and it's exactly the kind of length-prefixed, typed-part framing you'd hand-roll in Go for any custom streaming protocol.
+</UnderTheHood>
+
+<QuickCheck
+  question={"In a UMP MEDIA part, what does the first byte of the payload mean?"}
+  options={[
+    "The video codec",
+    "A header id that links this media chunk to its earlier MEDIA_HEADER (so interleaved audio/video segments can be demuxed)",
+    "The part length",
+    "An encryption key"
+  ]}
+  answer={1}
+  explain="MEDIA and MEDIA_END payloads begin with a header id byte. SabrUmpProcessor reads it (getUint8(0)) to route the remaining bytes to the right segment buffer, which is how one response can carry multiple interleaved segments."
+/>
+
+## SABR: The Streaming Loop
+
+Now the protocol that rides on UMP. **SABR** (Server-side Adaptive Bitrate) inverts classic streaming. In DASH/HLS the *client* decides which quality to fetch next and asks for specific byte ranges. In SABR the *client tells the server its state* — where playback is, what's buffered, its bandwidth estimate — and the *server* decides which segments to send back. It's a conversation, not a shopping list.
+
+<Define term="SABR (Server-side Adaptive Bitrate)">
+YouTube's streaming protocol where the **server** picks the next media segments based on client-reported state (player time, buffered ranges, bandwidth). The client POSTs a protobuf `VideoPlaybackAbrRequest` describing its situation; the server replies with a UMP stream of segments and control parts. The client updates its state and POSTs again. Repeat until the video is fully buffered. Implemented in `googlevideo`'s `SabrStream`.
+</Define>
+
+<Define term="Protocol Buffers (protobuf)">
+Google's compact binary serialization format (deep-dived in the gRPC chapter). Every field is written as a **tag** — `(field_number << 3) | wire_type` — followed by the value. Wire type 0 is a varint (integers); wire type 2 is length-delimited (bytes, strings, nested messages). SABR request/response bodies are protobuf. Note: protobuf's varint is a *different* scheme from UMP's varint — don't confuse them.
+</Define>
+
+The request body is a `VideoPlaybackAbrRequest` (`src/core/SabrStream.ts` → `buildRequestBody`). Its load-bearing fields:
+
+<ConceptGrid cols={2}>
+<ConceptCard label="clientAbrState (field 1)">
+The client's situation: `playerTimeMs` (how far playback has reached), bandwidth estimate, viewport, quality caps. This is what lets the *server* choose segments.
+</ConceptCard>
+<ConceptCard label="preferred + selected formatIds (16/17/2)">
+The itags you want (audio + video) and the ones already initialized. A `FormatId` is `{itag, lastModified, xtags}`.
+</ConceptCard>
+<ConceptCard label="videoPlaybackUstreamerConfig (field 5)">
+The base64 ticket from the player response, decoded to bytes and echoed back. Your authorization to stream.
+</ConceptCard>
+<ConceptCard label="streamerContext (field 19)">
+`poToken` (attestation, below), `clientInfo` (numeric client name + version), and the `playbackCookie` the server handed you last round.
+</ConceptCard>
+<ConceptCard label="bufferedRanges (field 3)">
+Exactly what you already have buffered, per format. The server uses it to avoid re-sending and to know what to send next.
+</ConceptCard>
+<Gotcha>⚠ The POST headers are specific: `content-type: application/x-protobuf`, `accept: application/vnd.yt-ump`, and a `?rn=<n>` counter that increments every request. Get them wrong and the server won't stream UMP back.</Gotcha>
+</ConceptGrid>
+
+To make protobuf concrete (and prove it's not magic), here's a **minimal protobuf encoder in pure Go stdlib** — enough to serialize a `FormatId` and a stripped `VideoPlaybackAbrRequest` the way `SabrStream` does. This is the actual protobuf wire format, hand-rolled.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+)
+
+// Protobuf wire types we need.
+const (
+	wireVarint = 0 // ints, bools, enums
+	wireLen    = 2 // strings, bytes, embedded messages
+)
+
+// tag writes a field's tag byte(s): (fieldNumber << 3) | wireType, as a varint.
+func tag(buf []byte, field, wire int) []byte {
+	return binary.AppendUvarint(buf, uint64(field)<<3|uint64(wire))
+}
+
+func putVarint(buf []byte, field int, v uint64) []byte {
+	buf = tag(buf, field, wireVarint)
+	return binary.AppendUvarint(buf, v)
+}
+
+func putBytes(buf []byte, field int, b []byte) []byte {
+	buf = tag(buf, field, wireLen)
+	buf = binary.AppendUvarint(buf, uint64(len(b))) // length prefix
+	return append(buf, b...)
+}
+
+// FormatId { itag=1, lastModified=2 } as an embedded message.
+func encodeFormatId(itag int, lastModified uint64) []byte {
+	var m []byte
+	m = putVarint(m, 1, uint64(itag))
+	m = putVarint(m, 2, lastModified)
+	return m
+}
+
+func main() {
+	// clientAbrState { playerTimeMs = 28 } — just field 28 for illustration.
+	var abrState []byte
+	abrState = putVarint(abrState, 28, 5000) // playerTimeMs = 5000
+
+	// VideoPlaybackAbrRequest:
+	//   clientAbrState        = field 1 (message)
+	//   preferredVideoFormat  = field 17 (message: FormatId)
+	//   videoPlaybackUstreamer= field 5 (bytes)
+	var req []byte
+	req = putBytes(req, 1, abrState)
+	req = putBytes(req, 17, encodeFormatId(137, 1699999999)) // itag 137 = 1080p
+	req = putBytes(req, 5, []byte("ustreamer-ticket-bytes"))
+
+	fmt.Printf("VideoPlaybackAbrRequest (%d bytes):\n% x\n", len(req), req)
+	fmt.Println("\nThat byte string is exactly what SabrStream POSTs (content-type: application/x-protobuf).")
+}
+```
+
+</GoPlayground>
+
+Now the control loop. The client POSTs the request, streams the UMP response through the reader from the last section, feeds each part to a dispatcher (this is `SabrUmpProcessor`'s handler map), updates its state from what it received, and loops. Here's the whole cycle as it plays out on the wire:
+
+<ExecTimeline
+  title="One SABR request/response cycle"
+  lanes={[
+    { id: "cli", label: "Go client", role: "operator" },
+    { id: "srv", label: "SABR server", role: "captain" }
+  ]}
+  steps={[
+    { lane: "cli", kind: "run", label: "build request", note: "Encode VideoPlaybackAbrRequest: clientAbrState (playerTimeMs, bufferedRanges), formatIds, ustreamer config, poToken." },
+    { lane: "cli", kind: "send", label: "POST ?rn=N", note: "content-type application/x-protobuf, accept application/vnd.yt-ump. rn increments each cycle." },
+    { lane: "srv", kind: "run", label: "server picks segments", note: "Reads your state, chooses which audio/video segments to send next — this is the 'server-side' in SABR." },
+    { lane: "srv", kind: "send", label: "stream UMP parts", note: "MEDIA_HEADER → MEDIA… → MEDIA_END per segment, plus NEXT_REQUEST_POLICY / SABR_REDIRECT control parts." },
+    { lane: "cli", kind: "recv", label: "dispatch each part", note: "Reader yields parts; handler map buffers segments by header id, applies control directives." },
+    { lane: "cli", kind: "run", label: "advance state", note: "Write segment bytes out; bump playerTimeMs and bufferedRanges past what you got." },
+    { lane: "cli", kind: "done", label: "loop or finish", note: "If more video remains, POST again with the new state. Else done.", beat: "solution" }
+  ]}
+  caption="The SABR loop: report state, receive server-chosen segments over UMP, advance, repeat. The server drives quality; the client drives the clock."
+/>
+
+Let's make the loop itself runnable. Below, a tiny in-process "SABR server" hands out segments over UMP (using the exact reader from the last section), and a client loop reports `playerTimeMs`, consumes segments, advances, and repeats until the whole video is buffered. No network — pure model of the control flow, so you can watch the state machine turn.
+
+<GoPlayground>
+
+```go
+package main
+
+import "fmt"
+
+// ---- UMP reader (from the previous section, trimmed) ----
+const partMedia, partMediaEnd = 21, 22
+
+func readVarint(b []byte, o int) (int, int) {
+	v := int(b[o])
+	if v < 128 {
+		return v, 1
+	}
+	return (v & 0x3f) + 64*int(b[o+1]), 2 // 2-byte case suffices here
+}
+
+type Part struct {
+	Type    int
+	Payload []byte
+}
+
+func parseUMP(b []byte) []Part {
+	var out []Part
+	for o := 0; o < len(b); {
+		t, n := readVarint(b, o)
+		o += n
+		sz, n2 := readVarint(b, o)
+		o += n2
+		out = append(out, Part{t, b[o : o+sz]})
+		o += sz
+	}
+	return out
+}
+
+// ---- a mock SABR server: given playerTimeMs, return the next 2s segment as UMP ----
+const segmentMs, totalMs = 2000, 10000
+
+func serverRespond(playerTimeMs int) []byte {
+	if playerTimeMs >= totalMs {
+		return nil // nothing left
+	}
+	seg := fmt.Sprintf("seg@%dms", playerTimeMs)
+	body := []byte{partMedia, byte(1 + len(seg)), 0x00} // MEDIA: headerId=0, then bytes
+	body = append(body, seg...)
+	body = append(body, partMediaEnd, 1, 0x00) // MEDIA_END: headerId=0
+	return body
+}
+
+// ---- the client control loop ----
+func main() {
+	playerTimeMs := 0
+	rn := 0
+	for {
+		rn++
+		resp := serverRespond(playerTimeMs) // == POST ?rn=rn with our clientAbrState
+		if resp == nil {
+			break
+		}
+		for _, p := range parseUMP(resp) {
+			if p.Type == partMedia {
+				fmt.Printf("rn=%d playerTimeMs=%-5d got %q\n", rn, playerTimeMs, p.Payload[1:])
+			}
+		}
+		playerTimeMs += segmentMs // advance state past what we buffered
+	}
+	fmt.Printf("\nBuffered the whole %dms video in %d SABR round-trips.\n", totalMs, rn-1)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="The control parts are the real intelligence">
+Media is the easy half. The reason SABR is robust is the **control parts** interleaved in the stream, each handled in `SabrUmpProcessor`:
+
+- **`NEXT_REQUEST_POLICY` (35)** carries a `playbackCookie` and backoff timing you must echo and obey on the next request — it's how the server keeps a session coherent across round-trips.
+- **`SABR_REDIRECT` (43)** tells you to switch to a different `googlevideo` host mid-stream (load balancing / geo). You follow it immediately.
+- **`STREAM_PROTECTION_STATUS` (58)** signals whether **attestation** is required; status `3` means "you're blocked, prove you're real." This is the PoToken gate.
+- **`SABR_ERROR` (44)** ends the stream with a reason.
+- **`RELOAD_PLAYER_RESPONSE` (46)** means your formats/URLs expired (IP changed, tokens aged out) — go re-do the InnerTube `/player` call and resume. The downloader example wires exactly this: on `reloadPlayerResponse` it re-fetches and calls `setStreamingURL`/`setUstreamerConfig`.
+
+A production Go client is mostly a state machine over these directives. That's the part worth studying: the media bytes are trivial; the *coordination* is the protocol.
+</UnderTheHood>
+
+Which brings us to door three, honestly. **PoToken / BotGuard attestation** is the anti-bot lock. `STREAM_PROTECTION_STATUS` can demand a **proof-of-origin token** — a value produced by running YouTube's BotGuard challenge (a heavily obfuscated JS program that probes the runtime environment) and attaching the result (`poToken`) to `streamerContext`.
+
+<Define term="PoToken / BotGuard attestation">
+An anti-abuse token YouTube can require to stream. It's generated by executing **BotGuard**, an obfuscated JavaScript challenge that inspects the environment to decide you're a "real" client, and returns a token you attach to requests (`streamerContext.poToken`). Because it must run adversarial JS, it's the single hardest part of any YouTube client to reproduce on a server, and it changes constantly. Reference tools like `LuanRT/BgUtils` exist to run it in a JS engine.
+</Define>
+
+<Callout kind="warn" title="Why we stop at the doorway on attestation">
+Producing PoTokens means running YouTube's active anti-bot code — the deliberately adversarial layer. We explain *where it sits* (a `streamerContext.poToken` field, gated by `STREAM_PROTECTION_STATUS`) and *how the ecosystem handles it* (a JS engine like goja running BgUtils/BotGuard, tokens cached and rotated), and we stop there. Your Go backend would treat token generation as an isolated, replaceable dependency behind an interface — `type Attestor interface { PoToken(ctx, videoID) (string, error) }` — so the volatile part is quarantined from the protocol code you actually own. That's good design regardless: wrap the thing that fights you behind a seam.
+</Callout>
+
+<QuickCheck
+  question={"In SABR, who decides which quality/segment is sent next?"}
+  options={[
+    "The client requests exact byte ranges, like DASH",
+    "The server chooses, based on the client's reported state (playerTimeMs, bufferedRanges, bandwidth) in the VideoPlaybackAbrRequest",
+    "A CDN edge node picks randomly",
+    "It's fixed at the start and never changes"
+  ]}
+  answer={1}
+  explain="That's the 'server-side' in Server-side Adaptive Bitrate. The client reports its situation via clientAbrState/bufferedRanges; the server decides which segments to stream back. The client controls playback time; the server controls quality selection."
+/>
+
+## The Browser Tax
+
+Here's my favorite part, and the one that most clearly justifies choosing Go. There's a whole repo in this stack — **ytc-bridge** — whose entire reason for existing is that **browsers are sandboxed**. Study it and you'll see a component that, in a Go backend, *simply vanishes*.
+
+<Define term="CORS (Cross-Origin Resource Sharing)">
+A browser security rule (covered in the CORS appendix chapter): JavaScript on `site-a.com` can't freely read responses from `site-b.com` unless `site-b` opts in with `Access-Control-Allow-Origin` headers. It's enforced **by the browser**, for web pages — not by servers, and not for non-browser clients. A Go program has no origin and no CORS.
+</Define>
+
+The problem ytc-bridge solves: a web app (like kira) running on `localhost` wants to POST to `googlevideo.com`. Two browser-only walls block it:
+
+<ConceptGrid cols={2}>
+<ConceptCard label="Wall 1 — forbidden headers">
+YouTube's servers expect `Origin`/`Referer` to say `youtube.com`. But browsers **forbid JavaScript from setting `Origin` or `Referer`** — they're on the "forbidden header" list precisely so pages can't lie about who they are. Your JS literally cannot send the headers the server wants.
+</ConceptCard>
+<ConceptCard label="Wall 2 — CORS">
+Even if the request goes out, `googlevideo.com` doesn't return `Access-Control-Allow-Origin` for your `localhost` page, so the browser **blocks you from reading the response**. The bytes arrive and the browser throws them away.
+</ConceptCard>
+<Gotcha>⚠ Both walls are enforced by the **browser**, not YouTube. A non-browser client never hits either one. That's the whole insight.</Gotcha>
+</ConceptGrid>
+
+ytc-bridge's fix is a browser extension, because extensions have privileges pages don't. Its `rules.json` uses `declarativeNetRequest` to **rewrite `origin`/`referer` to `https://www.youtube.com`** on requests to `*.googlevideo.com`, and to **inject `Access-Control-Allow-Origin: *`** onto the responses so the page can read them. A background script (`src/background.ts`) proxies the actual `fetch`. Real, from the repo:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// The Go version of "the whole ytc-bridge problem": there is no problem.
+// A server sets Origin/Referer freely and has no CORS to satisfy.
+func main() {
+	// A stand-in for googlevideo that checks Origin, like YouTube does.
+	upstream := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Origin") != "https://www.youtube.com" {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprintln(w, "bad origin")
+				return
+			}
+			fmt.Fprintln(w, "here are your video bytes")
+		}))
+	defer upstream.Close()
+
+	// From Go we just... set the headers. No extension. No forbidden-header list.
+	req, _ := http.NewRequest(http.MethodGet, upstream.URL, nil)
+	req.Header.Set("Origin", "https://www.youtube.com")
+	req.Header.Set("Referer", "https://www.youtube.com")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Println("status:", resp.Status)
+	buf := make([]byte, 64)
+	n, _ := resp.Body.Read(buf)
+	fmt.Printf("body: %s", buf[:n])
+	fmt.Println("\nNo CORS. No bridge. The entire ytc-bridge repo is a browser workaround Go doesn't need.")
+}
+```
+
+</GoPlayground>
+
+<Callout kind="pro" title="The general lesson: know which constraints are the platform's, not the protocol's">
+This is worth more than the YouTube specifics. A huge amount of "hard" web-client code exists to satisfy the **browser's** rules, not the **server's**. CORS, forbidden headers, mixed-content blocking, the same-origin policy, cookie partitioning — every one is a browser-imposed constraint that evaporates the moment your client is a backend. When you're deciding *where* to run integration code, ask: "Is this difficulty inherent to the protocol, or is it the sandbox I happen to be standing in?" If it's the sandbox, moving the work to a Go service can delete entire categories of complexity. ytc-bridge is a perfect, concrete case: a whole repo that a server-side rewrite reduces to two `Header.Set` calls.
+</Callout>
+
+<QuickCheck
+  question={"Why does the ytc-bridge browser extension exist?"}
+  options={[
+    "To speed up video decoding",
+    "Because browsers forbid JS from setting Origin/Referer and enforce CORS — so a web app needs extension privileges to send the headers YouTube wants and to read googlevideo's responses; a non-browser client has neither limit",
+    "To store the user's password",
+    "Because YouTube requires a browser extension to stream"
+  ]}
+  answer={1}
+  explain="Both walls (forbidden request headers and CORS response blocking) are enforced by the browser for web pages. The extension uses declarativeNetRequest to rewrite headers and inject CORS. A Go backend has no origin and no CORS, so the entire component is unnecessary."
+/>
+
+## Assembling a Go Backend
+
+Step back and look at the whole machine. You now understand every door. Here's how they compose into a real service — and how kira and SimpMusic fit the picture.
+
+<Scene
+  title="A YouTube streaming backend in Go"
+  actors={[
+    { id: "user", label: "dumb client", role: "operator" },
+    { id: "go", label: "your Go service", role: "captain" },
+    { id: "yt", label: "YouTube", role: "courier" }
+  ]}
+  rows={3}
+  cols={3}
+  frames={[
+    {
+      caption: "The hard parts — impersonation, deciphering, attestation, UMP/SABR — all live in ONE Go service. Clients (a web player, a mobile app, ffmpeg) just ask it for a video and get clean bytes. The mess is centralized where it's cheapest to maintain.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "done", label: "web player" },
+        { id: "A2", state: "done", label: "mobile app" },
+        { id: "A3", state: "done", label: "ffmpeg / CLI" },
+        { id: "B1", state: "active", label: "Go: InnerTube" },
+        { id: "B2", state: "active", label: "Go: decipher (goja)" },
+        { id: "B3", state: "active", label: "Go: SABR loop" },
+        { id: "C1", state: "warn", label: "youtubei/v1/player" },
+        { id: "C2", state: "warn", label: "base.js" },
+        { id: "C3", state: "warn", label: "googlevideo.com" }
+      ]
+    },
+    {
+      caption: "The service exposes something friendly — a clean progressive URL, an HLS manifest, or a raw segment stream — so every client stays dumb. Change a cipher or a client version once, in Go, and every consumer keeps working.",
+      beat: "solution",
+      cells: [
+        { id: "D1", state: "done", label: "GET /watch?v=…" },
+        { id: "D2", state: "done", label: "→ clean stream" },
+        { id: "D3", state: "done", label: "one place to fix" },
+        { id: "E1", state: "done", label: "concurrent DLs" },
+        { id: "E2", state: "done", label: "token cache" },
+        { id: "E3", state: "done", label: "one binary" },
+        { id: "F1", state: "idle", label: "" },
+        { id: "F2", state: "idle", label: "" },
+        { id: "F3", state: "idle", label: "" }
+      ]
+    }
+  ]}
+  caption="Centralize the volatile, adversarial work in one Go service; hand every client something standard. That's the architecture worth stealing."
+/>
+
+<UnderTheHood title="How kira and SimpMusic map onto this">
+Two reference points, two lessons:
+
+- **kira** (LuanRT) is the *browser* version of this diagram: a web player (Shaka Player) plus `SabrStreamingAdapter` from `googlevideo`, driven by persistent InnerTube sessions, with ytc-bridge as the sandbox escape. It proves the protocol end-to-end in the hardest possible environment. Every complication kira carries (the bridge, running JS in-page, MSE buffer juggling) is one your Go service either deletes or does more comfortably.
+- **SimpMusic** (maxrave-dev) is the *shipping app* version: Kotlin/Compose Multiplatform, with a dedicated `:kotlinYtmusicScraper` module that speaks InnerTube using the `WEB_REMIX` (YouTube Music) client — the same protocol we rebuilt, a different client string, wrapped behind a clean data layer the UI never sees. It's proof that the *right* structure is exactly the one above: quarantine the YouTube-specific reverse-engineering in one module, expose a tidy interface, and the rest of the app doesn't know or care how the bytes were obtained.
+
+Your Go backend is the same idea in the language best suited to the server role: `net/http` + `encoding/json` for InnerTube, `google.golang.org/protobuf` for SABR bodies, a `goja` seam for the JS transforms, `sync`/goroutines for concurrent segment fetches, and one static binary to deploy.
+</UnderTheHood>
+
+<BeforeAfter
+  badLabel="Client does everything (browser)"
+  goodLabel="Backend does the hard part (Go)"
+  bad={`// In-page JS, per client:
+// - can't set Origin/Referer
+// - needs ytc-bridge extension
+// - runs base.js + BotGuard in-page
+// - fights CORS on every fetch
+// - re-implements SABR in TS
+// Every client repeats all of it.`}
+  good={`// One Go service, once:
+svc.InnerTube(videoID)   // impersonate
+svc.Decipher(url)        // goja seam
+svc.PoToken(videoID)     // isolated
+svc.StreamSABR(w, fmts)  // UMP loop
+// Clients just: GET /watch?v=ID
+// No CORS, no bridge, no JS in client.`}
+/>
+
+<Callout kind="note" title="The dependency budget, justified">
+Per the course's rule — justify every dependency. For this backend: **stdlib** covers InnerTube (`net/http`, `encoding/json`), the UMP reader (hand-rolled, as you saw), and the whole server. **`google.golang.org/protobuf`** earns its place for SABR bodies (hand-rolling every message like our teaching encoder is fine for one struct, foolish for thirty). **`dop251/goja`** earns its place as the JS seam for deciphering/attestation — the alternative is shelling out to Node (a heavier operational dependency) or porting volatile transforms by hand. Everything else is yours. That's a lean, defensible tree for a job this adversarial.
+</Callout>
+
+## Exercises
+
+<Exercise n={1} title="Retarget the client to YouTube Music" level="easy">
+
+SimpMusic talks to YouTube **Music** by sending the `WEB_REMIX` client instead of `WEB`. Given the `Client` struct from the InnerTube section, write a constructor `musicClient()` that returns a `Client` configured as `WEB_REMIX` version `1.20250219.01.00`, English/US. Why does changing this one struct change which catalog and formats you get back?
+
+<Solution>
+
+```go
+func musicClient() Client {
+	return Client{
+		ClientName:    "WEB_REMIX",
+		ClientVersion: "1.20250219.01.00",
+		HL:            "en",
+		GL:            "US",
+	}
+}
+```
+
+YouTube branches server behavior on the client context: `WEB_REMIX` is the YouTube Music web app, so the same `/player` endpoint returns the music catalog's metadata and its available formats (and different cipher behavior). Nothing else in your request changes — the client string *is* the identity. This is exactly what SimpMusic's `:kotlinYtmusicScraper` module does.
+
+</Solution>
+</Exercise>
+
+<Exercise n={2} title="Write the UMP varint encoder" level="easy">
+
+You built the UMP varint *reader*. Write its inverse, `writeVarint(v int) []byte`, for the 1- and 2-byte cases (values `0` to `16383`). Recall the reader's 2-byte decode is `(b1 & 0x3f) + 64*b2`, and the first byte must fall in `128..191` to signal "2 bytes."
+
+<Solution>
+
+```go
+func writeVarint(v int) []byte {
+	if v < 128 {
+		return []byte{byte(v)} // 1 byte: value fits directly
+	}
+	// 2 bytes: low 6 bits go in b1 (with the 0x80 length tag); the rest in b2.
+	return []byte{byte(0x80 | (v & 0x3f)), byte(v >> 6)}
+}
+```
+
+The encoder must mirror the decoder's masks exactly. The low 6 bits of `v` go into the first byte, OR'd with `0x80` so the byte lands in the `128..191` range the reader uses to detect a 2-byte value. The remaining bits (`v >> 6`) go in the second byte, whose place value is `2^6 = 64` — matching the reader's `+ 64*b2`. Round-trip any value `0..16383` and reader ∘ writer is the identity.
+
+</Solution>
+</Exercise>
+
+<Exercise n={3} title="Detect which formats need deciphering" level="medium">
+
+An `adaptiveFormats` entry has either a ready-to-use `URL` **or** a `SignatureCipher` string (never both usefully). Write `streamURL(f Format) (url string, needsDecipher bool)` that returns the plain URL when present, or extracts the `url=` parameter from the `signatureCipher` and flags that it still needs the signature applied. (Assume `net/url`.)
+
+<Solution>
+
+```go
+type Format struct {
+	URL             string
+	SignatureCipher string // e.g. "s=SCRAMBLED&sp=sig&url=https%3A%2F%2F..."
+}
+
+func streamURL(f Format) (string, bool) {
+	if f.URL != "" {
+		return f.URL, false // already playable (still needs n-transform though!)
+	}
+	q, err := url.ParseQuery(f.SignatureCipher)
+	if err != nil {
+		return "", false
+	}
+	return q.Get("url"), true // needs the s->sig signature applied
+}
+```
+
+Formats split into two shapes. A plain `URL` skips the signature step (but its `n` param still needs transforming — never forget door two's second lock). A `signatureCipher` is a query string bundling the scrambled signature (`s`), the target param name (`sp`, usually `sig`), and the base `url`; you parse it, take `url`, then run the deciphered signature into the `sp` parameter before use. The boolean tells the caller which path to take.
+
+</Solution>
+</Exercise>
+
+<Exercise n={4} title="Handle a SABR_REDIRECT mid-stream" level="hard">
+
+The server can send a `SABR_REDIRECT` (part type 43) telling you to switch to a different `googlevideo` host for the rest of the stream. Extend a dispatcher so that when it sees a redirect part (payload = the new URL bytes, for this exercise), it updates the streaming URL and signals the loop to reconnect. Sketch `dispatch(parts []Part, streamURL *string) (reconnect bool)`.
+
+<Solution>
+
+```go
+const partSabrRedirect = 43
+
+func dispatch(parts []Part, streamURL *string) (reconnect bool) {
+	for _, p := range parts {
+		switch p.Type {
+		case partSabrRedirect:
+			*streamURL = string(p.Payload) // real payload is a SabrRedirect protobuf msg
+			reconnect = true               // stop draining; re-POST to the new host
+		case partMedia:
+			// ... buffer segment bytes (payload[1:], keyed by header id) ...
+		case partMediaEnd:
+			// ... finalize that segment ...
+		}
+	}
+	return reconnect
+}
+```
+
+`SABR_REDIRECT` is one of the in-band control parts that make SABR a state machine rather than a plain download. On seeing it, the client must abandon the current connection and re-issue its next `VideoPlaybackAbrRequest` to the new URL, carrying its existing state (playerTimeMs, bufferedRanges, playbackCookie) so playback continues seamlessly. In the real `SabrUmpProcessor` the payload is a `SabrRedirect` protobuf message you decode to get the URL; here we simplified it to raw bytes to focus on the control flow. This same pattern handles `RELOAD_PLAYER_RESPONSE` (re-do the InnerTube call) and `NEXT_REQUEST_POLICY` (apply backoff + cookie).
+
+</Solution>
+</Exercise>
+
+<Recap>
+
+- **There is no public streaming API.** Every third-party client impersonates a real YouTube app to its **InnerTube** internal API and decodes a proprietary streaming protocol. Four doors: impersonate, decipher, attest, decode.
+- **InnerTube** is a JSON `POST /youtubei/v1/player` whose power is the **client context** (`clientName`/`clientVersion`/`hl`/`gl`/`visitorData`). It returns `adaptiveFormats`, `serverAbrStreamingUrl`, and the `videoPlaybackUstreamerConfig` ticket. Choosing the client is strategy.
+- **Deciphering** runs two transforms hidden in YouTube's obfuscated `base.js`: the **signature** cipher (wrong → 403) and the **n** throttle param (wrong → silent slow-down). They're reversible string surgery; the secret is the *order*, extracted from the script. Go needs a JS engine (goja) at this seam.
+- **UMP** is YouTube's binary container: a **custom varint** (first byte's magnitude picks its length) framing typed `[type][size][payload]` parts. `MEDIA`/`MEDIA_END` payloads start with a header-id byte so interleaved segments demux. We rebuilt the reader in stdlib Go.
+- **SABR** inverts streaming: the client POSTs a protobuf `VideoPlaybackAbrRequest` of its state; the **server** picks segments and streams them back as UMP, with in-band control parts (`NEXT_REQUEST_POLICY`, `SABR_REDIRECT`, `STREAM_PROTECTION_STATUS`, `RELOAD_PLAYER_RESPONSE`) that make it a state machine, not a download.
+- **PoToken/BotGuard** is the adversarial attestation gate — quarantine it behind an interface.
+- **ytc-bridge** exists **only** because browsers forbid setting `Origin`/`Referer` and enforce CORS. A Go backend deletes that entire component. Know which constraints are the platform's, not the protocol's.
+- **Architecture:** centralize all the volatile, adversarial work in one Go service; hand every client something standard. That's how SimpMusic is structured, and it's the pattern to steal.
+
+</Recap>
+
+<Lab
+  title="Fix the UMP varint decoder"
+  archetype="fix-it"
+  difficulty="guided"
+  points={95}
+  hintCost={20}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="A miniature UMP parser is desyncing because readVarint decodes the 2-byte case with the wrong mask and multiplier, so any part whose type or size needs two bytes is misread — and every part after it lands at the wrong offset. Fix the 2-byte branch of readVarint to match UMP's real formula, (b1 & 0x3f) + 64*b2. main is the self-check harness: it encodes a known UMP body (including a MEDIA part whose size is 200, which requires a 2-byte varint), parses it back, and prints ALL CHECKS PASS only when every part's type, size, and payload round-trips exactly. Do not edit main."
+  starter={`package main
+
+import "fmt"
+
+// UMP part-type ids.
+const (
+	partMediaHeader = 20
+	partMedia       = 21
+	partMediaEnd    = 22
+)
+
+// readVarint decodes UMP's custom variable-length integer at buf[off].
+// The first byte's magnitude selects the length. Returns (value, bytesConsumed).
+//
+// BUG: the 2-byte branch uses the wrong mask (0x7f) and multiplier (128).
+// UMP's real 2-byte formula is (b1 & 0x3f) + 64*b2. Fix it.
+func readVarint(buf []byte, off int) (val, n int) {
+	b1 := int(buf[off])
+	switch {
+	case b1 < 128: // 1 byte
+		return b1, 1
+	case b1 < 192: // 2 bytes  <-- FIX THIS BRANCH
+		b2 := int(buf[off+1])
+		return (b1 & 0x7f) + 128*b2, 2
+	default:
+		panic("this lab only exercises 1- and 2-byte varints")
+	}
+}
+
+type Part struct {
+	Type    int
+	Payload []byte
+}
+
+// parseUMP walks a full UMP body: each part is [type][size][payload].
+func parseUMP(buf []byte) []Part {
+	var parts []Part
+	off := 0
+	for off < len(buf) {
+		partType, n1 := readVarint(buf, off)
+		off += n1
+		size, n2 := readVarint(buf, off)
+		off += n2
+		if off+size > len(buf) {
+			return parts // desync: ran off the end
+		}
+		parts = append(parts, Part{Type: partType, Payload: buf[off : off+size]})
+		off += size
+	}
+	return parts
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+
+// writeVarint is the CORRECT UMP encoder, used to build the known test body.
+func writeVarint(buf []byte, v int) []byte {
+	if v < 128 {
+		return append(buf, byte(v))
+	}
+	// 2-byte form: first byte is 0x80 | low6 bits; second byte is v>>6.
+	return append(buf, byte(0x80|(v&0x3f)), byte(v>>6))
+}
+
+func writePart(buf []byte, partType int, payload []byte) []byte {
+	buf = writeVarint(buf, partType)
+	buf = writeVarint(buf, len(payload))
+	return append(buf, payload...)
+}
+
+func main() {
+	// Build a known body. The MEDIA payload is 200 bytes, so its SIZE must be
+	// encoded as a 2-byte varint — this is what exercises the buggy branch.
+	bigPayload := make([]byte, 200)
+	for i := range bigPayload {
+		bigPayload[i] = byte(i)
+	}
+	type spec struct {
+		typ     int
+		payload []byte
+	}
+	want := []spec{
+		{partMediaHeader, []byte("hdr")},
+		{partMedia, bigPayload},
+		{partMediaEnd, []byte{0x00}},
+	}
+
+	var body []byte
+	for _, s := range want {
+		body = writePart(body, s.typ, s.payload)
+	}
+
+	got := parseUMP(body)
+
+	ok := true
+	if len(got) != len(want) {
+		fmt.Printf("FAIL: parsed %d parts, want %d (varint desync misreads a size)\n", len(got), len(want))
+		ok = false
+	} else {
+		for i := range want {
+			if got[i].Type != want[i].typ {
+				fmt.Printf("FAIL: part %d type = %d, want %d\n", i, got[i].Type, want[i].typ)
+				ok = false
+			}
+			if len(got[i].Payload) != len(want[i].payload) {
+				fmt.Printf("FAIL: part %d size = %d, want %d\n", i, len(got[i].Payload), len(want[i].payload))
+				ok = false
+			} else {
+				for j := range want[i].payload {
+					if got[i].Payload[j] != want[i].payload[j] {
+						fmt.Printf("FAIL: part %d payload byte %d mismatch\n", i, j)
+						ok = false
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if ok {
+		fmt.Println("parts:", len(got), "| MEDIA size:", len(got[1].Payload))
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main encodes a known 3-part UMP body with the correct writeVarint, including a MEDIA part of size 200 (which forces a 2-byte varint), then parses it with the learner's readVarint and compares every part's type, size, and payload. The flag unlocks only on a clean build that prints ALL CHECKS PASS, which is impossible while the 2-byte branch uses the wrong mask/multiplier (the size 200 misdecodes and the parse desyncs)."
+  hints={[
+    "The fix is one line. UMP's 2-byte value is (b1 & 0x3f) + 64*b2 — mask the low 6 bits of the first byte, and the second byte is worth 64 each, not 128.",
+    "Sanity-check with size 200: the encoder writes it as [0x80|(200&0x3f), 200>>6] = [0x88, 0x03]. The correct decode is (0x88 & 0x3f) + 64*3 = 8 + 192 = 200. The buggy (0x88 & 0x7f) + 128*3 = 8 + 384 = 392 reads 192 bytes too many and desyncs.",
+    "Why 0x3f and 64? The top two bits of the first byte (the 0x80..0xBF range) are the length TAG, not data. Only the low 6 bits carry value, so the second byte's place value is 2^6 = 64.",
+  ]}
+  flag="GO{first_byte_masks_low_six_bits}"
+>
+
+The parser is desyncing on any multi-byte length. Fix the 2-byte branch of `readVarint` so UMP's varint decodes correctly — mask the low 6 bits of the first byte and weight the second byte by 64. When the 200-byte MEDIA part round-trips and every part lines up, the books balance and the flag is yours. This is the exact bug that turns a UMP stream into garbage; get it right and you've written the load-bearing line of a real streaming client.
+
+</Lab>
+
+<Scoreboard
+  streak={8}
+  items={[
+    { label: "Named why there's no public streaming API (InnerTube)", kind: "concept", points: 10, done: true },
+    { label: "Built the InnerTube /player request + client context", kind: "mechanism", points: 15, done: true },
+    { label: "Explained the signature + n ciphers and the goja seam", kind: "mechanism", points: 20, done: true },
+    { label: "Rebuilt the UMP varint + part reader in Go", kind: "mechanism", points: 20, done: true },
+    { label: "Traced the SABR request/response control loop", kind: "protocol", points: 20, done: true },
+    { label: "Explained why ytc-bridge is pure browser tax", kind: "insight", points: 15, done: true },
+    { label: "Fixed the UMP varint decoder", kind: "lab", points: 95, done: false },
+  ]}
+  flag={{ label: "GO{first_byte_masks_low_six_bits}", captured: false, points: 95 }}
+/>
+
+That's the whole maze, sport — impersonation, ciphers, a bespoke binary protocol, and an anti-bot moat — and you just walked it end to end and rebuilt the load-bearing parts in Go without breaking a sweat. The browser crowd needs an extension and a prayer to do what you did with two `Header.Set` calls and a varint. Now go build the service that makes every other client look lazy. It's no *me*, but… it'll be close.
