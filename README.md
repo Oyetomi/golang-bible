@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/icon.svg" width="128" height="128" alt="The Go Bible">
+  <img src=".github/assets/logo.svg" width="128" height="128" alt="The Go Bible">
 </p>
 
 <h1 align="center">The Go Bible</h1>
@@ -20,7 +20,7 @@
 
 ---
 
-## 📖 What This Is
+## What This Is
 
 **The Go Bible** is an interactive, visualization-heavy Go course and encyclopedia built with Next.js 15, React 19, and MDX. Every single chapter is designed from physical machine reality: seeing the mechanism execute before writing code.
 
@@ -34,7 +34,7 @@ The running domain throughout the book is **Meridian Trust & Clearing**, a reali
 
 ---
 
-## 🗺️ The 4 Flagship Tracks (113 Chapters)
+## The 4 Flagship Tracks (113 Chapters)
 
 | Track | Focus | Topics & Systems | Chapters |
 | :--- | :--- | :--- | :---: |
@@ -45,7 +45,7 @@ The running domain throughout the book is **Meridian Trust & Clearing**, a reali
 
 ---
 
-## 🕹️ Interactive Visual Engine
+## Interactive Visual Engine
 
 The platform features tailored, stepped animation components built in pure React + SVG:
 
@@ -70,7 +70,7 @@ The platform features tailored, stepped animation components built in pure React
 
 ---
 
-## 💻 Tech Stack
+## Tech Stack
 
 - **Framework**: [Next.js 15](https://nextjs.org/) (App Router, Static Site Generation) + [React 19](https://react.dev/)
 - **Content Engine**: MDX via `next-mdx-remote/rsc` with [Shiki](https://shiki.style/) syntax highlighting
@@ -80,7 +80,7 @@ The platform features tailored, stepped animation components built in pure React
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 - Node.js 20+
@@ -110,7 +110,7 @@ pnpm search-index     # Rebuild the 2,100+ entry client search index
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```
 golang-bible/
