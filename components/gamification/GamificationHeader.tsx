@@ -11,6 +11,10 @@ import {
 import { playClick, playStreak } from "@/lib/sound";
 import { BadgesModal } from "./BadgesModal";
 
+import { ReadingProgress } from "@/components/nav/ReadingProgress";
+import { BookmarkButton } from "@/components/nav/BookmarkButton";
+import { openSearch } from "@/lib/search";
+
 interface XpToast {
   id: number;
   amount: number;
@@ -75,7 +79,6 @@ export function GamificationHeader() {
   };
 
   if (!mounted) {
-    // Return clean placeholder for SSR / hydration match
     return (
       <div className="gb-header-bar gb-header-placeholder">
         <div className="gb-header-inner">
@@ -90,9 +93,10 @@ export function GamificationHeader() {
 
   return (
     <>
-      <header className="gb-header-bar" role="region" aria-label="Player Stats">
+      <ReadingProgress />
+      <header className="gb-header-bar" role="region" aria-label="Player Stats & Navigation">
         <div className="gb-header-inner">
-          {/* Level & Title */}
+          {/* Level & Rank Pill */}
           <div
             className="gb-level-pill"
             title={`Total XP: ${profile.xp.toLocaleString()} XP`}
@@ -121,7 +125,7 @@ export function GamificationHeader() {
             </div>
           </div>
 
-          {/* XP Progress Bar */}
+          {/* XP Progress Bar Track */}
           <div
             className="gb-xp-bar-container"
             title={`${levelInfo.currentXP} / ${levelInfo.xpNeededForNext} XP towards Level ${levelInfo.level + 1}`}
@@ -146,8 +150,28 @@ export function GamificationHeader() {
             ))}
           </div>
 
-          {/* Right Action Badges: Streak, Sound, Badges */}
+          {/* Right Action Tools: Search, Bookmark, Streak, Badges, Sound */}
           <div className="gb-header-actions">
+            {/* Quick Search */}
+            <button
+              className="gb-action-pill gb-search-pill"
+              onClick={() => {
+                playClick();
+                openSearch();
+              }}
+              title="Search documentation (⌘K)"
+              type="button"
+            >
+              <svg className="gb-icon-svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                <circle cx="11" cy="11" r="8" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+              <span className="gb-search-kbd">⌘K</span>
+            </button>
+
+            {/* Bookmark Manager */}
+            <BookmarkButton />
+
             {/* Daily Streak */}
             <button
               className="gb-action-pill gb-streak-pill"
@@ -155,11 +179,10 @@ export function GamificationHeader() {
               title={`Daily Learning Streak: ${profile.streak} days.`}
               type="button"
             >
-              <svg className="gb-icon-svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+              <svg className="gb-icon-svg" width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 23c6.075 0 11-4.925 11-11 0-4.045-2.185-7.581-5.46-9.516-.625-.37-.77-.962-.43-1.484.288-.444.82-.607 1.306-.402C20.697 1.574 22 3.633 22 6c0 1.105-.895 2-2 2-.553 0-1-.447-1-1 0-1.745-.98-3.26-2.427-4.027-.37-.196-.823-.058-1.026.31-.202.368-.066.83.303 1.028C17.27 5.064 18 6.452 18 8c0 3.314-2.686 6-6 6s-6-2.686-6-6c0-1.548.73-2.936 2.15-3.689.37-.198.505-.66.303-1.028-.203-.368-.656-.506-1.026-.31C5.98 3.74 5 5.255 5 7c0 .553-.447 1-1 1-1.105 0-2-.895-2-2 0-2.367 1.303-4.426 3.584-5.402.486-.205 1.018-.042 1.306.402.34.522.195 1.114-.43 1.484C3.185 4.419 1 7.955 1 12c0 6.075 4.925 11 11 11z" />
               </svg>
               <span className="gb-streak-count">{profile.streak}</span>
-              <span className="gb-streak-label">day{profile.streak === 1 ? "" : "s"}</span>
             </button>
 
             {/* Badges Button */}
@@ -169,15 +192,14 @@ export function GamificationHeader() {
                 playClick();
                 setIsBadgesOpen(true);
               }}
-              title="Open Achievements Modal"
+              title="Open Achievements Modal (B)"
               type="button"
             >
-              <svg className="gb-icon-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg className="gb-icon-svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="8" r="6" />
                 <path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11" />
               </svg>
               <span className="gb-badge-count">{unlockedBadgesCount}/20</span>
-              <span className="gb-badge-btn-label">Badges</span>
             </button>
 
             {/* Sound Toggle */}
@@ -191,27 +213,24 @@ export function GamificationHeader() {
               }
               title={
                 profile.soundEnabled
-                  ? "Sound: ON (Click to mute)"
-                  : "Sound: MUTED (Click to enable)"
+                  ? "Audio: ON (M)"
+                  : "Audio: MUTED (M)"
               }
               type="button"
             >
               {profile.soundEnabled ? (
-                <svg className="gb-icon-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <svg className="gb-icon-svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                   <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
                   <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
                 </svg>
               ) : (
-                <svg className="gb-icon-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <svg className="gb-icon-svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                   <line x1="23" y1="9" x2="17" y2="15" />
                   <line x1="17" y1="9" x2="23" y2="15" />
                 </svg>
               )}
-              <span className="gb-sound-label">
-                {profile.soundEnabled ? "Audio" : "Muted"}
-              </span>
             </button>
           </div>
         </div>

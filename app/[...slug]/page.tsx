@@ -1,7 +1,8 @@
 import { notFound } from "next/navigation";
-import { chapters, chapterByHref, chapterBySlug } from "@/lib/manifest";
+import { chapters, chapterByHref } from "@/lib/manifest";
 import { renderChapter, chapterExists } from "@/lib/content";
-import { NextUp, ComingSoon } from "@/components/course/server";
+import { ComingSoon } from "@/components/course/server";
+import { ChapterPagination } from "@/components/nav/ChapterPagination";
 
 export const dynamicParams = true;
 
@@ -32,7 +33,8 @@ export default async function ChapterPage({
   params: Promise<{ slug: string[] }>;
 }) {
   const { slug } = await params;
-  const chapter = chapterByHref("/" + slug.join("/"));
+  const href = "/" + slug.join("/");
+  const chapter = chapterByHref(href);
   if (!chapter) notFound();
 
   if (!(await chapterExists(chapter.path))) {
@@ -44,12 +46,14 @@ export default async function ChapterPage({
   }
 
   const { content } = await renderChapter(chapter.path);
-  const next = chapter.next ? chapterBySlug(chapter.next) : null;
+  const currentIndex = chapters.findIndex((c) => c.href === chapter.href);
+  const prev = currentIndex > 0 ? chapters[currentIndex - 1] : null;
+  const next = currentIndex < chapters.length - 1 ? chapters[currentIndex + 1] : null;
 
   return (
     <article className="prose">
       {content}
-      {next && <NextUp href={next.href} title={next.title} />}
+      <ChapterPagination prev={prev} next={next} />
     </article>
   );
 }
