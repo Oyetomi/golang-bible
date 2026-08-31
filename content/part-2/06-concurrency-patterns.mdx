@@ -3,13 +3,13 @@ title: "Concurrency Patterns"
 part: 2
 order: 6
 type: "course"
-description: "The composition vocabulary: pipelines, fan-out/fan-in, done/or-done channels, generators, tee/bridge, bounded parallelism, semaphores, errgroup, futures, confinement, heartbeats, singleflight — and when a mutex is the right tool instead."
+description: "The composition vocabulary: pipelines, fan-out/fan-in, done/or-done channels, generators, tee/bridge, bounded parallelism, dynamic worker pools, semaphores, errgroup, futures, confinement, the actor model, heartbeats, singleflight — and when a mutex is the right tool instead."
 prerequisites: ["go-scheduler-gmp"]
 ---
 
 <HeroCard label="Part 2 · Chapter 6" title="Concurrency Patterns">
 
-Listen up, sport. You know about goroutines. You know about channels. You watched the GMP scheduler eat OS threads for breakfast in "The Go Scheduler (GMP), In Depth." That's knowledge. What we're building today is *vocabulary* — the twelve composition patterns that separate a Go engineer who knows the keywords from one who actually designs concurrent systems.
+Listen up, sport. You know about goroutines. You know about channels. You watched the GMP scheduler eat OS threads for breakfast in "The Go Scheduler (GMP), In Depth." That's knowledge. What we're building today is *vocabulary* — the foundational composition patterns that separate a Go engineer who knows the keywords from one who actually designs concurrent systems.
 
 A `go` statement is a hammer. These patterns are the blueprints. By the end of this chapter you will not ask "how do I make goroutines talk?" You'll ask "which pattern?" and you'll know the answer immediately. Because I demand nothing less, and frankly, neither does production.
 
@@ -116,7 +116,7 @@ The scenario: Meridian's **payment-batch processor**. Every night, thousands of 
   caption="The core problem: unbounded fan-out exhausts the downstream and bloats memory. The solution: a fixed worker pool that pulls work on demand, combined with a cancellation signal that drains every stage so no goroutine leaks."
 />
 
-<ChapterTabs tabs={["Pipelines", "Fan-out and Fan-in", "Done and Or-Done", "Generators", "Tee and Bridge", "Bounded Parallelism", "Semaphores", "errgroup", "Futures", "Confinement", "Heartbeats", "Singleflight", "When to Use a Mutex"]} />
+<ChapterTabs tabs={["Pipelines", "Fan-out and Fan-in", "Done and Or-Done", "Generators", "Tee and Bridge", "Bounded Parallelism", "Dynamic Worker Pools", "Semaphores", "errgroup", "Futures", "Confinement", "The Actor Model", "Heartbeats", "Singleflight", "When to Use a Mutex"]} />
 
 <SpacedRecall
   role={"operator"}
@@ -1088,6 +1088,304 @@ func main() {
   <Gotcha>A common mistake: closing the output channel from inside one of the worker goroutines. With N workers all capable of closing, you'll get a double-close panic. Always use a separate closer goroutine gated on a WaitGroup.</Gotcha>
 </ConceptGrid>
 
+## Dynamic Worker Pools
+
+Static worker pools are blunt instruments. Pre-allocating 50 worker goroutines at startup means 50 goroutines sit around consuming memory when the payment pipeline is idle. Worse, if an unexpected spike of 10,000 webhook events hits at midnight, a fixed pool of 50 might cause the bounded inbound channel to fill and backpressure upstream callers, or cause queue delays to breach SLAs.
+
+A **Dynamic Worker Pool** solves this by autoscaling:
+1. **Warm Baseline:** Maintains a minimum fleet of `minWorkers` to handle baseline traffic without spawn latency.
+2. **Elastic Burst:** Automatically scales up to `maxWorkers` as incoming queue depth increases or when all existing workers are saturated.
+3. **Idle Reclamation:** Automatically shrinks excess workers back down to `minWorkers` when tasks subside for longer than an `idleTimeout`.
+4. **Lifecycle Discipline:** Supports both graceful draining (completing queued work) and immediate context cancellation.
+
+**On the job:** Meridian's card transaction intake experiences extreme traffic shapes: 20 transactions/sec at 3am, bursting to 2,500 transactions/sec during a Black Friday flash sale. A static pool sized for Black Friday wastes resources 364 days a year. A dynamic pool scales from 4 baseline workers to 128 during the surge, then gracefully reclaims goroutine stacks within seconds of the surge subsiding.
+
+<ExecTimeline
+  title="Dynamic worker pool — scaling up under burst and shrinking on idle"
+  lanes={[
+    { id: "queue", label: "Task queue" },
+    { id: "w_base", label: "Base workers (min=2)" },
+    { id: "w_dyn", label: "Dynamic workers (max=5)" }
+  ]}
+  steps={[
+    { lane: "w_base", kind: "run", label: "2 workers active", note: "Pool starts with minWorkers=2 warm. Handling baseline traffic." },
+    { lane: "queue", kind: "recv", label: "burst: 10 tasks arrive", note: "Inbound burst floods task channel. Both base workers are 100% busy." },
+    { lane: "w_dyn", kind: "run", label: "spawn worker 3, 4, 5", note: "Dispatcher detects zero idle workers and spawns dynamic workers up to maxWorkers=5." },
+    { lane: "w_dyn", kind: "run", label: "parallel processing", note: "All 5 workers process tasks concurrently, draining the queue quickly." },
+    { lane: "queue", kind: "done", label: "queue empty", note: "All tasks processed. Workers enter idle timeout wait." },
+    { lane: "w_dyn", kind: "block", label: "idle timer expired", note: "After idleTimeout (150ms), excess dynamic workers exit." },
+    { lane: "w_base", kind: "run", label: "2 workers preserved", note: "Worker count stabilizes back at minWorkers=2. Zero goroutine leaks." }
+  ]}
+  caption="Dynamic worker pools expand under queue pressure and shrink on idle timeouts, preserving low latency without memory waste."
+/>
+
+### Implementing an Autoscaling Worker Pool
+
+Here is a production-grade, generic dynamic worker pool with atomic state tracking, bounded queueing, idle timeouts, and graceful draining.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	ErrPoolClosed = errors.New("worker pool closed")
+	ErrPoolFull   = errors.New("queue capacity exceeded")
+)
+
+type Task[T, R any] struct {
+	Data   T
+	Ctx    context.Context
+	Result chan<- Result[R]
+}
+
+type Result[R any] struct {
+	Value R
+	Err   error
+}
+
+// DynamicPool manages an autoscaling pool of worker goroutines.
+type DynamicPool[T, R any] struct {
+	minWorkers  int32
+	maxWorkers  int32
+	idleTimeout time.Duration
+	process     func(context.Context, T) (R, error)
+
+	tasks       chan Task[T, R]
+	workerCount int32
+	idleCount   int32
+
+	closed atomic.Bool
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func NewDynamicPool[T, R any](
+	parentCtx context.Context,
+	minWorkers, maxWorkers int32,
+	queueCap int,
+	idleTimeout time.Duration,
+	process func(context.Context, T) (R, error),
+) *DynamicPool[T, R] {
+	ctx, cancel := context.WithCancel(parentCtx)
+	p := &DynamicPool[T, R]{
+		minWorkers:  minWorkers,
+		maxWorkers:  maxWorkers,
+		idleTimeout: idleTimeout,
+		process:     process,
+		tasks:       make(chan Task[T, R], queueCap),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+
+	// Pre-spawn minimum warm workers
+	for range minWorkers {
+		p.spawnWorker()
+	}
+	return p
+}
+
+func (p *DynamicPool[T, R]) spawnWorker() bool {
+	for {
+		cur := atomic.LoadInt32(&p.workerCount)
+		if cur >= p.maxWorkers {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&p.workerCount, cur, cur+1) {
+			p.wg.Add(1)
+			go p.workerLoop()
+			return true
+		}
+	}
+}
+
+func (p *DynamicPool[T, R]) workerLoop() {
+	defer func() {
+		atomic.AddInt32(&p.workerCount, -1)
+		p.wg.Done()
+	}()
+
+	timer := time.NewTimer(p.idleTimeout)
+	defer timer.Stop()
+
+	for {
+		atomic.AddInt32(&p.idleCount, 1)
+
+		// Reset idle timer efficiently
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(p.idleTimeout)
+
+		select {
+		case <-p.ctx.Done():
+			atomic.AddInt32(&p.idleCount, -1)
+			return
+
+		case task, ok := <-p.tasks:
+			atomic.AddInt32(&p.idleCount, -1)
+			if !ok {
+				return // Channel closed and drained
+			}
+			p.runTask(task)
+
+		case <-timer.C:
+			atomic.AddInt32(&p.idleCount, -1)
+			// Shrink down if we exceed minWorkers
+			for {
+				cur := atomic.LoadInt32(&p.workerCount)
+				if cur <= p.minWorkers {
+					break // Maintain warm baseline
+				}
+				if atomic.CompareAndSwapInt32(&p.workerCount, cur, cur-1) {
+					// We claimed exit right; defer will perform the decrement on pool workerCount
+					atomic.AddInt32(&p.workerCount, 1)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (p *DynamicPool[T, R]) runTask(t Task[T, R]) {
+	taskCtx := t.Ctx
+	if taskCtx == nil {
+		taskCtx = p.ctx
+	}
+	val, err := p.process(taskCtx, t.Data)
+	if t.Result != nil {
+		t.Result <- Result[R]{Value: val, Err: err}
+	}
+}
+
+func (p *DynamicPool[T, R]) Submit(ctx context.Context, data T, resChan chan<- Result[R]) error {
+	if p.closed.Load() {
+		return ErrPoolClosed
+	}
+
+	task := Task[T, R]{Data: data, Ctx: ctx, Result: resChan}
+
+	// Try non-blocking submit
+	select {
+	case p.tasks <- task:
+		// If all workers are occupied and we can scale, spawn a worker
+		if atomic.LoadInt32(&p.idleCount) == 0 && atomic.LoadInt32(&p.workerCount) < p.maxWorkers {
+			p.spawnWorker()
+		}
+		return nil
+	default:
+		// Queue full: spawn a worker if possible to absorb load
+		if p.spawnWorker() {
+			select {
+			case p.tasks <- task:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		// Otherwise wait for queue slot or caller cancellation
+		select {
+		case p.tasks <- task:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// Drain closes the task queue, finishes in-flight jobs, and stops all workers.
+func (p *DynamicPool[T, R]) Drain() {
+	if p.closed.CompareAndSwap(false, true) {
+		close(p.tasks)
+		p.wg.Wait()
+	}
+}
+
+// Cancel immediately terminates all workers without waiting for pending tasks.
+func (p *DynamicPool[T, R]) Cancel() {
+	if p.closed.CompareAndSwap(false, true) {
+		p.cancel()
+		p.wg.Wait()
+	}
+}
+
+func (p *DynamicPool[T, R]) Stats() (total, idle int32) {
+	return atomic.LoadInt32(&p.workerCount), atomic.LoadInt32(&p.idleCount)
+}
+
+func main() {
+	ctx := context.Background()
+	processor := func(ctx context.Context, id int) (string, error) {
+		time.Sleep(30 * time.Millisecond)
+		return fmt.Sprintf("txn-%d-processed", id), nil
+	}
+
+	// Pool: min 2, max 5, queue 10, idle timeout 150ms
+	pool := NewDynamicPool[int, string](ctx, 2, 5, 10, 150*time.Millisecond, processor)
+
+	w, i := pool.Stats()
+	fmt.Printf("Initial pool: %d workers (%d idle)\n", w, i)
+
+	resCh := make(chan Result[string], 12)
+
+	// Fire a burst of 10 tasks
+	fmt.Println("Dispatching burst of 10 tasks...")
+	for id := 1; id <= 10; id++ {
+		_ = pool.Submit(ctx, id, resCh)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	w, i = pool.Stats()
+	fmt.Printf("Under burst: %d workers (%d idle)\n", w, i)
+
+	// Collect results
+	for range 10 {
+		r := <-resCh
+		fmt.Printf("Result: %s (err: %v)\n", r.Value, r.Err)
+	}
+
+	// Wait for idle timeout to reclaim excess workers
+	time.Sleep(250 * time.Millisecond)
+	w, i = pool.Stats()
+	fmt.Printf("After idle reclaim: %d workers (%d idle)\n", w, i)
+
+	pool.Drain()
+	fmt.Println("Pool successfully drained and stopped.")
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Goroutine Stack Allocation and GC Pressure Under Autoscaling">
+
+A common question is: "If goroutines are lightweight (~2 KB initial stack), why bother shrinking worker pools at all?"
+
+Three production realities dictate worker pool reclamation:
+1. **Stack Growth Memory Retention:** A goroutine stack starts at 2 KB, but if a task allocates large stack frames or deep call trees, the Go runtime expands the stack to 8 KB, 32 KB, or even megabytes. Goroutine stacks shrink only during GC when the stack is less than 1/4 utilized, but idle goroutines that remain parked still hold non-trivial resident set size (RSS).
+2. **GC Mark-Phase Overhead:** During garbage collection mark phase (STW root scanning), the Go runtime must inspect the stack of every alive goroutine. 50,000 idle worker goroutines add milliseconds of GC scan latency compared to 20 active workers.
+3. **File Descriptors and Thread Affinities:** Workers performing cgo or network I/O may pin OS threads or allocate thread-local resources that cannot be garbage collected while the goroutine survives.
+
+Autoscaling workers with idle timeouts keeps both RSS and GC mark durations bounded.
+
+</UnderTheHood>
+
+<Gotcha>
+When implementing idle worker shutdown, never use a naive `time.After(timeout)` in a hot loop! `time.After` allocates a new `time.Timer` on every iteration which cannot be garbage collected until the timer fires. Over millions of tasks, this causes severe heap allocation spikes. Always use a reusable `time.NewTimer` with proper `Stop()` and drain pattern.
+</Gotcha>
+
 ## Semaphores
 
 Sometimes you need to limit concurrency without a pre-spawned pool — you spawn goroutines dynamically but gate them so at most N run their critical section at a time. That's a semaphore.
@@ -1528,6 +1826,404 @@ func main() {
 </GoPlayground>
 
 This "actor" style (the `ledgerLoop` goroutine owns all state; operations arrive as messages) is a principled approach to shared state. The trade-off: function closures as messages are more complex to read than a struct with a mutex. Use confinement when the logic benefits from single-owner clarity; use a mutex when the simpler form is a plain protected read/write.
+
+## The Actor Model
+
+In the classic concurrent programming model, multiple goroutines share access to the same memory and coordinate using locks (`sync.Mutex`, `sync.RWMutex`). But as state machines grow complex, mutex-guarded architectures frequently suffer from lock contention, lock inversion deadlocks, and cognitive overload over which lock guards which field.
+
+The **Actor Model** offers a radically different paradigm:
+> **An Actor is a dedicated goroutine that exclusively owns private mutable state and communicates with the outside world purely through typed message channels.**
+
+No external goroutine is ever allowed to directly read or mutate the actor's internal fields. Instead of locking shared memory, you send a message to the actor's inbox. The actor processes messages sequentially in its single-threaded event loop, guaranteeing **data-race-free state transitions by construction**.
+
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Caller Goroutines                                           │
+   │                                                             │
+   │  Deposit(100) ──┐                                           │
+   │                 ├──> [ Inbox Channel ]                      │
+   │  Withdraw(50) ──┤           │                               │
+   │                 │           ▼                               │
+   │  GetBalance() ──┘    ┌──────────────────────────────────┐   │
+   │                      │ Dedicated Actor Goroutine        │   │
+   │                      │  - balance: 1000                 │   │
+   │  [ Reply Chan ] <────┤  - transactions: [...]           │   │
+   │  (Result: $1050)     │  (Private Mutable State)         │   │
+   │                      └──────────────────────────────────┘   │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+**On the job:** In Meridian's core banking engine, each customer account is represented by an `AccountActor`. Deposits, withdrawals, hold placements, and balance inquiries are dispatched to that account's mailbox. Because one goroutine processes that account's events in serial order, there is zero possibility of race conditions like double-spending — and zero mutex deadlocks between concurrent cross-account transfers.
+
+### Typed Request/Reply Protocol
+
+An actor requires a protocol for two-way communication: the caller sends a **Command** and receives a **Response** asynchronously or synchronously.
+
+To implement synchronous request/reply without blocking the actor:
+1. The command struct contains payload fields and a `chan Response` reply channel.
+2. The caller creates a buffered reply channel (`make(chan Response, 1)`).
+3. The caller sends the command to the actor's inbox and waits on `reply` with a timeout/context.
+4. The actor processes the command and sends the result onto `reply`.
+
+<Callout kind="warning" title="Always buffer the reply channel">
+The response channel **must** have a buffer capacity of at least 1 (`make(chan Response, 1)`). If the caller's context times out while the actor is processing, the caller abandons the reply channel. If the channel is unbuffered, the actor will block forever trying to send the response, leaking the actor goroutine!
+</Callout>
+
+### Supervisor Loops and Restart Policies
+
+In production, actors may encounter panics due to unexpected payloads, database disconnections, or runtime assertions. The Erlang / OTP philosophy embraces **"Let It Crash"**: rather than defensive error handling everywhere, isolate failures within the actor and let a **Supervisor** handle recovery.
+
+A Supervisor:
+1. Wraps the actor's event loop in a `defer recover()` handler.
+2. Catches any panic, captures stack traces, and increments error metrics.
+3. Applies a **Restart Policy**:
+   - **One-For-One:** Restart the crashed actor with clean state or rehydrated state from a write-ahead log.
+   - **Backoff & Budget:** Limit restarts (e.g. max 3 restarts within a 10-second sliding window). If the actor crashes repeatedly, escalate the failure to avoid spinning the CPU in a hot crash loop.
+4. Resumes message consumption from the inbox.
+
+Here is a full, runnable implementation of a supervised Meridian Account Actor with typed commands and restart management.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+var (
+	ErrInsufficientFunds = errors.New("insufficient funds")
+	ErrActorTerminated   = errors.New("actor terminated")
+	ErrInvalidAmount     = errors.New("amount must be positive")
+)
+
+// Typed Response
+type Response[T any] struct {
+	Value T
+	Err   error
+}
+
+// Commands
+type Command any
+
+type DepositCmd struct {
+	Amount int64
+	Reply  chan Response[int64]
+}
+
+type WithdrawCmd struct {
+	Amount int64
+	Reply  chan Response[int64]
+}
+
+type GetBalanceCmd struct {
+	Reply chan Response[int64]
+}
+
+type PoisonPillCmd struct {
+	Reply chan Response[struct{}]
+}
+
+// AccountActor encapsulates private state
+type AccountActor struct {
+	accountID    string
+	balance      int64
+	transactions []string
+	inbox        chan Command
+	ctx          context.Context
+	cancel       context.CancelFunc
+}
+
+func NewAccountActor(accountID string, initialBalance int64, bufferSize int) *AccountActor {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &AccountActor{
+		accountID:    accountID,
+		balance:      initialBalance,
+		transactions: make([]string, 0),
+		inbox:        make(chan Command, bufferSize),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
+// Supervisor manages actor lifecycle and restart policy
+type Supervisor struct {
+	actor        *AccountActor
+	maxRestarts  int
+	window       time.Duration
+	restartTimes []time.Time
+	mu           sync.Mutex
+	done         chan struct{}
+}
+
+func NewSupervisor(actor *AccountActor, maxRestarts int, window time.Duration) *Supervisor {
+	return &Supervisor{
+		actor:       actor,
+		maxRestarts: maxRestarts,
+		window:      window,
+		done:        make(chan struct{}),
+	}
+}
+
+func (s *Supervisor) Start() {
+	go func() {
+		defer close(s.done)
+		for {
+			s.runActor()
+			if s.actor.ctx.Err() != nil {
+				// Clean shutdown requested
+				return
+			}
+			// Actor crashed: evaluate restart budget
+			if !s.allowRestart() {
+				fmt.Printf("[Supervisor] Actor %s exceeded restart budget. Terminating.\n", s.actor.accountID)
+				s.actor.cancel()
+				return
+			}
+			fmt.Printf("[Supervisor] Restarting crashed actor %s...\n", s.actor.accountID)
+			time.Sleep(50 * time.Millisecond) // brief cooldown
+		}
+	}()
+}
+
+func (s *Supervisor) allowRestart() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	// Filter timestamps within sliding window
+	valid := s.restartTimes[:0]
+	for _, t := range s.restartTimes {
+		if now.Sub(t) <= s.window {
+			valid = append(valid, t)
+		}
+	}
+	s.restartTimes = append(valid, now)
+	return len(s.restartTimes) <= s.maxRestarts
+}
+
+func (s *Supervisor) runActor() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[Supervisor] Recovered panic in actor %s: %v\n", s.actor.accountID, r)
+		}
+	}()
+
+	s.actor.loop()
+}
+
+func (a *AccountActor) loop() {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case msg, ok := <-a.inbox:
+			if !ok {
+				return
+			}
+			a.handleMessage(msg)
+		}
+	}
+}
+
+func (a *AccountActor) handleMessage(msg Command) {
+	switch cmd := msg.(type) {
+	case DepositCmd:
+		if cmd.Amount <= 0 {
+			cmd.Reply <- Response[int64]{Err: ErrInvalidAmount}
+			return
+		}
+		a.balance += cmd.Amount
+		a.transactions = append(a.transactions, fmt.Sprintf("deposit +$%d", cmd.Amount/100))
+		cmd.Reply <- Response[int64]{Value: a.balance}
+
+	case WithdrawCmd:
+		if cmd.Amount <= 0 {
+			cmd.Reply <- Response[int64]{Err: ErrInvalidAmount}
+			return
+		}
+		// Deliberate bug simulation: panic on magic amount 99999 to test supervisor recovery
+		if cmd.Amount == 99999 {
+			panic("corrupted hardware transaction frame: panic triggered")
+		}
+		if a.balance < cmd.Amount {
+			cmd.Reply <- Response[int64]{Err: ErrInsufficientFunds}
+			return
+		}
+		a.balance -= cmd.Amount
+		a.transactions = append(a.transactions, fmt.Sprintf("withdraw -$%d", cmd.Amount/100))
+		cmd.Reply <- Response[int64]{Value: a.balance}
+
+	case GetBalanceCmd:
+		cmd.Reply <- Response[int64]{Value: a.balance}
+
+	case PoisonPillCmd:
+		cmd.Reply <- Response[struct{}]{}
+		a.cancel()
+	}
+}
+
+// Client API Methods (Thread-safe synchronous calls)
+
+func (a *AccountActor) Deposit(ctx context.Context, amount int64) (int64, error) {
+	reply := make(chan Response[int64], 1)
+	select {
+	case a.inbox <- DepositCmd{Amount: amount, Reply: reply}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	select {
+	case res := <-reply:
+		return res.Value, res.Err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (a *AccountActor) Withdraw(ctx context.Context, amount int64) (int64, error) {
+	reply := make(chan Response[int64], 1)
+	select {
+	case a.inbox <- WithdrawCmd{Amount: amount, Reply: reply}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	select {
+	case res := <-reply:
+		return res.Value, res.Err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (a *AccountActor) GetBalance(ctx context.Context) (int64, error) {
+	reply := make(chan Response[int64], 1)
+	select {
+	case a.inbox <- GetBalanceCmd{Reply: reply}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	select {
+	case res := <-reply:
+		return res.Value, res.Err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func main() {
+	actor := NewAccountActor("ACC-49102", 50000, 100) // $500.00
+	sup := NewSupervisor(actor, 3, 5*time.Second)
+	sup.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 1. Successful operations
+	bal, _ := actor.Deposit(ctx, 25000)
+	fmt.Printf("Balance after deposit: $%d.%02d\n", bal/100, bal%100)
+
+	bal, _ = actor.Withdraw(ctx, 15000)
+	fmt.Printf("Balance after withdrawal: $%d.%02d\n", bal/100, bal%100)
+
+	// 2. Trigger panic to demonstrate supervisor recovery
+	fmt.Println("\nTriggering a simulated crash via unhandled payload...")
+	go func() {
+		// Asynchronous send that will panic inside the actor loop
+		actor.inbox <- WithdrawCmd{Amount: 99999, Reply: make(chan Response[int64], 1)}
+	}()
+
+	// Give supervisor time to recover actor
+	time.Sleep(150 * time.Millisecond)
+
+	// 3. Verify actor is still responsive and healthy after restart
+	bal, err := actor.GetBalance(ctx)
+	if err != nil {
+		fmt.Println("GetBalance error:", err)
+	} else {
+		fmt.Printf("Balance after supervisor recovery: $%d.%02d\n", bal/100, bal%100)
+	}
+}
+```
+
+</GoPlayground>
+
+<CodeWalk
+  title="Actor message protocol and supervisor lifecycle"
+  steps={[
+    { lines: "1-18", note: "Typed commands and responses form the actor's public contract. Each command embeds a buffered chan Response to allow callers to receive return values asynchronously.", pose: "idle", role: "worker", state: "idle", beat: "neutral" },
+    { lines: "36-47", note: "AccountActor encapsulates all state (balance, transaction history) as unexported struct fields. No mutexes exist on the struct.", pose: "run", role: "worker", state: "active", beat: "neutral" },
+    { lines: "63-88", note: "The Supervisor wraps the actor loop in a restart loop with defer recover(). It tracks restart timestamps in a sliding window to prevent infinite crash loops.", pose: "run", role: "guard", state: "active", beat: "neutral" },
+    { lines: "115-151", note: "The single-threaded message dispatch switch executes one command at a time. Confinement guarantees zero data races without acquiring locks.", pose: "carry", role: "worker", state: "active", beat: "neutral" },
+    { lines: "155-199", note: "Client wrapper methods (Deposit, Withdraw) handle channel creation, context timeouts, and response extraction, presenting a clean synchronous API to callers.", pose: "happy", role: "worker", state: "done", beat: "solution" }
+  ]}
+  caption="The Actor model trades mutex synchronization for message passing, providing isolation and supervisor-based fault tolerance."
+>
+
+```go
+type Command any
+
+type DepositCmd struct {
+	Amount int64
+	Reply  chan Response[int64]
+}
+
+type AccountActor struct {
+	accountID    string
+	balance      int64
+	transactions []string
+	inbox        chan Command
+	ctx          context.Context
+	cancel       context.CancelFunc
+}
+
+func (a *AccountActor) loop() {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case msg, ok := <-a.inbox:
+			if !ok {
+				return
+			}
+			a.handleMessage(msg)
+		}
+	}
+}
+```
+
+</CodeWalk>
+
+<UnderTheHood title="Actors vs. Mutexes: Throughput, Latency, and Memory">
+
+When should you choose an Actor over a `sync.Mutex`?
+
+1. **Contention Under High Write Load:** A `sync.Mutex` suffers from lock contention and OS thread rescheduling (`futex` transitions) when dozens of goroutines hammer the same critical section simultaneously. An Actor serializes all writes through a lock-free channel queue, transforming contention into a FIFO queue.
+2. **Complex Multi-Step State Machines:** If an operation involves multiple state changes, async side effects, or timers (e.g. "hold funds for 30s, then either settle or release"), an Actor handles this naturally with internal state and `time.AfterFunc` messages. Doing this with mutexes requires holding locks across async boundaries — a recipe for deadlocks.
+3. **Throughput Comparison:** For simple, read-heavy in-memory state (like a cache), a `sync.RWMutex` delivers >10× higher read throughput because multiple goroutines read concurrently. An Actor processes one read at a time, creating a serialization bottleneck.
+
+**Guideline:** Use **Mutexes** for read-heavy shared data structures and simple caches. Use **Actors** for complex domain entities, write-heavy state machines, and components requiring supervisor-based lifecycle recovery.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Why must the reply channel inside a command struct (e.g., cmd.Reply) have a buffer capacity of at least 1?"
+  options={[
+    "To allow the actor to send multiple responses to the same command",
+    "To prevent the actor goroutine from blocking forever if the caller times out and stops listening",
+    "Because Go channels cannot transmit structs without buffering",
+    "To enable the Go runtime to inline the channel transmission"
+  ]}
+  answer={1}
+  explain="If the caller's context expires before the actor finishes, the caller abandons the reply channel. If the reply channel were unbuffered (cap 0), the actor's send cmd.Reply <- res would block indefinitely, permanently leaking the actor goroutine."
+/>
 
 ## Heartbeats
 

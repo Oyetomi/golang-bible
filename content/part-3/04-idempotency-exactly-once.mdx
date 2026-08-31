@@ -19,7 +19,7 @@ I built systems like this. You're about to learn how. Pay attention.
 
 </HeroCard>
 
-<ChapterTabs tabs={["Why idempotency matters", "Idempotency keys", "Deduplication", "At-least-once vs exactly-once", "Safe payment retries", "The transactional outbox"]} />
+<ChapterTabs tabs={["Why idempotency matters", "Idempotency keys", "Deduplication", "At-least-once vs exactly-once", "Safe payment retries", "The transactional outbox", "Idempotent consumer & inbox pattern"]} />
 
 <SpacedRecall
   role={"banker"}
@@ -749,12 +749,14 @@ The **dual-write problem** occurs when you need to update two separate systems a
 </Define>
 
 <Define term="The transactional outbox" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
-The **transactional outbox** pattern solves the dual-write problem without a distributed transaction. Instead of writing directly to the message broker, you write the event to an `outbox` table *inside the same database transaction* as the business change. A separate relay process polls unsent outbox rows and publishes them to the broker, then marks them sent. The DB transaction guarantees atomicity between the business write and the outbox write. The relay delivers at-least-once (it may publish twice if it crashes between publish and mark-sent), but your consumers are idempotent — so that is fine.
+The **transactional outbox** pattern solves the dual-write problem without a distributed transaction. Instead of writing directly to the message broker, you write the event to an `outbox` table *inside the same database transaction* as the business change. A separate relay process reads unsent outbox rows and publishes them to the broker, then marks them sent. The DB transaction guarantees atomicity between the business write and the outbox write. The relay delivers at-least-once (it may publish twice if it crashes between publish and mark-sent), but your consumers are idempotent — so that is fine.
 </Define>
 
 **On the job:** every Meridian transfer that must notify a downstream service (fraud check, notifications, analytics) uses the outbox pattern. Without it, a crash after the DB commit but before the Kafka publish silently drops the event — downstream services never know the transfer happened, and there is no error to alert on.
 
 Here is the centerpiece of this chapter. If you remember only one pattern from Part 3, remember this one.
+
+### The dual-write problem in detail
 
 The problem: you are processing a payment transfer at Meridian. You need to:
 1. Write the transfer record and update balances in PostgreSQL.
@@ -762,11 +764,34 @@ The problem: you are processing a payment transfer at Meridian. You need to:
 
 The naive approach: write to Postgres, then publish to Kafka. What could go wrong?
 
-Everything. If the process crashes after the Postgres commit but before the Kafka publish, the event is lost. Downstream services never know the transfer happened. If you reverse the order (publish to Kafka first, then write to Postgres), a crash leaves a published event with no corresponding DB record — a phantom event. There is no way to make these two writes atomic across two different systems without a distributed transaction coordinator, and distributed transaction coordinators are expensive, fragile, and couple your database to your message broker.
+```go
+// BROKEN: naive dual-write with split-brain failure modes
+func NaiveTransfer(ctx context.Context, db *sql.DB, producer KafkaProducer, t Transfer) error {
+	// Step 1: Commit to Postgres
+	if err := executeTransferDB(ctx, db, t); err != nil {
+		return err
+	}
+	// CRASH WINDOW: if the process is killed here (OOM, deployment, power loss),
+	// or if Kafka returns a network timeout / leader-not-available error,
+	// the database committed the money transfer but the event is LOST FOREVER.
+	// Downstream services will never know the transfer happened.
 
-This is the **dual-write problem**. The transactional outbox pattern solves it without distributed transactions.
+	// Step 2: Publish to Kafka
+	return producer.Publish(ctx, "transfers", t.ID, t)
+}
+```
 
-**The solution:** write the event to an `outbox` table *in the same database transaction* as the business change. The outbox row is the event. A separate **relay process** (a poller) reads unprocessed outbox rows and publishes them to Kafka, then marks them sent. The relay delivers at-least-once (it may publish a row twice if it crashes between publish and mark-sent), but your consumers are already idempotent — so that is fine.
+What if you reverse the order — publish to Kafka first, then write to Postgres?
+- If Kafka succeeds, but the PostgreSQL write fails (e.g. a unique constraint violation on account limits or database connection pool exhaustion), downstream services receive an event for a transfer that *never actually happened in the database*. That is a **phantom event**, and downstream microservices may ship goods or credit rewards for money that was never moved.
+
+Why not use a distributed transaction (Two-Phase Commit / XA)?
+- 2PC requires a central transaction coordinator that holds locks across network boundaries across all participants. Modern message brokers like Apache Kafka and AWS SQS do not support XA protocols with relational databases. Furthermore, 2PC is notoriously slow, brittle, and introduces a single point of failure that stalls if any node becomes unreachable.
+
+This is the **dual-write problem**. The transactional outbox pattern solves it using only standard, local PostgreSQL ACID transactions.
+
+### Writing domain state + outbox event in a single ACID transaction
+
+**The solution:** write the domain state mutation AND the event into an `outbox_events` table *within the exact same database transaction*. Either both commit together, or both roll back together.
 
 <ExecTimeline
   title="The transactional outbox pattern"
@@ -776,31 +801,34 @@ This is the **dual-write problem**. The transactional outbox pattern solves it w
     { lane: "db", kind: "run", label: "UPDATE balances", note: "Debit sender, credit receiver. All inside the same transaction." },
     { lane: "db", kind: "run", label: "INSERT INTO outbox", note: "Write the TransferCompleted event payload to the outbox table — same transaction, same commit." },
     { lane: "db", kind: "done", label: "COMMIT — atomic", note: "Both the balance update AND the outbox row commit together, or both roll back. No split-brain." },
-    { lane: "relay", kind: "run", label: "Poll outbox", note: "Relay reads unsent outbox rows on a short interval (e.g. 1 second)." },
-    { lane: "kafka", kind: "send", label: "Publish event", note: "Relay publishes the outbox event to Kafka. At-least-once: may re-publish if it crashes before marking sent." },
+    { lane: "relay", kind: "run", label: "Poll outbox / CDC", note: "Relay reads unsent outbox rows on a short interval or via WAL replication stream." },
+    { lane: "kafka", kind: "send", label: "Publish event", note: "Relay publishes the outbox event to Kafka with acks=all. At-least-once delivery." },
     { lane: "relay", kind: "done", label: "Mark row sent", note: "Relay updates outbox row to sent=true. Row may be pruned after a retention window." }
   ]}
   caption="Business write and outbox write commit atomically. The relay delivers at-least-once. Idempotent consumers make it effectively-once end-to-end."
 />
 
-The outbox table schema:
+The outbox table schema in PostgreSQL:
 
-```go
-// Schema (PostgreSQL):
-// CREATE TABLE outbox_events (
-//     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-//     event_type  TEXT NOT NULL,
-//     payload     JSONB NOT NULL,
-//     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-//     sent_at     TIMESTAMPTZ,           -- NULL until relayed
-//     sent        BOOLEAN NOT NULL DEFAULT FALSE
-// );
-// CREATE INDEX ON outbox_events (sent, created_at) WHERE NOT sent;
+```sql
+-- Schema (PostgreSQL):
+CREATE TABLE outbox_events (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type TEXT NOT NULL,                 -- e.g. 'transfer'
+    aggregate_id   TEXT NOT NULL,                 -- e.g. 'txn_90210' (used for Kafka partition key)
+    event_type     TEXT NOT NULL,                 -- e.g. 'transfer.completed'
+    payload        JSONB NOT NULL,                -- full event JSON payload
+    headers        JSONB NOT NULL DEFAULT '{}',   -- tracing headers, trace_id, idempotency keys
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at        TIMESTAMPTZ,                   -- NULL until relayed
+    sent           BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Partial index: only indexes unsent rows to keep the relay query lightning-fast as the table grows
+CREATE INDEX idx_outbox_unsent ON outbox_events (created_at) WHERE NOT sent;
 ```
 
-The partial index `WHERE NOT sent` makes the relay's polling query efficient — it only scans unsent rows, not the entire table. This is critical as the table grows.
-
-Now the Go implementation — the transactional write:
+The Go implementation — executing the domain transfer and writing the outbox event in a single atomic transaction:
 
 ```go
 // TransferWithOutbox executes a Meridian money transfer and writes the outbox event
@@ -812,55 +840,64 @@ func TransferWithOutbox(
 	amountCents int64,
 	idempotencyKey string,
 ) error {
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() // no-op after Commit
 
-	// Step 1: debit sender.
-	_, err = tx.ExecContext(ctx,
+	// Step 1: debit sender account (enforcing non-negative balance)
+	res, err := tx.ExecContext(ctx,
 		`UPDATE accounts SET balance_cents = balance_cents - $1
 		 WHERE id = $2 AND balance_cents >= $1`,
 		amountCents, fromAccount)
 	if err != nil {
-		return fmt.Errorf("debit: %w", err)
+		return fmt.Errorf("debit sender: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return fmt.Errorf("insufficient funds or account not found: %s", fromAccount)
 	}
 
-	// Step 2: credit receiver.
+	// Step 2: credit receiver account
 	_, err = tx.ExecContext(ctx,
 		`UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2`,
 		amountCents, toAccount)
 	if err != nil {
-		return fmt.Errorf("credit: %w", err)
+		return fmt.Errorf("credit receiver: %w", err)
 	}
 
-	// Step 3: write the outbox event — same transaction, same commit.
+	// Step 3: write the outbox event — same transaction, same commit
 	payload := fmt.Sprintf(
 		`{"from":%q,"to":%q,"amount_cents":%d,"idempotency_key":%q}`,
 		fromAccount, toAccount, amountCents, idempotencyKey,
 	)
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO outbox_events (event_type, payload)
-		 VALUES ('transfer.completed', $1)`,
-		payload)
+		`INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+		 VALUES ('account_transfer', $1, 'transfer.completed', $2::jsonb)`,
+		fromAccount, payload)
 	if err != nil {
 		return fmt.Errorf("outbox insert: %w", err)
 	}
 
-	// Step 4: commit — balance change and outbox event are atomic.
+	// Step 4: commit — balance changes and outbox event are durably committed together
 	return tx.Commit()
 }
 ```
 
-And the relay that publishes from the outbox to Kafka:
+### Relaying outbox events: polling vs Change Data Capture (CDC)
+
+Once the event row is durably stored in PostgreSQL, how does it get published to Kafka? There are two primary relay architectures:
+
+#### 1. The Polling Relay with `SELECT FOR UPDATE SKIP LOCKED`
+
+A background Go worker periodically queries the outbox table for unsent rows, publishes them to Kafka, and updates `sent = TRUE`.
+
+To support multiple relay workers running in parallel without stepping on each other, PostgreSQL provides `FOR UPDATE SKIP LOCKED`. Each worker locks a batch of rows; any other worker running concurrently skips those locked rows and immediately grabs the next available batch without waiting or deadlocking.
 
 ```go
-// RunOutboxRelay polls the outbox and publishes unsent events.
-// Delivers at-least-once: safe because consumers are idempotent.
-// ctx controls graceful shutdown.
+// RunOutboxRelay runs a background worker that polls the outbox table.
 func RunOutboxRelay(ctx context.Context, db *sql.DB, publisher EventPublisher) error {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -869,54 +906,97 @@ func RunOutboxRelay(ctx context.Context, db *sql.DB, publisher EventPublisher) e
 			return ctx.Err()
 		case <-ticker.C:
 			if err := relayBatch(ctx, db, publisher); err != nil {
-				// Log and continue — a single relay failure should not stop the loop.
+				// Log error and continue — transient failures should not crash the relay loop
 				fmt.Printf("relay batch error: %v\n", err)
 			}
 		}
 	}
 }
 
-// relayBatch reads up to 100 unsent outbox rows, publishes them,
-// and marks them sent. Non-atomic across publish+mark — safe because
-// publishing twice is handled by consumer idempotency.
+// relayBatch claims up to 100 unsent events using SKIP LOCKED, publishes to Kafka,
+// and marks them sent.
 func relayBatch(ctx context.Context, db *sql.DB, publisher EventPublisher) error {
-	rows, err := db.QueryContext(ctx,
-		`SELECT id, event_type, payload FROM outbox_events
-		 WHERE NOT sent ORDER BY created_at LIMIT 100
-		 FOR UPDATE SKIP LOCKED`) // skip rows locked by concurrent relays
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin relay tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Claim a batch of rows exclusively — concurrent workers skip these rows
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, aggregate_id, event_type, payload
+		 FROM outbox_events
+		 WHERE NOT sent
+		 ORDER BY created_at
+		 LIMIT 100
+		 FOR UPDATE SKIP LOCKED`)
 	if err != nil {
 		return fmt.Errorf("query outbox: %w", err)
 	}
 	defer rows.Close()
 
+	type outboxRecord struct {
+		id, aggregateID, eventType, payload string
+	}
+	var batch []outboxRecord
+
 	for rows.Next() {
-		var id, eventType, payload string
-		if err := rows.Scan(&id, &eventType, &payload); err != nil {
+		var rec outboxRecord
+		if err := rows.Scan(&rec.id, &rec.aggregateID, &rec.eventType, &rec.payload); err != nil {
 			return err
 		}
-		if err := publisher.Publish(ctx, eventType, payload); err != nil {
-			return fmt.Errorf("publish event %s: %w", id, err)
+		batch = append(batch, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Publish each event to Kafka
+	for _, rec := range batch {
+		if err := publisher.Publish(ctx, rec.eventType, rec.aggregateID, rec.payload); err != nil {
+			return fmt.Errorf("publish event %s: %w", rec.id, err)
 		}
-		if _, err := db.ExecContext(ctx,
-			`UPDATE outbox_events SET sent = TRUE, sent_at = NOW() WHERE id = $1`, id); err != nil {
-			return fmt.Errorf("mark sent %s: %w", id, err)
+		// Mark row as sent
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE outbox_events SET sent = TRUE, sent_at = NOW() WHERE id = $1`, rec.id); err != nil {
+			return fmt.Errorf("mark sent %s: %w", rec.id, err)
 		}
 	}
-	return rows.Err()
+
+	return tx.Commit()
 }
 
-// EventPublisher is a small interface so the relay can be tested
-// without a real Kafka connection.
+// EventPublisher defines the publisher interface (e.g. Kafka or Watermill)
 type EventPublisher interface {
-	Publish(ctx context.Context, eventType, payload string) error
+	Publish(ctx context.Context, topic, partitionKey, payload string) error
 }
 ```
 
 <UnderTheHood title="FOR UPDATE SKIP LOCKED — safe concurrent relay workers">
 
-`FOR UPDATE SKIP LOCKED` is a PostgreSQL locking hint that makes running multiple relay workers safe. When relay worker A locks a batch of outbox rows with `FOR UPDATE`, any concurrent worker B that queries the same rows will `SKIP` them (not block) and process a different batch. Without `SKIP LOCKED`, multiple relay workers would serialize on the same rows, negating the benefit of horizontal scaling. With it, each worker grabs a non-overlapping slice of unsent rows and works in parallel. The rows are never processed twice by two different relay workers *in the same pass* — though the publish-then-mark gap still means a message can be published twice across relay *restarts*, which is why consumer idempotency remains essential. As of PostgreSQL 9.5 and `pgx` v5 (the idiomatic Go Postgres driver as of Go 1.26), this clause is supported transparently.
+`FOR UPDATE SKIP LOCKED` is a PostgreSQL locking hint that makes running multiple relay workers safe and horizontally scalable. When relay worker A locks a batch of outbox rows with `FOR UPDATE`, any concurrent worker B that queries the same rows will `SKIP` them (not block) and process a different batch. Without `SKIP LOCKED`, multiple relay workers would serialize on the same rows, negating the benefit of horizontal scaling. With it, each worker grabs a non-overlapping slice of unsent rows and works in parallel. The rows are never processed twice by two different relay workers in the same pass — though the publish-then-mark gap still means a message can be published twice across relay restarts, which is why consumer idempotency remains essential.
 
 </UnderTheHood>
+
+#### 2. Change Data Capture (CDC) via PostgreSQL WAL
+
+At high throughput (thousands of events per second), polling `outbox_events` introduces database query load and replication lag. A production alternative is **Change Data Capture (CDC)** using Debezium and Kafka Connect.
+
+PostgreSQL writes every committed transaction to its **Write-Ahead Log (WAL)**. A CDC connector connects as a PostgreSQL replication client using the `pgoutput` plugin. When `TransferWithOutbox` commits, Debezium reads the new row from the WAL replication stream in memory and immediately emits a Kafka message with sub-millisecond latency:
+- **Zero polling overhead**: No `SELECT` queries hit the database tables.
+- **Zero lock contention**: Application writers never compete with poller locks.
+- **Outbox Event Router (SMT)**: Debezium's Outbox Single Message Transform extracts the `payload`, sets the Kafka message key to `aggregate_id`, and routes the event to topic `event_type`.
+
+### Guaranteed at-least-once publishing to Kafka
+
+The Transactional Outbox guarantees **at-least-once delivery** from your database to Kafka:
+1. The domain mutation and outbox row are committed atomically.
+2. The relay worker (or CDC engine) reads the row and publishes it to Kafka with `acks=all` (ensuring Kafka replicates the message across in-sync replicas before returning success).
+3. The relay marks `sent = TRUE` in the database.
+
+If the relay worker crashes after step 2 (Kafka received the event) but before step 3 (database marked as sent), the relay restarts, re-reads the un-marked row, and publishes the event to Kafka a second time.
+
+Because network retries and relay restarts can produce duplicate events on Kafka topics, the producer side is complete only when paired with **idempotent consumers** on the receiving side.
 
 <BeforeAfter
   badLabel="Dual write — split brain"
@@ -935,6 +1015,226 @@ if err != nil { return err }`}
 tx.ExecContext(ctx, updateBalances)
 tx.ExecContext(ctx, insertOutbox)
 tx.Commit() // atomic — no gap`}
+/>
+
+## Idempotent consumer & inbox pattern
+
+<Define term="Transactional inbox pattern" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+The **transactional inbox pattern** is the consumer-side counterpart to the transactional outbox. When consuming messages from an at-least-once message broker (Kafka, RabbitMQ, SQS), the consumer records incoming event IDs in an `inbox_events` table *inside the same database transaction* that applies the business logic. If a redelivered message arrives, the unique constraint on the event ID detects the duplicate and causes the handler to skip business logic execution while safely acknowledging the message to the broker.
+</Define>
+
+<Define term="Idempotent consumer" since="Idempotency & Exactly-Once Semantics (Part 3, Chapter 4) — this chapter">
+An **idempotent consumer** is a message consumer designed such that receiving the same message multiple times produces the exact same outcome as receiving it once, without duplicate side-effects. This is achieved through natural deduplication keys, unique constraints, or the transactional inbox pattern.
+</Define>
+
+**On the job:** message brokers only guarantee at-least-once delivery. If your consumer crashes after executing a database write but before committing its Kafka offset, Kafka redelivers the message on restart. Without an inbox pattern, your consumer executes the transfer a second time.
+
+### The consumer-side dual-write dilemma
+
+Just as producers face a dual-write problem when writing to PostgreSQL and publishing to Kafka, consumers face a dual-write dilemma when processing an event:
+1. Apply the state change to the consumer database (e.g. credit account balance, send notification).
+2. Commit the message offset to Kafka (`CommitOffsets` or `session.MarkMessage`).
+
+Consider the failure modes:
+- **Commit offset AFTER database write:** The consumer processes the message, updates the database, and is about to commit the offset to Kafka. Suddenly, the container is killed (pod restart, OOM, deployment). The offset was never committed. When the consumer comes back up, Kafka redelivers the message. The consumer executes the database write *again*. Result: duplicate payment credit.
+- **Commit offset BEFORE database write:** The consumer commits the offset to Kafka first, then attempts to update the database. If the database write fails or the process crashes mid-write, the message is permanently marked as processed in Kafka, but the database change was never applied. Result: message loss (at-most-once disaster).
+
+<ExecTimeline
+  title="The Transactional Inbox Pattern — absorbing consumer redeliveries"
+  lanes={[{ id: "kafka", label: "Kafka broker" }, { id: "worker", label: "Consumer worker" }, { id: "db", label: "Consumer PostgreSQL" }]}
+  steps={[
+    { lane: "kafka", kind: "send", label: "Deliver event evt_88", note: "Broker delivers transfer.completed event evt_88 to the worker." },
+    { lane: "worker", kind: "run", label: "BEGIN transaction", note: "Worker opens a local DB transaction." },
+    { lane: "db", kind: "run", label: "INSERT inbox_events", note: "INSERT INTO inbox_events (id='evt_88') ON CONFLICT DO NOTHING. 1 row affected — claimed!" },
+    { lane: "db", kind: "run", label: "Apply business mutations", note: "UPDATE account balances, write ledger audit row — same transaction." },
+    { lane: "db", kind: "done", label: "COMMIT — atomic", note: "Inbox entry AND business mutations commit together atomically." },
+    { lane: "worker", kind: "send", label: "ACK to Kafka (lost!)", note: "Worker attempts to commit offset to Kafka, but network timeout occurs or worker restarts." },
+    { lane: "kafka", kind: "send", label: "Redeliver event evt_88", note: "Kafka redelivers evt_88 to the restarted worker (at-least-once delivery)." },
+    { lane: "worker", kind: "run", label: "BEGIN tx + INSERT inbox", note: "Worker attempts to insert evt_88 again into inbox_events." },
+    { lane: "db", kind: "block", label: "ON CONFLICT — 0 rows affected", note: "Unique constraint triggers. Database signals this event was already completed." },
+    { lane: "worker", kind: "done", label: "Skip business logic + ACK", note: "Worker skips ledger updates, commits empty transaction, and ACKs Kafka cleanly. Exactly once in effect." }
+  ]}
+  caption="The inbox pattern binds message deduplication and business mutations into a single database commit. Redelivered messages are detected atomically and skipped."
+/>
+
+### Implementing the inbox pattern in Go
+
+The inbox table schema in PostgreSQL:
+
+```sql
+-- Schema (PostgreSQL):
+CREATE TABLE inbox_events (
+    id           TEXT NOT NULL,               -- the event's unique ID (from producer)
+    handler_name TEXT NOT NULL,               -- name of the consumer service (e.g. 'ledger_service')
+    payload      JSONB NOT NULL,              -- cached payload for auditing
+    status       TEXT NOT NULL DEFAULT 'processing', -- 'processing', 'completed', 'failed'
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at TIMESTAMPTZ,
+    PRIMARY KEY (id, handler_name)            -- composite key allows multiple services to consume same event
+);
+
+CREATE INDEX idx_inbox_cleanup ON inbox_events (created_at) WHERE status = 'completed';
+```
+
+Now, the Go implementation of the idempotent consumer using the transactional inbox:
+
+```go
+package consumer
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Event struct {
+	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+	Timestamp time.Time       `json:"timestamp"`
+}
+
+type TransferPayload struct {
+	FromAccount string `json:"from"`
+	ToAccount   string `json:"to"`
+	AmountCents int64  `json:"amount_cents"`
+}
+
+// InboxConsumer coordinates idempotent message consumption.
+type InboxConsumer struct {
+	db          *sql.DB
+	handlerName string
+}
+
+func NewInboxConsumer(db *sql.DB, handlerName string) *InboxConsumer {
+	return &InboxConsumer{
+		db:          db,
+		handlerName: handlerName,
+	}
+}
+
+// HandleMessage processes an inbound Kafka event with transactional inbox deduplication.
+// Returns nil if processed or successfully deduplicated (signaling that offset can be committed).
+func (c *InboxConsumer) HandleMessage(ctx context.Context, msg Event) error {
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() // no-op if committed
+
+	// Step 1: Claim the event atomically in the inbox table
+	const claimQuery = `
+		INSERT INTO inbox_events (id, handler_name, payload, status, created_at)
+		VALUES ($1, $2, $3, 'processing', NOW())
+		ON CONFLICT (id, handler_name) DO NOTHING`
+	res, err := tx.ExecContext(ctx, claimQuery, msg.ID, c.handlerName, string(msg.Payload))
+	if err != nil {
+		return fmt.Errorf("claim inbox event: %w", err)
+	}
+
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		// Event was already inserted. Check its existing status.
+		var status string
+		err := tx.QueryRowContext(ctx,
+			`SELECT status FROM inbox_events WHERE id = $1 AND handler_name = $2`,
+			msg.ID, c.handlerName).Scan(&status)
+		if err != nil {
+			return fmt.Errorf("lookup existing inbox status: %w", err)
+		}
+
+		if status == "completed" {
+			// Duplicate redelivery: already processed! Roll back and return nil so caller ACKs Kafka.
+			return nil
+		}
+
+		// If status is 'processing', another worker may be in-flight or a prior run crashed.
+		return errors.New("event is currently processing by another worker")
+	}
+
+	// Step 2: We claimed the event — execute domain business logic inside the same transaction
+	if err := c.applyBusinessLogic(ctx, tx, msg); err != nil {
+		// Business logic failed — transaction will roll back, leaving inbox row uncommitted
+		return fmt.Errorf("apply business logic: %w", err)
+	}
+
+	// Step 3: Mark inbox event as completed
+	_, err = tx.ExecContext(ctx,
+		`UPDATE inbox_events
+		 SET status = 'completed', processed_at = NOW()
+		 WHERE id = $1 AND handler_name = $2`,
+		msg.ID, c.handlerName)
+	if err != nil {
+		return fmt.Errorf("mark inbox completed: %w", err)
+	}
+
+	// Step 4: Commit transaction — business state + inbox status are atomic
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	return nil
+}
+
+// applyBusinessLogic applies mutations to domain tables inside the provided transaction.
+func (c *InboxConsumer) applyBusinessLogic(ctx context.Context, tx *sql.Tx, msg Event) error {
+	if msg.Type != "transfer.completed" {
+		return nil // ignore unrelated event types
+	}
+
+	var payload TransferPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal transfer payload: %w", err)
+	}
+
+	// Credit recipient's ledger account
+	const updateQuery = `
+		UPDATE accounts
+		SET balance_cents = balance_cents + $1, updated_at = NOW()
+		WHERE id = $2`
+	res, err := tx.ExecContext(ctx, updateQuery, payload.AmountCents, payload.ToAccount)
+	if err != nil {
+		return fmt.Errorf("credit recipient account: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return fmt.Errorf("account not found: %s", payload.ToAccount)
+	}
+
+	return nil
+}
+```
+
+### Dead Letter Queues (DLQs) for poison pills
+
+What happens when an event has malformed JSON or triggers an unrecoverable business error (e.g. references an account ID that was permanently deleted)?
+- If the consumer simply errors and rolls back, Kafka will redeliver the message repeatedly, causing an infinite retry loop that blocks the entire partition. This is a **poison pill**.
+- The solution is a **Dead Letter Queue (DLQ)** strategy:
+  1. Catch unrecoverable errors (e.g. deserialization errors or permanent invariant failures).
+  2. Write the failing event and error reason into an `inbox_dead_letters` table or publish to a `transfers.dlq` Kafka topic.
+  3. Mark the inbox status as `'failed'`.
+  4. Commit the Kafka offset so consumer progress resumes on subsequent healthy messages.
+  5. Fire an alert for on-call engineers to inspect and replay the DLQ message once investigated.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Idempotency Key">Generated by the API client. Sent via HTTP header (e.g. `Idempotency-Key`). Protects against client-to-server retries.</ConceptCard>
+  <ConceptCard label="Transactional Outbox">Employed by the producer. Writes domain mutations + event to an `outbox` table in one ACID transaction. Solves the producer dual-write problem.</ConceptCard>
+  <ConceptCard label="Transactional Inbox">Employed by the consumer. Writes inbox claim + domain mutations in one ACID transaction. Solves the consumer dual-write and redelivery problem.</ConceptCard>
+  <Gotcha>Never commit a Kafka offset before your database transaction commits. If you commit the offset early and the DB commit fails or the process dies, the event is permanently lost. Always: DB Commit first, Offset Commit second.</Gotcha>
+</ConceptGrid>
+
+<QuickCheck
+  question="A Kafka consumer uses the Transactional Inbox pattern. It processes a message, commits the PostgreSQL transaction (updating balances and marking the inbox row 'completed'), and then immediately crashes before committing its offset to Kafka. What happens when the consumer restarts?"
+  options={[
+    "The balance is updated a second time because Kafka redelivers the uncommitted message",
+    "The consumer crashes on startup because the inbox row already exists",
+    "Kafka drops the message automatically knowing it was committed in PostgreSQL",
+    "Kafka redelivers the message; the consumer finds the inbox row with status 'completed', skips business logic, and commits the offset cleanly"
+  ]}
+  answer={3}
+  explain="Because the database transaction committed, the inbox record is durably marked 'completed'. On redelivery, the consumer's INSERT ON CONFLICT detects the existing record with status 'completed', bypasses all domain mutations, and safely commits the Kafka offset. The customer is charged exactly once."
 />
 
 ---
@@ -1241,6 +1541,94 @@ The composite primary key `(merchant_id, key)` is the unique constraint. Merchan
 
 </Exercise>
 
+<Exercise n={6} title="Implement a transactional inbox consumer in PostgreSQL" level="hard">
+
+Meridian's rewards service listens to `transfer.completed` events and credits a 1% cashback reward to the sender's account. Because Kafka delivers at-least-once, a network partition between the rewards service and Kafka can cause the event to be redelivered. Write the `CreditRewardsWithInbox(ctx context.Context, db *sql.DB, eventID string, senderAccount string, transferCents int64) error` function that uses the `inbox_events` table and PostgreSQL ACID transactions to guarantee that cashback is credited exactly once.
+
+<Solution>
+
+```go
+package rewards
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// CreditRewardsWithInbox credits 1% cashback reward idempotently using the inbox pattern.
+func CreditRewardsWithInbox(
+	ctx context.Context,
+	db *sql.DB,
+	eventID string,
+	senderAccount string,
+	transferCents int64,
+) error {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Claim event in inbox table atomically
+	const claimSQL = `
+		INSERT INTO inbox_events (id, handler_name, payload, status, created_at)
+		VALUES ($1, 'rewards_cashback', '{}', 'processing', NOW())
+		ON CONFLICT (id, handler_name) DO NOTHING`
+	res, err := tx.ExecContext(ctx, claimSQL, eventID)
+	if err != nil {
+		return fmt.Errorf("claim inbox: %w", err)
+	}
+
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		// Duplicate delivery detected: verify it is completed
+		var status string
+		err := tx.QueryRowContext(ctx,
+			`SELECT status FROM inbox_events WHERE id = $1 AND handler_name = 'rewards_cashback'`,
+			eventID).Scan(&status)
+		if err != nil {
+			return fmt.Errorf("check inbox status: %w", err)
+		}
+		if status == "completed" {
+			// Already credited in a prior run — return nil to ACK Kafka offset cleanly
+			return nil
+		}
+		return fmt.Errorf("event %s is already processing", eventID)
+	}
+
+	// 2. Compute 1% cashback reward in cents
+	rewardCents := transferCents / 100
+	if rewardCents > 0 {
+		const creditSQL = `
+			UPDATE accounts
+			SET balance_cents = balance_cents + $1, updated_at = NOW()
+			WHERE id = $2`
+		if _, err := tx.ExecContext(ctx, creditSQL, rewardCents, senderAccount); err != nil {
+			return fmt.Errorf("credit cashback: %w", err)
+		}
+	}
+
+	// 3. Mark inbox event as completed
+	const completeSQL = `
+		UPDATE inbox_events
+		SET status = 'completed', processed_at = NOW()
+		WHERE id = $1 AND handler_name = 'rewards_cashback'`
+	if _, err := tx.ExecContext(ctx, completeSQL, eventID); err != nil {
+		return fmt.Errorf("complete inbox: %w", err)
+	}
+
+	// 4. Commit transaction — cashback reward + inbox entry commit atomically
+	return tx.Commit()
+}
+```
+
+The consumer opens a single transaction, attempts `INSERT ... ON CONFLICT DO NOTHING`, applies the cashback credit if claimed, marks the inbox status as `completed`, and commits. On redelivery, `rows == 0` intercepts the duplicate, skips the `UPDATE accounts`, and returns `nil` so the consumer loop commits the Kafka offset without duplicate payouts.
+
+</Solution>
+
+</Exercise>
+
 ---
 
 <Recap>
@@ -1250,7 +1638,8 @@ The composite primary key `(merchant_id, key)` is the unique constraint. Merchan
 - **Deduplication** at the message level uses a `processed_events` table with a natural key from the event payload. Same atomic insert primitive — `INSERT ... ON CONFLICT DO NOTHING`.
 - **At-least-once delivery + idempotent handler = effectively-once processing**. True exactly-once delivery is impossible in distributed systems. Any broker that advertises "exactly-once" is building at-least-once + a dedup layer — you still need idempotent consumers.
 - **Safe payment retries** combine idempotency keys + exponential backoff + jitter. Retry on transient (5xx, network) errors; do not retry on permanent (4xx) failures. Use `errors.AsType[T]` (Go 1.26) to unwrap typed errors when branching on transient vs permanent.
-- **The transactional outbox** solves the dual-write problem. Write the event to an outbox table in the same DB transaction as the business change. A relay process reads unsent outbox rows and publishes them at-least-once. The atomicity of the DB transaction guarantees no split-brain between your database and your message broker.
+- **The transactional outbox** solves the dual-write problem on the publishing side. Write domain mutations and the outbox event in the same DB transaction. A relay worker with `SELECT ... FOR UPDATE SKIP LOCKED` or a Change Data Capture (CDC) engine publishes the event to Kafka at-least-once.
+- **The transactional inbox** solves message redelivery on the consuming side. The consumer wraps the inbox claim and domain state updates in a single DB transaction, detecting redeliveries and skipping redundant side effects before acknowledging offsets to Kafka.
 
 </Recap>
 
@@ -1345,11 +1734,13 @@ Fifty goroutines storm the same payment key. Without idempotency, that is fifty 
     { label: "Quick check — retry with idempotency key", kind: "quiz", points: 10, done: false },
     { label: "Quick check — idempotency key on retry", kind: "quiz", points: 10, done: false },
     { label: "Quick check — at-least-once + idempotent = effectively-once", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — transactional inbox redelivery", kind: "quiz", points: 10, done: false },
     { label: "Exercise 1 — Retryable vs non-retryable errors", kind: "exercise", points: 10, done: false },
     { label: "Exercise 2 — Expiring idempotency store", kind: "exercise", points: 15, done: false },
     { label: "Exercise 3 — Webhook deduplication handler", kind: "exercise", points: 15, done: false },
     { label: "Exercise 4 — Outbox relay with mock publisher", kind: "exercise", points: 20, done: false },
-    { label: "Exercise 5 — Multi-tenant idempotency schema", kind: "exercise", points: 20, done: false }
+    { label: "Exercise 5 — Multi-tenant idempotency schema", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 6 — Transactional inbox consumer", kind: "exercise", points: 20, done: false }
   ]}
   flag={{ label: "Lab — Idempotent payment handler (50 concurrent goroutines, 1 charge)", captured: false, points: 100 }}
 />

@@ -3,7 +3,7 @@ title: "Reliability Patterns"
 part: 2
 order: 12
 type: "course"
-description: "Timeouts everywhere, retries with backoff and jitter, circuit breakers, graceful shutdown, health checks, idempotency, and rate limiting in depth (token vs leaky bucket, per-key, x/time/rate, distributed with Redis)."
+description: "Timeouts everywhere, retries with backoff and jitter, circuit breakers, bulkhead isolation, graceful degradation with fallback caches, graceful shutdown, health checks, idempotency, and rate limiting in depth (token vs leaky bucket, sliding windows, Redis Lua)."
 prerequisites: ["observability"]
 ---
 
@@ -104,7 +104,7 @@ I've been writing Go since before the Go team shipped the first public release, 
   caption="Without a circuit breaker every slow request holds a goroutine and a connection — the problem cascades. The breaker short-circuits the cascade, lets the downstream breathe, and reopens only when a probe confirms recovery."
 />
 
-<ChapterTabs tabs={["Timeouts Everywhere", "Retries with Backoff and Jitter", "Circuit Breakers", "Graceful Shutdown", "Health and Readiness", "Idempotency", "Rate Limiting in Depth"]} />
+<ChapterTabs tabs={["Timeouts Everywhere", "Retries with Backoff and Jitter", "Circuit Breakers", "Bulkhead Isolation", "Graceful Degradation and Fallback Caches", "Graceful Shutdown", "Health and Readiness", "Idempotency", "Rate Limiting in Depth"]} />
 
 <SpacedRecall
   role={"guard"}
@@ -757,6 +757,451 @@ As of Go 1.24, there is no circuit breaker in the standard library. `sony/gobrea
 
 ---
 
+## Bulkhead Isolation
+
+<Define term="Bulkhead isolation">
+**Bulkhead isolation** partitions a system's concurrent capacity into isolated resource pools per downstream dependency. If one downstream slows down or crashes, it only exhausts its own dedicated bulkhead pool — preventing resource starvation from cascading to the rest of the application. **On the job:** without bulkheads, a slow third-party analytics API can tie up all 2,000 HTTP client goroutines, causing high-priority credit card checkouts to fail.
+</Define>
+
+The name comes from naval architecture: a ship is partitioned into watertight compartments called bulkheads. If the hull is breached in compartment 3, water fills compartment 3, but the bulkheads prevent water from flooding the rest of the ship. The ship stays afloat.
+
+In a Go microservice, your shared resources are **goroutines, open TCP connections, memory, and CPU cycles**. When you make outbound HTTP, gRPC, or SQL calls, you are borrowing capacity from these shared resources.
+
+```
+Without Bulkheads (Shared Pool):
+┌──────────────────────────────────────────────────────────────┐
+│ All Outbound Requests (Shared Pool: 100 slots)               │
+│                                                              │
+│ [Analytics API (HUNG)]  ████████████████████████ 95 slots    │
+│ [Payment API]           ██ 2 slots                           │
+│ [New Requests]          ❌ REJECTED (Pool Exhausted!)        │
+└──────────────────────────────────────────────────────────────┘
+
+With Bulkheads (Isolated Partitions):
+┌──────────────────────────────────────────────────────────────┐
+│ Payment Bulkhead (Cap: 50)       [████                  ] 8  │
+│ Fraud Bulkhead (Cap: 25)         [██████████            ] 10 │
+│ Analytics Bulkhead (Cap: 10)     [████████████████████] 10   │
+│                                   └─> Extra calls fast-fail  │
+│                                       or degrade gracefully! │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Semaphore-Bounded Bulkheads in Go
+
+In languages like Java, bulkheads are often implemented using dedicated OS thread pools (e.g. Netflix Hystrix). In Go, goroutines are multiplexed by the M:N scheduler, so creating separate OS thread pools is unnecessary and counterproductive. Instead, Go implements bulkheads using **semaphore channels (`chan struct{}`)** or `golang.org/x/sync/semaphore.Weighted`.
+
+A production Go bulkhead provides:
+1. **Concurrency Limit:** Max in-flight goroutines allowed for that dependency.
+2. **Bounded Queue (Optional):** Small backlog buffer before fast-failing.
+3. **Execution Gating:** Non-blocking `TryAcquire()` for immediate fast-fail or `Acquire(ctx)` with a strict queue deadline.
+4. **Metrics Instrumentation:** Observability into active concurrency, rejected requests, and queue wait times.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	ErrBulkheadFull     = errors.New("bulkhead capacity reached: fast-failing")
+	ErrBulkheadTimeout  = errors.New("bulkhead acquisition timed out")
+)
+
+// Bulkhead gates concurrency for a specific downstream dependency.
+type Bulkhead struct {
+	name      string
+	semaphore chan struct{}
+	queue     chan struct{}
+	active    int64
+	rejected  int64
+	completed int64
+}
+
+// NewBulkhead creates an isolated capacity partition.
+// maxConcurrent: max in-flight calls allowed.
+// maxQueue: max pending calls allowed before fast-failing.
+func NewBulkhead(name string, maxConcurrent int, maxQueue int) *Bulkhead {
+	return &Bulkhead{
+		name:      name,
+		semaphore: make(chan struct{}, maxConcurrent),
+		queue:     make(chan struct{}, maxQueue),
+	}
+}
+
+// Execute runs fn within the bulkhead partition.
+func (b *Bulkhead) Execute(ctx context.Context, fn func(ctx context.Context) error) error {
+	// 1. Try immediate acquisition (no queuing)
+	select {
+	case b.semaphore <- struct{}{}:
+		return b.run(ctx, fn)
+	default:
+	}
+
+	// 2. Try entering the wait queue
+	select {
+	case b.queue <- struct{}{}:
+		defer func() { <-b.queue }()
+	default:
+		atomic.AddInt64(&b.rejected, 1)
+		return fmt.Errorf("%s: %w", b.name, ErrBulkheadFull)
+	}
+
+	// 3. Wait for a concurrency permit or context cancellation
+	select {
+	case b.semaphore <- struct{}{}:
+		return b.run(ctx, fn)
+	case <-ctx.Done():
+		atomic.AddInt64(&b.rejected, 1)
+		return fmt.Errorf("%s: %w (%v)", b.name, ErrBulkheadTimeout, ctx.Err())
+	}
+}
+
+func (b *Bulkhead) run(ctx context.Context, fn func(ctx context.Context) error) error {
+	atomic.AddInt64(&b.active, 1)
+	defer func() {
+		atomic.AddInt64(&b.active, -1)
+		atomic.AddInt64(&b.completed, 1)
+		<-b.semaphore
+	}()
+	return fn(ctx)
+}
+
+func (b *Bulkhead) Stats() (active, rejected, completed int64) {
+	return atomic.LoadInt64(&b.active), atomic.LoadInt64(&b.rejected), atomic.LoadInt64(&b.completed)
+}
+
+func main() {
+	// Bulkhead 1: Core Payment Gateway (High priority, cap 5)
+	paymentBulkhead := NewBulkhead("PaymentGW", 5, 2)
+
+	// Bulkhead 2: Third-Party Fraud Analytics (Prone to lag, cap 2, queue 1)
+	analyticsBulkhead := NewBulkhead("FraudAnalytics", 2, 1)
+
+	var wg sync.WaitGroup
+
+	// Scenario: Analytics service slows down drastically (takes 500ms).
+	// We fire 6 concurrent requests to Analytics.
+	fmt.Println("=== Flooding Slow Analytics Bulkhead ===")
+	for i := 1; i <= 6; i++ {
+		wg.Add(1)
+		go func(reqID int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+
+			err := analyticsBulkhead.Execute(ctx, func(ctx context.Context) error {
+				time.Sleep(400 * time.Millisecond) // Slow response!
+				return nil
+			})
+			if err != nil {
+				fmt.Printf("Analytics req %d: %v\n", reqID, err)
+			} else {
+				fmt.Printf("Analytics req %d: succeeded\n", reqID)
+			}
+		}(i)
+	}
+
+	// Simultaneously, critical Payment requests arrive.
+	// Because Payment has its OWN bulkhead, it is NOT starved by the analytics outage!
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("\n=== Executing Critical Payment Requests ===")
+	for i := 1; i <= 3; i++ {
+		wg.Add(1)
+		go func(reqID int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+
+			err := paymentBulkhead.Execute(ctx, func(ctx context.Context) error {
+				time.Sleep(20 * time.Millisecond) // Fast response
+				return nil
+			})
+			if err != nil {
+				fmt.Printf("Payment req %d: %v\n", reqID, err)
+			} else {
+				fmt.Printf("Payment req %d: processed successfully!\n", reqID)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	aActive, aRej, aComp := analyticsBulkhead.Stats()
+	pActive, pRej, pComp := paymentBulkhead.Stats()
+
+	fmt.Printf("\nFinal Stats:\n")
+	fmt.Printf("Analytics -> Active: %d, Rejected: %d, Completed: %d\n", aActive, aRej, aComp)
+	fmt.Printf("Payment   -> Active: %d, Rejected: %d, Completed: %d\n", pActive, pRej, pComp)
+}
+```
+
+</GoPlayground>
+
+<UnderTheHood title="Bulkheads in Go: Why Channel Semaphores Beat Thread Pools">
+
+In traditional multi-threaded runtimes (Java, C++, .NET), bulkheads require allocating distinct OS thread pools (e.g., 20 threads for Service A, 10 threads for Service B). This incurs huge overhead:
+- Each OS thread costs 1–2 MB of stack memory.
+- Context switching between OS threads incurs kernel transition and TLB cache invalidation overhead.
+
+In Go's M:N runtime:
+- Goroutines are multiplexed across `GOMAXPROCS` OS threads.
+- A channel semaphore (`chan struct{}`) costs only the channel allocation (~96 bytes) and uses Go's internal runtime wait-queue (`sudog`).
+- Blocked goroutines park without consuming OS threads or CPU cycles.
+
+Therefore, you can comfortably create hundreds of granular bulkheads across a large Go service mesh with near-zero memory footprint.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="What happens if a non-critical downstream dependency stalls and you do NOT have a bulkhead in place?"
+  options={[
+    "Only that dependency's endpoints fail; all other endpoints are automatically isolated by the Go scheduler",
+    "In-flight requests pile up, exhausting the service's HTTP connection pool and goroutines, causing unrelated high-priority endpoints to fail",
+    "Go automatically reallocates CPU cores to healthy endpoints",
+    "The Linux kernel drops TCP packets for the stalled endpoint"
+  ]}
+  answer={1}
+  explain="Without bulkheads, slow dependencies hold worker goroutines and shared HTTP client connection slots. This causes resource starvation across the entire process, taking down unrelated endpoints."
+/>
+
+---
+
+## Graceful Degradation and Fallback Caches
+
+<Define term="Graceful degradation & stale fallback cache">
+**Graceful degradation** is the architectural practice of maintaining partial service functionality when dependencies fail. A **stale fallback cache** stores the last known successful response from an upstream dependency with an extended stale-grace TTL; when the dependency fails or its circuit breaker opens, the system serves the cached stale data rather than returning an error. **On the job:** if Meridian's currency conversion API goes down, the checkout service serves exchange rates cached 15 minutes ago (flagged as degraded) instead of aborting customer purchases.
+</Define>
+
+When an upstream dependency fails, times out, or trips an open circuit breaker, you have three options:
+1. **Hard Failure (Fail-Stop):** Return an HTTP 500 / 503 error to the client. This breaks user journeys.
+2. **Feature Omission (Silent Drop):** Return the response without the failed component (e.g. render user profile without the "recommended friends" sidebar).
+3. **Stale Fallback Caching (Serve Stale):** Serve the most recently cached valid response stamped with `stale: true` metadata.
+
+```
+Incoming Request
+      │
+      ▼
+┌───────────────┐        Cache HIT (Age < FreshTTL)
+│ Check Cache   ├─────────────────────────────────────────> Return Fresh Data
+└───────┬───────┘
+        │ Cache MISS or Expired
+        ▼
+┌───────────────┐      Circuit CLOSED & HTTP 200
+│ Call Upstream ├─────────────────────────────────────────> Cache & Return New
+└───────┬───────┘
+        │ Upstream FAILED or Circuit OPEN
+        ▼
+┌──────────────────┐     Entry exists (Age < StaleGraceTTL)
+│ Fallback Cache   ├──────────────────────────────────────> Return Stale Data (Degraded: true)
+└───────┬──────────┘
+        │ No cached entry
+        ▼
+   Return Error (503 Service Unavailable)
+```
+
+### Stale-While-Revalidate Dual-TTL Architecture
+
+A resilient fallback cache uses two distinct TTL thresholds:
+- **`freshTTL` (e.g. 1 minute):** Within this window, cached data is considered completely fresh and returned immediately without contacting upstream.
+- **`staleGraceTTL` (e.g. 24 hours):** Beyond `freshTTL`, the data is stale. Normal requests will attempt to fetch fresh data from upstream. But if upstream fails, times out, or the circuit breaker is OPEN, the cache falls back to serving this stale data.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+var (
+	ErrUpstreamDown = errors.New("upstream service unavailable")
+	ErrCacheMiss    = errors.New("no cached data available")
+)
+
+type CacheItem[T any] struct {
+	Value     T
+	UpdatedAt time.Time
+}
+
+type StaleFallbackCache[K comparable, V any] struct {
+	mu            sync.RWMutex
+	items         map[K]CacheItem[V]
+	freshTTL      time.Duration
+	staleGraceTTL time.Duration
+}
+
+func NewStaleFallbackCache[K comparable, V any](freshTTL, staleGraceTTL time.Duration) *StaleFallbackCache[K, V] {
+	return &StaleFallbackCache[K, V]{
+		items:         make(map[K]CacheItem[V]),
+		freshTTL:      freshTTL,
+		staleGraceTTL: staleGraceTTL,
+	}
+}
+
+func (c *StaleFallbackCache[K, V]) Set(key K, val V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[key] = CacheItem[V]{
+		Value:     val,
+		UpdatedAt: time.Now(),
+	}
+}
+
+// Get evaluates fresh vs stale availability.
+// Returns (value, isStale, found).
+func (c *StaleFallbackCache[K, V]) Get(key K) (val V, isStale bool, found bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	item, exists := c.items[key]
+	if !exists {
+		return val, false, false
+	}
+
+	age := time.Since(item.UpdatedAt)
+	if age <= c.freshTTL {
+		return item.Value, false, true // Fresh
+	}
+	if age <= c.staleGraceTTL {
+		return item.Value, true, true // Stale fallback eligible
+	}
+	return val, false, false // Expired past grace period
+}
+
+// ExchangeRateService fetches rates with resilient fallback caching.
+type ExchangeRateService struct {
+	cache       *StaleFallbackCache[string, float64]
+	circuitOpen bool
+	mu          sync.Mutex
+}
+
+func NewExchangeRateService() *ExchangeRateService {
+	return &ExchangeRateService{
+		// Fresh for 200ms, fallback grace for 5 seconds
+		cache: NewStaleFallbackCache[string, float64](200*time.Millisecond, 5*time.Second),
+	}
+}
+
+func (s *ExchangeRateService) SetSimulatedOutage(open bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.circuitOpen = open
+}
+
+func (s *ExchangeRateService) fetchUpstream(ctx context.Context, currency string) (float64, error) {
+	s.mu.Lock()
+	open := s.circuitOpen
+	s.mu.Unlock()
+
+	if open {
+		return 0, ErrUpstreamDown
+	}
+	// Normal simulated rate
+	return 1.0850, nil // EUR/USD
+}
+
+func (s *ExchangeRateService) GetRate(ctx context.Context, currency string) (rate float64, degraded bool, err error) {
+	// 1. Check fresh cache
+	val, isStale, found := s.cache.Get(currency)
+	if found && !isStale {
+		return val, false, nil
+	}
+
+	// 2. Attempt upstream call
+	freshVal, err := s.fetchUpstream(ctx, currency)
+	if err == nil {
+		s.cache.Set(currency, freshVal)
+		return freshVal, false, nil
+	}
+
+	// 3. Upstream failed: check if stale fallback is available
+	if found && isStale {
+		fmt.Printf("  [Degradation] Upstream failed (%v). Serving stale cached rate.\n", err)
+		return val, true, nil
+	}
+
+	// 4. No cache exists and upstream failed: hard error
+	return 0, false, fmt.Errorf("failed to fetch rate: %w", err)
+}
+
+func main() {
+	svc := NewExchangeRateService()
+	ctx := context.Background()
+
+	// Step 1: Initial fetch (populates cache)
+	rate, degraded, err := svc.GetRate(ctx, "EUR")
+	fmt.Printf("1. Initial fetch: Rate=%.4f (Degraded=%v, Err=%v)\n", rate, degraded, err)
+
+	// Step 2: Immediate second fetch (served from fresh cache)
+	rate, degraded, err = svc.GetRate(ctx, "EUR")
+	fmt.Printf("2. Cached fetch:  Rate=%.4f (Degraded=%v, Err=%v)\n", rate, degraded, err)
+
+	// Step 3: Wait until freshTTL expires (250ms), and simulate upstream outage!
+	time.Sleep(250 * time.Millisecond)
+	svc.SetSimulatedOutage(true)
+	fmt.Println("\n--- Upstream Outage Occurred (Circuit Breaker Tripped) ---")
+
+	// Step 4: Fetch during outage -> Serves stale fallback
+	rate, degraded, err = svc.GetRate(ctx, "EUR")
+	fmt.Printf("3. Outage fetch:  Rate=%.4f (Degraded=%v, Err=%v)\n", rate, degraded, err)
+
+	// Step 5: Restore upstream
+	svc.SetSimulatedOutage(false)
+	fmt.Println("\n--- Upstream Recovered ---")
+	rate, degraded, err = svc.GetRate(ctx, "EUR")
+	fmt.Printf("4. Recovered:     Rate=%.4f (Degraded=%v, Err=%v)\n", rate, degraded, err)
+}
+```
+
+</GoPlayground>
+
+<Callout kind="warning" title="Critical Boundary: What data can NEVER be served stale?">
+
+Serving stale cache data is a business decision with financial and legal consequences.
+
+**Safe to serve stale (with Degraded metadata):**
+- Foreign exchange reference rates (for display purposes).
+- Product catalog titles, descriptions, and thumbnail image URLs.
+- Merchant profile metadata and public configuration.
+
+**NEVER serve stale:**
+- Customer account balance or available credit limits.
+- Payment authorization decisions or fraud risk scores.
+- Idempotency verification tokens.
+- Cryptographic keys or JWT signing public keys during key rotation.
+
+Always pair stale fallback data with clear observability alerts and client-facing degradation headers (e.g. `Warning: 199 - "Degraded: serving cached rates"`).
+
+</Callout>
+
+<QuickCheck
+  question="Why does a resilient fallback cache use two separate TTLs (freshTTL and staleGraceTTL) instead of a single TTL?"
+  options={[
+    "To reduce memory allocations in the Go garbage collector",
+    "To distinguish between data that can be served without checking upstream vs. data that should only be used as a disaster recovery fallback",
+    "Because the Go sync.Map only supports two timestamps per key",
+    "To allow the HTTP client to send two concurrent TCP requests"
+  ]}
+  answer={1}
+  explain="freshTTL specifies when data is completely valid and upstream can be skipped. staleGraceTTL keeps older data alive strictly as a fallback in case upstream outages or circuit breakers occur."
+/>
+
+---
+
 ## Graceful Shutdown
 
 <Define term="Graceful shutdown">
@@ -1068,21 +1513,23 @@ The server stores and honors idempotency keys. The *client* generates them — o
 **Rate limiting** caps how many requests a caller (or the whole service) can make in a time window, protecting capacity from a single bad actor or burst. **Token bucket:** a bucket holds up to N tokens; each request consumes one; tokens refill at a fixed rate. It allows short bursts (draining the bucket) then enforces the fill rate — this is what `golang.org/x/time/rate` implements. **Leaky bucket:** requests queue up and exit at a fixed constant rate regardless of arrival — useful for smoothing output to a downstream that can't absorb bursts. **On the job:** without per-client rate limits, a single misbehaving API key can saturate your entire connection pool and take down the service for everyone else.
 </Define>
 
-Rate limiting answers the question: "how do I prevent one caller from consuming all available capacity?" That sounds simple. The implementation choices matter enormously, because different algorithms behave differently under bursts, and the wrong choice either rejects legitimate traffic or lets bursts through unchecked.
+Rate limiting answers the question: "how do I prevent one caller from consuming all available capacity?" The choice of algorithm dictates how your service behaves during bursts, how much memory is consumed per active client key, and whether rate limiting remains accurate across multi-replica clusters.
 
-### The Algorithms
+### Algorithm Comparison Matrix
 
-There are four main algorithms. Each makes a different trade-off between burst tolerance and steady-state enforcement.
+| Algorithm | Memory per Key | CPU Cost | Burst Handling | Boundary Spike Risk | Primary Use Case |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Token Bucket** | $O(1)$ (~32 bytes) | $O(1)$ (lazy time math) | Allows bursts up to bucket capacity $B$ | None (continuous refill) | Inbound API gateway protection, client quotas |
+| **Leaky Bucket** | $O(1)$ (~24 bytes) | $O(1)$ (scheduled delay) | Zero burst (strictly meters output rate) | None (uniform spacing) | Outbound traffic shaping to sensitive/legacy APIs |
+| **Fixed Window** | $O(1)$ (~8 bytes) | $O(1)$ (atomic increment) | Resets at boundary | High (2× burst at window edge) | Simple bulk DDoS damping, coarse metrics |
+| **Sliding Window Log** | $O(N)$ (stores $N$ timestamps) | $O(\log N)$ (sorted set range) | Enforces exact rate limit over rolling window | Zero (mathematically exact) | High-stakes fintech limits (e.g. max 5 transfers/min) |
+| **Sliding Window Counter** | $O(1)$ (2 counter integers) | $O(1)$ (weighted multiplication) | Smooth sliding blend | Low (under 0.05% variance) | High-throughput distributed rate limiting in Redis |
 
-<ConceptGrid cols={2}>
-  <ConceptCard label="Token Bucket">A bucket holds up to N tokens. Each request consumes one token. Tokens are added at a fixed rate (e.g. 100/s). If the bucket is empty, the request is rejected. **Allows bursts** up to the bucket capacity, then enforces the fill rate. This is what most rate limiters in production actually use.</ConceptCard>
-  <ConceptCard label="Leaky Bucket">Requests enter a queue (the bucket). They exit at a fixed, constant rate. The queue absorbs small bursts, but if it fills, excess requests are dropped. Produces a **smooth, metered output** — useful for traffic shaping toward a downstream that can't handle bursts.</ConceptCard>
-  <ConceptCard label="Fixed Window">Count requests in a fixed time window (e.g. this minute). If count exceeds the limit, reject. Simple, but has a **boundary vulnerability**: 100 requests at 0:59 and 100 requests at 1:01 both pass the per-minute check, letting 200 through in two seconds.</ConceptCard>
-  <ConceptCard label="Sliding Window">Track individual timestamps in a ring buffer, or use a weighted average of two adjacent fixed windows. Eliminates the boundary spike of fixed windows. **More expensive** to compute but fairer.</ConceptCard>
-  <Gotcha>Token bucket and leaky bucket are often confused. Token bucket limits the *rate* while allowing bursts. Leaky bucket shapes the *output rate* to be constant. For protecting your own service from overload, use token bucket. For metering traffic *to* a downstream you control, leaky bucket.</Gotcha>
-</ConceptGrid>
+---
 
-### Visualizing a Token Bucket
+### 1. Token Bucket: Standard vs. Custom In-Memory
+
+The **Token Bucket** algorithm models a bucket of capacity $B$ that accumulates tokens at rate $R$ tokens/second. A request consumes 1 token. If the bucket is empty, the request is rejected or queued.
 
 <ExecTimeline
   title="Token bucket — filling and draining under load"
@@ -1102,9 +1549,7 @@ There are four main algorithms. Each makes a different trade-off between burst t
   caption="Token bucket allows short bursts (draining the bucket) then enforces the refill rate. Empty bucket → reject."
 />
 
-### `golang.org/x/time/rate` — the Go Standard
-
-The Go extended standard library provides a production-ready token-bucket limiter in `golang.org/x/time/rate`. It's the right default for in-process rate limiting in Go.
+While `golang.org/x/time/rate` is the standard library solution, understanding how to build an in-memory token bucket from scratch reveals how Go handles nanosecond-precision rate accounting without background goroutines.
 
 <GoPlayground>
 
@@ -1114,126 +1559,131 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
 )
 
+// CustomTokenBucket implements a zero-goroutine, nanosecond-precision token bucket.
+type CustomTokenBucket struct {
+	mu           sync.Mutex
+	rate         float64   // tokens added per second
+	capacity     float64   // maximum burst capacity
+	tokens       float64   // current available tokens
+	lastRefilled time.Time // last calculation timestamp
+}
+
+func NewCustomTokenBucket(ratePerSec float64, burstCap float64) *CustomTokenBucket {
+	return &CustomTokenBucket{
+		rate:         ratePerSec,
+		capacity:     burstCap,
+		tokens:       burstCap, // starts completely full
+		lastRefilled: time.Now(),
+	}
+}
+
+// refill calculates virtual token accumulation based on elapsed nanoseconds.
+// Must be called with tb.mu held.
+func (tb *CustomTokenBucket) refill(now time.Time) {
+	elapsed := now.Sub(tb.lastRefilled).Seconds()
+	tb.lastRefilled = now
+	tb.tokens = math.Min(tb.capacity, tb.tokens+(elapsed*tb.rate))
+}
+
+// Allow attempts to consume 1 token immediately (non-blocking).
+func (tb *CustomTokenBucket) Allow() bool {
+	return tb.AllowN(time.Now(), 1.0)
+}
+
+// AllowN attempts to consume n tokens at time 'now'.
+func (tb *CustomTokenBucket) AllowN(now time.Time, n float64) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	tb.refill(now)
+	if tb.tokens >= n {
+		tb.tokens -= n
+		return true
+	}
+	return false
+}
+
+// Wait blocks until 1 token is available or context is cancelled.
+func (tb *CustomTokenBucket) Wait(ctx context.Context) error {
+	for {
+		tb.mu.Lock()
+		now := time.Now()
+		tb.refill(now)
+
+		if tb.tokens >= 1.0 {
+			tb.tokens -= 1.0
+			tb.mu.Unlock()
+			return nil
+		}
+
+		// Calculate sleep time needed to accrue 1 full token
+		missing := 1.0 - tb.tokens
+		sleepDur := time.Duration((missing / tb.rate) * float64(time.Second))
+		tb.mu.Unlock()
+
+		timer := time.NewTimer(sleepDur)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func main() {
-	// Allow 3 events per second, with a burst capacity of 5.
-	// rate.Limit(3) = 3 tokens/second fill rate.
-	// Second arg = bucket capacity (max burst).
-	limiter := rate.NewLimiter(rate.Limit(3), 5)
+	fmt.Println("=== 1. Custom In-Memory Token Bucket ===")
+	// 5 tokens/sec, max burst of 3
+	tb := NewCustomTokenBucket(5, 3)
 
-	results := make([]string, 10)
-	for i := range 10 {
-		// Allow checks if a token is available right now.
-		// Use Wait(ctx) if you want to block until a token is available.
-		if limiter.Allow() {
-			results[i] = fmt.Sprintf("req %2d: allowed  (tokens ~%.2f)", i+1, limiter.Tokens())
+	for i := 1; i <= 5; i++ {
+		if tb.Allow() {
+			fmt.Printf("Req %d: ALLOWED\n", i)
 		} else {
-			results[i] = fmt.Sprintf("req %2d: rejected (tokens ~%.2f)", i+1, limiter.Tokens())
+			fmt.Printf("Req %d: REJECTED (bucket empty)\n", i)
 		}
 	}
 
-	for _, r := range results {
-		fmt.Println(r)
-	}
+	time.Sleep(300 * time.Millisecond) // refills ~1.5 tokens
+	fmt.Printf("After 300ms pause -> Allow: %v\n", tb.Allow())
 
-	// After a brief pause, tokens refill.
-	fmt.Println("\n--- 500ms later (refill ~1.5 tokens) ---")
-	time.Sleep(500 * time.Millisecond)
-	for i := range 3 {
-		if limiter.Allow() {
-			fmt.Printf("req %2d after pause: allowed\n", i+1)
-		} else {
-			fmt.Printf("req %2d after pause: rejected\n", i+1)
-		}
+	fmt.Println("\n=== 2. golang.org/x/time/rate Standard Limiter ===")
+	stdLimiter := rate.NewLimiter(rate.Limit(10), 2)
+	for i := 1; i <= 4; i++ {
+		fmt.Printf("Standard limiter req %d: %v\n", i, stdLimiter.Allow())
 	}
 }
 ```
 
 </GoPlayground>
 
-<UnderTheHood title="How x/time/rate computes available tokens from elapsed time">
+<UnderTheHood title="How x/time/rate and Custom Token Buckets eliminate background goroutines">
 
-`rate.Limiter` does **not** run a background goroutine to refill the bucket on a timer. That would be wasteful — a goroutine waking up 100 times per second for each limiter.
+A naive token bucket implementation might launch a background goroutine with `time.NewTicker` to add tokens every millisecond. With 100,000 active API keys, that would spawn 100,000 tickers waking up the Go runtime scheduler millions of times per second.
 
-Instead, it uses a **lazy computation** pattern. The limiter stores:
-
-1. `last` — the timestamp of the last token-consumption event.
-2. `tokens` — the number of tokens at `last`.
-
-When `Allow()` (or `Wait()`, or `Reserve()`) is called, the limiter computes how many tokens should have been added since `last`:
-
+Instead, both `x/time/rate` and our custom bucket use **lazy arithmetic evaluation**:
 ```
-newTokens = rate * (now - last)
-tokens    = min(tokens + newTokens, burst)
+newTokens = rate * (now - lastRefilled)
+tokens    = min(capacity, tokens + newTokens)
 ```
-
-This "virtual refill" is computed entirely from arithmetic on timestamps — no goroutine, no timer, no shared ticker. It's thread-safe via a `sync.Mutex`. The actual token count is never stored as a running value; it's derived from time on every call.
-
-This design has two elegant properties: it scales to thousands of limiters with zero goroutine overhead, and it correctly handles the case where a limiter hasn't been used for a long time — the bucket is simply computed as full (capped at burst capacity) when next consulted.
-
-As of Go 1.24, `x/time/rate` is the authoritative implementation. It handles `Allow()` (non-blocking), `Wait(ctx)` (blocking with context), and `Reserve()` (advanced: reserve a token and query when it will be available, for implementing delay-before-proceed semantics).
+On every invocation of `Allow()` or `Wait()`, the current timestamp is recorded, the delta time is computed, and tokens are updated synchronously under a `sync.Mutex`. If a key remains idle for an hour, zero CPU cycles are spent — when the client finally calls again, the math instantly computes `tokens = capacity`.
 
 </UnderTheHood>
 
-### Per-Key Rate Limiting
+---
 
-A global limiter protects your service from aggregate overload. But you also need **per-client** limiting: API key, user ID, or IP address. Without per-client limits, one bad actor can consume the entire global quota.
+### 2. Leaky Bucket: Egress Traffic Shaping
 
-```go
-// PerKeyLimiter holds one rate.Limiter per key.
-// In production, use a cache with TTL (e.g. go-cache or sync.Map + expiry)
-// so stale limiters don't accumulate in memory forever.
-type PerKeyLimiter struct {
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
-	r        rate.Limit
-	b        int
-}
+While Token Bucket controls *inbound burst capacity*, **Leaky Bucket** controls *outbound spacing*. It guarantees that requests leave at a constant, uniform rate $\Delta t = 1/R$, completely flattening any burst.
 
-func NewPerKeyLimiter(r rate.Limit, b int) *PerKeyLimiter {
-	return &PerKeyLimiter{limiters: make(map[string]*rate.Limiter), r: r, b: b}
-}
-
-func (l *PerKeyLimiter) Allow(key string) bool {
-	l.mu.Lock()
-	lim, ok := l.limiters[key]
-	if !ok {
-		lim = rate.NewLimiter(l.r, l.b)
-		l.limiters[key] = lim
-	}
-	l.mu.Unlock()
-	return lim.Allow()
-}
-```
-
-### Distributed Rate Limiting with Redis
-
-`x/time/rate` is **per-process**. If you run 10 replicas of your checkout service, each has its own limiter, and a client can get 10× the intended quota by round-robining requests across replicas. For a true rate limit across the fleet, the counter must live outside any single process — in Redis.
-
-The standard approach is a Lua script executed atomically in Redis. Because Lua scripts in Redis run atomically (no interleaving), you get the same compare-and-increment atomicity a mutex gives you in-process, but distributed across all replicas:
-
-```lua
--- distributed_rate_limit.lua
--- KEYS[1] = rate limit key (e.g. "rl:user:42")
--- ARGV[1] = max requests allowed
--- ARGV[2] = window in seconds
--- Returns 1 if allowed, 0 if rejected.
-local current = redis.call("INCR", KEYS[1])
-if current == 1 then
-  redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
-end
-if current <= tonumber(ARGV[1]) then
-  return 1
-else
-  return 0
-end
-```
-
-This is a **fixed-window** counter in Redis — simple and fast. For a sliding window or a Redis-native token bucket, libraries like [`go-redis/redis_rate`](https://github.com/go-redis/redis_rate) implement the GCRA (Generic Cell Rate Algorithm) via a Lua script.
+**On the job:** Meridian integrates with an older card-network settlement mainframe that hard-crashes if it receives more than 5 requests in any 100ms interval. A token bucket with burst=5 would let all 5 through in 1ms. A Leaky Bucket Shaper forces exactly 20ms between outbound requests, protecting the downstream mainframe.
 
 <GoPlayground>
 
@@ -1245,86 +1695,379 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
-// PerKeyLimiter manages one rate.Limiter per API key.
-// In production: add TTL-based eviction so stale keys are cleaned up.
-type PerKeyLimiter struct {
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
-	r        rate.Limit
-	b        int
+// LeakyBucketShaper shapes egress traffic to a constant rate (fixed time interval).
+type LeakyBucketShaper struct {
+	mu          sync.Mutex
+	interval    time.Duration // Time between consecutive releases: 1 / rate
+	lastRelease time.Time
 }
 
-func NewPerKeyLimiter(r rate.Limit, b int) *PerKeyLimiter {
-	return &PerKeyLimiter{
-		limiters: make(map[string]*rate.Limiter),
-		r:        r,
-		b:        b,
+func NewLeakyBucketShaper(ratePerSec float64) *LeakyBucketShaper {
+	return &LeakyBucketShaper{
+		interval:    time.Duration(float64(time.Second) / ratePerSec),
+		lastRelease: time.Now(),
 	}
 }
 
-// Allow checks whether key is within the rate limit.
-func (l *PerKeyLimiter) Allow(key string) bool {
-	l.mu.Lock()
-	lim, ok := l.limiters[key]
-	if !ok {
-		lim = rate.NewLimiter(l.r, l.b)
-		l.limiters[key] = lim
-	}
-	l.mu.Unlock()
-	return lim.Allow()
-}
+// Take blocks until the exact scheduled egress timestamp is reached.
+func (lb *LeakyBucketShaper) Take(ctx context.Context) error {
+	lb.mu.Lock()
+	now := time.Now()
 
-// RateLimitMiddleware returns an HTTP middleware that limits by API key.
-func RateLimitMiddleware(limiter *PerKeyLimiter) func(key string) bool {
-	return func(key string) bool {
-		return limiter.Allow(key)
+	// If idle and lastRelease is in past, reset schedule to now
+	if lb.lastRelease.Before(now) {
+		lb.lastRelease = now
+	}
+
+	// Schedule the next slot strictly at lastRelease + interval
+	nextSlot := lb.lastRelease.Add(lb.interval)
+	lb.lastRelease = nextSlot
+	sleepDur := time.Until(nextSlot)
+	lb.mu.Unlock()
+
+	if sleepDur <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(sleepDur)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
 func main() {
-	// 2 requests/second, burst of 3 per API key.
-	limiter := NewPerKeyLimiter(rate.Limit(2), 3)
-	check := RateLimitMiddleware(limiter)
+	// Shape traffic to exactly 5 requests/sec (1 request every 200ms)
+	shaper := NewLeakyBucketShaper(5)
+	ctx := context.Background()
 
-	keys := []string{"api_key_A", "api_key_B", "api_key_A", "api_key_A", "api_key_A", "api_key_B"}
+	start := time.Now()
+	fmt.Println("Dispatching 4 bursty requests through Leaky Bucket Shaper:")
+	for i := 1; i <= 4; i++ {
+		_ = shaper.Take(ctx)
+		fmt.Printf("Req %d dispatched at +%v (strictly spaced)\n", i, time.Since(start).Round(time.Millisecond))
+	}
+}
+```
 
-	for _, k := range keys {
-		allowed := check(k)
-		status := "ALLOWED"
-		if !allowed {
-			status = "REJECTED"
+</GoPlayground>
+
+---
+
+### 3. Sliding Window Log vs. Sliding Window Counter
+
+Fixed-window limiters suffer from a severe **boundary double-burst vulnerability**: if a client is allowed 100 req/min, they can send 100 requests at 00:59 and 100 requests at 01:01 — totaling 200 requests within a 2-second interval without violating either fixed window.
+
+Two sliding window algorithms solve this problem:
+
+```
+Fixed Window Spike (200 requests in 2 seconds):
+Window 1 [00:00 - 01:00]          Window 2 [01:00 - 02:00]
+                     ████ (100)  │  ████ (100)
+─────────────────────────────────┼──────────────────────────────
+                              00:59 01:01
+
+Sliding Window (Rolling 60s window eliminates the boundary):
+                [───── Rolling 60s Window (Max 100) ─────]
+                                 ████  ████ ❌ REJECTED!
+```
+
+#### Sliding Window Log (Exact Timestamp Tracking)
+
+The **Sliding Window Log** maintains a list of timestamps for every request made within the rolling window. On each request:
+1. Evict timestamps older than `now - windowSize`.
+2. If remaining count is less than `limit`, append `now` and allow; else reject.
+
+**Pros:** 100% mathematically exact; zero edge anomalies.  
+**Cons:** High memory overhead ($O(N)$ entries per active user).
+
+In Redis, this is implemented using a **Sorted Set (`ZSET`)** and executed via an atomic Lua script:
+
+```lua
+-- sliding_window_log.lua
+-- KEYS[1] = "rl:log:user:42"
+-- ARGV[1] = current timestamp (unix epoch in ms)
+-- ARGV[2] = window size in ms (e.g. 60000 for 1 minute)
+-- ARGV[3] = max requests allowed in window
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local clearBefore = now - window
+
+-- 1. Evict timestamps older than the sliding cutoff
+redis.call("ZREMRANGEBYSCORE", key, "-inf", clearBefore)
+
+-- 2. Count current elements in window
+local currentCount = redis.call("ZCARD", key)
+
+-- 3. Check limit and record timestamp
+if currentCount < limit then
+    redis.call("ZADD", key, now, now .. ":" .. math.random(100000))
+    redis.call("PEXPIRE", key, window)
+    return 1 -- Allowed
+else
+    return 0 -- Rejected
+end
+```
+
+#### Sliding Window Counter (Memory-Optimized Weighted Average)
+
+Instead of storing individual timestamps, the **Sliding Window Counter** divides time into fixed windows and estimates the rolling request count using a **weighted average**:
+
+```
+Estimated Count = (Previous Window Count * (Window Size - Time into Current Window) / Window Size) + Current Window Count
+```
+
+**Pros:** Constant $O(1)$ memory per key (only 2 integers stored!).  
+**Cons:** Small mathematical approximation assuming uniform request distribution in the previous window (under 0.05% variance in production).
+
+In Redis, this is implemented using two simple string keys with atomic Lua execution:
+
+```lua
+-- sliding_window_counter.lua
+-- KEYS[1] = current window key (e.g. "rl:cnt:user:42:1700000060")
+-- KEYS[2] = previous window key (e.g. "rl:cnt:user:42:1700000000")
+-- ARGV[1] = window size in seconds (e.g. 60)
+-- ARGV[2] = weight of previous window (fraction 0.0 to 1.0)
+-- ARGV[3] = max requests allowed
+local curr_key = KEYS[1]
+local prev_key = KEYS[2]
+local window = tonumber(ARGV[1])
+local weight = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+
+local prev_count = tonumber(redis.call("GET", prev_key) or "0")
+local curr_count = tonumber(redis.call("GET", curr_key) or "0")
+
+local estimated = math.floor(prev_count * weight) + curr_count
+if estimated < limit then
+    local new_count = redis.call("INCR", curr_key)
+    if new_count == 1 then
+        redis.call("EXPIRE", curr_key, window * 2)
+    end
+    return 1 -- Allowed
+else
+    return 0 -- Rejected
+end
+```
+
+Here is a side-by-side runnable Go implementation comparing both Sliding Window Log and Sliding Window Counter:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// SlidingWindowLog maintains exact timestamps in memory (O(N) space).
+type SlidingWindowLog struct {
+	mu         sync.Mutex
+	window     time.Duration
+	limit      int
+	timestamps []time.Time
+}
+
+func NewSlidingWindowLog(window time.Duration, limit int) *SlidingWindowLog {
+	return &SlidingWindowLog{window: window, limit: limit}
+}
+
+func (s *SlidingWindowLog) Allow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-s.window)
+
+	valid := s.timestamps[:0]
+	for _, t := range s.timestamps {
+		if t.After(cutoff) {
+			valid = append(valid, t)
 		}
-		fmt.Printf("  key=%-12s  %s\n", k, status)
 	}
+	s.timestamps = valid
 
-	fmt.Println("\n--- 500ms pause: key_A refills ~1 token ---")
-	time.Sleep(500 * time.Millisecond)
+	if len(s.timestamps) < s.limit {
+		s.timestamps = append(s.timestamps, now)
+		return true
+	}
+	return false
+}
 
-	for range 2 {
-		allowed := check("api_key_A")
-		status := "ALLOWED"
-		if !allowed {
-			status = "REJECTED"
+// SlidingWindowCounter approximates moving window counts in O(1) space.
+type SlidingWindowCounter struct {
+	mu         sync.Mutex
+	window     time.Duration
+	limit      int64
+	currWindow int64
+	currCount  int64
+	prevCount  int64
+}
+
+func NewSlidingWindowCounter(window time.Duration, limit int64) *SlidingWindowCounter {
+	return &SlidingWindowCounter{window: window, limit: limit}
+}
+
+func (s *SlidingWindowCounter) Allow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	windowNanos := s.window.Nanoseconds()
+	currentWindowIdx := now.UnixNano() / windowNanos
+
+	if currentWindowIdx > s.currWindow {
+		if currentWindowIdx == s.currWindow+1 {
+			s.prevCount = s.currCount
+		} else {
+			s.prevCount = 0
 		}
-		fmt.Printf("  key=%-12s  %s\n", "api_key_A", status)
+		s.currCount = 0
+		s.currWindow = currentWindowIdx
 	}
 
-	// Demonstrate context-aware Wait: block until a token is available or ctx expires.
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
+	offset := now.UnixNano() % windowNanos
+	weight := float64(windowNanos-offset) / float64(windowNanos)
+	estimated := int64(float64(s.prevCount)*weight) + s.currCount
 
-	lim := rate.NewLimiter(rate.Limit(1), 1)
-	lim.Allow() // drain the single token
-	fmt.Println("\n--- Wait with context (should time out) ---")
-	if err := lim.Wait(ctx); err != nil {
-		fmt.Println("Wait timed out:", err)
-	} else {
-		fmt.Println("Wait succeeded")
+	if estimated < s.limit {
+		s.currCount++
+		return true
 	}
+	return false
+}
+
+func main() {
+	// Window: 100ms, Limit: 3 requests
+	logLimiter := NewSlidingWindowLog(100*time.Millisecond, 3)
+	cntLimiter := NewSlidingWindowCounter(100*time.Millisecond, 3)
+
+	fmt.Println("=== Testing Sliding Window Log (Exact) ===")
+	for i := 1; i <= 5; i++ {
+		fmt.Printf("Req %d -> Allowed: %v\n", i, logLimiter.Allow())
+	}
+
+	fmt.Println("\n=== Testing Sliding Window Counter (Weighted O(1)) ===")
+	for i := 1; i <= 5; i++ {
+		fmt.Printf("Req %d -> Allowed: %v\n", i, cntLimiter.Allow())
+	}
+}
+```
+
+</GoPlayground>
+
+---
+
+### Per-Key Rate Limiting with TTL Eviction
+
+In production systems handling millions of distinct API keys, IP addresses, or account IDs, storing limiters in a plain `map[string]*rate.Limiter` causes an **unbounded memory leak** because stale keys from one-off callers never get deleted.
+
+A production per-key limiter tracks access timestamps and runs a background sweeper to evict inactive limiters:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+type keyEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// TTLPerKeyLimiter prevents memory leaks by automatically sweeping stale keys.
+type TTLPerKeyLimiter struct {
+	mu            sync.Mutex
+	entries       map[string]*keyEntry
+	r             rate.Limit
+	b             int
+	ttl           time.Duration
+	stopClean     chan struct{}
+}
+
+func NewTTLPerKeyLimiter(r rate.Limit, b int, ttl time.Duration, sweepInterval time.Duration) *TTLPerKeyLimiter {
+	lim := &TTLPerKeyLimiter{
+		entries:   make(map[string]*keyEntry),
+		r:         r,
+		b:         b,
+		ttl:       ttl,
+		stopClean: make(chan struct{}),
+	}
+	go lim.cleanupLoop(sweepInterval)
+	return lim
+}
+
+func (l *TTLPerKeyLimiter) Allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	entry, exists := l.entries[key]
+	if !exists {
+		entry = &keyEntry{
+			limiter: rate.NewLimiter(l.r, l.b),
+		}
+		l.entries[key] = entry
+	}
+	entry.lastSeen = time.Now()
+	return entry.limiter.Allow()
+}
+
+func (l *TTLPerKeyLimiter) cleanupLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.stopClean:
+			return
+		case <-ticker.C:
+			l.mu.Lock()
+			cutoff := time.Now().Add(-l.ttl)
+			for k, entry := range l.entries {
+				if entry.lastSeen.Before(cutoff) {
+					delete(l.entries, k)
+				}
+			}
+			l.mu.Unlock()
+		}
+	}
+}
+
+func (l *TTLPerKeyLimiter) Stop() {
+	close(l.stopClean)
+}
+
+func main() {
+	// 2 req/s per key, burst 2, key TTL 100ms, sweep every 50ms
+	limiter := NewTTLPerKeyLimiter(rate.Limit(2), 2, 100*time.Millisecond, 50*time.Millisecond)
+	defer limiter.Stop()
+
+	fmt.Printf("API Key 1 (Attempt 1): Allowed=%v\n", limiter.Allow("key_1"))
+	fmt.Printf("API Key 1 (Attempt 2): Allowed=%v\n", limiter.Allow("key_1"))
+	fmt.Printf("API Key 1 (Attempt 3): Allowed=%v (Burst exhausted)\n", limiter.Allow("key_1"))
+
+	fmt.Printf("API Key 2 (Attempt 1): Allowed=%v (Separate quota)\n", limiter.Allow("key_2"))
+
+	// Wait for TTL expiration
+	time.Sleep(160 * time.Millisecond)
+	fmt.Printf("\nAfter TTL sweep -> Inactive keys evicted from memory safely.\n")
 }
 ```
 
@@ -1332,26 +2075,26 @@ func main() {
 
 <Callout kind="note" title="When distributed rate limiting is actually needed">
 
-Don't reach for Redis rate limiting before you need it. A single Go service with a per-process `x/time/rate` limiter handles **millions of requests per second** — it's fast, it's zero-dependency, and it's correct for a single instance. You only need distributed limiting when:
+Don't reach for Redis rate limiting before you need it. A single Go service with a per-process `x/time/rate` or in-memory sliding window limiter handles **millions of requests per second** — it's fast, zero-dependency, and correct for a single instance. You only need distributed limiting when:
 
-1. You run multiple replicas and the per-key quota must be enforced across all of them.
-2. You need rate limit state to survive a restart (Redis persists it; in-memory does not).
-3. Different services in your mesh share a quota (e.g. both the API gateway and the checkout service limit the same user).
+1. You run multiple replicas and the per-key quota must be enforced globally across all of them.
+2. You need rate limit state to survive service restarts and deployments.
+3. Different services in your mesh share a unified quota pool (e.g. both the API gateway and the background webhook worker consume the same customer API quota).
 
-In a fintech context, per-account rate limiting for fraud prevention (rule: "no account may initiate more than 5 transfers in 60 seconds") almost always requires Redis — because transfers may arrive on any replica.
+In fintech fraud prevention (such as "no user may initiate more than 5 wire transfers per minute"), Redis Sliding Window Counter is mandatory because transfer requests may hit any replica.
 
 </Callout>
 
 <QuickCheck
-  question="Your checkout service runs 8 replicas. Each uses an in-process x/time/rate limiter set to 10 req/s per API key. What is the effective rate limit across the fleet?"
+  question="Why is the Sliding Window Counter algorithm preferred over the Sliding Window Log in large-scale Redis rate limiters?"
   options={[
-    "10 req/s — the limiter is shared via a shared-memory segment",
-    "80 req/s — each replica allows 10 req/s independently",
-    "1.25 req/s — requests are load-balanced evenly so each replica gets 1/8",
-    "10 req/s, but only if you use rate.NewLimiter with GOMAXPROCS set to 8"
+    "Because Sliding Window Log does not support expiration in Redis",
+    "Because Sliding Window Counter uses O(1) memory by storing only two window counts, whereas Sliding Window Log stores an entry for every individual request timestamp",
+    "Because Lua scripts cannot process Sorted Sets in Redis",
+    "Because Sliding Window Counter prevents all network round-trips"
   ]}
   answer={1}
-  explain="Each replica has its own independent limiter. A client that round-robins across all 8 replicas can get 10 req/s from each — 80 req/s total. For a true fleet-wide limit, the counter must live in a shared store like Redis."
+  explain="Sliding Window Log requires storing every request timestamp in a Sorted Set (O(N) memory), which explodes Redis RAM under high traffic. Sliding Window Counter achieves near-identical accuracy using only two integer counters per key (O(1) memory)."
 />
 
 ---

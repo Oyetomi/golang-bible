@@ -19,7 +19,7 @@ I've decoupled bigger systems than Meridian in my sleep. Pay attention and so wi
 
 </HeroCard>
 
-<ChapterTabs tabs={["The Coupling Problem", "A Naive Channel Bus", "Typed Edges with Generics", "Routing by Type", "Backpressure & the Pump", "The Actor Model", "Why So Many Parts", "Tailscale's Real Bus"]} />
+<ChapterTabs tabs={["The Coupling Problem", "A Naive Channel Bus", "Typed Edges with Generics", "Routing by Type", "Backpressure & the Pump", "The Actor Model", "Why So Many Parts", "Tailscale's Real Bus", "The Saga Pattern"]} />
 
 <SpacedRecall
   role={"courier"}
@@ -1136,6 +1136,380 @@ That's the payoff of this chapter: a real, load-bearing piece of infrastructure 
 
 ---
 
+## The Saga Pattern
+
+<Define term="Saga pattern" since="In-Process Pub/Sub: Building an Event Bus (Part 3, Chapter 6) — this chapter">
+A **saga** is a design pattern for managing distributed transactions across decoupled services or modules without using two-phase commit (2PC). A saga breaks a distributed operation into a sequence of **local transactions** `T1, T2, ..., Tn`. Each local transaction updates an internal database and emits an event or command. If a step fails, the saga executes a series of **compensating transactions** `Cn-1, ..., C1` in reverse order to semantically undo the committed changes.
+</Define>
+
+<Define term="Compensating transaction" since="In-Process Pub/Sub: Building an Event Bus (Part 3, Chapter 6) — this chapter">
+A **compensating transaction** is a forward-reversing operation that semantically undoes the effect of a previously committed local transaction. Unlike a database `ROLLBACK` (which physically discards uncommitted data), a compensating transaction runs *after* a local transaction has already committed and become visible to the world. It records a corrective entry (such as releasing a balance hold or refunding a charge) rather than erasing historical data.
+</Define>
+
+**On the job:** once you decouple Meridian's monolith into separate modules (Transfers, Accounts, Fraud, External Payouts, Notifications), you lose single-database ACID transactions. An operation like `POST /transfers/cross-border` touches three independent systems and an external clearing network. A database `ROLLBACK` cannot undo an HTTP request sent to SWIFT or Stripe. You need a Saga.
+
+### Why distributed transactions (2PC) fail at scale
+
+When modules or microservices own their own databases, traditional ACID transactions across multiple databases require **Two-Phase Commit (2PC)** with an XA coordinator.
+
+In 2PC:
+1. The coordinator asks all databases to **prepare** (locking rows across the network).
+2. If all vote yes, the coordinator sends **commit**; if any votes no, it sends **abort**.
+
+Why 2PC is avoided in modern financial systems:
+- **Lock amplification & blocking:** Rows remain locked across all services throughout network round-trips. If the coordinator or any network link stalls, all locked rows remain unavailable, starving other transactions.
+- **Incompatible with external systems:** External payment APIs (Stripe, Adyen, FedNow, SWIFT) do not participate in database 2PC protocols. You cannot ask a card network to "prepare" a charge and hold a lock for 5 seconds.
+- **Availability bottleneck:** By the CAP theorem, 2PC sacrifices availability for strict consistency. A single partition brings the entire workflow to a dead stop.
+
+The **Saga pattern** (first formulated by Hector Garcia-Molina and Kenneth Salem in 1987) replaces cross-service locking with **eventual consistency** and **compensating actions**.
+
+### Compensating transactions: semantic rollbacks
+
+In a Saga, every step $T_i$ commits immediately to its own local datastore. Its changes become visible to the rest of the system.
+
+If step $T_3$ (e.g. External Bank Payout) fails, step $T_1$ (Reserve Sender Funds) and step $T_2$ (Log Compliance Entry) have already committed. We cannot run `ROLLBACK`.
+
+Instead, the Saga executes **compensating transactions** $C_2$ and $C_1$ in reverse order:
+- Forward Action $T_1$: Hold $500 from sender account $\to$ Compensating Action $C_1$: Release $500 hold back to sender account.
+- Forward Action $T_2$: Record compliance screening $\to$ Compensating Action $C_2$: Mark compliance record as voided/cancelled.
+
+<ExecTimeline
+  title="Saga execution with compensating rollback"
+  lanes={[
+    { id: "orch", label: "Saga Orchestrator", role: "banker" },
+    { id: "acct", label: "Accounts Module", role: "scribe" },
+    { id: "fraud", label: "Fraud Module", role: "detective" },
+    { id: "payout", label: "External Bank API", role: "courier" }
+  ]}
+  steps={[
+    { lane: "orch", kind: "run", label: "Start Transfer Saga", note: "Orchestrator initializes saga instance for $500 cross-border transfer." },
+    { lane: "acct", kind: "send", label: "T1: Hold $500", note: "Accounts debits balance into a 'reserved_hold' state and commits locally." },
+    { lane: "fraud", kind: "send", label: "T2: Screen risk", note: "Fraud checks velocity rules and approves transaction (commits locally)." },
+    { lane: "payout", kind: "block", label: "T3: Call SWIFT -> DECLINED", note: "External bank API rejects the payout (invalid destination routing code). Permanent failure!" },
+    { lane: "orch", kind: "run", label: "Initiate Compensation", note: "Step 3 failed. Orchestrator transitions to COMPENSATING state." },
+    { lane: "fraud", kind: "recv", label: "C2: Void screening record", note: "Compensates T2: marks screening record as aborted." },
+    { lane: "acct", kind: "recv", label: "C1: Release $500 hold", note: "Compensates T1: releases held funds back to sender available balance." },
+    { lane: "orch", kind: "done", label: "Saga FAILED (Clean)", note: "All completed steps compensated. System state is semantically consistent. Support ticket logged." }
+  ]}
+  caption="Local transactions commit forward. When Step 3 fails, compensating actions run in reverse order (C2 then C1) to restore financial invariants."
+/>
+
+#### Three classes of transactions in a Saga
+
+Every production saga categorizes its steps into three distinct phases:
+
+1. **Compensable transactions (`T_1 ... T_k-1`):** Steps that can be semantically undone. Each compensable step `T_i` MUST have a corresponding compensating step `C_i`.
+2. **Pivot transaction (`T_pivot`):** The go/no-go point of the saga. If the pivot transaction succeeds, the saga *must* commit forward to the end. If the pivot fails, the saga compensates backward.
+3. **Retriable transactions (`T_pivot+1 ... T_n`):** Steps that follow the pivot. They *cannot* fail permanently; they must be idempotent and retried until they succeed (e.g. posting the final double-entry ledger line or sending customer confirmation emails).
+
+#### Rules for compensating transactions
+
+- **Idempotency is mandatory:** A compensating transaction may be called multiple times if the orchestrator crashes during recovery. `ReleaseHold(transferID)` must produce the exact same outcome whether executed once or ten times.
+- **Compensation cannot fail permanently:** If a database is unreachable during compensation, the orchestrator must retry with backoff. If an unrecoverable bug occurs, it must alert human operators immediately.
+- **Semantic, not physical:** Compensation appends audit entries (e.g. `HOLD_RELEASED`) rather than deleting previous rows, maintaining double-entry ledger integrity.
+
+### Choreography vs Orchestration
+
+There are two primary ways to coordinate a Saga:
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Choreographed Saga (Event-Driven)">
+    **No central coordinator.** Each service listens to events published on the bus, performs its local transaction, and publishes the next event. If a step fails, it publishes a failure event, and participating services listen and run their own compensations.
+    
+    *Best for:* Simple 2-3 step workflows where adding a coordinator is unnecessary overhead.
+  </ConceptCard>
+  <ConceptCard label="Orchestrated Saga (State Machine)">
+    **Central coordinator.** A dedicated Saga Orchestrator executes a state machine. It calls services directly (via RPC or command messages), waits for responses, records progress in a durable store, and explicitly triggers compensating actions if a step fails.
+    
+    *Best for:* Complex, multi-step financial flows (transfers, disbursements, KYC verification) requiring clear auditing and monitoring.
+  </ConceptCard>
+</ConceptGrid>
+
+#### Why high-stakes fintech uses Orchestration
+
+In Choreography, the workflow logic is scattered across multiple services. When a cross-border transfer stalls, answering "what step is this transfer currently waiting on?" requires querying distributed logs across five different services. This is commonly referred to as **distributed spaghetti**.
+
+With an **Orchestrated Saga**:
+- The state machine is explicit and lives in one place.
+- In-flight sagas can be inspected, paused, retried, or resumed after server restarts.
+- Adding a new step (e.g. currency conversion fee calculation) only requires editing the orchestrator, rather than re-wiring event listeners across three independent services.
+
+### Building a Saga Orchestrator in Go
+
+Let's build a production-grade, generic Saga Orchestrator with persistent state tracking, exponential retry timers, and reverse-order compensation.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type SagaState string
+
+const (
+	StatePending      SagaState = "PENDING"
+	StateExecuting    SagaState = "EXECUTING"
+	StateCompensating SagaState = "COMPENSATING"
+	StateCompleted    SagaState = "COMPLETED"
+	StateFailed       SagaState = "FAILED"
+)
+
+// Step defines a single action in the saga and its matching compensating transaction.
+type Step[T any] struct {
+	Name       string
+	Action     func(ctx context.Context, data *T) error
+	Compensate func(ctx context.Context, data *T) error // nil for retriable steps
+	MaxRetries int
+	RetryDelay time.Duration
+}
+
+// SagaRecord represents the persisted state of a saga instance.
+type SagaRecord[T any] struct {
+	ID          string
+	State       SagaState
+	CurrentStep int
+	Data        T
+	UpdatedAt   time.Time
+}
+
+// MemorySagaStore simulates a persistent database store (e.g. PostgreSQL table).
+type MemorySagaStore[T any] struct {
+	mu      sync.Mutex
+	records map[string]SagaRecord[T]
+}
+
+func NewMemorySagaStore[T any]() *MemorySagaStore[T] {
+	return &MemorySagaStore[T]{records: make(map[string]SagaRecord[T])}
+}
+
+func (s *MemorySagaStore[T]) Save(_ context.Context, rec SagaRecord[T]) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec.UpdatedAt = time.Now()
+	s.records[rec.ID] = rec
+	return nil
+}
+
+func (s *MemorySagaStore[T]) Load(_ context.Context, id string) (SagaRecord[T], bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.records[id]
+	return rec, ok
+}
+
+// SagaOrchestrator executes forward steps and coordinates reverse compensation on failure.
+type SagaOrchestrator[T any] struct {
+	store *MemorySagaStore[T]
+	steps []Step[T]
+}
+
+func NewSagaOrchestrator[T any](store *MemorySagaStore[T], steps []Step[T]) *SagaOrchestrator[T] {
+	return &SagaOrchestrator[T]{store: store, steps: steps}
+}
+
+func (o *SagaOrchestrator[T]) Execute(ctx context.Context, sagaID string, initialData T) error {
+	data := initialData
+	rec := SagaRecord[T]{
+		ID:          sagaID,
+		State:       StateExecuting,
+		CurrentStep: 0,
+		Data:        data,
+	}
+	_ = o.store.Save(ctx, rec)
+
+	var failedStep int = -1
+	var stepErr error
+
+	// Phase 1: Forward execution loop
+	for i, step := range o.steps {
+		rec.CurrentStep = i
+		_ = o.store.Save(ctx, rec)
+
+		fmt.Printf("[SAGA %s] Executing step %d: %s\n", sagaID, i+1, step.Name)
+
+		// Retry loop with backoff timer
+		var err error
+		attempts := step.MaxRetries + 1
+		for attempt := 1; attempt <= attempts; attempt++ {
+			err = step.Action(ctx, &data)
+			if err == nil {
+				break
+			}
+			fmt.Printf("  -> step '%s' attempt %d/%d failed: %v\n", step.Name, attempt, attempts, err)
+			if attempt < attempts && step.RetryDelay > 0 {
+				select {
+				case <-time.After(step.RetryDelay):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+
+		if err != nil {
+			failedStep = i
+			stepErr = err
+			break
+		}
+	}
+
+	// Phase 2: All forward steps succeeded
+	if failedStep == -1 {
+		rec.State = StateCompleted
+		rec.CurrentStep = len(o.steps)
+		rec.Data = data
+		_ = o.store.Save(ctx, rec)
+		fmt.Printf("[SAGA %s] All steps completed successfully!\n", sagaID)
+		return nil
+	}
+
+	// Phase 3: Failure encountered — execute reverse compensation
+	fmt.Printf("[SAGA %s] Step '%s' failed permanently: %v. Initiating compensation...\n",
+		sagaID, o.steps[failedStep].Name, stepErr)
+
+	rec.State = StateCompensating
+	_ = o.store.Save(ctx, rec)
+
+	// Iterate backwards from the last completed step down to 0
+	for i := failedStep - 1; i >= 0; i-- {
+		step := o.steps[i]
+		if step.Compensate == nil {
+			continue
+		}
+		fmt.Printf("[SAGA %s] Compensating step %d: %s\n", sagaID, i+1, step.Name)
+
+		// Compensation must succeed; retry until success
+		for {
+			compErr := step.Compensate(ctx, &data)
+			if compErr == nil {
+				break
+			}
+			fmt.Printf("  -> compensation for '%s' failed: %v, retrying...\n", step.Name, compErr)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	rec.State = StateFailed
+	rec.Data = data
+	_ = o.store.Save(ctx, rec)
+	fmt.Printf("[SAGA %s] Compensation finished. Final state: FAILED\n", sagaID)
+	return fmt.Errorf("saga failed at step %s: %w", o.steps[failedStep].Name, stepErr)
+}
+
+// ── Meridian Money Transfer Saga Data ──
+
+type TransferSagaData struct {
+	TransferID     string
+	SenderID       string
+	ReceiverID     string
+	AmountCents    int64
+	FundsReserved  bool
+	FraudPassed    bool
+	ExternalBankOK bool
+	LedgerPosted   bool
+}
+
+func main() {
+	ctx := context.Background()
+	store := NewMemorySagaStore[TransferSagaData]()
+
+	steps := []Step[TransferSagaData]{
+		{
+			Name: "Reserve Sender Funds",
+			Action: func(ctx context.Context, d *TransferSagaData) error {
+				d.FundsReserved = true
+				fmt.Printf("  [Accounts] Held %d cents from sender %s\n", d.AmountCents, d.SenderID)
+				return nil
+			},
+			Compensate: func(ctx context.Context, d *TransferSagaData) error {
+				d.FundsReserved = false
+				fmt.Printf("  [Accounts] RELEASED held %d cents back to sender %s\n", d.AmountCents, d.SenderID)
+				return nil
+			},
+			MaxRetries: 1,
+			RetryDelay: 10 * time.Millisecond,
+		},
+		{
+			Name: "Fraud & Compliance Screening",
+			Action: func(ctx context.Context, d *TransferSagaData) error {
+				d.FraudPassed = true
+				fmt.Println("  [Fraud] Risk score: 12/100 (APPROVED)")
+				return nil
+			},
+			Compensate: func(ctx context.Context, d *TransferSagaData) error {
+				d.FraudPassed = false
+				fmt.Println("  [Fraud] Voided screening audit record")
+				return nil
+			},
+			MaxRetries: 0,
+		},
+		{
+			Name: "External Bank Payout",
+			Action: func(ctx context.Context, d *TransferSagaData) error {
+				// Simulate external network rejection (e.g. invalid IBAN)
+				return errors.New("SWIFT network rejected: invalid destination routing number")
+			},
+			Compensate: func(ctx context.Context, d *TransferSagaData) error {
+				// External call failed; nothing to compensate at the bank
+				return nil
+			},
+			MaxRetries: 2,
+			RetryDelay: 20 * time.Millisecond,
+		},
+		{
+			Name: "Post Final Ledger Entries",
+			Action: func(ctx context.Context, d *TransferSagaData) error {
+				d.LedgerPosted = true
+				fmt.Println("  [Ledger] Double-entry posting completed")
+				return nil
+			},
+			Compensate: nil, // Retriable step after clearing pivot
+			MaxRetries: 3,
+		},
+	}
+
+	orchestrator := NewSagaOrchestrator(store, steps)
+
+	data := TransferSagaData{
+		TransferID:  "txn_crossborder_4091",
+		SenderID:    "acct_alice",
+		ReceiverID:  "acct_bob_london",
+		AmountCents: 50000,
+	}
+
+	err := orchestrator.Execute(ctx, data.TransferID, data)
+	if err != nil {
+		fmt.Printf("\nResult: %v\n", err)
+	}
+
+	rec, _ := store.Load(ctx, data.TransferID)
+	fmt.Printf("Final Store State: ID=%s State=%s FundsReserved=%v\n",
+		rec.ID, rec.State, rec.Data.FundsReserved)
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question="In a 4-step money transfer saga (1. Reserve Funds -> 2. Compliance Check -> 3. Charge External Bank -> 4. Send Email), Step 3 fails permanently due to a card network decline. What sequence of operations should the Saga Orchestrator execute?"
+  options={[
+    "Issue a PostgreSQL ROLLBACK command spanning all 4 services",
+    "Retry Step 3 indefinitely until the card network accepts it",
+    "Run Compensate Step 2 (void compliance check), then Compensate Step 1 (release reserved funds) in reverse order, then mark saga FAILED",
+    "Execute Step 4 anyway to notify the customer that Step 3 failed"
+  ]}
+  answer={2}
+  explain="Because Step 1 and Step 2 committed local transactions before Step 3 failed, the orchestrator triggers reverse compensation: it compensates Step 2, then compensates Step 1 (releasing the reserved funds). The customer's balance is restored, and the saga terminates in the FAILED state."
+/>
+
+---
+
 ## Exercises
 
 <Exercise n={1} title="A third event type, zero bus changes" level="easy">
@@ -1283,6 +1657,53 @@ The key insight: **the single inbound channel is the serialization point.** Go's
 
 </Exercise>
 
+<Exercise n={5} title="Add a pivot step and retriable action to a Saga" level="hard">
+
+In our `SagaOrchestrator`, compensable steps have matching `Compensate` functions. A **pivot transaction** is the decision boundary: once it succeeds, the saga *must* commit forward to completion and never compensate backward. Any step after the pivot is a **retriable transaction** that has `Compensate: nil` and retries indefinitely until success.
+
+Add support for a pivot step in `SagaOrchestrator`. If a retriable step (after the pivot) fails on its initial attempts, verify that the orchestrator retries until success rather than triggering compensation for pre-pivot steps.
+
+<Solution>
+
+```go
+// In the Saga Orchestrator:
+// A Step with Compensate == nil following a successful pivot step
+// is treated as a retriable transaction that retries until success.
+func (o *SagaOrchestrator[T]) ExecuteWithPivot(ctx context.Context, sagaID string, data T) error {
+	var pivotPassed bool
+
+	for i, step := range o.steps {
+		for {
+			err := step.Action(ctx, &data)
+			if err == nil {
+				if step.Compensate == nil {
+					pivotPassed = true
+				}
+				break
+			}
+
+			// If pivot has already passed, retriable steps MUST NOT compensate:
+			// they retry with backoff until eventual success.
+			if pivotPassed {
+				fmt.Printf("post-pivot step %s retrying: %v\n", step.Name, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			// Pre-pivot failure: trigger reverse compensation
+			return o.compensate(ctx, sagaID, i-1, data, err)
+		}
+	}
+	return nil
+}
+```
+
+Once the pivot transaction commits (e.g. money transferred across SWIFT), pre-pivot operations (like balance reservation) cannot be rolled back without creating a massive reconciliation imbalance. The post-pivot steps (such as posting ledger lines and sending receipts) must be idempotent and retried until successful.
+
+</Solution>
+
+</Exercise>
+
 ---
 
 ## The Lab
@@ -1396,13 +1817,12 @@ Two types. One bus. Five publishes, interleaved on purpose. The payment subscrib
 
 You can now build, and read, an in-process event bus from first principles:
 
-- An **in-process event bus** applies last chapter's pub/sub model inside a single binary: the "wire" is a channel, the "message" is a Go value. It **decouples modules** with zero serialization and zero network — but it's **not durable**, so it decouples modules, not services.
-- The crude version — a slice of channels of one concrete type — works but needs a new bus per event type. The production design uses **generics for the typed edges** (`Publisher[T]`/`Subscriber[T]`) and **reflection for the untyped core** (`map[reflect.Type][]chan any`). Neither alone suffices: generics can't hold a heterogeneous set of subscribers; `any` alone throws away routing.
-- **Boxing** a value into `any` is a two-word interface header (+ usually one heap allocation); `reflect.TypeOf` reads the type word for free; the **`v.(T)` assertion** on delivery is safe because routing guarantees the type.
-- A **single pump goroutine** with a **bounded queue** buys two things at once: a **total order** over all events ("one true timeline") and **one predictable backpressure point**. Backpressure is a forced choice among **block** (preserve events, slow the producer), **drop** (stay fast, lose events), or **grow unbounded** (preserve + fast, eventually OOM) — `select`/`default` is the one keyword that switches block→drop.
-- The bus is the substrate for the **actor model**: each module owns its state and interacts only by emitting and reacting to events — deleting cross-module pointers, locks, and blocking, and making each module independently testable.
-- Tailscale's `util/eventbus` is this exact design, hardened: a central router goroutine drains a bounded 16-event queue and fans out to per-client dispatch loops that unbox inline (no per-subscriber goroutine), a named `Client` carries an actor's pubs+subs, and `PublishedEvent.From` + `RoutedEvent` feed a live debugger. Backpressure specifics are in flux (subscriber queues are currently unbounded, issue #18020; doc.go calls the semantics "provisional"), but the shape is the model you built plus a name tag and an introspection UI.
-- As of Go 1.25, prefer `wg.Go(func(){ ... })` over the `wg.Add(1)`/`defer wg.Done()` pair when launching the subscriber goroutines.
+- An **in-process event bus** applies pub/sub within a single binary: channels act as the wire and Go structs as messages. It **decouples modules** with zero network serialization overhead — but it is **not durable**, so it decouples modules within a process, not independent services.
+- The production design uses **generics for typed edges** (`Publisher[T]`/`Subscriber[T]`) and **reflection for the untyped core** (`map[reflect.Type][]chan any`). Generics provide compile-time safety at call sites; reflection enables runtime routing across heterogeneous event types.
+- A **single pump goroutine** with a bounded queue guarantees a **total event order** ("one true timeline") and provides a predictable backpressure boundary.
+- The bus is the substrate for the **actor model**: each module encapsulates its own state and communicates purely via events, eliminating cross-module mutexes and tight coupling.
+- **The Saga Pattern** coordinates multi-step business transactions across decoupled event-driven modules without Two-Phase Commit (2PC). It executes a sequence of local transactions and runs **compensating transactions** (semantic rollbacks) in reverse order if a step fails.
+- **Orchestrated Sagas** use a centralized state machine with durable persistence and retry timers to manage forward execution and reverse compensation cleanly, avoiding "distributed spaghetti."
 
 </Recap>
 
@@ -1411,10 +1831,12 @@ You can now build, and read, an in-process event bus from first principles:
   items={[
     { label: "Quick check — why generics + reflection, not generics alone", kind: "quiz", points: 10, done: false },
     { label: "Quick check — slow subscriber and backpressure", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — saga compensating rollback", kind: "quiz", points: 10, done: false },
     { label: "Exercise 1 — third event type, zero bus changes", kind: "exercise", points: 10, done: false },
     { label: "Exercise 2 — drop instead of block", kind: "exercise", points: 15, done: false },
     { label: "Exercise 3 — unsubscribe without racing the pump", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 4 — total order under concurrent publishers", kind: "exercise", points: 25, done: false }
+    { label: "Exercise 4 — total order under concurrent publishers", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 5 — Saga pivot steps and retriable actions", kind: "exercise", points: 20, done: false }
   ]}
   flag={{ label: "Lab — Type-routed event bus", captured: false, points: 90 }}
 />
