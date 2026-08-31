@@ -27,11 +27,10 @@ const GO_WISDOM_TIPS = [
 export function GopherCompanion() {
   const [tipIndex, setTipIndex] = useState(0);
   const [speech, setSpeech] = useState<string>(GO_WISDOM_TIPS[0]);
-  const [speechVisible, setSpeechVisible] = useState(true);
+  const [speechVisible, setSpeechVisible] = useState(false);
   const [minimized, setMinimized] = useState(false);
   const [pose, setPose] = useState<GopherPose>("idle");
   const [role, setRole] = useState<GopherRole>("scientist");
-  const [reactionTimer, setReactionTimer] = useState<NodeJS.Timeout | null>(null);
 
   const bubbleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -105,15 +104,19 @@ export function GopherCompanion() {
     e.stopPropagation();
     playSuccess();
     triggerConfetti(window.innerWidth - 120, window.innerHeight - 100, 50);
-    showTemporarySpeech("Let's go write some clean, concurrent Go! 🚀", "happy", 4000);
+    showTemporarySpeech("Let's build clean, high-concurrency Go systems.", "happy", 4000);
   };
 
   if (minimized) {
     return (
       <div className="gb-companion-minimized" onClick={() => setMinimized(false)}>
         <button className="gb-companion-restore-btn" title="Open Gopher Companion">
-          <span className="gb-companion-mini-emoji">🐹</span>
-          <span className="gb-companion-mini-sparkle">✨</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+            <line x1="9" y1="9" x2="9.01" y2="9" />
+            <line x1="15" y1="9" x2="15.01" y2="9" />
+          </svg>
         </button>
       </div>
     );
@@ -137,10 +140,10 @@ export function GopherCompanion() {
           </div>
           <div className="gb-speech-actions">
             <button className="gb-speech-next-btn" onClick={handleGopherClick}>
-              Next tip ↻
+              Next tip
             </button>
             <button className="gb-speech-cheer-btn" onClick={handleCheer}>
-              Cheer 🎉
+              Cheer
             </button>
           </div>
           <div className="gb-speech-arrow" />
@@ -160,13 +163,13 @@ export function GopherCompanion() {
         <button
           className="gb-gopher-char-btn"
           onClick={handleGopherClick}
-          title="Click Gopher for Go tips & wisdom!"
+          title="Click Gopher for Go tips & wisdom"
           aria-label="Click for Go tip"
         >
           <Gopher
             pose={pose}
             role={role}
-            size={56}
+            size={52}
             title="The Go Bible Companion"
           />
         </button>

@@ -32,13 +32,17 @@ export function ContinueReading() {
 
   return (
     <button className="continue" onClick={go}>
-      <span className="continue-ribbon" aria-hidden />
+      <span className="continue-ribbon" aria-hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="var(--gold)" stroke="none">
+          <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+        </svg>
+      </span>
       <span className="continue-body">
-        <span className="continue-label">Your ribbon rests in</span>
+        <span className="continue-label">Resume from bookmark</span>
         <span className="continue-title">{ribbon.title}</span>
       </span>
       <span className="continue-meta">
-        {pct > 0 ? `${pct}% in` : "start"} <span className="continue-arrow">→</span>
+        {pct > 0 ? `${pct}% read` : "start"} <span className="continue-arrow">→</span>
       </span>
     </button>
   );

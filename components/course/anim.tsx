@@ -120,14 +120,35 @@ function AnimShell({
               {speedLabel(speed ?? 1)}
             </button>
           )}
-          <button className="anim-btn" onClick={onReset} aria-label="Reset">
-            ⤺
+          <button className="anim-btn" onClick={onReset} aria-label="Reset" title="Reset">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+              <path d="M3 3v5h5" />
+            </svg>
           </button>
-          <button className="anim-btn" onClick={onStep} aria-label="Step forward">
-            ⏭
+          <button className="anim-btn" onClick={onStep} aria-label="Step forward" title="Step forward">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="5 4 15 12 5 20 5 4" fill="currentColor" />
+              <line x1="19" y1="5" x2="19" y2="19" />
+            </svg>
           </button>
           <button className="anim-btn anim-play" onClick={onToggle}>
-            {playing ? "❚❚ Pause" : "▶ Play"}
+            {playing ? (
+              <>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="4" width="4" height="16" rx="1" />
+                  <rect x="14" y="4" width="4" height="16" rx="1" />
+                </svg>
+                <span>Pause</span>
+              </>
+            ) : (
+              <>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>Play</span>
+              </>
+            )}
           </button>
         </div>
       </div>
@@ -1062,12 +1083,35 @@ export function GraphAnim({
           )}
           {nodes.map((n) => {
             const s = f.nodes[n.id] ?? "idle";
+            const label = n.label ?? n.id;
+            const isShort = label.length <= 3;
             return (
               <g key={n.id} className={`grf-node grf-${s}`}>
-                <circle cx={n.x} cy={n.y} r="17" />
-                <text x={n.x} y={n.y + 4} textAnchor="middle">
-                  {n.label ?? n.id}
-                </text>
+                <circle cx={n.x} cy={n.y} r="15" />
+                {isShort ? (
+                  <text x={n.x} y={n.y + 4} textAnchor="middle" className="grf-node-text">
+                    {label}
+                  </text>
+                ) : (
+                  <>
+                    <text x={n.x} y={n.y + 4} textAnchor="middle" className="grf-node-id">
+                      {n.id}
+                    </text>
+                    <g className="grf-tag">
+                      <rect
+                        x={n.x - label.length * 3.8 - 6}
+                        y={n.y + 18}
+                        width={label.length * 7.6 + 12}
+                        height="18"
+                        rx="4"
+                        className="grf-tag-bg"
+                      />
+                      <text x={n.x} y={n.y + 31} textAnchor="middle" className="grf-tag-text">
+                        {label}
+                      </text>
+                    </g>
+                  </>
+                )}
               </g>
             );
           })}
@@ -1077,7 +1121,7 @@ export function GraphAnim({
             className="grf-walker"
             style={{ left: `${(at.x / 460) * 100}%`, top: `${(at.y / height) * 100}%` } as CSSProperties}
           >
-            <Gopher pose="run" state="active" size={34} role="scholar" title="walker" />
+            <Gopher pose="run" state="active" size={32} role="scholar" title="walker" />
           </span>
         )}
       </div>
@@ -2793,4 +2837,508 @@ export function LocksmithAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   LinkedListAnim — Visualizes linked list nodes,
+   memory pointers, and traversal algorithms
+   (Reversal, Fast & Slow Tortoise/Hare, Merge).
+   ════════════════════════════════════════════ */
+export type LLNode = {
+  id: string;
+  val: string | number;
+  nextId?: string | null;
+  state?: "idle" | "active" | "target" | "done" | "deleted";
+};
+
+export type LLFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  nodes: LLNode[];
+  /** Pointer labels attached to node IDs, e.g. { head: "n1", prev: "n1", cur: "n2", fast: "n3" } */
+  pointers?: Record<string, string>;
+  /** Highlighted connection, e.g. ["n1-n2"] */
+  links?: { from: string; to: string | "nil"; dir?: "forward" | "backward" | "broken" }[];
+};
+
+export function LinkedListAnim({
+  title = "Linked List Traversal",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: LLFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="linked list"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="dsa-ll-stage">
+        <div className="dsa-ll-track">
+          {f.nodes.map((node, i) => {
+            const pointersHere = Object.entries(f.pointers || {})
+              .filter(([_, nodeId]) => nodeId === node.id)
+              .map(([ptr]) => ptr);
+
+            const isLast = i === f.nodes.length - 1;
+            const link = f.links?.find((l) => l.from === node.id);
+
+            return (
+              <div key={node.id} className={`dsa-ll-node-wrap st-${node.state || "idle"}`}>
+                {/* Pointer Flags above node */}
+                <div className="dsa-ll-pointers-bar">
+                  {pointersHere.map((ptr) => (
+                    <span key={ptr} className={`dsa-ll-ptr-tag ptr-${ptr}`}>
+                      {ptr}
+                      <span className="dsa-ll-ptr-arrow">↓</span>
+                    </span>
+                  ))}
+                </div>
+
+                {/* Node Box */}
+                <div className="dsa-ll-node">
+                  <div className="dsa-ll-val">{node.val}</div>
+                  <div className="dsa-ll-next-dot" title={`Next pointer: ${node.nextId ?? "nil"}`}>
+                    •
+                  </div>
+                </div>
+
+                {/* Arrow to Next Node or NIL */}
+                <div className={`dsa-ll-edge ${link?.dir || "forward"}`}>
+                  {link?.dir === "backward" ? (
+                    <span className="dsa-ll-arrow backward">←</span>
+                  ) : link?.dir === "broken" ? (
+                    <span className="dsa-ll-arrow broken">✕</span>
+                  ) : (
+                    <span className="dsa-ll-arrow forward">→</span>
+                  )}
+                  {isLast && !link && <span className="dsa-ll-nil-tag">nil</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   TreeAnim — Visualizes Binary Trees & BSTs,
+   in-order traversal, search, and balancing.
+   ════════════════════════════════════════════ */
+export type TreeNode = {
+  id: string;
+  val: string | number;
+  left?: string;
+  right?: string;
+  x: number;
+  y: number;
+};
+
+export type TreeFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  nodeStates: Record<string, "idle" | "visited" | "current" | "found" | "insert">;
+  /** Active path edges, e.g. ["root-left", "left-right"] */
+  highlightEdges?: string[];
+  gopherAt?: string;
+};
+
+export function TreeAnim({
+  title = "Binary Tree Traversal",
+  nodes,
+  height = 240,
+  frames,
+  caption,
+}: {
+  title?: string;
+  nodes: TreeNode[];
+  height?: number;
+  frames: TreeFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+  const posMap = Object.fromEntries(nodes.map((n) => [n.id, n]));
+  const at = f.gopherAt ? posMap[f.gopherAt] : null;
+  const litEdges = new Set(f.highlightEdges || []);
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="binary tree"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="dsa-tree-stage">
+        <svg className="dsa-tree-svg" viewBox={`0 0 460 ${height}`}>
+          {/* Tree branch lines */}
+          {nodes.map((n) => {
+            const leftNode = n.left ? posMap[n.left] : null;
+            const rightNode = n.right ? posMap[n.right] : null;
+            return (
+              <Fragment key={n.id}>
+                {leftNode && (
+                  <line
+                    x1={n.x}
+                    y1={n.y}
+                    x2={leftNode.x}
+                    y2={leftNode.y}
+                    className={`dsa-tree-edge ${
+                      litEdges.has(`${n.id}-${leftNode.id}`) ? "lit" : ""
+                    }`}
+                  />
+                )}
+                {rightNode && (
+                  <line
+                    x1={n.x}
+                    y1={n.y}
+                    x2={rightNode.x}
+                    y2={rightNode.y}
+                    className={`dsa-tree-edge ${
+                      litEdges.has(`${n.id}-${rightNode.id}`) ? "lit" : ""
+                    }`}
+                  />
+                )}
+              </Fragment>
+            );
+          })}
+
+          {/* Tree Nodes */}
+          {nodes.map((n) => {
+            const s = f.nodeStates[n.id] || "idle";
+            return (
+              <g key={n.id} className={`dsa-tree-node st-${s}`}>
+                <circle cx={n.x} cy={n.y} r="18" className="dsa-tree-circle" />
+                <text x={n.x} y={n.y + 5} textAnchor="middle" className="dsa-tree-text">
+                  {n.val}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+
+        {/* Mascot Walker */}
+        {at && (
+          <span
+            className="dsa-tree-walker"
+            style={{
+              left: `${(at.x / 460) * 100}%`,
+              top: `${(at.y / height) * 100}%`,
+            } as CSSProperties}
+          >
+            <Gopher pose="run" state="active" size={32} role="scientist" title="Tree Explorer" />
+          </span>
+        )}
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   StackQueueAnim — Visualizes LIFO Stack and
+   FIFO Queue push/pop operations.
+   ════════════════════════════════════════════ */
+export type StackQueueFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  items: (string | number)[];
+  action: "push" | "pop" | "enqueue" | "dequeue" | "peek" | "idle";
+  actionItem?: string | number;
+};
+
+export function StackQueueAnim({
+  title = "Stack & Queue Mechanics",
+  type = "stack",
+  frames,
+  caption,
+}: {
+  title?: string;
+  type?: "stack" | "queue";
+  frames: StackQueueFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1600);
+  const f = frames[st.cur] ?? frames[0];
+
+  return (
+    <AnimShell
+      title={title}
+      kicker={type === "stack" ? "LIFO STACK" : "FIFO QUEUE"}
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className={`dsa-sq-stage type-${type}`}>
+        <div className="dsa-sq-action-bar">
+          <span className={`dsa-sq-op-tag op-${f.action}`}>
+            {f.action.toUpperCase()} {f.actionItem !== undefined ? `(${f.actionItem})` : ""}
+          </span>
+        </div>
+
+        <div className="dsa-sq-container">
+          {type === "stack" ? (
+            <div className="dsa-stack-chamber">
+              <div className="dsa-stack-top-label">TOP (Push / Pop) ↓</div>
+              <div className="dsa-stack-items">
+                {f.items.length === 0 ? (
+                  <div className="dsa-sq-empty">Empty Stack</div>
+                ) : (
+                  f.items.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className={`dsa-sq-item ${
+                        idx === 0 && (f.action === "push" || f.action === "peek") ? "hot" : ""
+                      }`}
+                    >
+                      <span className="dsa-sq-idx">[{idx}]</span>
+                      <span className="dsa-sq-val">{item}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="dsa-queue-pipe">
+              <div className="dsa-queue-head-label">← DEQUEUE (Head)</div>
+              <div className="dsa-queue-items">
+                {f.items.length === 0 ? (
+                  <div className="dsa-sq-empty">Empty Queue</div>
+                ) : (
+                  f.items.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className={`dsa-sq-item ${
+                        idx === 0 && f.action === "dequeue" ? "hot" : ""
+                      }`}
+                    >
+                      <span className="dsa-sq-val">{item}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="dsa-queue-tail-label">ENQUEUE (Tail) ←</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   SlidingWindowAnim — Visualizes Two Pointers,
+   window expansion, and condition contraction.
+   ════════════════════════════════════════════ */
+export type SlidingWindowFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  array: (string | number)[];
+  left: number;
+  right: number;
+  status: "expanding" | "valid" | "invalid_shrinking" | "found_max";
+  metricLabel?: string;
+  metricValue?: string | number;
+};
+
+export function SlidingWindowAnim({
+  title = "Sliding Window Algorithm",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: SlidingWindowFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="sliding window"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="dsa-sw-stage">
+        {/* Metric Bar */}
+        {f.metricLabel && (
+          <div className="dsa-sw-metric-bar">
+            <span className="dsa-sw-m-label">{f.metricLabel}:</span>
+            <span className="dsa-sw-m-val">{f.metricValue}</span>
+            <span className={`dsa-sw-status-tag st-${f.status}`}>
+              {f.status.replace("_", " ").toUpperCase()}
+            </span>
+          </div>
+        )}
+
+        {/* Array with pointers */}
+        <div className="dsa-sw-array-row">
+          {f.array.map((val, idx) => {
+            const inWindow = idx >= f.left && idx <= f.right;
+            const isLeft = idx === f.left;
+            const isRight = idx === f.right;
+
+            return (
+              <div key={idx} className={`dsa-sw-cell-wrap ${inWindow ? "in-window" : ""}`}>
+                {/* Pointer tags */}
+                <div className="dsa-sw-ptr-slot">
+                  {isLeft && <span className="dsa-sw-ptr-tag ptr-l">L</span>}
+                  {isRight && <span className="dsa-sw-ptr-tag ptr-r">R</span>}
+                </div>
+
+                {/* Array cell */}
+                <div className={`dsa-sw-cell ${inWindow ? "window-active" : ""}`}>
+                  <span className="dsa-sw-cell-val">{val}</span>
+                  <span className="dsa-sw-cell-idx">{idx}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   DPTableAnim — Visualizes Dynamic Programming
+   memoization grids and recurrence formulas.
+   ════════════════════════════════════════════ */
+export type DPTableFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  grid: (string | number)[][];
+  rowLabels: string[];
+  colLabels: string[];
+  activeCell?: { r: number; c: number };
+  dependencyCells?: { r: number; c: number }[];
+  formula?: string;
+};
+
+export function DPTableAnim({
+  title = "DP Memoization Table",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: DPTableFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="dynamic programming"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="dsa-dp-stage">
+        {f.formula && (
+          <div className="dsa-dp-formula-bar">
+            <span className="dsa-dp-f-label">Recurrence:</span>
+            <code>{f.formula}</code>
+          </div>
+        )}
+
+        <div className="dsa-dp-grid-wrap">
+          <table className="dsa-dp-table">
+            <thead>
+              <tr>
+                <th className="dsa-dp-corner" />
+                {f.colLabels.map((col, idx) => (
+                  <th key={idx} className="dsa-dp-col-hdr">
+                    {col}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {f.grid.map((row, rIdx) => (
+                <tr key={rIdx}>
+                  <th className="dsa-dp-row-hdr">{f.rowLabels[rIdx]}</th>
+                  {row.map((cell, cIdx) => {
+                    const isActive = f.activeCell?.r === rIdx && f.activeCell?.c === cIdx;
+                    const isDep = f.dependencyCells?.some(
+                      (d) => d.r === rIdx && d.c === cIdx
+                    );
+                    return (
+                      <td
+                        key={cIdx}
+                        className={`dsa-dp-cell ${isActive ? "cell-active" : ""} ${
+                          isDep ? "cell-dep" : ""
+                        }`}
+                      >
+                        {cell}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
 

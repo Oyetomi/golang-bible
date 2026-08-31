@@ -82,12 +82,6 @@ export function ChapterTabs({ tabs }: { tabs: string[] }) {
           </button>
         ))}
       </div>
-      <div className="tabs-track">
-        <div
-          className="tabs-fill"
-          style={{ width: `${((active + 1) / tabs.length) * 100}%` }}
-        />
-      </div>
     </nav>
   );
 }

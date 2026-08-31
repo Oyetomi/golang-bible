@@ -106,35 +106,29 @@ export function GamificationHeader() {
               <span className="gb-lv-val">{levelInfo.level}</span>
             </div>
             <div className="gb-title-col">
-              <span className="gb-player-title">{levelInfo.title}</span>
+              <div className="gb-title-row">
+                <span className="gb-player-title">{levelInfo.title}</span>
+                <span className="gb-xp-pct">
+                  {levelInfo.isMaxLevel ? "MAX" : `${levelInfo.progressPct}%`}
+                </span>
+              </div>
               <div className="gb-xp-meta">
+                <div className="gb-xp-track">
+                  <div
+                    className="gb-xp-fill"
+                    style={{ width: `${levelInfo.progressPct}%` }}
+                  />
+                </div>
                 <span className="gb-xp-numbers">
                   {levelInfo.isMaxLevel ? (
-                    "MAX LEVEL"
+                    "MAX"
                   ) : (
                     <>
-                      <strong>{levelInfo.currentXP}</strong> /{" "}
-                      {levelInfo.xpNeededForNext} XP
+                      <strong>{levelInfo.currentXP}</strong>/{levelInfo.xpNeededForNext}
                     </>
                   )}
                 </span>
-                <span className="gb-xp-pct">
-                  {levelInfo.isMaxLevel ? "100%" : `${levelInfo.progressPct}%`}
-                </span>
               </div>
-            </div>
-          </div>
-
-          {/* XP Progress Bar Track */}
-          <div
-            className="gb-xp-bar-container"
-            title={`${levelInfo.currentXP} / ${levelInfo.xpNeededForNext} XP towards Level ${levelInfo.level + 1}`}
-          >
-            <div className="gb-xp-track">
-              <div
-                className="gb-xp-fill"
-                style={{ width: `${levelInfo.progressPct}%` }}
-              />
             </div>
           </div>
 
