@@ -938,6 +938,65 @@ func main() {
 Of everything in this chapter, the authz-matrix fuzzer is the tool to put in your own CI today. It's the offense methodology from the field guide pointed inward: enumerate your endpoints, run each as owner / stranger / unauthenticated, assert the expected allow/deny. The attacker has to find one missing check; this asserts every one of yours on every push. Generate the matrix from your OpenAPI/protobuf spec and a new endpoint without authorization tests fails the build.
 </Callout>
 
+<UnderTheHood title="Raw Sockets, PCAP & Go Runtime Syscalls">
+
+High-performance security tools like port scanners (`naabu`), network analyzers, and packet crafting engines drop below `net/http` and `net.Dial` to interact directly with raw sockets, BPF filters, and kernel syscalls.
+
+### 1. Raw Sockets & Synthetic SYN Scans
+Standard `net.Dial("tcp", target)` performs a full 3-way TCP handshake (`SYN` $\to$ `SYN-ACK` $\to$ `ACK`), leaving an open connection that must be torn down (`RST` or `FIN`). Port scanners achieve massive throughput by sending raw TCP `SYN` packets and inspecting incoming `SYN-ACK` or `RST` responses without completing the handshake.
+
+In Go, constructing raw IP/TCP packets utilizes `golang.org/x/net/ipv4` or direct syscalls:
+```go
+// Creating a raw AF_INET socket (requires CAP_NET_RAW or root)
+fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+if err != nil {
+    log.Fatalf("raw socket creation failed: %v", err)
+}
+defer syscall.Close(fd)
+
+// Tell the kernel that the IP header is provided in the buffer
+err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+```
+The scanner manually serializes the IPv4 header (20 bytes) and TCP header (20 bytes), computes the 16-bit one's complement TCP checksum (including the pseudo-header), and transmits the frame via `syscall.Sendto`.
+
+### 2. Kernel-Space Filtering with BPF (Berkeley Packet Filter)
+When listening for response packets across thousands of concurrent scans, reading all raw interface traffic into userspace would saturate CPU caches and trigger high GC pressure.
+
+Instead, Go tools compile filter instructions into BPF bytecode (using `golang.org/x/net/bpf`) and attach them directly to the socket via `SO_ATTACH_FILTER`:
+```go
+// BPF instructions: accept only TCP packets with SYN-ACK or RST flags matching scan port
+filter := []bpf.Instruction{
+    // Load IP Protocol byte (offset 9)
+    bpf.LoadAbsolute{Off: 9, Size: 1},
+    bpf.JumpIf{Cond: bpf.JumpEqual, Val: 6, SkipTrue: 0, SkipFalse: 3}, // IPPROTO_TCP = 6
+    // Load TCP flags (offset 33 in standard IPv4 frame)
+    bpf.LoadAbsolute{Off: 33, Size: 1},
+    // Check for SYN+ACK (0x12) or RST (0x04)
+    bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x12, SkipTrue: 1, SkipFalse: 0},
+    bpf.RetConstant{Val: 0},     // Drop packet
+    bpf.RetConstant{Val: 65535}, // Keep packet
+}
+rawInstructions, _ := bpf.Assemble(filter)
+```
+The Linux kernel executes this bytecode in JIT-compiled kernel space, discarding irrelevant packets with zero user-kernel context switches.
+
+### 3. The Go Netpoller vs. Blocking Syscalls
+Standard Go network handles (`net.Conn`, `net.PacketConn`) set the underlying file descriptor to non-blocking mode (`O_NONBLOCK`). When a read or write returns `EAGAIN` or `EWOULDBLOCK`, the Go runtime registers the descriptor with the OS netpoller (`epoll` on Linux, `kqueue` on macOS/BSD) and puts the calling goroutine to sleep without blocking the OS thread ($M$).
+
+When using raw syscalls (`syscall.RawConn` or raw file descriptors via `os.NewFile`):
+- Direct `syscall.Read` or `syscall.Recvfrom` calls will **block the OS worker thread** ($M$), causing the runtime scheduler to spawn new $M$ threads (`sysmon` thread creation).
+- Idiomatic Go security tools wrap raw descriptors in `os.NewFile(uintptr(fd), "raw-pcap")` and use `net.FilePacketConn` or `syscall.RawConn.Read(func(fd uintptr) bool { ... })`. This integrates raw socket descriptors into Go's non-blocking netpoller, allowing tens of thousands of packet handlers to run concurrently on minimal OS threads.
+
+### 4. Linux Capabilities & Memory-Mapped Packet Rings (PACKET_MMAP)
+Running recon binaries as `root` is a security anti-pattern. Modern Go tools leverage Linux capabilities:
+```bash
+# Grant packet capture and raw socket permissions without root execution
+sudo setcap cap_net_raw,cap_net_admin=eip ./recon-prober
+```
+For ultra-high-speed packet ingestion (10GbE+ packet capture), Go tools integrate with `AF_PACKET` sockets configured with `PACKET_RX_RING` (`PACKET_MMAP`). The kernel writes incoming frames directly into a ring buffer shared with userspace memory (`mmap`), eliminating `recvmsg` syscall overhead and buffer copying entirely.
+
+</UnderTheHood>
+
 ---
 
 ## Exercises

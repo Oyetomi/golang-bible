@@ -185,6 +185,34 @@ func main() {
   explain="Measured above: Go follows RFC 7230 §3.3.3 — when both are present, Transfer-Encoding wins and Content-Length is dropped (r.TransferEncoding is [chunked], the chunked body is parsed). It's deterministic, not a guess. (Duplicate Content-Length is a different case — that Go rejects with 400; an unknown Transfer-Encoding it rejects with 501.) A consistent choice is what makes Go a poor smuggling back-end."
 />
 
+<UnderTheHood title="HTTP Request Smuggling & Parser Inconsistencies">
+
+HTTP request smuggling is fundamentally an architectural desynchronization vulnerability created by conflicting protocol interpretations across layered HTTP parsers (e.g. reverse proxy load balancers and backend application runtimes).
+
+### 1. The Parsing Pipeline in Go's `net/http` (Go 1.22+)
+
+Inside `net/http/request.go`, Go invokes `readRequest(b *bufio.Reader)` to parse incoming wire bytes into structured `http.Request` instances:
+
+- **Strict Header Field Line Grammar:** Go uses `net/textproto.Reader.ReadLineBytes`. It strictly enforces `\r\n` line delimiters and rejects obsolete line folding (multiline headers starting with whitespace/tab), returning `400 Bad Request`.
+- **Precedence Rule Enforcement (RFC 7230 §3.3.3 / RFC 9112 §6.3):** If an incoming request contains both `Transfer-Encoding: chunked` and `Content-Length: <N>`, Go removes the `Content-Length` header from `req.Header` and sets `req.TransferEncoding = []string{"chunked"}`. The body is wrapped in an internal `chunkedReader`.
+- **Duplicate & Malformed Header Handling:**
+  - Multiple `Content-Length` headers with mismatched values immediately trigger a `bad Content-Length header` error and a `400 Bad Request` response.
+  - Any unknown `Transfer-Encoding` token (e.g. `Transfer-Encoding: chunked, identity` or obfuscated `Transfer-Encoding: xchunked`) causes Go to return `501 Not Implemented`, refusing to guess or fall back to `Content-Length`.
+
+### 2. Front-End vs. Back-End Desync Vectors
+
+While Go's origin server behaves deterministically, request smuggling occurs when upstream proxies (Nginx, HAProxy, AWS ALB, Cloudflare) parse headers differently:
+
+- **CL.TE Desync:** The front-end proxy reads `Content-Length`, forwarding $X$ bytes across a persistent backend connection. Go's backend reads `Transfer-Encoding: chunked`, reading the terminal chunk `0\r\n\r\n` and interpreting the trailing bytes as the prefix of the next HTTP request in the TCP stream.
+- **TE.CL Desync:** The front-end proxy processes `Transfer-Encoding: chunked` and forwards the entire stream. If an obfuscation (e.g. `Transfer-Encoding: [\t]chunked`) causes the front-end to recognize chunked encoding but causes an intermediary to ignore it and fall back to `Content-Length`, remaining chunk payloads leak into subsequent user requests.
+- **H2.CL / H2.TE Request Downgrading:** Modern front-ends receive HTTP/2 from clients (where stream length is framed explicitly) but downgrade connections to HTTP/1.1 keep-alive pools when talking to backend Go origins. If the front-end translates HTTP/2 pseudo-headers into conflicting HTTP/1.1 `content-length` and `transfer-encoding` headers, request smuggling can occur across downgraded pools.
+
+### 3. Connection Reuse & Boundary Isolation
+
+Smuggling relies on persistent TCP connection reuse across multiple distinct users. Enforcing `http.Transport.DisableKeepAlives = true` on sensitive internal proxies, or running end-to-end HTTP/2 or HTTP/3 (where binary frame stream multiplexing eliminates text-based framing ambiguity), completely neutralizes the attack surface.
+
+</UnderTheHood>
+
 ---
 
 ## Host Header Attacks
@@ -516,6 +544,202 @@ The three attacks share one cure and a few specifics. Internalize the pattern an
 
 ---
 
+## Exercises
+
+<Exercise n={1} title="Detect Framing Conflicts" level="easy">
+
+Write `DetectFramingConflict(headers map[string][]string) string` that inspects HTTP headers and returns `"CL.TE"` if both `Content-Length` and `Transfer-Encoding` are present, `"DUPLICATE_CL"` if multiple conflicting `Content-Length` values are passed, or `"VALID"` if no framing conflict exists.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func DetectFramingConflict(headers map[string][]string) string {
+	clVals := headers["Content-Length"]
+	teVals := headers["Transfer-Encoding"]
+
+	if len(clVals) > 1 {
+		first := strings.TrimSpace(clVals[0])
+		for _, v := range clVals[1:] {
+			if strings.TrimSpace(v) != first {
+				return "DUPLICATE_CL"
+			}
+		}
+	}
+
+	if len(clVals) > 0 && len(teVals) > 0 {
+		return "CL.TE"
+	}
+
+	return "VALID"
+}
+
+func main() {
+	h1 := map[string][]string{"Content-Length": {"10"}, "Transfer-Encoding": {"chunked"}}
+	h2 := map[string][]string{"Content-Length": {"10", "20"}}
+	h3 := map[string][]string{"Content-Length": {"15"}}
+
+	fmt.Println("H1 conflict:", DetectFramingConflict(h1)) // CL.TE
+	fmt.Println("H2 conflict:", DetectFramingConflict(h2)) // DUPLICATE_CL
+	fmt.Println("H3 conflict:", DetectFramingConflict(h3)) // VALID
+}
+```
+
+Conflicting framing indicators (`Content-Length` alongside `Transfer-Encoding` or divergent duplicate `Content-Length` headers) must be rejected with 400 Bad Request at the perimeter.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Host Header Normalization & Allowlist Check" level="medium">
+
+Write `ValidateHost(rawHost string, allowedHosts map[string]bool) (string, bool)` that strips any trailing `:port` from `rawHost`, converts the hostname to lowercase, and returns the normalized host and `true` if it exists in `allowedHosts`, or `("", false)` if not.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"strings"
+)
+
+func ValidateHost(rawHost string, allowedHosts map[string]bool) (string, bool) {
+	host := strings.TrimSpace(rawHost)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(host)
+
+	if allowedHosts[host] {
+		return host, true
+	}
+	return "", false
+}
+
+func main() {
+	allowed := map[string]bool{"app.example.com": true, "api.example.com": true}
+
+	h1, ok1 := ValidateHost("app.example.com:8080", allowed)
+	h2, ok2 := ValidateHost("EVIL.attacker.com", allowed)
+	h3, ok3 := ValidateHost("api.example.com", allowed)
+
+	fmt.Printf("h1: %s (ok=%v)\n", h1, ok1) // app.example.com (ok=true)
+	fmt.Printf("h2: %s (ok=%v)\n", h2, ok2) //  (ok=false)
+	fmt.Printf("h3: %s (ok=%v)\n", h3, ok3) // api.example.com (ok=true)
+}
+```
+
+Normalizing port numbers and case before checking against a strict allowlist prevents Host header injection, password reset poisoning, and routing confusion.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Compute Cache Key with Vary Headers" level="medium">
+
+Write `ComputeCacheKey(method, uri string, headers map[string]string, varyHeaders []string) string` that builds a deterministic cache key by concatenating the method, URI, and sorted `Vary` header values.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+func ComputeCacheKey(method, uri string, headers map[string]string, varyHeaders []string) string {
+	sort.Strings(varyHeaders)
+	var b strings.Builder
+	b.WriteString(method + "|" + uri)
+
+	for _, v := range varyHeaders {
+		val := headers[strings.ToLower(v)]
+		b.WriteString("|" + strings.ToLower(v) + ":" + val)
+	}
+
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func main() {
+	reqHeaders1 := map[string]string{"accept-encoding": "gzip", "origin": "https://a.com"}
+	reqHeaders2 := map[string]string{"accept-encoding": "br", "origin": "https://a.com"}
+
+	k1 := ComputeCacheKey("GET", "/api/data", reqHeaders1, []string{"Accept-Encoding", "Origin"})
+	k2 := ComputeCacheKey("GET", "/api/data", reqHeaders2, []string{"Accept-Encoding", "Origin"})
+
+	fmt.Println("Key 1 (gzip):", k1)
+	fmt.Println("Key 2 (br):  ", k2)
+	fmt.Println("Different keys:", k1 != k2)
+}
+```
+
+When a response varies based on client headers (such as `Accept-Encoding` or `Origin`), all varying header dimensions must be included in the cache key hash to prevent cache poisoning across clients.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Evaluate Response Cacheability" level="hard">
+
+Write `IsCacheable(method string, status int, cacheControl string) bool` that returns `true` only for safe methods (`GET`, `HEAD`), successful or redirect responses (`200`, `301`), and when `Cache-Control` does not contain `no-store`, `private`, or `no-cache`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func IsCacheable(method string, status int, cacheControl string) bool {
+	if method != "GET" && method != "HEAD" {
+		return false
+	}
+	if status != 200 && status != 301 {
+		return false
+	}
+
+	cc := strings.ToLower(cacheControl)
+	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") || strings.Contains(cc, "no-cache") {
+		return false
+	}
+
+	return true
+}
+
+func main() {
+	fmt.Println("Public 200 GET:", IsCacheable("GET", 200, "public, max-age=3600"))     // true
+	fmt.Println("Private user GET:", IsCacheable("GET", 200, "private, no-cache"))     // false
+	fmt.Println("POST 200:", IsCacheable("POST", 200, "public"))                       // false
+	fmt.Println("No-store GET:", IsCacheable("GET", 200, "no-store"))                  // false
+}
+```
+
+Marking authenticated or dynamic user responses with `Cache-Control: no-store, private` prevents shared CDNs and proxy caches from caching confidential responses, defeating Web Cache Deception.
+
+</Solution>
+
+</Exercise>
+
+---
+
 ## The Lab
 
 I've written a password-reset handler that builds the reset link from `r.Host` — the poisoning bug. A test harness sends a request with `Host: evil.attacker.com` (the attack) and a request with the legitimate host, and checks that the evil host is **rejected** while the legitimate one still works. Fix the handler to validate `r.Host` against the `allowedHosts` allowlist.
@@ -603,5 +827,18 @@ The reset link is a security boundary — built from `r.Host`, it lets an attack
 <Callout kind="note" title="Sources">
 **The attacks:** the PortSwigger Web Security Academy is the canonical reference for HTTP request smuggling, Host header attacks, web cache poisoning, and **web cache deception** (with free interactive labs for each — a great place to drill these hands-on after this chapter). **HTTP framing:** RFC 7230 §3.3.3 (message body length; the `Transfer-Encoding`-over-`Content-Length` precedence and the rejection rules) and RFC 9110/9112. **Cookies / SameSite:** RFC 6265bis (the `Strict`/`Lax`/`None` cross-site policy — `Lax` permits cookies on top-level GET navigations, which is the gap WCD exploits). **Go:** the `net/http` parsing behavior shown here was *measured* against a running server (Go follows TE over CL, 400s duplicate `Content-Length`, 501s unknown `Transfer-Encoding`), and the `Cookie.String()` `SameSite` emission (unset and `SameSiteDefaultMode` emit **no** attribute) was measured against `go1.24` — not taken from memory. The Host-header and cache-poisoning defenses build on the **application-security-baseline** chapter (hostile input by default) and the caching-headers material in the **file-servers** and **CORS** chapters (`Vary`, cache keys). Every Go snippet here was run and verified.
 </Callout>
+
+<Scoreboard
+  streak={28}
+  items={[
+    { label: "Predict — where request-level attacks live", kind: "quiz", points: 10, done: false },
+    { label: "Quick check — web cache deception and SameSite", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Detect framing conflicts", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Host header validation", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3 — Cache key with Vary headers", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Response cacheability evaluation", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab — Stop the password-reset poisoning", captured: false, points: 70 }}
+/>
 
 That's the request-level family — smuggling, Host header, cache poisoning — and the one idea under all three: an HTTP request is bytes that several machines must agree on, and the attack lives wherever they stop agreeing. You can now read a request as a thing being parsed *repeatedly* down a chain, spot where a value the client controls feeds a decision it shouldn't, and say precisely how strict Go is at the back-end (strict — you measured it) and why that still isn't the whole story. Go make your parsers agree, sport.

@@ -571,6 +571,62 @@ func main() {
 Before you ship any retry, run this list: **(1)** Is the operation idempotent (or does it carry an idempotency key)? If not, *don't retry it blindly.* **(2)** Is there jitter? No jitter = herd. **(3)** Is there a cap on the backoff? **(4)** Is there an overall deadline, and does the loop stop at it? **(5)** Is the backoff sleep interruptible by `ctx.Done()`? **(6)** Is this the *only* layer retrying, or are you amplifying? **(7)** Is there a budget so a broad outage can't turn retries into a load multiplier? **(8)** Do you retry only *retryable* errors (a 400 won't get better; a 503 might)? Miss any one and your retry is a latent outage amplifier.
 </Callout>
 
+<UnderTheHood title="Timer Internals, Channel Buffers & Jitter Math">
+
+Understanding why retry systems fail requires dissecting both the Go runtime timer implementation and the mathematical distributions that govern backoff curves.
+
+### 1. The Runtime Timer Architecture (Go 1.14 $\to$ Go 1.23+)
+Timers in Go are not standalone OS threads or POSIX signals; they are managed directly by the Go runtime scheduler.
+- **Go 1.14–1.22 (Per-P Timer Heaps):** Each logical processor (`runtime.p`) maintains a four-ary min-heap of active timers. When a goroutine creates a `time.Timer`, it is inserted into the local $P$'s heap. The scheduler checks the heap head during `findrunnable` and context switches, stealing timer events across $P$s if necessary. However, unexpired timers held strong references in the runtime, meaning calling `time.After()` in a retry loop leaked memory until each timer expired.
+- **Go 1.23 Timer GC Revolution:** In Go 1.23, timers that are no longer referenced by user code are **immediately garbage collected**, even if they have not yet fired. Furthermore, the channel associated with a timer (`t.C`) is now unbuffered/buffered synchronously with runtime state. Calling `t.Reset(d)` reliably reschedules the timer without needing the historical `if !t.Stop() { <-t.C }` drain pattern that plagued older Go code with deadlocks.
+
+### 2. The `select` Race & Context Deadlines
+In an event loop with multiple ready channels, Go's `select` statement selects a branch via pseudo-random uniform selection:
+```go
+select {
+case <-ctx.Done():
+    return ctx.Err()
+case <-timer.C:
+    // Execute retry attempt
+}
+```
+If the context deadline expires at the exact nanosecond the backoff timer fires, Go does *not* prioritize `ctx.Done()`. Half the time, the retry branch executes. A robust production retry loop checks `ctx.Err()` explicitly before dispatching network I/O:
+```go
+select {
+case <-ctx.Done():
+    return ctx.Err()
+case <-timer.C:
+    if err := ctx.Err(); err != nil {
+        return err
+    }
+    // Safe to retry
+}
+```
+
+### 3. Jitter Mathematics: Comparative Distribution Analysis
+Amazon's landmark study (*Exponential Backoff and Jitter*, Marc Brooker) proved that without randomness, client retry requests form resonant shockwaves that prolong downstream recovery.
+
+Let `c = cap`, `b = base`, and `v_i = min(cap, base * 2^attempt)`:
+
+| Strategy | Mathematical Formula | Distribution Characteristic | Workload Impact |
+| :--- | :--- | :--- | :--- |
+| **No Jitter** | `t_i = v_i` | Discrete deterministic pulses | Severe stampedes; high collision |
+| **Full Jitter** | `t_i ~ Uniform(0, v_i)` | Uniform spread across `[0, v_i]` | Lowest total work; fastest recovery |
+| **Equal Jitter** | `t_i = (v_i / 2) + Uniform(0, v_i / 2)` | Guaranteed floor `v_i / 2`, bounded spread | Smooth queueing; moderate delay |
+| **Decorrelated Jitter** | `t_i = min(cap, Uniform(base, 3 * t_prev))` | Random walk with autocorrelation | Excellent desynchronization under high concurrency |
+
+**Why Full Jitter outperforms Equal Jitter under heavy contention:**
+Full Jitter allows retries to fire almost immediately (`t ≈ 0`) if lucky, draining queues rapidly when transient hiccups clear, while still distributing the aggregate retry load smoothly over the full backoff window.
+
+### 4. PRNG Concurrency & `math/rand/v2`
+Older Go code using `math/rand.Int63n()` suffered from contention on a single global `sync.Mutex` inside the default source. Under 10,000 concurrent goroutines retrying simultaneously, the lock contention in `math/rand` often consumed more CPU than the actual network payloads.
+
+In modern Go (Go 1.22+), always use `math/rand/v2`:
+- Default functions (`rand.N`, `rand.Float64`) use lock-free, per-thread ChaCha8 or PCG-DXSM generators.
+- Zero allocation, zero global mutex locks, and uniform statistical properties across high concurrency.
+
+</UnderTheHood>
+
 ---
 
 ## Exercises

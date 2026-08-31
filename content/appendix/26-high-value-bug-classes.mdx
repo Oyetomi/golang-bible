@@ -769,6 +769,69 @@ func main() {
 
 This bug is the interactive **Authorization Matrix** and **SSRF** labs above, chained: a function-level authz gap *plus* an unvalidated server-side fetch. Replay the config route as a non-admin (it should be denied) and fuzz the URL param toward `169.254.169.254` (it should be blocked) — if either succeeds, you've found the next Odysseus.
 
+<UnderTheHood title="Race Windows & HTTP Desync Internals">
+
+Understanding the exploitation and defense of high-value web vulnerabilities requires analyzing the concurrency runtime, database transaction isolation, and TCP/HTTP stream synchronization.
+
+### 1. The Anatomy of a Web Race Window
+In theory, an in-memory TOCTOU condition has a microscopic window of vulnerability (a few CPU cycles between checking `balance >= amount` and writing `balance -= amount`).
+
+In real-world web services, that window expands by orders of magnitude due to I/O yielding:
+1. **Goroutine Scheduler Yielding:** When a Go handler executes a database query (`db.QueryRow(...)`) or an external API call, the network I/O blocks. The Go runtime scheduler immediately detaches the goroutine from the processor ($P$) and parks it in the netpoller.
+2. **Expansion to Milliseconds:** The race window widens from nanoseconds to **5–50 milliseconds** (the round-trip time to the database). During this extended window, dozens of concurrent HTTP worker goroutines can read the identical, un-updated balance.
+3. **HTTP/2 Single-Packet Attack:** Attackers synchronize requests to hit the server within the same millisecond by multiplexing 30+ HTTP/2 streams inside a single TCP packet. All streams arrive at the server NIC in the exact same TCP window, waking up concurrent worker goroutines simultaneously.
+
+### 2. Database Isolation & Atomic Countermeasures
+A common anti-pattern is wrapping check-then-act logic in a basic database transaction:
+```sql
+-- VULNERABLE under default READ COMMITTED isolation:
+BEGIN;
+SELECT balance FROM accounts WHERE id = 42; -- Goroutine 1 reads $100, Goroutine 2 reads $100
+-- (Application checks: 100 >= 100 -> OK)
+UPDATE accounts SET balance = balance - 100 WHERE id = 42;
+COMMIT;
+```
+Under standard SQL `READ COMMITTED` or `REPEATABLE READ`, both transactions see the starting balance of $100, allowing a double spend of $200.
+
+**Defensive Fixes in Go:**
+- **Pessimistic Row Locking (`SELECT ... FOR UPDATE`):**
+  ```sql
+  SELECT balance FROM accounts WHERE id = $1 FOR UPDATE;
+  ```
+  Forces concurrent transactions to block at the database engine level until the first transaction commits or rolls back.
+- **Single-Statement Atomic Decrement (Atomic CAS):**
+  ```sql
+  UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1;
+  ```
+  Returns `RowsAffected()`. If `RowsAffected == 0`, the balance was insufficient or already consumed, guaranteeing atomicity without application-level distributed locks.
+
+### 3. HTTP Desynchronization (Request Smuggling) Mechanics
+HTTP Request Smuggling exploits discrepancies between how frontend reverse proxies (e.g., Cloudflare, NGINX, HAProxy) and backend application servers (e.g., Go `net/http`) delimit the boundaries of piped HTTP requests across a shared persistent TCP connection.
+
+```
++------------------+         +--------------------+         +-------------------+
+| Attacker Request | ------> | Frontend Proxy     | ------> | Backend Server    |
+| (CL + Chunked)   |         | (Uses Content-Len) |         | (Uses Chunked)    |
++------------------+         +--------------------+         +-------------------+
+                                                                     |
+                                                           [Unread Payload remains in
+                                                            backend socket buffer ->
+                                                            Prepended to NEXT user request]
+```
+
+#### CL.TE vs. TE.CL Desync
+- **CL.TE:** Frontend honors `Content-Length`, forwarding the entire body. Backend honors `Transfer-Encoding: chunked`, terminates parsing early at the zero chunk (`0\r\n\r\n`), and treats the remainder of the body as the start of the next incoming request on that TCP socket.
+- **TE.CL:** Frontend processes chunked streams. Backend reads only `Content-Length` bytes, leaving the rest of the chunked payload queued in the TCP buffer to poison the next victim's request.
+
+#### HTTP/2 Downgrading (H2.CL / H2.TE)
+When frontend proxies accept HTTP/2 binary frames and downgrade them to HTTP/1.1 keep-alive connections to backend Go servers, header injection becomes possible:
+- An attacker sends an HTTP/2 header containing CRLF: `foo: bar\r\nTransfer-Encoding: chunked`.
+- When translated to HTTP/1.1 plaintext on the backend connection, this splits the HTTP stream and poisons the backend connection pool.
+
+**Defense:** Configure frontend proxies to use end-to-end HTTP/2 or enforce strict RFC 7230 header validation, rejecting requests that contain both `Content-Length` and `Transfer-Encoding` or illegal whitespace in header names.
+
+</UnderTheHood>
+
 ---
 
 ## Exercises

@@ -476,6 +476,215 @@ The last truth about webhooks, and the one that surprises people: **you cannot g
 **Exactly-once is a fantasy; at-least-once + idempotency is the real system.** Don't try to make delivery exactly-once — across a network it's provably impossible, and code that claims it is hiding a bug. Instead: the **sender** retries (accepting it may double-deliver) and sends a **stable event id** on every attempt of the same event; the **receiver** dedups on that id (process once, ignore repeats). The same id must survive every retry — generate it when the event is *created*, not per attempt, or each retry looks like a new event and dedup fails. This is the idempotency-key pattern from the distributed-systems and payments chapters, now spanning the gap between your sender and someone else's receiver.
 </Gotcha>
 
+<UnderTheHood title="WebSocket Framing, Hijacking & TCP Buffer Semantics">
+
+Underneath high-level WebSocket libraries (`nhooyr.io/websocket` or `gorilla/websocket`), Go performs low-level connection hijacking, framing byte manipulation, and socket buffer management.
+
+### 1. The HTTP Connection Hijack (`http.Hijacker`)
+
+Standard `net/http` handlers manage the request-response lifecycle and automatically close connections on return. Upgrading to a persistent WebSocket requires seizing direct ownership of the underlying TCP socket:
+
+```go
+hijacker, ok := w.(http.Hijacker)
+if !ok {
+    http.Error(w, "websocket: response writer does not support hijacking", http.StatusInternalServerError)
+    return
+}
+conn, bufrw, err := hijacker.Hijack()
+if err != nil {
+    return
+}
+// From this moment, net/http's ReadTimeout and WriteTimeout no longer apply.
+// You own conn (net.Conn) and must manage read/write deadlines and conn.Close().
+```
+
+Calling `Hijack()` detaches the connection from `http.Server`. Go returns a `*bufio.ReadWriter` (`bufrw`) holding any bytes already buffered from the client handshake. Any subsequent writes bypass `net/http`'s response formatting.
+
+### 2. RFC 6455 Framing & The Client Masking Invariant
+
+A WebSocket message is split into one or more binary frames on the wire:
+- **Byte 0:** `FIN` (1 bit indicating final frame), `RSV1-3` (3 extension bits, usually 0), `Opcode` (4 bits: `0x1` Text, `0x2` Binary, `0x8` Close, `0x9` Ping, `0xA` Pong).
+- **Byte 1:** `MASK` bit (1 bit) + 7-bit Payload Length.
+  - If length $\le 125$, the 7-bit value is the exact length.
+  - If length $= 126$, the next 2 bytes encode an unsigned 16-bit integer length.
+  - If length $= 127$, the next 8 bytes encode an unsigned 64-bit integer length.
+- **Masking Key (4 bytes):** Mandated by RFC 6455 for all **client-to-server** frames (and strictly forbidden for server-to-client frames). Why? To prevent **cache poisoning attacks** against intermediary transparent proxies: if an attacker's script in a browser could send unmasked predictable raw HTTP request bytes inside a WebSocket payload, an unsuspecting intermediate proxy might misinterpret the stream as pipelined HTTP requests.
+
+### 3. TCP Buffer Bloat, `SO_SNDBUF`, and Netpoll Semantics
+
+When a Go server writes to a WebSocket (`conn.Write(b)`):
+- Bytes enter the OS kernel socket send buffer (`SO_SNDBUF`, typically 64KB–256KB).
+- If a slow client stops acknowledging TCP packets (window size collapses to 0), the kernel buffer fills.
+- When `SO_SNDBUF` is full, `conn.Write` would block the calling goroutine. In Go's runtime, `net.Conn` delegates to the runtime network poller (`netpoll` via `epoll`/`kqueue`), parking the goroutine until the socket is writable.
+- If the Hub sends directly to slow sockets without buffered channels and `select` with `default`, every active sender goroutine parks in `netpoll`, stalling the entire broadcast system. Per-client buffered channels decouple the Hub's broadcast loop from kernel socket backpressure.
+
+</UnderTheHood>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Calculate RFC 6455 Frame Header Size" level="easy">
+
+Write `FrameHeaderSize(payloadLen int, isClient bool) int` that computes the exact number of header bytes on the wire for an unfragmented RFC 6455 frame, taking into account the 2 initial bytes, extended length bytes (16-bit or 64-bit), and the mandatory 4-byte mask for client frames.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func FrameHeaderSize(payloadLen int, isClient bool) int {
+	// Base header: 1 byte (FIN+Opcode) + 1 byte (MASK+7-bit len)
+	size := 2
+	if payloadLen > 65535 {
+		size += 8 // 64-bit extended payload length
+	} else if payloadLen > 125 {
+		size += 2 // 16-bit extended payload length
+	}
+	if isClient {
+		size += 4 // Client frames must include a 4-byte masking key
+	}
+	return size
+}
+
+func main() {
+	fmt.Println("Server 50 bytes:", FrameHeaderSize(50, false))       // 2
+	fmt.Println("Client 50 bytes:", FrameHeaderSize(50, true))        // 6
+	fmt.Println("Server 1000 bytes:", FrameHeaderSize(1000, false))   // 4
+	fmt.Println("Client 70000 bytes:", FrameHeaderSize(70000, true))  // 14
+}
+```
+
+Client frames always incur 4 additional bytes for the random XOR mask key, while large payloads append 2 or 8 bytes of extended length indicators.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Non-Blocking Hub Fan-Out" level="medium">
+
+Write `NonBlockingBroadcast(clients []chan string, message string) (sent, dropped int)` that delivers `message` to all provided client channels without blocking. If a client's channel is full or unbuffered and cannot receive immediately, increment `dropped` and proceed to the next client.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func NonBlockingBroadcast(clients []chan string, message string) (sent, dropped int) {
+	for _, ch := range clients {
+		select {
+		case ch <- message:
+			sent++
+		default:
+			dropped++
+		}
+	}
+	return sent, dropped
+}
+
+func main() {
+	fast := make(chan string, 2)
+	slow := make(chan string) // unbuffered, will block if no active receiver
+
+	sent, dropped := NonBlockingBroadcast([]chan string{fast, slow}, "live_event")
+	fmt.Printf("Broadcast result: sent=%d, dropped=%d\n", sent, dropped)
+}
+```
+
+The `select` with `default` prevents the broadcaster from parking on saturated or unresponsive consumer channels, isolating slow clients from degrading system throughput.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Timestamped Webhook Signature" level="medium">
+
+Implement `SignStripeStyle(secret []byte, payload []byte, timestamp int64) string` that returns a header string formatted as `t=<timestamp>,v1=<hmac-sha256(secret, "<timestamp>.<payload>")>`.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
+
+func SignStripeStyle(secret []byte, payload []byte, timestamp int64) string {
+	signedPayload := fmt.Sprintf("%d.%s", timestamp, string(payload))
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(signedPayload))
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return fmt.Sprintf("t=%d,v1=%s", timestamp, sig)
+}
+
+func main() {
+	secret := []byte("whsec_live_abcdef123456")
+	payload := []byte(`{"id":"evt_001","type":"charge.captured"}`)
+	header := SignStripeStyle(secret, payload, 1700000000)
+	fmt.Println("Header:", header)
+}
+```
+
+Prefixing the signed payload with the UNIX timestamp prevents replay attacks by enabling the receiver to reject signatures created outside a defined tolerance window (e.g. 5 minutes).
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Idempotent Receiver Deduplication" level="hard">
+
+Write `IsDuplicate(seen map[string]int64, eventID string, now int64, ttl int64) bool` that checks if an incoming `eventID` has already been processed within the given `ttl` window. If not seen, record `eventID` with `now` and return `false`. Also purge any stale entries in `seen` older than `now - ttl`.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func IsDuplicate(seen map[string]int64, eventID string, now int64, ttl int64) bool {
+	// 1. Evict expired entries
+	cutoff := now - ttl
+	for id, timestamp := range seen {
+		if timestamp < cutoff {
+			delete(seen, id)
+		}
+	}
+
+	// 2. Check if already processed
+	if _, exists := seen[eventID]; exists {
+		return true
+	}
+
+	// 3. Mark as processed
+	seen[eventID] = now
+	return false
+}
+
+func main() {
+	cache := make(map[string]int64)
+	ttl := int64(300) // 5 minutes
+
+	fmt.Println("First delivery:", IsDuplicate(cache, "evt_1", 1000, ttl))     // false
+	fmt.Println("Duplicate delivery:", IsDuplicate(cache, "evt_1", 1050, ttl)) // true
+	fmt.Println("After TTL expiry:", IsDuplicate(cache, "evt_1", 1400, ttl))   // false (evicted & accepted)
+}
+```
+
+At-least-once delivery guarantees that duplicate webhooks will arrive. Maintaining an expiring bounded deduplication cache at the receiver ensures idempotency without unbounded memory growth.
+
+</Solution>
+
+</Exercise>
+
 ---
 
 ## The Lab
@@ -585,8 +794,10 @@ The receiver verifies `HMAC-SHA256(secret, rawBody)` on every request and 401s a
   items={[
     { label: "Predict — non-blocking send on a full buffer", kind: "quiz", points: 10, done: false },
     { label: "Quick check — why per-client send channels", kind: "quiz", points: 10, done: false },
-    { label: "Read — the Hub, line by line", kind: "exercise", points: 15, done: false },
-    { label: "Read — the delivery engine", kind: "exercise", points: 15, done: false }
+    { label: "Exercise 1 — Frame header size", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Non-blocking Hub fan-out", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Timestamped HMAC signature", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Idempotent receiver deduplication", kind: "exercise", points: 20, done: false }
   ]}
   flag={{ label: "Lab — Sign the outbound webhook", captured: false, points: 70 }}
 />

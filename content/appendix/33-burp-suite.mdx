@@ -140,6 +140,53 @@ func main() {
 **Installing Burp's CA certificate gives Burp the power to read all your HTTPS — so do it only in a dedicated testing browser/profile.** That CA is what lets Burp forge a trusted certificate for *any* site and decrypt the traffic; it's the same capability a real attacker would need, granted to Burp on purpose. Never install it in your everyday browser, never leave Burp proxying when you're doing normal browsing, and remove/segregate it when you're done. The flip side is the defender's lesson: this is exactly why **certificate pinning** exists (an app that pins its server's cert refuses Burp's forged one), why you keep your CA trust store clean, and why "just click through the cert warning" is dangerous advice — a cert warning can mean someone is doing to you what Burp does for you.
 </Gotcha>
 
+<UnderTheHood title="TLS Interception, MITM Cert Generation & HTTP Proxying">
+
+An intercepting proxy does not simply forward packets at layer 4; it terminates, re-encrypts, and rewrites layer 7 HTTP/1.1, HTTP/2, and TLS state machines simultaneously.
+
+### 1. The HTTP `CONNECT` Tunneling Lifecycle
+
+When a browser configured with an explicit proxy attempts to navigate to `https://target.example.com`, the connection handshake proceeds as follows:
+
+1. **The Plaintext Handshake (`CONNECT`):** The browser establishes a plain TCP connection to Burp (e.g. `127.0.0.1:8080`) and issues:
+   ```http
+   CONNECT target.example.com:443 HTTP/1.1
+   Host: target.example.com:443
+   User-Agent: Mozilla/5.0 ...
+   ```
+2. **Proxy Hijacking & 200 Connection Established:** The proxy calls `http.Hijacker.Hijack()`, detaches the raw TCP socket from `net/http`, and sends:
+   ```http
+   HTTP/1.1 200 Connection Established\r\n\r\n
+   ```
+3. **Downstream TLS Termination:** The proxy now treats the client socket as a TLS server connection (`tls.Server(conn, tlsConfig)`), expecting a TLS `ClientHello` with SNI `target.example.com`.
+
+### 2. On-the-Fly X.509 Leaf Certificate Minting (`crypto/x509`)
+
+To satisfy the client's TLS handshake without triggering a certificate validation error:
+
+- **The Root CA Pair:** Burp generates a long-lived RSA-2048/ECDSA CA private key and self-signed root certificate (`PortSwigger CA`), installed in the user's OS/browser trust store (`/Library/Keychains` on macOS or `cert9.db` in Firefox).
+- **Dynamic SAN Generation:** When the client sends `ClientHello` with SNI `target.example.com`, the proxy's `GetCertificate` callback dynamically creates an `x509.Certificate` template:
+  ```go
+  template := &x509.Certificate{
+      SerialNumber: big.NewInt(time.Now().UnixNano()),
+      Subject:      pkix.Name{CommonName: sniHost},
+      DNSNames:     []string{sniHost},
+      NotBefore:    time.Now().Add(-1 * time.Hour),
+      NotAfter:     time.Now().Add(24 * time.Hour),
+      KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+      ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+  }
+  derBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, leafPubKey, caPrivKey)
+  ```
+- **Leaf Key Caching:** To avoid burning CPU generating new asymmetric keypairs for every TCP connection, the proxy reuses a single shared ephemeral leaf private key across all minted host certs, caching signed DER certificates in an in-memory LRU map.
+
+### 3. Upstream Dialing & Hop-by-Hop Header Stripping (Go 1.22+)
+
+- **Independent Upstream TLS Handshake:** Simultaneously, the proxy dials `target.example.com:443` using a standard `tls.Dialer`, performing authentic public certificate validation against Mozilla's root store.
+- **Hop-by-Hop Header Sanitization:** RFC 7230 requires proxies to strip hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailers`, `Transfer-Encoding`, `Upgrade`) before forwarding the sanitized request to the upstream target. In Go 1.22+, `httputil.ReverseProxy` handles hop-by-hop cleanup automatically via `Rewrite` hooks.
+
+</UnderTheHood>
+
 ---
 
 ## Proxy & Intercept
@@ -309,6 +356,289 @@ Tools are nothing without a process. Here's the loop almost every web tester run
 
 ---
 
+## Exercises
+
+<Exercise n={1} title="Dynamic X.509 Leaf Certificate Generation" level="easy">
+
+Write `MintLeafCertTemplate(hostname string) *x509.Certificate` that configures a valid X.509 certificate template with the specified hostname as both `CommonName` and in `DNSNames`, valid for 24 hours starting 1 hour in the past.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"fmt"
+	"math/big"
+	"time"
+)
+
+func MintLeafCertTemplate(hostname string) *x509.Certificate {
+	now := time.Now()
+	return &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano()),
+		Subject:      pkix.Name{CommonName: hostname},
+		DNSNames:     []string{hostname},
+		NotBefore:    now.Add(-1 * time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+}
+
+func main() {
+	tmpl := MintLeafCertTemplate("api.target.com")
+	fmt.Println("CN:", tmpl.Subject.CommonName)
+	fmt.Println("SANs:", tmpl.DNSNames)
+	fmt.Println("Valid hours:", tmpl.NotAfter.Sub(tmpl.NotBefore).Hours())
+}
+```
+
+Dynamic TLS interception proxies must configure exact Subject Alternative Names (SANs) matching the client's SNI to avoid browser certificate domain mismatch errors.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Strip Hop-by-Hop Headers in Proxy Middleware" level="medium">
+
+Write `StripHopByHop(h http.Header)` that removes standard RFC 7230 hop-by-hop headers (`Connection`, `Proxy-Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Te`, `Trailer`, `Transfer-Encoding`, `Upgrade`) from an `http.Header` map in place.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+var hopByHop = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func StripHopByHop(h http.Header) {
+	for _, k := range hopByHop {
+		h.Del(k)
+	}
+}
+
+func main() {
+	headers := http.Header{
+		"Authorization":    {"Bearer secret123"},
+		"Proxy-Connection": {"keep-alive"},
+		"Upgrade":          {"websocket"},
+		"Content-Type":     {"application/json"},
+	}
+
+	StripHopByHop(headers)
+	fmt.Println("Remaining headers:")
+	for k, v := range headers {
+		fmt.Printf("  %s: %v\n", k, v)
+	}
+}
+```
+
+Forwarding hop-by-hop headers across proxy boundaries creates proxy confusion and socket synchronization errors.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Intruder Sniper Payload Generation" level="medium">
+
+Write `GenerateSniperRequests(template string, marker string, payloads []string) []string` that replaces each occurrence of `marker` in `template` with a payload, generating a slice of customized raw HTTP requests.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func GenerateSniperRequests(template string, marker string, payloads []string) []string {
+	var requests []string
+	for _, p := range payloads {
+		req := strings.ReplaceAll(template, marker, p)
+		requests = append(requests, req)
+	}
+	return requests
+}
+
+func main() {
+	tmpl := "GET /api/user/§ID§ HTTP/1.1\r\nHost: target.com\r\n\r\n"
+	payloads := []string{"101", "102", "103"}
+
+	reqs := GenerateSniperRequests(tmpl, "§ID§", payloads)
+	for i, r := range reqs {
+		fmt.Printf("Req %d: %s", i+1, strings.ReplaceAll(r, "\r\n", " | "))
+	}
+}
+```
+
+Intruder's Sniper attack iterates sequentially over a payload list, substituting each value into marked positions while leaving the surrounding request structure intact.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Decode JWT Claims in Proxy Pipeline" level="hard">
+
+Write `ExtractJWTClaims(authHeader string) (string, error)` that extracts the bearer token from `authHeader`, base64URL-decodes the middle payload segment (without verifying cryptographic signature, simulating Burp Inspector behavior), and returns the raw JSON string.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+func ExtractJWTClaims(authHeader string) (string, error) {
+	parts := strings.Split(strings.TrimSpace(authHeader), " ")
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+		return "", errors.New("invalid authorization header")
+	}
+
+	jwtParts := strings.Split(parts[1], ".")
+	if len(jwtParts) != 3 {
+		return "", errors.New("malformed JWT")
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(jwtParts[1])
+	if err != nil {
+		return "", fmt.Errorf("base64url decode error: %w", err)
+	}
+
+	return string(payloadBytes), nil
+}
+
+func main() {
+	auth := "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYiLCJyb2xlIjoiYWRtaW4ifQ.signature"
+	claims, err := ExtractJWTClaims(auth)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	fmt.Println("Decoded claims:", claims)
+}
+```
+
+Inspecting token payloads in-flight allows security analysts to detect privilege levels, embedded tenant IDs, and algorithm tampering vectors (`alg: none`).
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+I've written an in-process intercepting proxy with **two bugs**: its request rewriter fails to preserve existing URL query parameters when appending audit tags, and it fails to strip the sensitive `Proxy-Authorization` header before forwarding to upstream origins. Fix both issues so that all requests are cleanly rewritten and sanitized.
+
+<Lab
+  title="Fix the Intercepting Header & Query Rewriter"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Fix two proxy rewriter bugs: (1) Preserve existing URL query parameters while setting 'tampered=true'. (2) Strip the 'Proxy-Authorization' hop-by-hop header so it does not leak upstream. When all checks pass, the program prints ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+)
+
+func main() {
+	allOK := true
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		auth := r.Header.Get("Proxy-Authorization")
+		fmt.Fprintf(w, "id=%s&tampered=%s&proxyAuth=%s", q.Get("id"), q.Get("tampered"), auth)
+	}))
+	defer origin.Close()
+	originURL, _ := url.Parse(origin.URL)
+
+	proxy := httputil.NewSingleHostReverseProxy(originURL)
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = originURL.Scheme
+		req.URL.Host = originURL.Host
+
+		// BUG 1: Overwriting RawQuery wipes out existing query params like id=42
+		// FIX: parse req.URL.Query(), set "tampered", "true", and assign q.Encode()
+		q := req.URL.Query()
+		q.Set("tampered", "true")
+		req.URL.RawQuery = q.Encode()
+
+		// BUG 2: Leaking hop-by-hop Proxy-Authorization header
+		// FIX: req.Header.Del("Proxy-Authorization")
+		req.Header.Del("Proxy-Authorization")
+	}
+
+	front := httptest.NewServer(proxy)
+	defer front.Close()
+
+	req, _ := http.NewRequest("GET", front.URL+"/items?id=42", nil)
+	req.Header.Set("Proxy-Authorization", "Basic secretproxyauth")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Println("FAIL: proxy request failed:", err)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	got := string(body)
+	if got != "id=42&tampered=true&proxyAuth=" {
+		fmt.Printf("FAIL: expected 'id=42&tampered=true&proxyAuth=', got %q\\n", got)
+		allOK = false
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="main verifies that the intercepting reverse proxy retains the original 'id=42' query param, sets 'tampered=true', and deletes the 'Proxy-Authorization' header before upstream dispatch. The flag unlocks when the program runs cleanly and prints ALL CHECKS PASS."
+  hints={[
+    "Do not assign raw strings to req.URL.RawQuery without encoding existing parameters.",
+    "Use req.Header.Del(\"Proxy-Authorization\") to strip hop-by-hop credentials.",
+  ]}
+  flag="GO{mitm_proxy_query_rewriting_and_header_sanitization}"
+>
+
+Fix query preservation and hop-by-hop header stripping in the proxy director to ensure reliable request interception and clean upstream forwarding.
+
+</Lab>
+
+---
+
 <Recap>
 
 - **Burp Suite is an intercepting proxy plus a toolkit.** You point your browser through Burp; it records, and lets you pause, edit, and replay any request. Everything else operates on captured requests.
@@ -324,5 +654,18 @@ Tools are nothing without a process. Here's the loop almost every web tester run
 <Callout kind="note" title="Sources">
 **The tool:** PortSwigger's official Burp Suite documentation and the **Web Security Academy** (free, with labs designed to be solved *with* Burp) are the authoritative, hands-on references — work the Academy labs to practice every tool here. **Editions:** Community (free) covers the proxy, Repeater, Decoder, Comparer, and a throttled Intruder — enough for all manual testing; Professional adds full-speed Intruder, the Scanner, and Collaborator. **Go grounding:** the interception demo is a real `net/http/httputil.ReverseProxy` that modifies a request in flight — the same mechanism Burp uses for your browser's traffic; the Decoder demo uses `encoding/base64` and `net/url`. The attack-class mappings point back to the **broken-access-control**, **auth-api-design**, **application-security-baseline**, and **request-level-attacks** chapters. Authorized testing only — your own apps, in-scope programs, or deliberately-vulnerable labs. Every Go snippet here was run and verified.
 </Callout>
+
+<Scoreboard
+  streak={32}
+  items={[
+    { label: "Predict — where Burp interception occurs", kind: "quiz", points: 10, done: false },
+    { label: "Concept check — Repeater vs Intruder workflows", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Dynamic X.509 cert template", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2 — Strip hop-by-hop headers", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3 — Intruder Sniper payload generation", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4 — Decode JWT claims in proxy pipeline", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab — Fix the Intercepting Header & Query Rewriter", captured: false, points: 80 }}
+/>
 
 That's Burp Suite from the mechanism up: a proxy you own, a toolkit that operates on what it captures, and a loop that turns "see the request" into "find the bug." You can explain *why* you install the CA (and why that's dangerous anywhere but your test browser), reach for Repeater to test one hypothesis and Intruder to scale it, decode a token without thinking, and map any vulnerability in this course onto the tab that exercises it. The browser starts the request; Burp is where you take it apart. Go set your scope and start mapping, sport.
