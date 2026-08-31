@@ -1,0 +1,1091 @@
+---
+title: "Distributed Locking, Leases & Fencing Tokens"
+part: "appendix"
+order: 40
+type: "course"
+description: "Redis Redlock, PostgreSQL advisory locks, etcd lease-based distributed mutexes, the Martin Kleppmann GC pause hazard, and monotonic fencing tokens."
+prerequisites: ["consistency-consensus"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Distributed Systems" title="Distributed Locking, Leases & Fencing Tokens">
+
+Here's the thing, sport. Distributed locking is where junior engineers go to feel clever and senior engineers go to get humbled by physics.
+
+Someone discovers Redis, types `SET resource_id worker_uuid NX PX 5000`, and declares with supreme confidence: "I have achieved mutual exclusion across the cluster." It's adorable. They think a distributed lock is just a `sync.Mutex` that happens to talk over TCP.
+
+Then real life happens.
+
+A hypervisor stalls a container for 6 seconds during a live VM migration. A Go runtime garbage collection cycle pauses an allocation-heavy thread. A switch drops packets. The 5-second lease expires silently in Redis. Another worker happily acquires the lock. And then the first worker wakes up, blissfully unaware that time has passed, and executes a $10,000,000 double-payout against Meridian's escrow database.
+
+In this chapter, we destroy the amateur illusions of distributed locking and rebuild mutual exclusion from first principles. You will master the canonical **Martin Kleppmann GC pause hazard**, understand why leases *always* fail without storage validation, implement **monotonic fencing tokens**, wield **PostgreSQL advisory locks** without connection-pool leaks, harness **etcd lease-based consensus mutexes**, and dissect the fiery **Redlock debate**. By the end, you'll write distributed locking code that stands up to network partitions, clock jumps, and process freezes without losing a single cent.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The Distributed Locking Lie", "The Kleppmann GC Pause Hazard", "Monotonic Fencing Tokens", "PostgreSQL Advisory Locks", "etcd Leases & Revision Mutexes", "The Redlock Debate & Redis Realities", "Production Fenced Lock Engine in Go"]} />
+
+<SpacedRecall
+  role={"architect"}
+  items={[
+    {
+      from: "Consistency & Consensus (part 2, ch16)",
+      q: "Why can't independent nodes in an asynchronous distributed network rely on physical wall clocks for ordering?",
+      options: [
+        "Wall clocks cannot measure fractions of a millisecond",
+        "Network delays, NTP clock adjustments, and virtualization drift make physical timestamps non-monotonic across machines",
+        "Linux kernels disable wall clocks during network partitions",
+        "Physical clocks only work with GPS hardware in data centers"
+      ],
+      answer: 1,
+      tie: "Physical clocks drift constantly and can jump backward during NTP sync. Distributed correctness requires logical or consensus-backed ordering (Raft revisions or monotonic fencing tokens)."
+    },
+    {
+      from: "Double-Entry Ledgers (part 3, ch2)",
+      q: "What prevents duplicate financial disbursements when two workers execute identical transfer instructions?",
+      options: [
+        "Using float64 for account balances",
+        "Idempotency keys and atomic conditional database transactions",
+        "Running the Go service with GOMAXPROCS=1",
+        "Retrying failed HTTP requests indefinitely"
+      ],
+      answer: 1,
+      tie: "A distributed lock is only an optimization; the storage layer must enforce idempotency and version fencing to guarantee mutual exclusion under failure."
+    },
+  ]}
+/>
+
+<PredictLab
+  prompt={"Lease Expiration Hazard: If a lock has a 3-second TTL and a worker sleeps 4 seconds, what does redis.Del return if another worker acquired the lock?"}
+  role={"architect"}
+  code={`// Worker 1 holds lock with UUID "worker-1"
+// 4 seconds pass... Lock expires in Redis.
+// Worker 2 acquires lock with UUID "worker-2".
+// Worker 1 wakes up and calls: redis.Del("lock:settlement")
+// What happened?`}
+  options={[
+    "Redis returns an error refusing to delete another worker's lock",
+    "Worker 1 deletes Worker 2's valid lock, leaving the critical section completely unprotected",
+    "Worker 2's lock is automatically renewed for another 3 seconds",
+    "Redis queues Worker 1's delete until Worker 2 finishes"
+  ]}
+  answer={1}
+  output={`Worker 1 deletes Worker 2's active lock`}
+  explain={"A bare DEL command deletes the key regardless of who currently owns it. Because Worker 1's lease expired, Worker 2 acquired it. Worker 1's unconditional DEL obliterates Worker 2's protection, allowing a third worker (Worker 3) to enter concurrently!"}
+/>
+
+## The Distributed Locking Lie
+
+Let us begin by exposing the fundamental difference between an in-memory lock (`sync.Mutex`) and a distributed lock.
+
+When you lock a `sync.Mutex` in Go:
+1. The memory address lives in the same process address space.
+2. The operating system thread or goroutine scheduler coordinates directly with CPU cache coherency protocols (`MESI` / atomic compare-and-swap).
+3. If the process crashes, everything dies together. There is no partial failure.
+
+In a distributed system, every single one of those assumptions is false:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    THE ASYNCHRONOUS NETWORK                 │
+│                                                              │
+│   Worker Node 1                  Worker Node 2               │
+│  ┌──────────────┐               ┌──────────────┐             │
+│  │ GC Pause 10s │               │ Running Fast │             │
+│  └──────┬───────┘               └──────┬───────┘             │
+│         │                              │                     │
+│         │ (Stale write)                │ (Valid write)       │
+│         ▼                              ▼                     │
+│    ┌────────────────────────────────────────┐                │
+│    │      Shared Database / Ledger          │                │
+│    │    "WHO ACTUALLY HOLDS THE LOCK?"      │                │
+│    └────────────────────────────────────────┘                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Distributed locks serve two completely different objectives, and confusing them causes multi-million dollar outages:
+
+1. **Efficiency (Optimization)**: Preventing redundant expensive computation. If two workers render the same monthly PDF statement twice, it wastes CPU cycles, but nobody loses money. A simple Redis lock with a TTL is completely fine here.
+2. **Correctness (Safety)**: Preventing data corruption, double-transfers, or split-brain mutations. If two workers disburse the same settlement batch, the ledger is corrupted. **A time-bounded lease ALONE cannot provide correctness.**
+
+<Define term="Distributed Lock">
+A synchronization mechanism coordinating access to a shared resource across multiple independent network nodes. Because nodes can crash or disconnect, all distributed locks use time-bounded leases (TTLs) to prevent permanent deadlocks, making them vulnerable to expiration while work is still ongoing.
+</Define>
+
+<BeforeAfter
+  bad={`// NAIVE: Dangerous Redis lock release
+// If our TTL expired, this deletes the NEXT worker's lock!
+func ReleaseNaive(rdb *redis.Client, lockKey string) {
+    rdb.Del(context.Background(), lockKey)
+}`}
+  good={`// IDIOMATIC: Safe atomic CAS release via Lua
+// Only deletes the lock if the key still contains OUR unique token
+var releaseLua = redis.NewScript(\`
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+    else
+        return 0
+    end
+\`)
+
+func ReleaseSafe(ctx context.Context, rdb *redis.Client, lockKey, ownerToken string) (bool, error) {
+    res, err := releaseLua.Run(ctx, rdb, []string{lockKey}, ownerToken).Int()
+    return res == 1, err
+}`}
+  badLabel="Unconditional DEL (Deletes Others' Locks)"
+  goodLabel="Atomic CAS Lua Script (Safe Release)"
+/>
+
+---
+
+## The Kleppmann GC Pause Hazard
+
+In 2016, distributed systems researcher **Martin Kleppmann** published a seminal critique titled *"How to do distributed locking"*. He proved a mathematical reality that shattered the industry's reliance on lease-based locks.
+
+Consider Meridian's wire payout engine.
+
+<Scene
+  title="The Martin Kleppmann GC Pause Hazard in Meridian Wire Settlement"
+  actors={[
+    { id: "w1", label: "Worker 1 (Node A)" },
+    { id: "lock", label: "Lock Manager (Redis/etcd)" },
+    { id: "w2", label: "Worker 2 (Node B)" },
+    { id: "db", label: "Postgres Ledger" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "Worker 1 acquires lock 'settlement:101' with a 5-second TTL. It begins computing a $5,000,000 wire payout.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "W1: Lock Held" },
+        { id: "A2", state: "active", label: "TTL: 5.0s" },
+        { id: "A3", state: "idle", label: "W2: Idle" },
+        { id: "A4", state: "idle", label: "DB: Clean" },
+        { id: "B1", state: "active", label: "Compute Wires" },
+        { id: "B2", state: "idle", label: "No Contest" },
+        { id: "B3", state: "idle", label: "Waiting" },
+        { id: "B4", state: "idle", label: "Balance: $5M" }
+      ]
+    },
+    {
+      caption: "Disaster strikes Worker 1: A major GC cycle or hypervisor pause freezes the process for 7 seconds. The lock TTL expires in Redis.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "bad", label: "W1: FROZEN (GC)" },
+        { id: "A2", state: "bad", label: "TTL EXPIRED" },
+        { id: "A3", state: "idle", label: "W2: Checking" },
+        { id: "A4", state: "idle", label: "DB: Untouched" },
+        { id: "B1", state: "bad", label: "STW Pause 7s" },
+        { id: "B2", state: "bad", label: "Lock Released" },
+        { id: "B3", state: "idle", label: "Ready" },
+        { id: "B4", state: "idle", label: "Balance: $5M" }
+      ]
+    },
+    {
+      caption: "Worker 2 sees the lock is free, acquires it with a new 5s TTL, and writes payout #101 to Postgres. Payout completed!",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "bad", label: "W1: Still Frozen" },
+        { id: "A2", state: "active", label: "TTL: 5.0s (W2)" },
+        { id: "A3", state: "active", label: "W2: Lock Held" },
+        { id: "A4", state: "ok", label: "DB: Paid $5M" },
+        { id: "B1", state: "bad", label: "STW Resuming" },
+        { id: "B2", state: "active", label: "Owned by W2" },
+        { id: "B3", state: "done", label: "Wrote Payout" },
+        { id: "B4", state: "done", label: "Balance: $0" }
+      ]
+    },
+    {
+      caption: "Worker 1 wakes up! Believing it STILL holds the lock, it writes payout #101 AGAIN. Double payout of $10M! Disaster!",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "bad", label: "W1: Woke Up" },
+        { id: "A2", state: "warn", label: "Blind Write" },
+        { id: "A3", state: "done", label: "W2: Finished" },
+        { id: "A4", state: "bad", label: "DOUBLE PAYOUT!" },
+        { id: "B1", state: "bad", label: "Wrote Stale Data" },
+        { id: "B2", state: "bad", label: "Split Brain" },
+        { id: "B3", state: "done", label: "Complete" },
+        { id: "B4", state: "bad", label: "Balance: -$5M" }
+      ]
+    }
+  ]}
+  caption="A process cannot know how long it was paused. Once a lease expires, any subsequent write without a fencing token is a potential split-brain corruption."
+/>
+
+<ExecTimeline
+  title="The Kleppmann Pause Sequence: How Silent Delays Break Mutexes"
+  lanes={[
+    { id: "w1", label: "Worker 1 (Node A)" },
+    { id: "lock", label: "Lock Server" },
+    { id: "w2", label: "Worker 2 (Node B)" },
+    { id: "db", label: "Storage (Postgres)" }
+  ]}
+  steps={[
+    { lane: "w1", label: "Acquire Lock", note: "Worker 1 gets lease for 5 seconds", kind: "send" },
+    { lane: "lock", label: "Grant Lease", note: "Lock assigned to Worker 1, TTL starts ticking", kind: "run" },
+    { lane: "w1", label: "GC Pause (7s)", note: "Stop-The-World GC or hypervisor descheduling halts Worker 1", kind: "block" },
+    { lane: "lock", label: "TTL Expires", note: "5 seconds elapse; lock server deletes key", kind: "done" },
+    { lane: "w2", label: "Acquire Lock", note: "Worker 2 requests lock and succeeds", kind: "recv" },
+    { lane: "w2", label: "Write Storage", note: "Worker 2 completes payout #101 successfully", kind: "send" },
+    { lane: "w1", label: "Wake & Write", note: "Worker 1 wakes up and issues stale write — CORRUPTING STORAGE!", kind: "run" }
+  ]}
+  caption="Client-side lock checks cannot protect against pauses between the check and the write."
+/>
+
+<Define term="Martin Kleppmann GC Hazard">
+The vulnerability where a distributed worker acquires a time-bounded lease, experiences an unbounded pause (GC stop-the-world, network partition, CPU throttling), and wakes up after lease expiry believing it still holds the lock, issuing stale writes that corrupt storage.
+</Define>
+
+---
+
+## Monotonic Fencing Tokens
+
+How do we solve the Kleppmann hazard?
+
+You cannot fix it at the lock server alone. **The storage engine must participate in mutual exclusion.**
+
+The solution is **Monotonic Fencing Tokens**.
+
+```
+  Lock Server (etcd/Consul)                   Database / Storage Engine
+┌───────────────────────────┐               ┌───────────────────────────┐
+│ Token Generator:          │               │ UPDATE accounts           │
+│   Acquire() -> Token 42   │               │ SET balance = ...,        │
+│   Acquire() -> Token 43   │               │     last_token = 43       │
+│   Acquire() -> Token 44   │               │ WHERE id = 101            │
+│                           │               │   AND last_token < 43;    │
+└───────────────────────────┘               └───────────────────────────┘
+```
+
+### The Fencing Protocol
+
+1. When a worker requests a lock, the lock manager grants the lease AND a **monotonically increasing integer** (Token: `1, 2, 3...` or etcd `Raft Revision`).
+2. Every write request sent to the storage system (PostgreSQL, MySQL, S3 object storage) must attach the current `fencing_token`.
+3. The storage engine validates that the incoming `fencing_token` is **strictly greater** than the highest token it has ever committed.
+4. If a stale worker wakes up from a GC pause and tries to write with an older token, the database rejects the write (`0 rows updated`).
+
+<ExecTimeline
+  title="Fencing Token Defense: Storage Rejects Stale Writes"
+  lanes={[
+    { id: "w1", label: "Worker 1" },
+    { id: "lock", label: "Lock Server" },
+    { id: "w2", label: "Worker 2" },
+    { id: "db", label: "Postgres (Fenced)" }
+  ]}
+  steps={[
+    { lane: "w1", label: "Acquire (Token 42)", note: "Worker 1 receives lock with fencing token 42", kind: "recv" },
+    { lane: "w1", label: "GC Pause 7s", note: "Worker 1 freezes; lease expires in lock server", kind: "block" },
+    { lane: "w2", label: "Acquire (Token 43)", note: "Worker 2 acquires expired lock with fencing token 43", kind: "recv" },
+    { lane: "w2", label: "Write (Token 43)", note: "DB executes: UPDATE ... WHERE last_token < 43 (commits, last_token=43)", kind: "send" },
+    { lane: "w1", label: "Wake & Write (42)", note: "Worker 1 wakes up and sends write with token 42", kind: "send" },
+    { lane: "db", label: "REJECT WRITE (42)", note: "DB check fails: 42 is not > 43. 0 rows updated! Data safe!", kind: "done" }
+  ]}
+  caption="Fencing tokens transform the storage layer into the ultimate arbiter of concurrency."
+/>
+
+<Define term="Fencing Token">
+A strictly monotonically increasing number generated by a consensus-backed lock manager upon each lock grant. Downstream storage systems verify that incoming operations have a higher token than previously seen operations, rejecting stale writes from expired lock holders.
+</Define>
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+// LedgerAccount represents a bank account protected by fencing tokens
+type LedgerAccount struct {
+	mu               sync.Mutex
+	AccountID        string
+	BalanceCents     int64
+	LastFencingToken uint64
+}
+
+var ErrStaleFencingToken = errors.New("storage: rejected write with stale fencing token")
+
+// UpdateBalanceFenced enforces monotonic token verification in storage
+func (acc *LedgerAccount) UpdateBalanceFenced(deltaCents int64, fencingToken uint64) error {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+
+	// Storage invariant: incoming token MUST be strictly greater than last committed
+	if fencingToken <= acc.LastFencingToken {
+		return fmt.Errorf("%w: token %d <= last seen %d",
+			ErrStaleFencingToken, fencingToken, acc.LastFencingToken)
+	}
+
+	if acc.BalanceCents+deltaCents < 0 {
+		return errors.New("insufficient funds")
+	}
+
+	acc.BalanceCents += deltaCents
+	acc.LastFencingToken = fencingToken
+	return nil
+}
+
+// LockManager simulates etcd/Raft generating monotonic fencing tokens
+type LockManager struct {
+	currentToken atomic.Uint64
+}
+
+func (lm *LockManager) AcquireLock() uint64 {
+	return lm.currentToken.Add(1)
+}
+
+func main() {
+	lm := &LockManager{}
+	acc := &LedgerAccount{AccountID: "ACC-MERIDIAN-99", BalanceCents: 50_000_00} // $50,000.00
+
+	// Step 1: Worker 1 acquires lock -> gets Token 1
+	tokenW1 := lm.AcquireLock()
+	fmt.Printf("Worker 1 acquired lock with Fencing Token: %d\n", tokenW1)
+
+	// Step 2: Worker 1 pauses (GC / network freeze). Lock expires.
+	// Worker 2 acquires lock -> gets Token 2
+	tokenW2 := lm.AcquireLock()
+	fmt.Printf("Worker 2 acquired lock with Fencing Token: %d\n", tokenW2)
+
+	// Step 3: Worker 2 commits payout $10,000 with Token 2
+	err := acc.UpdateBalanceFenced(-10_000_00, tokenW2)
+	fmt.Printf("Worker 2 write status: err=%v | Balance: $%d\n", err, acc.BalanceCents/100)
+
+	// Step 4: Worker 1 wakes up and attempts to commit payout $10,000 with Token 1
+	err = acc.UpdateBalanceFenced(-10_000_00, tokenW1)
+	if errors.Is(err, ErrStaleFencingToken) {
+		fmt.Printf("SUCCESS: Storage rejected Worker 1's stale write! Error: %v\n", err)
+	}
+
+	fmt.Printf("Final Account Balance: $%d (Double payout prevented!)\n", acc.BalanceCents/100)
+}
+```
+
+</GoPlayground>
+
+---
+
+## PostgreSQL Advisory Locks
+
+If your application already uses PostgreSQL as its source of truth, you don't need Redis or etcd for many distributed locking workflows. PostgreSQL provides built-in application-level locks known as **Advisory Locks**.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   PostgreSQL Server                         │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                   pg_locks Catalog                    │  │
+│  │   - locktype: 'advisory'                              │  │
+│  │   - objid: 4294967296 (64-bit BigInt key)             │  │
+│  │   - pid: 14022 (Bound to backend connection)          │  │
+│  │   - granted: true                                     │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Postgres advisory locks come in two distinct scopes:
+1. **Transaction-Level (`pg_advisory_xact_lock`)**: Held strictly for the duration of the SQL transaction (`BEGIN ... COMMIT`). Automatically released when the transaction ends (commit or rollback).
+2. **Session-Level (`pg_advisory_lock`)**: Held for the lifetime of the database connection until explicitly released with `pg_advisory_unlock` or when the TCP connection closes.
+
+<Define term="PostgreSQL Advisory Lock">
+An application-controlled mutual exclusion primitive managed directly by PostgreSQL's in-kernel lock table (`pg_locks`). They lock arbitrary 64-bit integer numbers rather than table rows or pages, incurring zero disk I/O.
+</Define>
+
+### The Go `database/sql` Connection Pool Trap ⚠
+
+Here is the single most dangerous bug in Go database programming:
+
+Go's `sql.DB` is a **connection pool**, not a single connection. When you execute `db.Exec("SELECT pg_advisory_lock(123)")`, Go checks out a connection from the pool, runs the query, and **immediately returns the connection to the pool**.
+
+If another goroutine later checks out that same connection, it unintentionally inherits your lock! If your goroutine tries to unlock on a different connection, the unlock fails or unlocks someone else's resource.
+
+```go
+// ❌ BROKEN: Session lock leaks across sql.DB connection pool
+func BrokenLock(db *sql.DB, lockID int64) {
+    // Checked out Conn A, acquired lock, returned Conn A to pool!
+    db.Exec("SELECT pg_advisory_lock($1)", lockID) 
+    
+    // ... do work ...
+    
+    // Checked out Conn B, tried to unlock! Conn B DOES NOT HOLD THE LOCK!
+    db.Exec("SELECT pg_advisory_unlock($1)", lockID) 
+}
+
+// ✅ IDIOMATIC 1: Transaction-level advisory lock (Always safe)
+func SafeTxLock(ctx context.Context, db *sql.DB, lockID int64, fn func(tx *sql.Tx) error) error {
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+
+    // Lock automatically released on Commit or Rollback
+    if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", lockID); err != nil {
+        return err
+    }
+
+    if err := fn(tx); err != nil {
+        return err
+    }
+    return tx.Commit()
+}
+
+// ✅ IDIOMATIC 2: Dedicated sql.Conn for session locks
+func SafeSessionLock(ctx context.Context, db *sql.DB, lockID int64) (*sql.Conn, error) {
+    conn, err := db.Conn(ctx) // Checkout dedicated connection
+    if err != nil {
+        return nil, err
+    }
+    if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", lockID); err != nil {
+        conn.Close()
+        return nil, err
+    }
+    return conn, nil // Caller MUST defer conn.Close() and unlock
+}
+```
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="pg_advisory_xact_lock">Transaction-scoped. Zero risk of connection leaks. Automatically unlocked when transaction commits or fails.</ConceptCard>
+  <ConceptCard label="64-Bit Integer Keys">Advisory locks accept a single bigint (`int64`). Use deterministic hashing (e.g. FNV-1a or Murmur3) to convert entity strings (`settlement:101`) to int64.</ConceptCard>
+  <ConceptCard label="Zero Disk I/O">Advisory locks live entirely in PostgreSQL shared memory (`pg_locks`). They create no WAL logs and generate no table bloat.</ConceptCard>
+  <Gotcha>⚠ sql.DB Pool Hazard: Never execute session-level pg_advisory_lock on a bare *sql.DB handle. Always use an explicit sql.Tx with pg_advisory_xact_lock or acquire a dedicated *sql.Conn.</Gotcha>
+</ConceptGrid>
+
+---
+
+## etcd Leases & Revision Mutexes
+
+When building distributed systems outside a single PostgreSQL database, **etcd** (the consensus engine behind Kubernetes) is the gold standard.
+
+etcd implements distributed locks using the **Raft consensus algorithm**, guaranteeing linearizable consistency even across server crashes and network splits.
+
+### How `etcd/clientv3/concurrency` Works
+
+```
+1. Create Lease with TTL (e.g. 10s)
+         │
+         ▼
+2. Background KeepAlive Goroutine (Heartbeat)
+         │
+         ▼
+3. Create Sequential Key in etcd:
+   Key:   /meridian/locks/settlement/75878252274987
+   Value: empty
+         │
+         ▼
+4. Raft Consents: Key gets a global 64-bit `CreateRevision` (e.g. Rev #1042)
+         │
+         ▼
+5. Is our Revision the LOWEST under /meridian/locks/settlement/?
+   ├── YES: We hold the lock! Rev #1042 IS OUR FENCING TOKEN.
+   └── NO:  Watch the preceding revision key until it is deleted.
+```
+
+<Define term="etcd Revision Fencing">
+Using etcd's 64-bit globally monotonic Raft store revision number as an unforgeable, consensus-backed fencing token for downstream storage checks.
+</Define>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
+)
+
+func RunWithEtcdLock(ctx context.Context, client *clientv3.Client, lockPrefix string) error {
+	// 1. Create a session with a 10-second lease (manages heartbeat automatically)
+	session, err := concurrency.NewSession(client, concurrency.WithTTL(10))
+	if err != nil {
+		return fmt.Errorf("failed to create etcd session: %w", err)
+	}
+	defer session.Close()
+
+	// 2. Create distributed mutex under prefix
+	mutex := concurrency.NewMutex(session, lockPrefix)
+
+	// 3. Acquire lock (blocks until lowest revision in Raft log)
+	log.Println("Acquiring etcd distributed lock...")
+	if err := mutex.Lock(ctx); err != nil {
+		return fmt.Errorf("failed to acquire lock: %w", err)
+	}
+	defer mutex.Unlock(context.Background())
+
+	// 4. EXTRACT MONOTONIC FENCING TOKEN: etcd's Raft Header Revision!
+	fencingToken := mutex.Header().Revision
+	log.Printf("Lock ACQUIRED! Consensus Fencing Token (Raft Revision): %d\n", fencingToken)
+
+	// 5. Execute critical section passing fencingToken to database
+	return processSettlementWithFencing(ctx, fencingToken)
+}
+
+func processSettlementWithFencing(ctx context.Context, token int64) error {
+	log.Printf("Executing critical section with Fencing Token %d...\n", token)
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+```
+
+---
+
+## The Redlock Debate & Redis Realities
+
+No discussion of distributed locks is complete without addressing **Redlock**, the multi-node Redis locking algorithm created by Salvatore Sanfilippo (Antirez).
+
+### The Redlock Algorithm
+
+To avoid single-point-of-failure issues with a single Redis instance, Redlock uses N independent Redis masters (typically N = 5, with no replication between them):
+1. The client gets the current timestamp in milliseconds.
+2. It attempts to acquire the lock in all N instances sequentially using `SET resource token NX PX ttl`.
+3. The client considers the lock acquired if it successfully locks a **majority** (at least (N/2)+1 = 3 nodes out of 5) within a total time less than the lock validity time.
+4. The remaining validity time is: `validity = TTL - elapsed_time - clock_drift`.
+
+<QuickCheck
+  question={"Why is Redlock without storage-level fencing tokens considered unsafe for financial transactions?"}
+  options={[
+    "Redis does not support TLS encryption",
+    "If a client experiences a GC pause or hypervisor delay after acquiring Redlock, the lease expires while the client still believes it holds the lock",
+    "Redlock only works on single-core Linux servers",
+    "Lua scripts are disabled in Redis cluster mode"
+  ]}
+  answer={1}
+  explain="The Kleppmann critique applies to Redlock just as it does to single-instance Redis: no lock algorithm based on time leases can prevent a paused client from executing stale writes unless downstream storage checks monotonic fencing tokens."
+/>
+
+### The Industry Consensus: When to Use What
+
+| Solution | Strongest Use Case | Consensus Model | Fencing Token Available? |
+| :--- | :--- | :--- | :--- |
+| **PostgreSQL Advisory Locks** | Single-cluster apps with Postgres database | ACID / Postgres Shared Memory | Yes (via monotonic `SEQUENCE` / timestamps) |
+| **etcd / Consul** | Correctness, financial ledgers, distributed microservices | Linearizable Raft Consensus | **Yes (Raft Store Revision Number)** |
+| **Redis (Single Instance `SET NX PX`)** | High-throughput efficiency locks (cron deduplication, cache warmers) | Asynchronous single-threaded in-memory | Manual sequence required |
+<UnderTheHood title="The Physics of Distributed Locking: Clock Drift, Consensus & Connection Pools">
+
+Distributed locking is where hardware physics and network realities collide with programmatic guarantees:
+
+1. **The Physical Impossibility of Synchronized Clocks**: Standard server hardware uses quartz crystal oscillators that drift by 1–5 seconds per week due to thermal fluctuation. Network Time Protocol (NTP) synchronizes clocks with unpredictable network jitter (±5ms to ±50ms). Crucially, NTP can jump backwards during synchronization steps unless monotonic time (`time.Since`) is used exclusively.
+2. **TrueTime vs. Raft Consensus**: Google Spanner achieves external consistency by using GPS receivers and atomic clocks with bounded uncertainty (around 7ms), waiting out the uncertainty window before committing. Systems like `etcd` bypass physical clocks entirely by using logical Raft consensus terms and store revision numbers.
+3. **Database Connection Pool Hazards**: PostgreSQL advisory locks are bound to physical backend server processes (`PGPROC`). If your Go service executes `pg_advisory_lock` on a generic `*sql.DB` pool without holding a dedicated `*sql.Conn` or wrapping inside `sql.Tx`, subsequent queries may execute on different pooled connections, silently bypassing the lock and leaking locks indefinitely.
+
+</UnderTheHood>
+
+---
+
+## Production Fenced Lock Engine in Go
+
+Let's assemble a complete, production-grade distributed lock manager with monotonic fencing token tracking, simulated network pauses, and storage validation in pure Go.
+
+```go
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// FencedLock represents an acquired lock with a monotonic token
+type FencedLock struct {
+	Key          string
+	OwnerUUID    string
+	FencingToken uint64
+	LeaseExpiry  time.Time
+}
+
+// LockManagerEngine manages distributed leases and monotonic tokens
+type LockManagerEngine struct {
+	mu           sync.Mutex
+	locks        map[string]*FencedLock
+	tokenCounter atomic.Uint64
+}
+
+func NewLockManagerEngine() *LockManagerEngine {
+	return &LockManagerEngine{
+		locks: make(map[string]*FencedLock),
+	}
+}
+
+// Acquire attempts to acquire a named lock with a time-to-live
+func (lm *LockManagerEngine) Acquire(ctx context.Context, key string, ttl time.Duration) (*FencedLock, error) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	now := time.Now()
+	existing, exists := lm.locks[key]
+
+	// If lock exists and has not expired, acquisition fails
+	if exists && now.Before(existing.LeaseExpiry) {
+		return nil, errors.New("lock already held by another worker")
+	}
+
+	// Generate random owner ID and monotonic fencing token
+	b := make([]byte, 8)
+	rand.Read(b)
+	ownerID := hex.EncodeToString(b)
+
+	token := lm.tokenCounter.Add(1)
+	lock := &FencedLock{
+		Key:          key,
+		OwnerUUID:    ownerID,
+		FencingToken: token,
+		LeaseExpiry:  now.Add(ttl),
+	}
+
+	lm.locks[key] = lock
+	return lock, nil
+}
+
+// Release safely releases a lock using atomic CAS comparison
+func (lm *LockManagerEngine) Release(key string, ownerUUID string) bool {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	existing, exists := lm.locks[key]
+	if !exists {
+		return false
+	}
+
+	// CAS check: only the true owner can release the lock!
+	if existing.OwnerUUID == ownerUUID {
+		delete(lm.locks, key)
+		return true
+	}
+	return false // Owned by someone else (lease had expired)
+}
+```
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Atomic Redis Lock CAS Script Runner" level="easy">
+
+Implement a Go helper function `FormatRedisCASRelease(lockKey, ownerUUID string) (script string, keys []string, args []any)` that constructs the exact Lua script, keys, and arguments required to release a Redis distributed lock safely without deleting a newer lock.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func FormatRedisCASRelease(lockKey, ownerUUID string) (string, []string, []any) {
+	luaScript := `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end`
+	keys := []string{lockKey}
+	args := []any{ownerUUID}
+	return luaScript, keys, args
+}
+
+func main() {
+	script, keys, args := FormatRedisCASRelease("lock:payout:99", "worker-uuid-1234")
+	fmt.Printf("Lua Script:\n%s\nKeys: %v\nArgs: %v\n", script, keys, args)
+}
+```
+
+By packaging the `GET` and `DEL` operations into a single atomic Redis Lua script, the Redis server executes both instructions without interleaving commands from other network clients.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Fenced Ledger Mutation Validator" level="medium">
+
+Write a Go type `FencedLedger` that maintains account balances and enforces monotonic fencing token validation on every mutation. Return custom errors when tokens arrive out of order.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+var ErrStaleToken = errors.New("fenced_ledger: rejected mutation with stale fencing token")
+
+type FencedLedger struct {
+	mu         sync.RWMutex
+	balances   map[string]int64
+	lastTokens map[string]uint64
+}
+
+func NewFencedLedger() *FencedLedger {
+	return &FencedLedger{
+		balances:   make(map[string]int64),
+		lastTokens: make(map[string]uint64),
+	}
+}
+
+func (fl *FencedLedger) Credit(accountID string, amountCents int64, token uint64) error {
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+
+	lastToken := fl.lastTokens[accountID]
+	if token <= lastToken {
+		return fmt.Errorf("%w: token %d <= last seen %d for account %s",
+			ErrStaleToken, token, lastToken, accountID)
+	}
+
+	fl.balances[accountID] += amountCents
+	fl.lastTokens[accountID] = token
+	return nil
+}
+
+func main() {
+	ledger := NewFencedLedger()
+	if err := ledger.Credit("MERIDIAN-ESCROW", 100_00, 10); err != nil {
+		panic(err)
+	}
+	// Stale write with token 8 must be rejected
+	err := ledger.Credit("MERIDIAN-ESCROW", 100_00, 8)
+	if errors.Is(err, ErrStaleToken) {
+		fmt.Println("Correctly rejected stale write with token 8!")
+	}
+}
+```
+
+The storage layer enforces that time flows strictly forward by verifying `token > lastTokens[accountID]`, guaranteeing that delayed network packets or resurrected GC-paused processes cannot corrupt ledger balances.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Automatic Lease KeepAlive Heartbeat" level="hard">
+
+Implement a Go background lease refresher `StartHeartbeat(ctx context.Context, renewFn func() error, interval time.Duration) <-chan error` that continually extends a distributed lease until context cancellation or a heartbeat renewal error occurs.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
+
+func StartHeartbeat(ctx context.Context, renewFn func() error, interval time.Duration) <-chan error {
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer close(errChan)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := renewFn(); err != nil {
+					errChan <- fmt.Errorf("heartbeat failed: %w", err)
+					return
+				}
+			}
+		}
+	}()
+
+	return errChan
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var renewCount atomic.Int32
+	renewFn := func() error {
+		renewCount.Add(1)
+		return nil
+	}
+
+	errChan := StartHeartbeat(ctx, renewFn, 20*time.Millisecond)
+
+	for err := range errChan {
+		if err != nil {
+			fmt.Println("Error:", err)
+		}
+	}
+	fmt.Printf("Heartbeat finished cleanly. Total renewals: %d\n", renewCount.Load())
+}
+```
+
+A robust lease manager uses a background ticker running at roughly one-third (1/3) of the total TTL duration to refresh the lease, ensuring transient network hiccups don't cause premature expiration while work is actively executing.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="PostgreSQL 64-Bit Advisory Lock Key Hasher" level="hard">
+
+PostgreSQL advisory locks accept an `int64` identifier. Write a deterministic, collision-resistant hasher `HashAdvisoryLockKey(namespace, entityID string) int64` using the 64-bit FNV-1a algorithm that maps arbitrary string entity names into signed 64-bit integers.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"hash/fnv"
+)
+
+// HashAdvisoryLockKey converts a namespace and entity ID into a deterministic int64
+// suitable for PostgreSQL pg_advisory_xact_lock(bigint).
+func HashAdvisoryLockKey(namespace, entityID string) int64 {
+	hasher := fnv.New64a()
+	hasher.Write([]byte(namespace))
+	hasher.Write([]byte(":"))
+	hasher.Write([]byte(entityID))
+	
+	// Cast uint64 hash directly to signed int64
+	return int64(hasher.Sum64())
+}
+
+func main() {
+	key1 := HashAdvisoryLockKey("meridian:settlement", "BATCH-2026-08-31-001")
+	key2 := HashAdvisoryLockKey("meridian:settlement", "BATCH-2026-08-31-002")
+
+	fmt.Printf("Postgres Lock Key 1: %d\n", key1)
+	fmt.Printf("Postgres Lock Key 2: %d\n", key2)
+}
+```
+
+The 64-bit FNV-1a algorithm provides rapid, non-cryptographic distribution with minimal collision probability across 2^64 possible values, perfectly bridging application string keys into PostgreSQL's `int64` advisory lock space.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## Recap
+
+- **Distributed locks require leases (TTLs)** to prevent infinite deadlocks on node failure, but leases can expire silently during GC pauses, hypervisor stalls, or network partitions.
+- The **Martin Kleppmann GC Hazard** proves that client-side lock checks cannot protect against split-brain writes when processes freeze.
+- **Monotonic Fencing Tokens** provide the only mathematically sound defense: storage engines must reject incoming writes where `fencing_token <= last_seen_token`.
+- **PostgreSQL Advisory Locks** provide zero-overhead transactional mutual exclusion, but require using `pg_advisory_xact_lock` inside a transaction to prevent connection-pool leaks.
+- **etcd** utilizes the Raft consensus algorithm to provide linearizable distributed mutexes, where the Raft store revision number acts as an unforgeable fencing token.
+- **Redis single-instance locks** require atomic Lua CAS scripts for safe release, and should be reserved for efficiency optimization rather than financial correctness unless combined with storage fencing.
+
+---
+
+<Lab
+  title="The Split-Brain Payout Heist"
+  archetype="fix-it"
+  difficulty="hard"
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  hints={[
+    "Look at UnsafeRelease in DistributedLockManager: it deletes the lock key unconditionally without verifying that ownerUUID matches the current lock owner.",
+    "Inspect CommitPayout in FencedStorage: it currently performs a blind update without checking if the incoming fencingToken is strictly greater than lastFencingToken.",
+    "Ensure CommitPayout returns an error when fencingToken <= lastFencingToken so stale workers are rejected."
+  ]}
+  flag="GO{monotonic_fencing_tokens_defeat_gc_pauses}"
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type LockRecord struct {
+	OwnerUUID    string
+	FencingToken uint64
+	ExpiresAt    time.Time
+}
+
+type DistributedLockManager struct {
+	mu           sync.Mutex
+	locks        map[string]*LockRecord
+	tokenCounter atomic.Uint64
+}
+
+func NewDistributedLockManager() *DistributedLockManager {
+	return &DistributedLockManager{
+		locks: make(map[string]*LockRecord),
+	}
+}
+
+func (m *DistributedLockManager) Acquire(key, ownerUUID string, ttl time.Duration) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	rec, exists := m.locks[key]
+	if exists && now.Before(rec.ExpiresAt) {
+		return 0, errors.New("lock already acquired")
+	}
+
+	token := m.tokenCounter.Add(1)
+	m.locks[key] = &LockRecord{
+		OwnerUUID:    ownerUUID,
+		FencingToken: token,
+		ExpiresAt:    now.Add(ttl),
+	}
+	return token, nil
+}
+
+// BUG 1: Unsafe release deletes the lock even if another worker now owns it!
+// Fix it to only delete if rec.OwnerUUID == ownerUUID.
+func (m *DistributedLockManager) Release(key, ownerUUID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rec, exists := m.locks[key]
+	if !exists {
+		return false
+	}
+
+	// BUGGY: Deletes lock unconditionally
+	if rec.OwnerUUID != ownerUUID {
+		// Should NOT delete if we don't own it!
+		// Fix: return false here
+	}
+	delete(m.locks, key)
+	return true
+}
+
+type FencedStorage struct {
+	mu               sync.Mutex
+	BalanceCents     int64
+	LastFencingToken uint64
+	PayoutCount      int
+}
+
+// BUG 2: Missing monotonic fencing token verification!
+// Fix CommitPayout to reject writes where fencingToken <= s.LastFencingToken.
+func (s *FencedStorage) CommitPayout(amountCents int64, fencingToken uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// BUGGY: Blindly updates without checking if fencingToken > s.LastFencingToken!
+	// Add the check here and return errors.New("stale fencing token") if invalid.
+
+	s.BalanceCents -= amountCents
+	s.LastFencingToken = fencingToken
+	s.PayoutCount++
+	return nil
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+
+func main() {
+	lockMgr := NewDistributedLockManager()
+	storage := &FencedStorage{
+		BalanceCents:     10_000_000, // $100,000.00
+		LastFencingToken: 0,
+		PayoutCount:      0,
+	}
+
+	// Scenario: Worker 1 acquires lock (short TTL) -> gets Token 1
+	token1, err := lockMgr.Acquire("settlement:batch:99", "worker-1", 50*time.Millisecond)
+	if err != nil {
+		fmt.Printf("FAIL: Worker 1 could not acquire lock: %v\n", err)
+		return
+	}
+
+	// Worker 1 encounters a GC pause of 100ms.
+	time.Sleep(100 * time.Millisecond) // Lease expires in lock manager!
+
+	// Worker 2 acquires lock -> gets Token 2
+	token2, err := lockMgr.Acquire("settlement:batch:99", "worker-2", 200*time.Millisecond)
+	if err != nil {
+		fmt.Printf("FAIL: Worker 2 could not acquire lock: %v\n", err)
+		return
+	}
+
+	// Worker 2 completes valid payout of $50,000
+	if err := storage.CommitPayout(5_000_000, token2); err != nil {
+		fmt.Printf("FAIL: Worker 2 commit rejected: %v\n", err)
+		return
+	}
+
+	// Worker 1 wakes up and tries to release lock with its stale owner ID
+	// Because Worker 2 now owns the lock, Worker 1's release MUST return false and NOT delete Worker 2's lock!
+	w1Released := lockMgr.Release("settlement:batch:99", "worker-1")
+
+	ok := true
+	if w1Released {
+		fmt.Println("FAIL: Worker 1 was able to release Worker 2's lock! (Unsafe release bug)")
+		ok = false
+	}
+
+	// Worker 1 tries to commit its stale payout with Token 1 -> Storage MUST reject it!
+	err = storage.CommitPayout(5_000_000, token1)
+	if err == nil {
+		fmt.Println("FAIL: Storage accepted stale write with Token 1! (Fencing token bug)")
+		ok = false
+	}
+
+	if storage.BalanceCents != 5_000_000 {
+		fmt.Printf("FAIL: Storage Balance = $%d, want $50,000 (double payout occurred!)\n", storage.BalanceCents/100)
+		ok = false
+	}
+
+	if storage.PayoutCount != 1 {
+		fmt.Printf("FAIL: PayoutCount = %d, want 1\n", storage.PayoutCount)
+		ok = false
+	}
+
+	if ok {
+		fmt.Println("Fencing token check passed: Stale write rejected, storage balance preserved at $50,000.00")
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+>
+
+Meridian's payout processor is suffering from split-brain double-disbursements caused by unvalidated lock releases and missing storage-level fencing checks. Fix `Release` to only delete matching owner locks and fix `CommitPayout` to reject stale fencing tokens. When all invariants hold, `ALL CHECKS PASS` will print and unlock the flag.
+
+</Lab>
+
+<Recap>
+- **Efficiency vs. Correctness**: Efficiency locks (single-instance Redis) avoid duplicated work like cron runs. Correctness locks (financial settlement, ledger writes) require linearizable consensus and storage-level validation.
+- **The Kleppmann Hazard**: No distributed lock based on time leases can guarantee mutual exclusion on asynchronous networks when clients experience stop-the-world GC pauses, CPU starvation, or hypervisor freezes.
+- **Fencing Tokens**: Every lock acquisition returns a strictly monotonically increasing counter ($Token = N+1$). Storage engines enforce `WHERE fencing_token > highest_seen_token`, deterministically discarding stale writes.
+- **PostgreSQL Advisory Locks**: Session-level (`pg_advisory_lock`) vs Transaction-level (`pg_advisory_xact_lock`). Transaction-level locks auto-release on `COMMIT`/`ROLLBACK` and are safe for Go connection pools.
+- **etcd Consensus Leases**: Built on Raft linearizability. etcd generates monotonic 64-bit store revision numbers on every mutation, providing native fencing tokens directly out of the box.
+</Recap>
+
+<Scoreboard
+  streak={10}
+  items={[
+    { label: "Differentiated efficiency locks from correctness locks", kind: "concept", points: 10, done: true },
+    { label: "Deconstructed the Martin Kleppmann GC Pause Hazard", kind: "theory", points: 15, done: true },
+    { label: "Implemented Monotonic Fencing Tokens in storage", kind: "mechanism", points: 20, done: true },
+    { label: "Mastered PostgreSQL advisory locks without connection pool leaks", kind: "database", points: 20, done: true },
+    { label: "Integrated etcd Raft consensus leases and revisions", kind: "consensus", points: 20, done: true },
+    { label: "Evaluated Redis single-instance vs Redlock tradeoffs", kind: "architecture", points: 15, done: true },
+    { label: "Fixed the split-brain distributed mutex and storage fence", kind: "lab", points: 95, done: false }
+  ]}
+  flag={{ label: "GO{monotonic_fencing_tokens_defeat_gc_pauses}", captured: false, points: 95 }}
+/>
+
+Look at what you just built, sport. While the rest of the industry is still slapping random Redis keys into their services and praying their network never hiccups, you understand that true mutual exclusion lives in consensus and monotonic storage fencing. You know how to make PostgreSQL, etcd, and Go dance together so seamlessly that not even a 10-second GC freeze can steal a single dollar from Meridian's ledger. It's no *me*, of course… but you're finally writing code worthy of the name.

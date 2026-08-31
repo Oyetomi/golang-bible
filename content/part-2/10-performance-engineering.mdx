@@ -60,6 +60,10 @@ The amateur opens their editor and starts guessing. You open a profiler.
 
 ### What pprof gives you
 
+<Define term="CPU Profiling (pprof) & Statistical Sampling">
+**CPU profiling** in Go is a low-overhead statistical sampling mechanism. The OS kernel sets a periodic timer (`setitimer` / `SIGPROF`) firing every 10ms (100 Hz); upon each signal, the runtime records the call stack of the currently active goroutine on that thread. **Why it matters:** captures real-world CPU hotspots with under 1–2% runtime overhead, safe to run on production traffic. **Production hazard:** profiling CPU-bound tight loops without I/O or function calls can suffer from sampling bias (skid), where instructions immediately following a signal arrival are slightly over-represented; always collect at least 30–60 seconds of samples.
+</Define>
+
 `pprof` is Go's built-in profiling framework. It collects four kinds of profiles, and you need to know all four because they point at different problems:
 
 <ConceptGrid cols={2}>
@@ -577,6 +581,10 @@ func generateLedgerReport(rows []LedgerRow) []byte {
 }
 ```
 
+<Define term="sync.Pool & Zero-Allocation Reuse">
+**`sync.Pool`** is a concurrent, lock-free object cache designed to amortize memory allocations for short-lived temporary objects (like byte buffers, encoder scratch space, or decode structs). It maintains per-P local ring buffers that can be accessed without cross-core lock contention. **Why it matters:** reduces steady-state heap allocations to zero on hot request paths, eliminating GC CPU pressure. **Production hazard:** storing unbounded buffers in `sync.Pool` causes memory leaks; if a single 50MB payload causes a buffer to expand to 50MB and is returned to the pool, that 50MB allocation remains pinned in RAM until drained by subsequent GC cycles. Always reset buffer length and cap max capacity before calling `Put()`.
+</Define>
+
 <CodeWalk
   title="sync.Pool — reuse scratch buffers across calls"
   steps={[
@@ -766,7 +774,15 @@ debug.SetMemoryLimit(512 << 20) // 512 MB
   <Gotcha>Setting `GOGC` very high without `GOMEMLIMIT` in a container is asking to be OOM-killed. Always pair them. The GC will happily let your heap grow to 4× if `GOGC=400` with no ceiling — and your pod will die.</Gotcha>
 </ConceptGrid>
 
-<UnderTheHood title="Tri-color mark-sweep and write barriers (Go 1.26)">
+<Define term="Tri-Color Mark-Sweep & Write Barriers">
+Go's concurrent garbage collection algorithm categorizes heap objects into three sets: **White** (unvisited/candidate garbage), **Grey** (visited but child pointer references not yet scanned), and **Black** (visited and all child pointers scanned). The **write barrier** is a small compiler-injected snippet executed during pointer writes that prevents live white objects from being hidden behind black objects while marking runs concurrently. **Why it matters:** allows GC to execute concurrently with user goroutines, capping Stop-The-World (STW) pauses below 1 millisecond. **Production hazard:** dense pointer graph modifications during active mark phases trigger heavy write barrier execution (`runtime.gcWriteBarrier`), consuming up to 25% of mutator CPU time.
+</Define>
+
+<Define term="Non-Generational GC vs Generational GC">
+Unlike Java HotSpot or V8 which partition memory into Young and Old generations (generational hypothesis: "most objects die young"), Go uses a **single-generation non-moving mark-sweep collector**. **Why it matters:** Go's aggressive escape analysis keeps almost all short-lived objects on the thread stack where they are freed at zero cost without GC involvement, eliminating the need for a nursery generation. **Production hazard:** expecting Java-style JVM generational tuning flags or ignoring stack-to-heap escapes can lead to excessive full-heap scanning overhead.
+</Define>
+
+<UnderTheHood title="Tri-color mark-sweep, write barriers, and why Go is non-generational">
 
 *This is a simplified model of GC internals. Go 1.26 ships the Green Tea GC, which changes some of the internal phases described below — treat these as a conceptual guide, not a precise specification.*
 
@@ -778,7 +794,13 @@ Go's GC runs **mostly concurrently** with your goroutines. Here's the simplified
 4. **STW finish**: goroutines pause again so the GC can drain the final grey queue and confirm marking is complete.
 5. **Concurrent sweep**: dead (white) objects are swept asynchronously. Memory is returned to span freelists; spans are returned to the OS lazily.
 
-The GC has a **pacer** that models your allocation rate and schedules cycles to meet the `GOGC` target. In practice, verify pause time with your own workload instead of relying on a universal number.
+### The Deep "Why": Why Go Chose a Non-Generational GC
+Virtually all other managed languages (Java, C#, JavaScript, Python) use generational collectors with moving compactions. Why did Go's designers deliberately choose a **non-generational, non-moving** collector?
+
+1. **Escape Analysis Solves Infant Mortality on the Stack:** Generational GCs exist because 95%+ of allocated objects die almost immediately ("infant mortality"). In Java, primitive arrays and small objects must live on the heap. In Go, structs and small buffers **do not escape to the heap** — they live on the stack and are destroyed instantly when the function returns (`add $size, %rsp`). The heap only receives long-lived data.
+2. **Zero Write Barrier Overhead in Steady State:** In a generational GC, every single pointer write in your application must execute a write barrier to track Old-to-Young inter-generational references (card marking). In Go, write barriers are **completely disabled** during normal execution and only activate during the brief concurrent mark phase.
+3. **Non-Moving Allocations Enable C-Interop and Direct Pointers:** A moving generational GC relocates objects during compaction, requiring pointer updating and forbidding interior pointers. Go allows interior pointers (`&s.Field`), direct unsafe casting, and zero-copy CGO memory sharing because heap object addresses remain strictly immutable throughout their lifetime.
+4. **Predictable Low-Latency STW Pauses (&lt;1ms):** By avoiding full-heap stop-the-world compaction, Go delivers predictable sub-millisecond tail latencies required for modern distributed microservices.
 
 </UnderTheHood>
 
@@ -787,6 +809,10 @@ The GC has a **pacer** that models your allocation rate and schedules cycles to 
 ## Mechanical Sympathy
 
 This is where it gets beautiful. You've cut allocations. You've tuned the GC. Now we go one level deeper — to the hardware your Go binary runs on.
+
+<Define term="False Sharing & CPU Cache Coherence (MESI)">
+**False sharing** is a hardware degradation occurring when two independent goroutines running on separate CPU cores concurrently modify distinct variables that reside within the same 64-byte CPU cache line. Under the **MESI** (Modified-Exclusive-Shared-Invalid) cache-coherence protocol, each core's write invalidates the other core's L1 cache copy, causing high-latency bus transactions. **Why it matters:** can degrade multi-threaded throughput by 10× to 40× despite the absence of a logical data race. **Production hazard:** closely-packed struct fields or adjacent array elements updated by parallel workers cause severe latency spikes; eliminate false sharing by padding shared fields to 64-byte boundaries with `_ [56]byte` or `cpu.CacheLinePad`.
+</Define>
 
 **On the job:** False sharing is a common culprit in concurrent Go services where throughput fails to scale with `GOMAXPROCS`. The race detector stays silent — it's not a data race — but the hardware contention is just as real. Profile throughput under different `GOMAXPROCS` values; if adding cores helps less than expected, false sharing is a prime suspect.
 
@@ -1025,6 +1051,10 @@ Cache misses from false sharing won't show up in CPU profiles as obviously as CP
 
 `pprof` tells you *what* is slow. The execution tracer tells you *why* by recording a precise event log of everything the runtime does — goroutine scheduling, GC pauses, syscalls, network I/O — over time.
 
+<Define term="Execution Tracer (runtime/trace)">
+**`runtime/trace`** is Go's deep instrumentation engine that logs every runtime event (goroutine scheduling, GC phases, heap allocation, network I/O, and syscall transitions) with nanosecond hardware timestamps (`RDTSC`). **Why it matters:** exposes non-CPU latency bottlenecks — like lock contention, scheduler queues, and GC STW pauses — that cannot be detected by standard CPU statistical samplers. **Production hazard:** collecting continuous execution traces on high-throughput microservices generates gigabytes of event logs and incurs 5–10% CPU overhead; use `trace.FlightRecorder` in Go 1.25+ to maintain a rolling in-memory buffer without disk I/O.
+</Define>
+
 **On the job:** Reach for the execution tracer when `pprof` shows healthy CPU utilization but your latency p99 is still high. Scheduling stalls, GC interference, and goroutine pile-ups are invisible to the CPU profiler but obvious in a trace.
 
 ### `runtime/trace` — collecting a trace
@@ -1119,7 +1149,7 @@ Everything in this chapter so far runs one loop: **you** measure, **you** read t
 **On the job:** PGO is the cheapest real win in Go performance. The Go team measured **2–7%** CPU reduction on representative benchmarks when it shipped in Go 1.21, and the devirtualization work in 1.22 pushed some dispatch-heavy workloads past 10%. The price is one committed file and a refresh habit. If your service already exposes `net/http/pprof` — and after the first section of this chapter, it does — you are one `curl` away from the input.
 
 <Define term="Profile-guided optimization (PGO)">
-**PGO** feeds a CPU profile from a real run back into the compiler, which uses the sample weights to optimize the paths your program *actually* takes — more aggressive inlining of hot functions, and devirtualization of hot interface calls. `go build` activates it automatically when a pprof file named `default.pgo` sits in the main package's directory. Stable since Go 1.21.
+**Profile-guided optimization (PGO)** is a compiler optimization technique where a CPU profile (`default.pgo`) collected from real production traffic is fed into `go build`. The compiler uses execution frequencies to make smarter decisions: inlining hot functions past default size thresholds, devirtualizing frequent interface calls, and ordering basic blocks for optimal branch prediction. **Why it matters:** yields 2% to 14% CPU efficiency gains and latency reductions with zero application source code changes. **Production hazard:** feeding a stale or unrepresentative profile (e.g. captured during an abnormal incident or synthetic micro-benchmark) can cause the compiler to optimize the wrong paths, degrading steady-state performance.
 </Define>
 
 ### Why the compiler guesses without you

@@ -124,11 +124,11 @@ func main() {
 Two ideas in those few lines carry the whole chapter:
 
 <Define term="Log (append-only file)" since="Storage Engines (Part 2)">
-A **log** here is not application log output — it's an **append-only sequence of records on disk**. Writes only ever go on the *end*; existing bytes are never modified. Why it matters: appending is the single fastest write a disk can do (no seeking, no rewriting), so almost every storage engine has a log at its core. The cost: old versions pile up, and finding a key means knowing *where* it is.
+A **log** in storage engine architecture is an **append-only sequence of immutable records on disk**. New records are appended strictly to the tail; existing bytes are never updated in place. **Why it matters:** sequential disk appends maximize drive throughput by saturating controller bandwidth and eliminating expensive disk head seeks or SSD random-write block-erase cycles. **Production hazard:** logs grow indefinitely; without background truncation or compaction, the host disk fills to 100%, causing the database process to crash fatally and lock out new transactions.
 </Define>
 
 <Define term="Index" since="Storage Engines (Part 2)">
-An **index** is an extra structure *derived* from your data that makes reads faster — like the in-memory hash map above (key → byte offset). Why it matters: without an index, finding a key means scanning the whole file, `O(n)` — double the data, double the wait. *With* one, it's a direct jump. But every index must be **updated on every write**, so indexes speed up reads and **slow down writes**. That trade-off — pay on writes to save on reads — is the central tension of all storage engines, and why databases don't index every column by default.
+An **index** is an auxiliary data structure derived from raw data that accelerates lookup operations (e.g. mapping a primary key to a file byte offset). **Why it matters:** transforms linear file scans (`O(n)`) into logarithmic or constant-time jumps (`O(log n)` or `O(1)`). **Production hazard:** every write, update, or deletion must synchronously update all attached indexes, multiplying disk write amplification and degrading write throughput under heavy ingest.
 </Define>
 
 <Callout kind="warn" title="The toy engine has three fatal flaws — and fixing them gives us real engines">
@@ -142,7 +142,7 @@ Our append-log-plus-hash-index is fast, but: (1) it never reclaims space — sta
 The first fix keeps the append-only spirit but makes the on-disk files **sorted**. A sorted file of key-value pairs is called an **SSTable**, and the engine built around them is the **LSM-tree** (Log-Structured Merge-tree) — the heart of Cassandra, ScyllaDB, RocksDB, HBase, and Bigtable.
 
 <Define term="SSTable & memtable" since="Storage Engines (Part 2)">
-An **SSTable** (Sorted String Table) is an on-disk file of key-value pairs **sorted by key**, with each key appearing once. A **memtable** is an in-memory sorted structure (a balanced tree or skip list) that buffers recent writes. Why it matters: sorting unlocks cheap range scans and lets two files be merged with a memory-light mergesort. Writes go to the fast memtable; when it's full, it's flushed to disk as a new immutable SSTable. You get log-speed writes *and* sorted files.
+An **SSTable** (Sorted String Table) is an immutable on-disk file containing key-value pairs **sorted by key**. A **memtable** is an in-memory sorted buffer (typically a red-black tree or skiplist) that collects live writes. **Why it matters:** sorted keys allow binary search or sparse indexing, efficient range scans, and O(n) streaming multi-way merges. **Production hazard:** if background SSTable flushing falls behind heavy burst traffic, the memtable exhausts allocated RAM, forcing write stalls and throttling upstream client requests.
 </Define>
 
 Here is the write path. Notice every write is durable *before* it's acknowledged, via a separate write-ahead log:
@@ -196,7 +196,7 @@ Reads are trickier: a key might be in the memtable, or the newest SSTable, or an
 The other family throws out the log entirely. Instead of immutable sorted files, a **B-tree** divides the disk into fixed-size **pages** (typically 4–16 KiB) and **updates them in place**. It's the most widespread index structure on earth — every major relational database (Postgres, MySQL, SQL Server, Oracle) uses one.
 
 <Define term="B-tree (pages & branching factor)" since="Storage Engines (Part 2)">
-A **B-tree** stores sorted key-value pairs in fixed-size **pages** arranged as a balanced tree. One page is the **root**; it holds keys and references to child pages, each child covering a key range, down to **leaf** pages holding the actual values. (Databases almost always use the **B+tree** variant: only the leaf pages hold values, internal pages hold keys purely for navigation, and the leaves are linked for fast range scans. We say "B-tree" loosely here; the on-disk reality is a B+tree.) The **branching factor** (references per page, often several hundred) keeps the tree shallow — three or four levels can address hundreds of terabytes. Why it matters: a lookup reads just one page per level (≈3–4 disk reads), giving fast, *predictable* read performance — the B-tree's headline strength.
+A **B-tree** (and its ubiquitous on-disk variant, the **B+tree**) is a self-balancing search tree that divides storage into fixed-size **pages** (typically 4 KB to 16 KB) aligned with OS page cache and hardware storage blocks. Internal pages hold routing keys with high **branching factors** (hundreds of child pointers), keeping tree depth to 3–4 levels even for terabytes of records. **Why it matters:** guarantees predictable `O(log n)` read latency requiring at most 3 to 4 page reads per lookup. **Production hazard:** concurrent inserts causing root-level page splits lock large subtrees, generating sudden P99 write latency spikes; random in-place updates fragment flash memory blocks.
 </Define>
 
 A lookup walks the tree from the root, following the one child whose range contains your key:
@@ -220,7 +220,7 @@ A lookup walks the tree from the root, following the one child whose range conta
 />
 
 <Define term="Write-ahead log (WAL) & in-place overwrite" since="Storage Engines (Part 2)">
-A B-tree's basic write **overwrites a page on disk in place**. A page split overwrites *several* pages at once — and if the database crashes mid-split, the tree is corrupted (an orphan page, or a half-written "torn" page). The fix is a **write-ahead log (WAL)**: every change is appended to a durable log *before* the tree pages are touched, so a crash can be recovered by replaying it. Why it matters: in-place updates make B-trees fast to read but fragile to crash — the WAL (filesystem people call it *journaling*) is what makes them safe. Data is durable once it's in the WAL and `fsync`'d to disk.
+A **Write-Ahead Log (WAL)** is a persistent append-only file where transaction modifications are recorded and flushed to disk *before* any in-place page changes or memtable updates are applied. **Why it matters:** ensures strict Atomicity and Durability (ACID) — if power is lost mid-transaction, crash recovery replays the WAL to reconstruct a consistent state. **Production hazard:** returning a success response to a client before calling `file.Sync()` (`fsync`) leaves WAL data in the OS volatile page cache; an abrupt power cut or kernel panic causes silent data loss.
 </Define>
 
 So both families use a WAL for durability — but for opposite reasons. The LSM uses it to recover the in-memory memtable; the B-tree uses it to survive a dangerous in-place page overwrite. Same tool, different fear.
@@ -237,14 +237,23 @@ Now the decision you'll actually make. The one-line rule: **LSM-trees are better
 </ConceptGrid>
 
 <Define term="Write amplification" since="Storage Engines (Part 2)">
-**Write amplification** is the ratio of bytes actually written to disk versus the bytes the application asked to write. If a 100-byte write causes 600 bytes of disk I/O (log, flush, compactions), amplification is 6×. Why it matters: in write-heavy systems the bottleneck is disk write bandwidth, so high amplification directly caps your writes per second — *and* it wears out SSDs faster (flash has a limited number of write cycles). Choosing the lower-amplification engine for a write-heavy ledger is a real, measurable win.
+**Write amplification (WA)** is the ratio of physical bytes written to underlying storage relative to the logical bytes requested by the application (`WA = Bytes_written_to_disk / Bytes_written_by_user`). **Why it matters:** high write amplification consumes storage bus bandwidth and exhausts SSD flash endurance limits. **Production hazard:** unoptimized compaction triggers write amplification factors above 30×, saturating NVMe controller I/O queues and prematurely destroying flash memory cells.
 </Define>
 
-<UnderTheHood title="Why sequential beats random, even on SSDs — and the Go durability detail">
+<UnderTheHood title="Why sequential beats random on SSDs, kernel dirty pages, and fsync durability">
 
-On spinning disks, a random write means physically moving the head — milliseconds, an eternity. SSDs have no moving parts, yet sequential *still* wins, for a subtler reason: flash can be **written** one ~4 KiB page at a time but only **erased** one ~512 KiB block at a time. A big sequential write fills whole blocks that can later be erased cleanly; scattered random writes leave blocks half-valid, forcing the SSD's **garbage collector** to relocate live pages before erasing — stealing bandwidth and adding wear. So an LSM's large sequential flushes are gentler on the drive than a B-tree's scattered page overwrites.
+### 1. Physical Flash Memory Architecture: Pages vs Erase Blocks
+Even though solid-state drives (SSDs) have no physical spinning heads:
+- Flash memory can be **read and written** only in fixed units called **pages** (typically 4 KB).
+- Flash memory can only be **erased** in large units called **erase blocks** (typically 2 MB to 4 MB).
+- When a B-tree modifies a single 50-byte record inside a 4 KB page, the drive must rewrite the entire 4 KB page. Over time, random in-place updates leave erase blocks fragmented with stale pages. The SSD controller's internal **Flash Translation Layer (FTL)** must perform background Garbage Collection — reading valid pages, writing them to a new block, and erasing the old block — stealing drive I/O bandwidth.
+- LSM-trees write large sequential chunks (64 MB+ SSTables), filling contiguous erase blocks that can later be erased in a single hardware cycle.
 
-**The Go angle:** none of this durability is real until the bytes are physically on the disk, and the OS buffers writes in a page cache. A normal `file.Write` can be lost in a crash. You must call `file.Sync()` — Go's wrapper around the `fsync` syscall — to force the WAL to durable storage before acknowledging a write. As of Go 1.26, prefer `os.OpenFile` with `O_APPEND` for the log, `bufio.Writer` to batch, then `Sync()` at the commit point; and `slices.SortFunc` (Go 1.21+) to keep a memtable's flush sorted. The engine is only as durable as its last successful `Sync()`.
+### 2. OS Dirty Page Cache and fsync()
+When your Go program calls `file.Write([]byte)`, data is merely copied into the **Linux OS Page Cache** (kernel RAM).
+- The write is **not durable** yet.
+- You must invoke `file.Sync()` (which calls the `fsync()` or `fdatasync()` syscall) to issue hardware barrier commands to the NVMe/SATA controller, flushing the drive's volatile write cache onto non-volatile NAND flash.
+- In Go 1.26, high-throughput engines use `bufio.Writer` to batch log entries in user space, issuing a single `file.Sync()` per group commit.
 
 </UnderTheHood>
 
@@ -265,7 +274,7 @@ On spinning disks, a random write means physically moving the head — milliseco
 An LSM read may have to check many SSTables — and most of them won't contain your key. Reading each one to discover that is wasteful. A **Bloom filter** is a tiny, fast, *probabilistic* gate that says "definitely not here" or "maybe here," letting you skip most SSTables without touching them.
 
 <Define term="Bloom filter" since="Storage Engines (Part 2)">
-A **Bloom filter** is a bit array plus a few hash functions that answers "is this key in this set?" with **no false negatives** (a "no" is always correct) but occasional **false positives** (a "maybe" might be wrong). To add a key, hash it to several bit positions and set them to 1; to test a key, check those bits — if any is 0, it's definitely absent. Why it matters: a few bits per key (≈10 bits → 1% false positives) lets an LSM skip SSTables that can't contain the key, turning many disk reads into one cheap in-memory check.
+A **Bloom filter** is a space-efficient, probabilistic data structure backed by a bit vector and `k` independent hash functions. It tests set membership with **zero false negatives** (a negative response guarantees absence) and a tunable, bounded rate of **false positives**. **Why it matters:** allows an LSM engine to verify if an SSTable on disk contains a key using ~10 bits per key in RAM, eliminating 99% of unnecessary disk I/O lookups. **Production hazard:** inserting significantly more keys than the filter was sized for causes the bit array to saturate with 1s, driving the false positive rate toward 100% and degrading reads to full disk scans.
 </Define>
 
 The whole thing is just bit-setting and bitwise checks — watch it run:
@@ -324,7 +333,7 @@ The magic is the asymmetry: a "no" is *guaranteed*, so it's always safe to skip.
 One last twist, and it's about *layout*. Everything so far stored a whole record together — fine for "fetch account 7." But Meridian's finance dashboard asks different questions: *"sum the amount of every settled transaction this quarter."* That scans **millions of rows** but needs **one column**. Storing rows together makes you read everything to get a little.
 
 <Define term="Row-oriented vs column-oriented storage" since="Storage Engines (Part 2)">
-**Row-oriented** storage keeps all of a row's fields next to each other (great for "give me this whole record" — OLTP). **Column-oriented** (columnar) storage keeps all values of *one column* together across rows (great for "aggregate this one field over millions of rows" — OLAP/analytics). Why it matters: an analytics query touching 3 of 100 columns reads only those 3 columns off disk in a column store, instead of dragging every full row through memory. Columnar storage also compresses far better, because a single column's values repeat. It's why warehouses (BigQuery, Snowflake, DuckDB, Parquet) are columnar.
+**Row-oriented storage** clusters all fields of a single record contiguously on disk/RAM (ideal for OLTP point lookups and complete record writes). **Column-oriented (columnar) storage** clusters all values of a given column contiguously across millions of rows (ideal for OLAP aggregate analytics queries like `SUM(amount)`). **Why it matters:** columnar engines skip unreferenced columns entirely during I/O and achieve 10× higher compression ratios (via run-length and dictionary encoding). **Production hazard:** attempting high-frequency single-record updates or inserts on columnar formats (like Parquet or ClickHouse) causes massive write amplification and metadata churn; buffer writes in row-oriented memtables first.
 </Define>
 
 The bytes-read difference is stark — one aggregate query, same data, two layouts:

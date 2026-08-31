@@ -99,7 +99,7 @@ Here's the scene: a customer hits "Buy Now." Your checkout service needs prices 
 Go's answer is the **goroutine**: a lightweight, cooperatively-and-preemptively scheduled function that runs concurrently with everything else. You launch one with the `go` keyword, and the Go runtime handles the rest.
 
 <Define term="Goroutine" since="The Go Scheduler (GMP), In Depth (Part 2)">
-A **goroutine** is a function running concurrently with the rest of your program, managed by the Go runtime rather than the OS. It starts with a ~2 KB growable stack (versus ~1–8 MB for an OS thread), so you can run hundreds of thousands of them. You create one with `go f()` — that's the entire syntax. Why it matters: goroutines are what make Go's concurrency model practical at scale; without them, concurrent I/O would require the same number of expensive OS threads as concurrent tasks.
+A **goroutine** is an independently executing concurrent function managed entirely in user space by the Go runtime scheduler. It begins with a tiny ~2 KB dynamically growable stack (compared to an OS thread's fixed 1–8 MB stack allocation). You launch one with the `go f()` keyword. **Why it matters:** goroutines allow servers to handle hundreds of thousands of concurrent network connections without exhausting system memory or incurring kernel context-switching latency. **Production hazard:** launching unconstrained goroutines inside high-frequency HTTP request loops without worker pools or semaphores will rapidly consume memory, exhaust database connection pools, and trigger catastrophic process OOM crashes.
 </Define>
 
 ```go
@@ -256,24 +256,28 @@ Why not just use OS threads directly? Because goroutines are dramatically cheape
   <Gotcha>A goroutine that blocks on a raw OS syscall (like cgo or certain CGO calls) *does* hold onto its OS thread. The runtime creates a new thread for the remaining goroutines. This can cause thread count spikes you don't expect. Stick to stdlib I/O and the runtime stays in control.</Gotcha>
 </ConceptGrid>
 
-<UnderTheHood title="The GMP Scheduler — intro (Go 1.14+, asynchronous preemption)">
+<UnderTheHood title="The GMP Scheduler — physical machine reality and why M:N">
 
-Every goroutine runs on a thread managed by Go's **GMP scheduler**. Three letters, three concepts:
+Every goroutine runs on a thread managed by Go's **GMP scheduler**. Three letters, three physical machine concepts:
 
-- **G** — a Goroutine. The unit of concurrent work. Has its own stack (starts at 2 KB, grows/shrinks dynamically). Carries its function pointer, current PC, and local variables.
-- **M** — a Machine (OS thread). The actual kernel-scheduled thread. There are usually `GOMAXPROCS` of them running goroutines, plus a few extras for blocking syscalls.
-- **P** — a Processor (logical processor). A scheduling context with its own *local run queue* of goroutines waiting to run. There are exactly `GOMAXPROCS` Ps. An M must hold a P to execute Go code.
+- **G** — a Goroutine. The unit of concurrent work. Begins with a tiny 2 KB dynamically growable stack that expands and shrinks contiguously in memory. Carries its program counter (`PC`), stack bounds, and local variables.
+- **M** — a Machine (OS thread). A kernel-level thread created via `clone()` on Linux or `pthread_create()` on macOS. There are usually `GOMAXPROCS` active Ms executing Go code.
+- **P** — a Processor (logical processor). The scheduling context representing a physical CPU core execution right. There are exactly `GOMAXPROCS` Ps. An M must acquire a P to execute Go bytecode.
+
+### 1. Physical Machine Reality: Kernel Thread vs Goroutine Context Switch
+Why can Go run 1,000,000 goroutines while an OS crashes with 10,000 threads?
+- **OS Kernel Context Switch (~1,000–2,000 ns):** The CPU must transition from Ring 3 (User space) to Ring 0 (Kernel space) via hardware interrupts. The kernel saves all 16 general-purpose registers, floating-point/AVX registers, switches the page table pointer (`CR3`), invalidates the Translation Lookaside Buffer (TLB), and pollutes the L1/L2 CPU cache lines.
+- **Goroutine User-Space Switch (~10–15 ns):** No kernel transition occurs. The Go runtime simply swaps 4 callee-saved registers (`SP`, `PC`, `BP`, `DX`) into the `g.sched` struct in memory and jumps to the new goroutine. It is 100× faster and leaves CPU page tables intact.
+
+### 2. The Deep "Why": Why M:N Dynamic Stacks over Async/Await
+Languages like JavaScript, Python, and Rust use `async/await` state machines. Why did Go reject `async/await`?
+- **Eliminating the "Function Coloring Problem":** In `async/await` languages, async functions return promises/futures and **cannot be called directly from synchronous functions**. The entire codebase gets split into two incompatible worlds ("colored" functions).
+- **In Go, all functions are written identically as straightforward synchronous code.** When a goroutine calls a network socket or channel, the Go runtime intercepts the call, parks the goroutine via the netpoller (`epoll`/`kqueue`), and hands the OS thread to another goroutine — without changing function signatures or infecting the call hierarchy.
 
 The scheduler maintains:
-1. **Local run queues** (one per P, ~256 slots): goroutines ready to run on this P.
-2. **Global run queue**: overflow when a local queue is full, and goroutines coming off blocked I/O.
-3. **Work stealing**: when a P's local queue is empty, it steals half the goroutines from another P's queue, keeping all CPUs busy.
-
-When a goroutine blocks on a channel, mutex, or sleep, the runtime *parks* it (removes it from any run queue) and lets the P run something else — no OS thread wasted. When a goroutine blocks on a real syscall (disk, network, cgo), the M parks its P, the blocked M continues the syscall alone, and another M picks up the P to keep running goroutines.
-
-Before Go 1.14, a tight compute loop without a function call could hold a P hostage (no yield point). Go 1.14 added **asynchronous preemption** via POSIX signals — the runtime sends `SIGURG` to a running M, which forces a preemption check. A CPU-bound goroutine can no longer starve everything else.
-
-**The full GMP deep-dive** — work stealing in detail, sysmon, the network poller, and execution traces — lives in **Part 2 · Chapter 5 (The Go Scheduler in Depth)**. We've covered enough here to reason about behavior. More would just be showing off before you've used channels.
+1. **Local run queues** (one per P, 256 slots): lock-free ring buffers for goroutines ready to run on this P.
+2. **Global run queue**: overflow queue protected by a mutex for work arriving from external events.
+3. **Work stealing**: when a P's local queue is empty, it steals half the goroutines from another P's local queue via atomic CAS operations, keeping all CPU cores 100% utilized.
 
 </UnderTheHood>
 
@@ -289,11 +293,15 @@ Before Go 1.14, a tight compute loop without a function call could hold a P host
 Goroutines run concurrently. But how do they *talk* to each other, and how does a goroutine hand off a result without a data race? **Channels** — Go's typed communication pipes. Send a value in, receive it out. The channel handles synchronization for you.
 
 <Define term="Data race" since="Advanced Concurrency &amp; Correctness (Part 2)">
-A **data race** happens when two goroutines access the same memory location concurrently and at least one of the accesses is a write — with no synchronization between them. The result is erroneous: you might read a stale or inconsistent value, or crash if the race corrupts a multiword runtime data structure. In Meridian's ledger service, a data race on an account balance could silently corrupt a transfer. Go ships a built-in race detector (`go run -race`) that catches these at runtime.
+A **data race** occurs when two concurrent goroutines access the exact same physical memory location simultaneously, at least one access is a write, and there is no synchronization or memory fence establishing a happens-before order. **Why it matters:** without synchronization, CPU out-of-order execution and multi-core L1/L2 cache incoherence cause partial memory writes ("memory tearing") and unpredictable silent corruption. **Production hazard:** a data race on an account balance or internal map will corrupt state and crash the Go runtime with `fatal error: concurrent map writes`. Go provides a built-in race detector (`go test -race`).
 </Define>
 
 <Define term="Channel" since="Concurrency Patterns (Part 2)">
-A **channel** is a typed conduit for passing values between goroutines safely. Sending on a channel (`ch <- v`) and receiving from one (`v := <-ch`) are synchronized — the runtime guarantees no data race on the transferred value. An **unbuffered** channel (`make(chan T)`) forces sender and receiver to meet at the same instant (a rendezvous); a **buffered** channel (`make(chan T, N)`) lets the sender deposit up to N values before blocking, decoupling their speeds. Why it matters: channels are Go's primary tool for goroutines to hand off work and results without shared mutable state.
+A **channel** is a synchronized, typed FIFO queue allocated in runtime memory (`hchan`) that passes values safely between goroutines. **Why it matters:** channel sends and receives establish a formal **happens-before** memory barrier, guaranteeing that all memory writes performed before sending are visible to the receiving goroutine without explicit mutex locking. **Production hazard:** writing to a closed channel causes an instant panic (`panic: send on closed channel`), reading from a closed channel returns the zero value immediately, and reading/writing to a `nil` channel blocks the calling goroutine forever.
+</Define>
+
+<Define term="CSP & Memory Barriers" since="Advanced Concurrency &amp; Correctness (Part 2)">
+**Communicating Sequential Processes (CSP)** is a mathematical concurrency model where independent processes exchange messages across explicit channels rather than mutating shared memory. Under the hood, channel operations emit **memory barriers (fences)** that enforce hardware cache coherence across CPU cores (MESI protocol). **Why it matters:** eliminates shared mutable state bugs and complex lock hierarchies. **Production hazard:** using channels to pass pointers to mutable structs without transferring ownership recreates hidden data races across goroutine boundaries.
 </Define>
 
 The Go proverb: **"Don't communicate by sharing memory; share memory by communicating."**
@@ -579,7 +587,7 @@ Only the *sender* should close a channel. If you close a channel from multiple g
 A `nil` channel (a `chan int` that was never initialized with `make`) blocks forever on both send and receive. This sounds useless, but it's a deliberate tool in `select` (next section) — you can disable a case by setting its channel to `nil`.
 
 <Define term="Deadlock" since="Advanced Concurrency &amp; Correctness (Part 2)">
-A **deadlock** is a state where every goroutine in a program is blocked waiting for something that will never happen — so nothing can ever run again. Go's runtime detects the simplest case (all goroutines sleeping) and panics with `all goroutines are asleep — deadlock!`. A nil channel receive, two goroutines each waiting for the other to send first, or a `sync.Mutex` locked twice by the same goroutine are all classic deadlock triggers. Why it matters: a deadlock in a Meridian payment handler means the service hangs silently — no crash, no response, just a frozen process until your health check kills it.
+A **deadlock** is an unrecoverable state where two or more goroutines are mutually blocked waiting for each other to release a lock, send a channel message, or perform a state transition. **Why it matters:** the Go runtime detects global program deadlocks (where *every* goroutine in the process is parked) and terminates with `fatal error: all goroutines are asleep - deadlock!`. **Production hazard:** partial deadlocks (e.g. 5 worker goroutines deadlocked while HTTP handlers continue receiving requests) are **not** caught by the runtime deadlock detector — they silently freeze individual request lifecycles until worker pools starve and connections exhaust.
 </Define>
 
 ```go
@@ -618,7 +626,7 @@ The `lock` field protects the struct from concurrent access — `hchan` is safe 
 </UnderTheHood>
 
 <Define term="Goroutine leak" since="Advanced Concurrency &amp; Correctness (Part 2)">
-A **goroutine leak** is a goroutine that is permanently blocked with no way to exit — typically because it is waiting to send or receive on a channel that nobody will ever use. In a long-running Meridian service, leaked goroutines accumulate over time, consuming stack memory and appearing in `/debug/pprof/goroutine` as a growing pile of parked goroutines. The fix is always to give the goroutine an exit path: a buffered channel, a `done` signal, or a `context.Context` cancellation.
+A **goroutine leak** occurs when a goroutine is launched but becomes permanently parked waiting on an unbuffered channel, mutex, or network socket that will never resolve. **Why it matters:** unlike unreachable heap objects, the garbage collector **cannot** collect a parked goroutine; it retains its stack memory, local variables, and all heap objects reachable from its stack. **Production hazard:** accumulated leaked goroutines steadily consume gigabytes of RAM, triggering Out-Of-Memory container evictions. Inspect via `/debug/pprof/goroutine` or the Go 1.26 `/debug/pprof/goroutineleak` endpoint.
 </Define>
 
 <ConceptGrid cols={2}>
@@ -638,7 +646,7 @@ A **goroutine leak** is a goroutine that is permanently blocked with no way to e
 You have N vendor goroutines, each sending on its own channel. You want a result as soon as one arrives, then move on. That's exactly what `select` does: it waits on multiple channel operations and runs one ready case. If several cases are ready at the same time, Go chooses among them pseudo-randomly.
 
 <Define term="select">
-**`select`** is Go's multi-way channel switch. It blocks until one of its `case` channel operations is ready, then executes that case. If multiple cases are ready simultaneously, Go picks one at random (not the first written). A `default` case makes `select` non-blocking — it fires immediately if no channel is ready. Why it matters: `select` is how you implement timeouts, cancellation, and racing multiple concurrent results without spinning — it's the only way to wait on more than one channel at once.
+**`select`** is Go's multi-way channel multiplexer. It blocks until at least one of its communication `case` clauses is ready to execute, then executes that single case. If multiple channels are ready simultaneously, the runtime picks one via uniform pseudo-random selection (preventing starvation). **Why it matters:** enables timeout handling (`time.After`), cooperative cancellation (`ctx.Done()`), and non-blocking polling (`default:` case). **Production hazard:** omitting a `default:` case when non-blocking behavior is required causes the calling goroutine to block indefinitely if no channel sends.
 </Define>
 
 ```go
@@ -871,7 +879,7 @@ Back to our checkout: after collecting all vendor prices, we want to accumulate 
 A `sync.Mutex` is a binary lock: held or not held. Only one goroutine can hold it at a time. Everyone else blocks until it's released.
 
 <Define term="sync.Mutex" since="Advanced Concurrency &amp; Correctness (Part 2)">
-A **`sync.Mutex`** (mutual exclusion lock) is a binary lock: exactly one goroutine holds it at a time. Call `mu.Lock()` to acquire — any other goroutine that tries will block until you call `mu.Unlock()`. Always pair with `defer mu.Unlock()` so you can't forget to release it. A **`sync.RWMutex`** extends this to allow many concurrent readers but only one writer. Why it matters: when goroutines share a struct (like Meridian's account balance), a mutex turns a data race into a guarantee — only one goroutine mutates the value at a time.
+A **`sync.Mutex`** (mutual exclusion lock) is a hardware-backed spinlock/semaphore that grants exclusive memory access to exactly one goroutine at a time. Call `mu.Lock()` to enter the critical section and `mu.Unlock()` to release. A **`sync.RWMutex`** permits arbitrary concurrent readers (`RLock`) but grants exclusive access to single writers (`Lock`). **Why it matters:** enforces strict atomicity and hardware memory barriers on shared memory regions without channel allocation overhead. **Production hazard:** copying a `sync.Mutex` by value (e.g. passing a struct holding a mutex without a pointer) copies its internal lock state, resulting in deadlocks or broken synchronization; forgetting to unlock on early-return branches freezes all subsequent callers.
 </Define>
 
 ```go
@@ -1031,7 +1039,7 @@ Use `RWMutex` when reads heavily outnumber writes — a price cache, a config sn
 A `WaitGroup` lets a goroutine wait for a collection of goroutines to finish.
 
 <Define term="sync.WaitGroup">
-A **`sync.WaitGroup`** is a counter that tracks running goroutines. You increment it before spawning a goroutine (or use `wg.Go` in Go 1.25+, which does this automatically), the goroutine decrements it when done (`wg.Done()`), and the caller blocks on `wg.Wait()` until the counter reaches zero. Why it matters: without a WaitGroup (or a channel), `main()` exits and kills every goroutine before they finish — a silent data loss. The WaitGroup is the idiomatic "wait for all of them" tool when you don't need results (use a channel when you do).
+A **`sync.WaitGroup`** is an atomic synchronization counter that blocks execution until a specified collection of concurrent goroutines finishes executing. You increment the counter via `wg.Add(n)` (or launch with `wg.Go` in Go 1.25+), decrement via `wg.Done()`, and block until completion via `wg.Wait()`. **Why it matters:** prevents premature program termination where `main()` exits and forcibly kills background goroutines before they persist data or complete I/O. **Production hazard:** calling `wg.Add(1)` *inside* the spawned goroutine rather than in the parent caller creates a data race where `wg.Wait()` might evaluate a 0-counter and return before the child goroutine starts; negative counter values trigger an immediate fatal panic (`panic: sync: negative WaitGroup counter`).
 </Define>
 
 **Go 1.25 added `wg.Go(func())`** — a single call that does `wg.Add(1)`, spawns the goroutine, and wires up `wg.Done()` automatically. This is now the idiomatic way to launch tracked goroutines:

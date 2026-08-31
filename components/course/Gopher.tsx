@@ -48,14 +48,24 @@ export type GopherRole =
   | "runner" // race flag — labs, CTF, goroutine racers
   | "analyst" // bar chart — analytics, metrics, observability
   | "consumer" // drumstick — queue/topic consumers (they CONSUME)
-  | "producer"; // freshly-made parcel + sparkle — producers CREATE messages
+  | "producer" // freshly-made parcel + sparkle — producers CREATE messages
+  | "architect" // blueprint roll + drafting square — architecture, DDD, clean arch
+  | "kernel" // microchip + eBPF probe — kernel, ebpf, xdp, kprobe, syscall
+  | "locksmith" // golden master key + keyring — locks, mutexes, redlock, lease, fencing
+  | "pilot" // aviator goggles + radar — proxy, router, load balancer, service mesh, gateway
+  | "alchemist"; // transmutation flask + spark — zero-alloc, arena, SIMD, wasm, wasi, binary
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/attacker|adversary|malicious|intruder|\bthief\b|\bmallory\b|burglar|exfiltrat|\bidor\b|\bbola\b/i, "thief"],
+  [/ebpf|\bbpf\b|xdp|kprobe|uprobe|syscall|kernel|tracepoint/i, "kernel"],
+  [/lock|mutex|redlock|lease|fencing|semaphore|rwmutex|deadlock/i, "locksmith"],
+  [/architect|ddd|hexagonal|clean.?arch|domain.?driven/i, "architect"],
+  [/zero.?alloc|arena|simd|wasm|wasi|binary|transmute|bit.?twiddl|unsafe/i, "alchemist"],
+  [/proxy|router|\blb\b|mesh|gateway|load.?balanc|ingress|envoy|traefik/i, "pilot"],
   [/ledger|audit|complian|book|journal|entry/i, "scribe"],
   [/money|pay|charge|transfer|balance|account|bank|fintech|settle|coin|card/i, "banker"],
-  [/auth|secur|secret|lock|tls|token|jwt|password|vault|cred/i, "guard"],
+  [/auth|secur|secret|tls|token|jwt|password|vault|cred/i, "guard"],
   [/debug|trace|profil|pprof|fraud|detect|search|find|inspect|delve|dlv/i, "detective"],
   [/produc/i, "producer"],
   [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream/i, "courier"],
@@ -73,7 +83,7 @@ const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/worker|pool|process|batch|job|task/i, "worker"],
   [/lab|flag|ctf|race|goroutine/i, "runner"],
   [/analytic|metric|dashboard|observ|telemetry|slo|monitor/i, "analyst"],
-  [/net|http|grpc|server|client|request|api|dns|proxy|gateway|socket|conn/i, "operator"],
+  [/net|http|grpc|server|client|request|api|dns|socket|conn/i, "operator"],
 ];
 
 /** Best-effort role from a free-text label ("ledger svc" → scribe). */
@@ -304,6 +314,83 @@ function RoleGear({ role }: { role: GopherRole }) {
           <circle cx="58.5" cy="48.5" r="2" fill="#f4f6fb" stroke="#c8cfdd" strokeWidth=".8" />
           {/* bite taken */}
           <circle cx="47" cy="35.5" r="2.2" fill="var(--gph-tint)" />
+        </g>
+      );
+    case "architect": // blueprint roll + golden drafting square
+      return (
+        <g className="gph-gear">
+          {/* Blueprint roll */}
+          <rect x="48" y="32" width="13" height="17" rx="2" fill="#1e3a8a" stroke="#3b82f6" strokeWidth="1.3" transform="rotate(12 54 40)" />
+          <line x1="51" y1="36" x2="60" y2="38" stroke="#93c5fd" strokeWidth="1" strokeDasharray="1.5,1" />
+          <line x1="50" y1="41" x2="59" y2="43" stroke="#93c5fd" strokeWidth="1" />
+          <line x1="49" y1="46" x2="58" y2="48" stroke="#93c5fd" strokeWidth="1" strokeDasharray="2,1" />
+          {/* Architect drafting triangle ruler */}
+          <path d="M47 28 L56 21 L56 34 Z" fill="rgba(232,195,90,0.85)" stroke="#b08a18" strokeWidth="1.1" />
+          <circle cx="52" cy="28" r="1.1" fill="#14161d" />
+        </g>
+      );
+    case "kernel": // microchip with glowing eBPF probe
+      return (
+        <g className="gph-gear">
+          {/* Chip package body */}
+          <rect x="49" y="34" width="13" height="13" rx="1.6" fill="#0f172a" stroke="#38bdf8" strokeWidth="1.4" />
+          {/* Gold pins on top & bottom */}
+          <line x1="51.5" y1="31.5" x2="51.5" y2="34" stroke="#e8c35a" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="55.5" y1="31.5" x2="55.5" y2="34" stroke="#e8c35a" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="59.5" y1="31.5" x2="59.5" y2="34" stroke="#e8c35a" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="51.5" y1="47" x2="51.5" y2="49.5" stroke="#e8c35a" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="55.5" y1="47" x2="55.5" y2="49.5" stroke="#e8c35a" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="59.5" y1="47" x2="59.5" y2="49.5" stroke="#e8c35a" strokeWidth="1.2" strokeLinecap="round" />
+          {/* eBPF / probe trace */}
+          <path d="M51.5 42.5 L54.5 37 L57 43.5 L60 38" fill="none" stroke="#38bdf8" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="55.5" cy="40.5" r="1.2" fill="#38bdf8" />
+        </g>
+      );
+    case "locksmith": // golden master key + keyring
+      return (
+        <g className="gph-gear">
+          {/* Key ring */}
+          <circle cx="52" cy="35" r="4" fill="none" stroke="#e8c35a" strokeWidth="1.5" />
+          {/* Golden master key */}
+          <path d="M54 37 L63 46" stroke="#e8c35a" strokeWidth="2.2" strokeLinecap="round" />
+          {/* Key teeth */}
+          <line x1="61" y1="44" x2="63" y2="42" stroke="#e8c35a" strokeWidth="1.8" strokeLinecap="round" />
+          <line x1="59" y1="42" x2="61" y2="40" stroke="#e8c35a" strokeWidth="1.8" strokeLinecap="round" />
+          {/* Key ring hole in bow */}
+          <circle cx="51" cy="34" r="1.3" fill="#14161d" />
+          {/* Secondary silver key */}
+          <line x1="50" y1="38" x2="48" y2="47" stroke="#94a3b8" strokeWidth="1.6" strokeLinecap="round" />
+          <line x1="48" y1="45" x2="50" y2="46" stroke="#94a3b8" strokeWidth="1.4" strokeLinecap="round" />
+        </g>
+      );
+    case "pilot": // aviator goggles + radar flight badge
+      return (
+        <g className="gph-gear">
+          {/* Goggles strap across crown */}
+          <path d="M15 17 Q32 14.5 49 17" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round" />
+          {/* Goggle glass frames */}
+          <ellipse cx="25" cy="16.5" rx="5" ry="4" fill="#0f172a" stroke="#94a3b8" strokeWidth="1.5" />
+          <ellipse cx="39" cy="16.5" rx="5" ry="4" fill="#0f172a" stroke="#94a3b8" strokeWidth="1.5" />
+          <ellipse cx="25" cy="16.5" rx="3.5" ry="2.6" fill="rgba(56,189,248,0.4)" />
+          <ellipse cx="39" cy="16.5" rx="3.5" ry="2.6" fill="rgba(56,189,248,0.4)" />
+          <line x1="30" y1="16.5" x2="34" y2="16.5" stroke="#94a3b8" strokeWidth="1.6" />
+          {/* Radar badge in paw */}
+          <circle cx="56" cy="39" r="5.5" fill="#1e293b" stroke="#38bdf8" strokeWidth="1.3" />
+          <path d="M50.5 39 L61.5 39 M56 33.5 L56 44.5" stroke="#38bdf8" strokeWidth="0.8" strokeDasharray="1,1" />
+          <line x1="56" y1="39" x2="59.5" y2="36" stroke="#38bdf8" strokeWidth="1.5" strokeLinecap="round" />
+        </g>
+      );
+    case "alchemist": // crucible / flask with transmutation sparkle
+      return (
+        <g className="gph-gear">
+          {/* Flask neck and body */}
+          <path d="M54 31 h4 v4 l5 10 a2 2 0 0 1 -1.8 3 h-10.4 a2 2 0 0 1 -1.8 -3 l5 -10 z" fill="rgba(168,85,247,0.35)" stroke="#c084fc" strokeWidth="1.5" />
+          {/* Glowing liquid */}
+          <path d="M47.5 45 Q56 48 64.5 45 L63.2 48 H48.8 Z" fill="#c084fc" />
+          {/* Transmutation star / sparkle */}
+          <path d="M56 25 l1 2.2 2.2 1 -2.2 1 -1 2.2 -1 -2.2 -2.2 -1 2.2 -1 z" fill="#facc15" />
+          <circle cx="50" cy="27" r="0.9" fill="#c084fc" />
+          <circle cx="61" cy="28" r="0.8" fill="#facc15" />
         </g>
       );
   }

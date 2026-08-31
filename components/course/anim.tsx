@@ -8,7 +8,7 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { Gopher, type GopherRole } from "./Gopher";
+import { Gopher, type GopherPose, type GopherRole } from "./Gopher";
 import { SPEEDS, speedLabel } from "./client";
 
 /* ──────────────────────────────────────────────
@@ -1649,3 +1649,1148 @@ export function SqlAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   OutboxAnim — Transactional Outbox pattern:
+   Atomic DB commit of state + outbox event row,
+   followed by CDC/Poller relay publishing to
+   Kafka, broker ACK, and outbox cleanup.
+   ════════════════════════════════════════════ */
+export type OutboxFrame = {
+  phase: "idle" | "tx_write" | "tx_commit" | "poll" | "publish" | "ack" | "cleanup";
+  txState?: "idle" | "active" | "committed";
+  orderRow?: { id: string; user: string; total: string; status: string };
+  outboxRow?: { id: string; event: string; status: "PENDING" | "RELAYING" | "PUBLISHED" } | null;
+  brokerMessages?: { offset: number; event: string }[];
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+const DEFAULT_OUTBOX_FRAMES: OutboxFrame[] = [
+  {
+    phase: "idle",
+    txState: "idle",
+    orderRow: undefined,
+    outboxRow: null,
+    brokerMessages: [{ offset: 104, event: "UserCreated" }],
+    note: "System ready: DB and Kafka broker idle. Incoming client request to create Order #902.",
+    beat: "neutral",
+  },
+  {
+    phase: "tx_write",
+    txState: "active",
+    orderRow: { id: "#902", user: "alice", total: "$120", status: "created" },
+    outboxRow: { id: "e-88", event: "OrderCreated(#902)", status: "PENDING" },
+    brokerMessages: [{ offset: 104, event: "UserCreated" }],
+    note: "BEGIN TX: App writes 'orders' row + 'outbox_events' row inside the SAME ACID transaction.",
+    beat: "neutral",
+  },
+  {
+    phase: "tx_commit",
+    txState: "committed",
+    orderRow: { id: "#902", user: "alice", total: "$120", status: "created" },
+    outboxRow: { id: "e-88", event: "OrderCreated(#902)", status: "PENDING" },
+    brokerMessages: [{ offset: 104, event: "UserCreated" }],
+    note: "COMMIT: Both rows committed to disk atomically. No dual-write split-brain possible.",
+    beat: "solution",
+  },
+  {
+    phase: "poll",
+    txState: "idle",
+    orderRow: { id: "#902", user: "alice", total: "$120", status: "created" },
+    outboxRow: { id: "e-88", event: "OrderCreated(#902)", status: "RELAYING" },
+    brokerMessages: [{ offset: 104, event: "UserCreated" }],
+    note: "CDC / Poller Relay reads pending outbox row e-88 and prepares message packet.",
+    beat: "neutral",
+  },
+  {
+    phase: "publish",
+    txState: "idle",
+    orderRow: { id: "#902", user: "alice", total: "$120", status: "created" },
+    outboxRow: { id: "e-88", event: "OrderCreated(#902)", status: "RELAYING" },
+    brokerMessages: [{ offset: 104, event: "UserCreated" }],
+    note: "Relay sends message payload to Kafka broker topic 'orders.events'.",
+    beat: "neutral",
+  },
+  {
+    phase: "ack",
+    txState: "idle",
+    orderRow: { id: "#902", user: "alice", total: "$120", status: "created" },
+    outboxRow: { id: "e-88", event: "OrderCreated(#902)", status: "RELAYING" },
+    brokerMessages: [
+      { offset: 104, event: "UserCreated" },
+      { offset: 105, event: "OrderCreated(#902)" },
+    ],
+    note: "Kafka broker appends to partition log at offset 105 and replies with ACK.",
+    beat: "solution",
+  },
+  {
+    phase: "cleanup",
+    txState: "idle",
+    orderRow: { id: "#902", user: "alice", total: "$120", status: "created" },
+    outboxRow: { id: "e-88", event: "OrderCreated(#902)", status: "PUBLISHED" },
+    brokerMessages: [
+      { offset: 104, event: "UserCreated" },
+      { offset: 105, event: "OrderCreated(#902)" },
+    ],
+    note: "Relay updates outbox row to PUBLISHED (or deletes it). At-least-once guarantee achieved!",
+    beat: "solution",
+  },
+];
+
+export function OutboxAnim({
+  title = "Transactional Outbox: Atomic Commit → Relay",
+  frames = DEFAULT_OUTBOX_FRAMES,
+  caption,
+}: {
+  title?: string;
+  frames?: OutboxFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1800);
+  const f = frames[st.cur] ?? frames[0];
+  const isRelaying = f.phase === "poll" || f.phase === "publish";
+  const isAcked = f.phase === "ack" || f.phase === "cleanup";
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="outbox pattern"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="obx">
+        {/* Left: Application Database */}
+        <div className={`obx-db ${f.txState === "active" ? "tx-active" : f.txState === "committed" ? "tx-commit" : ""}`}>
+          <div className="obx-hdr">
+            <span className="obx-tag">PostgreSQL (ACID)</span>
+            <span className={`obx-tx-badge tx-${f.txState ?? "idle"}`}>
+              {f.txState === "active" ? "TX: IN PROGRESS" : f.txState === "committed" ? "TX: COMMITTED" : "TX: IDLE"}
+            </span>
+          </div>
+
+          <div className="obx-tables">
+            <div className="obx-tbl">
+              <div className="obx-tbl-title">orders</div>
+              <table className="obx-grid">
+                <thead>
+                  <tr>
+                    <th>id</th>
+                    <th>user</th>
+                    <th>total</th>
+                    <th>status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {f.orderRow ? (
+                    <tr className="obx-row-on">
+                      <td>{f.orderRow.id}</td>
+                      <td>{f.orderRow.user}</td>
+                      <td>{f.orderRow.total}</td>
+                      <td><span className="obx-pill ok">{f.orderRow.status}</span></td>
+                    </tr>
+                  ) : (
+                    <tr className="obx-row-empty">
+                      <td colSpan={4}>no uncommitted rows</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="obx-tbl">
+              <div className="obx-tbl-title">outbox_events</div>
+              <table className="obx-grid">
+                <thead>
+                  <tr>
+                    <th>id</th>
+                    <th>event</th>
+                    <th>status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {f.outboxRow ? (
+                    <tr className={`obx-row-on st-${f.outboxRow.status.toLowerCase()}`}>
+                      <td>{f.outboxRow.id}</td>
+                      <td>{f.outboxRow.event}</td>
+                      <td>
+                        <span className={`obx-pill ${f.outboxRow.status === "PUBLISHED" ? "ok" : f.outboxRow.status === "RELAYING" ? "info" : "warn"}`}>
+                          {f.outboxRow.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr className="obx-row-empty">
+                      <td colSpan={3}>0 pending events</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        {/* Center: CDC / Poller Relay */}
+        <div className="obx-relay">
+          <div className={`obx-pipe wire-left ${isRelaying ? "wire-active" : ""}`}>
+            <span className="obx-packet">{isRelaying ? "📦" : "•"}</span>
+          </div>
+
+          <div className="obx-gopher-wrap">
+            <Gopher
+              pose={isRelaying ? "carry" : isAcked ? "happy" : f.txState === "active" ? "run" : "idle"}
+              state={isAcked ? "ok" : isRelaying ? "active" : "idle"}
+              size={48}
+              role="courier"
+              payload={isRelaying ? "e-88" : undefined}
+              title="CDC / Outbox Relay"
+            />
+            <span className="obx-name">Outbox Relay</span>
+            <span className="obx-subname">
+              {f.phase === "publish" ? "Publishing..." : isAcked ? "ACK Received" : f.phase === "poll" ? "Scanning Outbox" : "Polling"}
+            </span>
+          </div>
+
+          <div className={`obx-pipe wire-right ${f.phase === "publish" ? "wire-active" : f.phase === "ack" ? "wire-ack" : ""}`}>
+            <span className="obx-packet">{f.phase === "publish" ? "📨" : f.phase === "ack" ? "✓" : "•"}</span>
+          </div>
+        </div>
+
+        {/* Right: Message Broker (Kafka) */}
+        <div className="obx-broker">
+          <div className="obx-hdr">
+            <span className="obx-tag">Kafka Cluster</span>
+            <span className="obx-topic">topic: orders.events</span>
+          </div>
+
+          <div className="obx-partition">
+            <div className="obx-part-title">Partition 0 (Log)</div>
+            <div className="obx-offsets">
+              {(f.brokerMessages ?? [{ offset: 104, event: "UserCreated" }]).map((msg) => (
+                <div key={msg.offset} className="obx-msg">
+                  <span className="obx-off">off {msg.offset}</span>
+                  <span className="obx-payload-txt">{msg.event}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   SagaAnim — Distributed Saga pattern:
+   Step-by-step saga orchestration showing
+   forward progress across microservices (T1 -> T2 -> T3)
+   and compensating rollbacks (C2 -> C1) when T3
+   encounters a business failure.
+   ════════════════════════════════════════════ */
+export type SagaStepState = "pending" | "running" | "success" | "failed" | "compensating" | "compensated";
+
+export type SagaFrame = {
+  activeStep: "T1" | "T2" | "T3" | "C2" | "C1" | "done";
+  orderStatus: string;
+  orderState: SagaStepState;
+  paymentStatus: string;
+  paymentState: SagaStepState;
+  inventoryStatus: string;
+  inventoryState: SagaStepState;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+const DEFAULT_SAGA_FRAMES: SagaFrame[] = [
+  {
+    activeStep: "T1",
+    orderStatus: "Creating Order #8401...",
+    orderState: "running",
+    paymentStatus: "Awaiting Order",
+    paymentState: "pending",
+    inventoryStatus: "Awaiting Order",
+    inventoryState: "pending",
+    note: "Saga Step 1 (T1): Order Service initiates saga, creates Order #8401 with status=PENDING.",
+    beat: "neutral",
+  },
+  {
+    activeStep: "T2",
+    orderStatus: "Order Created (PENDING)",
+    orderState: "success",
+    paymentStatus: "Charging $180 via Card...",
+    paymentState: "running",
+    inventoryStatus: "Awaiting Payment",
+    inventoryState: "pending",
+    note: "Saga Step 2 (T2): Payment Service captures payment of $180.00 successfully.",
+    beat: "neutral",
+  },
+  {
+    activeStep: "T3",
+    orderStatus: "Order Created (PENDING)",
+    orderState: "success",
+    paymentStatus: "Charged $180.00 (PAID)",
+    paymentState: "success",
+    inventoryStatus: "Reserving SKU #88... Out of Stock! (0 avail)",
+    inventoryState: "failed",
+    note: "Saga Step 3 (T3) FAILS: Inventory Service reports item is out of stock! Forward execution halts.",
+    beat: "problem",
+  },
+  {
+    activeStep: "C2",
+    orderStatus: "Order Pending Rollback",
+    orderState: "compensating",
+    paymentStatus: "Refunding $180.00...",
+    paymentState: "compensating",
+    inventoryStatus: "Stock Reservation Failed",
+    inventoryState: "failed",
+    note: "Compensating Action (C2): Saga triggers reverse compensation. Payment Service refunds $180.00.",
+    beat: "problem",
+  },
+  {
+    activeStep: "C1",
+    orderStatus: "Cancelling Order #8401...",
+    orderState: "compensating",
+    paymentStatus: "Refunded $180.00 (COMPENSATED)",
+    paymentState: "compensated",
+    inventoryStatus: "Stock Unavailable",
+    inventoryState: "failed",
+    note: "Compensating Action (C1): Order Service transitions Order status from PENDING to CANCELLED.",
+    beat: "neutral",
+  },
+  {
+    activeStep: "done",
+    orderStatus: "Order CANCELLED (COMPENSATED)",
+    orderState: "compensated",
+    paymentStatus: "Refund Confirmed",
+    paymentState: "compensated",
+    inventoryStatus: "No Inventory Held",
+    inventoryState: "compensated",
+    note: "Saga Rollback Complete: All services back in consistent state without distributed 2PC locking.",
+    beat: "solution",
+  },
+];
+
+export function SagaAnim({
+  title = "Distributed Saga: Forward Progress & Compensation",
+  frames = DEFAULT_SAGA_FRAMES,
+  caption,
+}: {
+  title?: string;
+  frames?: SagaFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1900);
+  const f = frames[st.cur] ?? frames[0];
+
+  const steps: { id: "T1" | "T2" | "T3" | "C2" | "C1"; label: string; desc: string; type: "fwd" | "comp" }[] = [
+    { id: "T1", label: "T1: Order", desc: "Create Order", type: "fwd" },
+    { id: "T2", label: "T2: Payment", desc: "Charge Card", type: "fwd" },
+    { id: "T3", label: "T3: Inventory", desc: "Reserve Stock", type: "fwd" },
+    { id: "C2", label: "C2: Refund", desc: "Compensate Payment", type: "comp" },
+    { id: "C1", label: "C1: Cancel", desc: "Compensate Order", type: "comp" },
+  ];
+
+  const getPose = (state: SagaStepState): GopherPose => {
+    switch (state) {
+      case "running":
+      case "compensating":
+        return "run";
+      case "success":
+        return "happy";
+      case "failed":
+        return "panic";
+      case "compensated":
+        return "idle";
+      default:
+        return "idle";
+    }
+  };
+
+  const getGphState = (state: SagaStepState) => {
+    switch (state) {
+      case "running":
+      case "compensating":
+        return "active";
+      case "success":
+      case "compensated":
+        return "ok";
+      case "failed":
+        return "bad";
+      default:
+        return "idle";
+    }
+  };
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="saga pattern"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="sga">
+        {/* Top Orchestrator timeline */}
+        <div className="sga-timeline">
+          <span className="sga-tl-label">Saga Execution Log:</span>
+          <div className="sga-steps">
+            {steps.map((s) => {
+              const isCur = f.activeStep === s.id;
+              const isDone =
+                (s.id === "T1" && f.orderState !== "pending") ||
+                (s.id === "T2" && f.paymentState !== "pending") ||
+                (s.id === "T3" && f.inventoryState === "failed") ||
+                (s.id === "C2" && f.paymentState === "compensated") ||
+                (s.id === "C1" && f.orderState === "compensated");
+              return (
+                <div
+                  key={s.id}
+                  className={`sga-step-pill ${s.type} ${isCur ? "active" : isDone ? "done" : ""}`}
+                >
+                  <span className="sga-pill-code">{s.id}</span>
+                  <span className="sga-pill-desc">{s.desc}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* 3 Service Nodes */}
+        <div className="sga-services">
+          {/* Service 1: Order Service */}
+          <div className={`sga-svc st-${f.orderState}`}>
+            <div className="sga-svc-hdr">
+              <span className="sga-svc-name">Order Service</span>
+              <span className={`sga-badge ${f.orderState}`}>{f.orderState.toUpperCase()}</span>
+            </div>
+            <div className="sga-svc-body">
+              <Gopher
+                pose={getPose(f.orderState)}
+                state={getGphState(f.orderState)}
+                size={44}
+                role="architect"
+                title="Order Service"
+              />
+              <div className="sga-svc-info">
+                <span className="sga-status-line">{f.orderStatus}</span>
+                <span className="sga-db-sub">DB: orders table</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Service 2: Payment Service */}
+          <div className={`sga-svc st-${f.paymentState}`}>
+            <div className="sga-svc-hdr">
+              <span className="sga-svc-name">Payment Service</span>
+              <span className={`sga-badge ${f.paymentState}`}>{f.paymentState.toUpperCase()}</span>
+            </div>
+            <div className="sga-svc-body">
+              <Gopher
+                pose={getPose(f.paymentState)}
+                state={getGphState(f.paymentState)}
+                size={44}
+                role="banker"
+                title="Payment Service"
+              />
+              <div className="sga-svc-info">
+                <span className="sga-status-line">{f.paymentStatus}</span>
+                <span className="sga-db-sub">Gateway: Stripe API</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Service 3: Inventory Service */}
+          <div className={`sga-svc st-${f.inventoryState}`}>
+            <div className="sga-svc-hdr">
+              <span className="sga-svc-name">Inventory Service</span>
+              <span className={`sga-badge ${f.inventoryState}`}>{f.inventoryState.toUpperCase()}</span>
+            </div>
+            <div className="sga-svc-body">
+              <Gopher
+                pose={getPose(f.inventoryState)}
+                state={getGphState(f.inventoryState)}
+                size={44}
+                role="librarian"
+                title="Inventory Service"
+              />
+              <div className="sga-svc-info">
+                <span className="sga-status-line">{f.inventoryStatus}</span>
+                <span className="sga-db-sub">Warehouse Stock API</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   RateLimitAnim — Traffic Rate Limiting:
+   Token Bucket vs Leaky Bucket vs Sliding Window:
+   Visualizing token drip, burst consumption, and
+   429 Too Many Requests shedding.
+   ════════════════════════════════════════════ */
+export type RateLimitAlgorithm = "token-bucket" | "leaky-bucket" | "sliding-window";
+
+export type RateLimitFrame = {
+  algorithm?: RateLimitAlgorithm;
+  bucketTokens?: number;
+  bucketMax?: number;
+  waterLevel?: number;
+  waterMax?: number;
+  windowCount?: number;
+  windowLimit?: number;
+  incomingReq?: { id: string; client: string; action: "allow" | "drop" | "idle" };
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+const DEFAULT_RATELIMIT_FRAMES: RateLimitFrame[] = [
+  {
+    algorithm: "token-bucket",
+    bucketTokens: 5,
+    bucketMax: 5,
+    incomingReq: { id: "req-1", client: "client-1", action: "idle" },
+    note: "Token Bucket: Capacity B=5 tokens. Refill rate r=+1 token/sec. Full bucket ready for traffic.",
+    beat: "neutral",
+  },
+  {
+    algorithm: "token-bucket",
+    bucketTokens: 4,
+    bucketMax: 5,
+    incomingReq: { id: "GET /checkout", client: "client-1", action: "allow" },
+    note: "Request 1 arrives -> Consumes 1 token -> 200 OK (Allowed). 4 tokens remaining.",
+    beat: "solution",
+  },
+  {
+    algorithm: "token-bucket",
+    bucketTokens: 1,
+    bucketMax: 5,
+    incomingReq: { id: "Burst [3 reqs]", client: "client-2", action: "allow" },
+    note: "Traffic burst (3 concurrent requests) -> 3 tokens consumed simultaneously -> 200 OK. 1 token left.",
+    beat: "neutral",
+  },
+  {
+    algorithm: "token-bucket",
+    bucketTokens: 0,
+    bucketMax: 5,
+    incomingReq: { id: "GET /profile", client: "client-3", action: "allow" },
+    note: "Request 5 arrives -> Consumes last token -> 200 OK. Bucket is now completely EMPTY (0 tokens).",
+    beat: "neutral",
+  },
+  {
+    algorithm: "token-bucket",
+    bucketTokens: 0,
+    bucketMax: 5,
+    incomingReq: { id: "GET /search", client: "client-4", action: "drop" },
+    note: "Request 6 arrives with 0 tokens available -> 429 Too Many Requests (SHED)! Backend protected.",
+    beat: "problem",
+  },
+  {
+    algorithm: "token-bucket",
+    bucketTokens: 2,
+    bucketMax: 5,
+    incomingReq: { id: "GET /api/v2", client: "client-1", action: "allow" },
+    note: "Ticker refuels +2 tokens -> Next request consumes 1 token -> 200 OK. Normal operation resumed.",
+    beat: "solution",
+  },
+];
+
+export function RateLimitAnim({
+  title = "Rate Limiting: Token Bucket & Traffic Shedding",
+  algorithm = "token-bucket",
+  frames = DEFAULT_RATELIMIT_FRAMES,
+  caption,
+}: {
+  title?: string;
+  algorithm?: RateLimitAlgorithm;
+  frames?: RateLimitFrame[];
+  caption?: string;
+}) {
+  const [algo] = useState<RateLimitAlgorithm>(algorithm);
+  const st = useStepper(frames.length, 1700);
+  const f = frames[st.cur] ?? frames[0];
+
+  const tokens = f.bucketTokens ?? 0;
+  const maxTokens = f.bucketMax ?? 5;
+  const isDropped = f.incomingReq?.action === "drop";
+  const isAllowed = f.incomingReq?.action === "allow";
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="rate limiter"
+      note={f.note}
+      beat={f.beat ?? (isDropped ? "problem" : isAllowed ? "solution" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rtb">
+        {/* Incoming Traffic Side */}
+        <div className="rtb-client">
+          <Gopher
+            pose={isDropped ? "blocked" : isAllowed ? "run" : "idle"}
+            state={isDropped ? "warn" : isAllowed ? "active" : "idle"}
+            size={46}
+            role="pilot"
+            title="Ingress Traffic"
+          />
+          <span className="rtb-name">Ingress Traffic</span>
+          {f.incomingReq && f.incomingReq.action !== "idle" && (
+            <div className={`rtb-req-packet ${f.incomingReq.action}`}>
+              <span className="rtb-req-id">{f.incomingReq.id}</span>
+              <span className={`rtb-verdict ${f.incomingReq.action}`}>
+                {f.incomingReq.action === "allow" ? "✓ 200 ALLOWED" : "✕ 429 SHED"}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Center: Token Bucket Container */}
+        <div className={`rtb-bucket-wrap ${isDropped ? "rtb-shed" : ""}`}>
+          <div className="rtb-faucet">
+            <span className="rtb-drip">💧</span>
+            <span className="rtb-rate">+1 token/sec</span>
+          </div>
+
+          <div className="rtb-bucket">
+            <div className="rtb-bucket-hdr">
+              <span className="rtb-b-label">Token Bucket</span>
+              <span className="rtb-b-count">{tokens} / {maxTokens} tokens</span>
+            </div>
+
+            <div className="rtb-tokens-grid">
+              {Array.from({ length: maxTokens }, (_, i) => {
+                const filled = i < tokens;
+                return (
+                  <div key={i} className={`rtb-token ${filled ? "filled" : "empty"}`}>
+                    {filled ? "🟡" : "○"}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* Right: Protected Downstream Service */}
+        <div className="rtb-backend">
+          <Gopher
+            pose={isDropped ? "idle" : isAllowed ? "happy" : "idle"}
+            state={isDropped ? "idle" : isAllowed ? "ok" : "idle"}
+            size={46}
+            role="medic"
+            title="Backend Service"
+          />
+          <span className="rtb-name">Protected Backend</span>
+          <span className={`rtb-load-badge ${isDropped ? "safe" : isAllowed ? "load" : "idle"}`}>
+            {isDropped ? "Load Protected (0 impact)" : isAllowed ? "Processing Request" : "Capacity OK"}
+          </span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   ActorAnim — Goroutine Actor Pattern:
+   Isolated actor owning private state, FIFO
+   inbox channel, sequential single-threaded
+   execution, and private response channels.
+   ════════════════════════════════════════════ */
+export type ActorEnvelope = {
+  from: string;
+  cmd: string;
+  replyChan: string;
+};
+
+export type ActorFrame = {
+  clients: { name: string; action: "idle" | "send" | "await" | "received"; role?: GopherRole }[];
+  mailbox: ActorEnvelope[];
+  processing?: ActorEnvelope | null;
+  actorState: Record<string, string | number>;
+  activeReply?: { to: string; val: string } | null;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+const DEFAULT_ACTOR_FRAMES: ActorFrame[] = [
+  {
+    clients: [
+      { name: "Client A", action: "idle", role: "worker" },
+      { name: "Client B", action: "idle", role: "banker" },
+    ],
+    mailbox: [],
+    processing: null,
+    actorState: { Balance: "$100", OpCount: 0 },
+    activeReply: null,
+    note: "Actor Goroutine initialized with private state (Balance=$100). Listening on FIFO inbox channel.",
+    beat: "neutral",
+  },
+  {
+    clients: [
+      { name: "Client A", action: "send", role: "worker" },
+      { name: "Client B", action: "send", role: "banker" },
+    ],
+    mailbox: [
+      { from: "Client A", cmd: "Deposit $50", replyChan: "ch_A" },
+      { from: "Client B", cmd: "Withdraw $30", replyChan: "ch_B" },
+    ],
+    processing: null,
+    actorState: { Balance: "$100", OpCount: 0 },
+    activeReply: null,
+    note: "Clients concurrently send commands with private reply channels. Messages serialize in inbox FIFO.",
+    beat: "neutral",
+  },
+  {
+    clients: [
+      { name: "Client A", action: "await", role: "worker" },
+      { name: "Client B", action: "await", role: "banker" },
+    ],
+    mailbox: [{ from: "Client B", cmd: "Withdraw $30", replyChan: "ch_B" }],
+    processing: { from: "Client A", cmd: "Deposit $50", replyChan: "ch_A" },
+    actorState: { Balance: "$150", OpCount: 1 },
+    activeReply: null,
+    note: "Actor pops Client A's command, mutates private Balance to $150. No mutex lock needed!",
+    beat: "solution",
+  },
+  {
+    clients: [
+      { name: "Client A", action: "received", role: "worker" },
+      { name: "Client B", action: "await", role: "banker" },
+    ],
+    mailbox: [{ from: "Client B", cmd: "Withdraw $30", replyChan: "ch_B" }],
+    processing: null,
+    actorState: { Balance: "$150", OpCount: 1 },
+    activeReply: { to: "Client A", val: "OK: Balance=$150" },
+    note: "Actor replies on ch_A. Client A unblocks with updated balance.",
+    beat: "solution",
+  },
+  {
+    clients: [
+      { name: "Client A", action: "idle", role: "worker" },
+      { name: "Client B", action: "await", role: "banker" },
+    ],
+    mailbox: [],
+    processing: { from: "Client B", cmd: "Withdraw $30", replyChan: "ch_B" },
+    actorState: { Balance: "$120", OpCount: 2 },
+    activeReply: null,
+    note: "Actor pops Client B's command, mutates Balance to $120. Sequential, lock-free safety guaranteed.",
+    beat: "solution",
+  },
+  {
+    clients: [
+      { name: "Client A", action: "idle", role: "worker" },
+      { name: "Client B", action: "received", role: "banker" },
+    ],
+    mailbox: [],
+    processing: null,
+    actorState: { Balance: "$120", OpCount: 2 },
+    activeReply: { to: "Client B", val: "OK: Balance=$120" },
+    note: "Actor replies on ch_B. Both client requests executed sequentially with zero race conditions.",
+    beat: "solution",
+  },
+];
+
+export function ActorAnim({
+  title = "Goroutine Actor: Private State & Lock-Free Channel Mailbox",
+  frames = DEFAULT_ACTOR_FRAMES,
+  caption,
+}: {
+  title?: string;
+  frames?: ActorFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1800);
+  const f = frames[st.cur] ?? frames[0];
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="actor pattern"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="act">
+        {/* Left: Client Goroutines */}
+        <div className="act-clients">
+          <span className="act-sec-title">Concurrent Clients</span>
+          {f.clients.map((c) => (
+            <div key={c.name} className={`act-client-card ${c.action}`}>
+              <Gopher
+                pose={c.action === "send" ? "carry" : c.action === "received" ? "happy" : c.action === "await" ? "blocked" : "idle"}
+                state={c.action === "received" ? "ok" : c.action === "await" ? "warn" : c.action === "send" ? "active" : "idle"}
+                size={40}
+                role={c.role ?? "worker"}
+                title={c.name}
+              />
+              <div className="act-client-meta">
+                <span className="act-client-name">{c.name}</span>
+                <span className={`act-client-pill ${c.action}`}>{c.action.toUpperCase()}</span>
+                {f.activeReply?.to === c.name && (
+                  <span className="act-reply-badge">↩ {f.activeReply.val}</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Center: Inbox FIFO Channel */}
+        <div className="act-channel">
+          <div className="act-chan-hdr">
+            <span className="act-tag">inbox chan Envelope</span>
+            <span className="act-chan-cap">FIFO Queue</span>
+          </div>
+
+          <div className="act-chan-pipe">
+            {f.mailbox.length === 0 && !f.processing && (
+              <span className="act-chan-empty">Channel empty (Awaiting messages)</span>
+            )}
+            {f.mailbox.map((env, i) => (
+              <div key={i} className="act-envelope">
+                <span className="act-env-from">{env.from}</span>
+                <span className="act-env-cmd">{env.cmd}</span>
+                <span className="act-env-reply">reply: {env.replyChan}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Right: Actor Execution Chamber */}
+        <div className="act-chamber">
+          <div className="act-chamber-hdr">
+            <span className="act-chamber-title">Actor Goroutine</span>
+            <span className="act-lockfree-badge">100% Lock-Free</span>
+          </div>
+
+          <div className="act-chamber-body">
+            <Gopher
+              pose={f.processing ? "run" : "idle"}
+              state={f.processing ? "active" : "ok"}
+              size={48}
+              role="alchemist"
+              title="Actor Goroutine"
+            />
+            {f.processing && (
+              <div className="act-current-op">
+                <span className="act-op-label">Processing:</span>
+                <span className="act-op-val">{f.processing.cmd} (from {f.processing.from})</span>
+              </div>
+            )}
+          </div>
+
+          <div className="act-state-reg">
+            <div className="act-reg-title">Private Internal State:</div>
+            <div className="act-reg-fields">
+              {Object.entries(f.actorState).map(([k, v]) => (
+                <div key={k} className="act-reg-row">
+                  <span className="act-reg-k">{k}:</span>
+                  <span className="act-reg-v">{String(v)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   LocksmithAnim — Distributed Locking & Fencing:
+   Visualizing Redis/etcd distributed lock leases,
+   heartbeat renewals, GC pauses / partitions,
+   and monotonic fencing token validation at storage.
+   ════════════════════════════════════════════ */
+export type LocksmithFrame = {
+  worker1: { state: "holding" | "paused" | "stale_write" | "rejected" | "idle"; token?: number };
+  worker2: { state: "idle" | "waiting" | "acquired" | "active_write" | "success"; token?: number };
+  coordinator: { holder: string | null; ttlSeconds: number; maxTtl: number; currentFencingToken: number };
+  storage: { highestSeenToken: number; lastWriteStatus: "none" | "success" | "rejected"; lastWriteMsg?: string };
+  networkPartition?: boolean;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+const DEFAULT_LOCKSMITH_FRAMES: LocksmithFrame[] = [
+  {
+    worker1: { state: "holding", token: 41 },
+    worker2: { state: "waiting" },
+    coordinator: { holder: "Worker 1", ttlSeconds: 10, maxTtl: 10, currentFencingToken: 41 },
+    storage: { highestSeenToken: 40, lastWriteStatus: "none" },
+    networkPartition: false,
+    note: "Worker 1 acquires lock on Redis/etcd with 10s lease and monotonic Fencing Token #41.",
+    beat: "neutral",
+  },
+  {
+    worker1: { state: "paused", token: 41 },
+    worker2: { state: "waiting" },
+    coordinator: { holder: "Worker 1", ttlSeconds: 2, maxTtl: 10, currentFencingToken: 41 },
+    storage: { highestSeenToken: 40, lastWriteStatus: "none" },
+    networkPartition: true,
+    note: "Worker 1 suffers long GC Stop-The-World pause / network split! Lease heartbeat stops.",
+    beat: "problem",
+  },
+  {
+    worker1: { state: "paused", token: 41 },
+    worker2: { state: "acquired", token: 42 },
+    coordinator: { holder: "Worker 2", ttlSeconds: 10, maxTtl: 10, currentFencingToken: 42 },
+    storage: { highestSeenToken: 40, lastWriteStatus: "none" },
+    networkPartition: true,
+    note: "Lease expires! Coordinator grants lock to Worker 2 with incremented Fencing Token #42.",
+    beat: "neutral",
+  },
+  {
+    worker1: { state: "paused", token: 41 },
+    worker2: { state: "active_write", token: 42 },
+    coordinator: { holder: "Worker 2", ttlSeconds: 8, maxTtl: 10, currentFencingToken: 42 },
+    storage: {
+      highestSeenToken: 42,
+      lastWriteStatus: "success",
+      lastWriteMsg: "Worker 2 write accepted (Token 42 >= HighestSeen 40)",
+    },
+    networkPartition: true,
+    note: "Worker 2 writes to Storage with Token #42. Storage records Highest Token = 42. Success!",
+    beat: "solution",
+  },
+  {
+    worker1: { state: "stale_write", token: 41 },
+    worker2: { state: "success", token: 42 },
+    coordinator: { holder: "Worker 2", ttlSeconds: 6, maxTtl: 10, currentFencingToken: 42 },
+    storage: {
+      highestSeenToken: 42,
+      lastWriteStatus: "rejected",
+      lastWriteMsg: "REJECTED: Stale Token #41 < HighestSeen #42! Corruption Prevented!",
+    },
+    networkPartition: false,
+    note: "Worker 1 wakes up (unaware its lease expired!), sends write with Token #41 -> Storage REJECTS stale write!",
+    beat: "problem",
+  },
+  {
+    worker1: { state: "rejected", token: 41 },
+    worker2: { state: "success", token: 42 },
+    coordinator: { holder: "Worker 2", ttlSeconds: 5, maxTtl: 10, currentFencingToken: 42 },
+    storage: {
+      highestSeenToken: 42,
+      lastWriteStatus: "success",
+      lastWriteMsg: "Data integrity preserved by monotonic fencing token validation",
+    },
+    networkPartition: false,
+    note: "Fencing tokens ensure correctness even during GC pauses, network partitions, and clock skew.",
+    beat: "solution",
+  },
+];
+
+export function LocksmithAnim({
+  title = "Distributed Locking: TTL Leases & Monotonic Fencing Tokens",
+  frames = DEFAULT_LOCKSMITH_FRAMES,
+  caption,
+}: {
+  title?: string;
+  frames?: LocksmithFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1900);
+  const f = frames[st.cur] ?? frames[0];
+
+  const w1Pose: GopherPose =
+    f.worker1.state === "paused"
+      ? "sleep"
+      : f.worker1.state === "rejected"
+      ? "panic"
+      : f.worker1.state === "holding" || f.worker1.state === "stale_write"
+      ? "run"
+      : "idle";
+
+  const w2Pose: GopherPose =
+    f.worker2.state === "success"
+      ? "happy"
+      : f.worker2.state === "acquired" || f.worker2.state === "active_write"
+      ? "run"
+      : f.worker2.state === "waiting"
+      ? "blocked"
+      : "idle";
+
+  const ttlPct = Math.max(0, Math.min(100, (f.coordinator.ttlSeconds / (f.coordinator.maxTtl || 10)) * 100));
+
+  return (
+    <AnimShell
+      title={title}
+      kicker="distributed locks"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="lks">
+        {/* Top: Two Distributed Workers */}
+        <div className="lks-workers">
+          {/* Worker 1 */}
+          <div className={`lks-worker st-${f.worker1.state}`}>
+            <div className="lks-worker-hdr">
+              <span className="lks-w-title">Worker 1</span>
+              {f.worker1.token && <span className="lks-token-pill">Token #{f.worker1.token}</span>}
+            </div>
+            <div className="lks-worker-body">
+              <Gopher
+                pose={w1Pose}
+                state={f.worker1.state === "rejected" ? "bad" : f.worker1.state === "holding" ? "active" : "idle"}
+                size={44}
+                role="locksmith"
+                title="Worker 1"
+              />
+              <div className="lks-worker-status">
+                <span className={`lks-state-tag tag-${f.worker1.state}`}>
+                  {f.worker1.state === "holding"
+                    ? "HOLDING LOCK"
+                    : f.worker1.state === "paused"
+                    ? "GC PAUSED (FROZEN)"
+                    : f.worker1.state === "stale_write"
+                    ? "SENDING WRITE (STALE)"
+                    : f.worker1.state === "rejected"
+                    ? "WRITE REJECTED"
+                    : "IDLE"}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Partition indicator */}
+          {f.networkPartition && (
+            <div className="lks-partition-indicator">
+              <span className="lks-split-icon">⚡</span>
+              <span className="lks-split-text">Network Partition / GC Delay</span>
+            </div>
+          )}
+
+          {/* Worker 2 */}
+          <div className={`lks-worker st-${f.worker2.state}`}>
+            <div className="lks-worker-hdr">
+              <span className="lks-w-title">Worker 2</span>
+              {f.worker2.token && <span className="lks-token-pill">Token #{f.worker2.token}</span>}
+            </div>
+            <div className="lks-worker-body">
+              <Gopher
+                pose={w2Pose}
+                state={f.worker2.state === "success" ? "ok" : f.worker2.state === "acquired" || f.worker2.state === "active_write" ? "active" : "idle"}
+                size={44}
+                role="locksmith"
+                title="Worker 2"
+              />
+              <div className="lks-worker-status">
+                <span className={`lks-state-tag tag-${f.worker2.state}`}>
+                  {f.worker2.state === "acquired"
+                    ? "ACQUIRED LOCK"
+                    : f.worker2.state === "active_write"
+                    ? "WRITING WITH TOKEN 42"
+                    : f.worker2.state === "success"
+                    ? "WRITE ACCEPTED"
+                    : f.worker2.state === "waiting"
+                    ? "WAITING FOR LOCK"
+                    : "IDLE"}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Center: Distributed Lock Coordinator (Redis/etcd) */}
+        <div className="lks-coord">
+          <div className="lks-coord-hdr">
+            <span className="lks-coord-title">Distributed Lock Manager (Redis / etcd)</span>
+            <span className="lks-fencing-badge">Monotonic Token: #{f.coordinator.currentFencingToken}</span>
+          </div>
+
+          <div className="lks-coord-body">
+            <div className="lks-coord-field">
+              <span className="lks-k">Resource:</span>
+              <span className="lks-v">lock/user-account-99</span>
+            </div>
+            <div className="lks-coord-field">
+              <span className="lks-k">Current Owner:</span>
+              <span className="lks-v-owner">{f.coordinator.holder ?? "NONE (Free)"}</span>
+            </div>
+            <div className="lks-coord-ttl">
+              <div className="lks-ttl-hdr">
+                <span className="lks-k">Lease TTL:</span>
+                <span className="lks-v">{f.coordinator.ttlSeconds}s remaining</span>
+              </div>
+              <div className="lks-ttl-track">
+                <div
+                  className={`lks-ttl-fill ${ttlPct < 30 ? "low" : ""}`}
+                  style={{ width: `${ttlPct}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom: Storage / Resource Validation */}
+        <div className={`lks-storage st-${f.storage.lastWriteStatus}`}>
+          <div className="lks-storage-hdr">
+            <span className="lks-storage-title">Storage / Database (Fencing Guard)</span>
+            <span className="lks-high-watermark">Highest Seen Token = {f.storage.highestSeenToken}</span>
+          </div>
+
+          <div className="lks-storage-body">
+            <div className="lks-rule-box">
+              <code>rule: Write is ACCEPTED only if token &gt;= HighestSeenToken</code>
+            </div>
+            {f.storage.lastWriteMsg && (
+              <div className={`lks-write-result ${f.storage.lastWriteStatus}`}>
+                {f.storage.lastWriteStatus === "rejected" ? "✕ " : "✓ "}
+                {f.storage.lastWriteMsg}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+

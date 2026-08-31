@@ -143,6 +143,10 @@ Let's set the scene. Meridian's ledger service handles hundreds of concurrent `P
 
 That something is the **GMP scheduler**, and it's built from three interlocking concepts.
 
+<Define term="GMP Scheduler Model">
+Go's concurrency runtime coordinates three primary entities: **G** (Goroutine: lightweight user-space task with ~2 KB dynamic stack), **M** (Machine: OS kernel thread managed by the kernel scheduler), and **P** (Processor: logical resource context holding a local run queue; exactly `GOMAXPROCS` Ps exist). **Why it matters:** multiplexing thousands of Gs onto a small pool of Ms through Ps eliminates kernel context-switching latency and bounds memory consumption. **Production hazard:** a goroutine executing non-preemptible CGO/raw syscalls ties up an M indefinitely, forcing the runtime to spawn additional OS threads up to `sched.maxmcount` (default 10,000) until the operating system refuses new threads and crashes the process.
+</Define>
+
 <ConceptGrid cols={3}>
   <ConceptCard label="G — Goroutine">A goroutine: a lightweight, independently scheduled function. A `G` struct in the runtime tracks its stack (starting at 2 KB, growing as needed), its program counter, and its scheduling state. There can be millions of Gs. They cost almost nothing to create.</ConceptCard>
   <ConceptCard label="M — Machine (OS Thread)">An OS thread — the actual thing the operating system schedules onto a CPU core. An `M` runs exactly one `G` at a time. The runtime creates and parks Ms as needed. You'll typically have far fewer Ms than Gs.</ConceptCard>
@@ -341,17 +345,35 @@ But what happens when one P's queue is full, or when one P finishes its queue an
 
 *This animation is a simplified model: in practice, the idle P first checks the global queue and netpoller before attempting to steal, and the victim P is chosen pseudo-randomly from all Ps, not just the busiest one.*
 
+<Define term="Work-Stealing Algorithm">
+A decentralized load-balancing algorithm where an idle processor (P) actively attempts to steal executable tasks (goroutines) from the local run queues of other randomly chosen processors. **Why it matters:** achieves near-optimal CPU load distribution without a centralized lock or global scheduler bottleneck. **Production hazard:** under highly asymmetric workloads where one goroutine allocates heavily and starves others, work-stealing creates cross-core CPU cache line bouncing as goroutine stack metadata is transferred across CPU sockets (NUMA nodes).
+</Define>
+
 There is also a **global run queue** (`sched.runq` in the runtime). Goroutines land there when a P's local queue is full (the overflow path), or when they're woken up without a clear home P. Every N scheduler ticks, a P checks the global queue first (to prevent starvation of goroutines stuck there).
 
-<UnderTheHood title="The work-stealing algorithm in detail">
+<UnderTheHood title="The work-stealing algorithm in detail: physical hardware & lock-free queues">
 
-The stealing logic lives in `runtime/proc.go` in the function `stealWork`. When a P goes idle, it runs a spinning loop (briefly, to avoid immediate thread parking): it checks the global queue, polls the netpoller for network-ready goroutines, then randomly scans up to `gomaxprocs` other Ps. When it finds a victim P with more than one goroutine in its queue, it locks the victim's `runqhead` and `runqtail` (it's a lock-free ring buffer with atomic operations), copies half the entries to its own queue, and returns.
+The stealing logic lives in `runtime/proc.go` in the function `stealWork`.
 
-The "steal half" heuristic was chosen deliberately: stealing one goroutine at a time is wasteful (you pay locking cost for minimal gain); stealing all of them is unfair. Half is the balance.
+### 1. Lock-Free Local Run Queues (256-entry Ring Buffers)
+Each P's local run queue is a 256-slot fixed-size ring buffer defined by `runqhead`, `runqtail`, and `runq` array.
+- The **owner P** accesses the queue head without mutexes.
+- A **stealing P** uses atomic Compare-And-Swap (`CAS`) operations on `runqhead` to claim a batch of goroutines. Because all slots are pre-allocated contiguous memory, queue operations execute in CPU L1/L2 cache with zero heap allocation.
 
-The global queue check happens roughly every `schedtick%61 == 0` in `schedule()` — the `61` is a prime chosen to avoid rhythmic collisions with other periodic work.
+### 2. The Stealing Order of Operations
+When a P exhausts its local run queue (`runq`), it does not immediately sleep. It searches for work in a strict deterministic sequence to balance throughput against lock contention:
+1. **Local `runnext` slot:** check if a high-priority successor G is waiting.
+2. **Global Run Queue (`sched.runq`):** check every 61 scheduler ticks (`schedtick%61 == 0`) with a global mutex lock to prevent starving background tasks.
+3. **Netpoller (`netpoll(0)`):** non-blocking poll of network sockets to see if any I/O completed.
+4. **Work Stealing (`runqsteal`):** iterate through all other Ps in a pseudo-random permutation, stealing `n/2` goroutines from the first busy P found.
+5. **Netpoller Blocking Wait:** if all Ps are empty, park the thread and wait on `epoll_wait`/`kqueue`.
 
-Work-stealing with per-P run queues was introduced in Go 1.1 by Dmitry Vyukov (Go 1.14 introduced *asynchronous preemption*, a distinct mechanism), with successive refinements over the years to the idle-thread parking mechanism to reduce unnecessary thread wakeups under light load. This is a conceptual model; the precise locking primitives and atomic ordering are implementation details subject to change.
+### 3. The Deep "Why": Why No Thread Affinity / CPU Pinning?
+Why does Go not let you pin a goroutine to a specific CPU core (`pthread_setaffinity_np`)?
+- In an M:N scheduler, goroutines frequently migrate across Ms (threads) and Ps (cores) during I/O and work-stealing.
+- Pinning a G to a single OS core breaks work-stealing: if that pinned G blocks or computes heavily, the core cannot steal work from overloaded siblings, causing severe scheduling pathology and tail latency spikes.
+
+Work-stealing with per-P run queues was introduced in Go 1.1 by Dmitry Vyukov (Go 1.14 introduced *asynchronous preemption*, a distinct mechanism), with successive refinements to reduce unnecessary thread wakeups under light load.
 
 </UnderTheHood>
 
@@ -467,6 +489,14 @@ When a goroutine makes a **blocking syscall** — like reading from a file descr
 
 ### Blocking syscalls: the P handoff
 
+<Define term="Syscall Disassociation (entersyscall / exitsyscall)">
+When a goroutine invokes a blocking OS system call (like disk `read()` or cgo), the runtime calls `entersyscall`, physically disassociating the logical processor `P` from the calling OS thread `M`. The blocked `M` enters the kernel alone while another `M` claims `P` to continue executing runnable goroutines. Upon syscall completion, `exitsyscall` reacquires a free `P` or parks the returning `M`. **Why it matters:** prevents raw OS syscalls from freezing all goroutines queued behind the executing task. **Production hazard:** calling blocking C functions via CGO without `runtime.LockOSThread` or unbound CGO concurrency spawns thousands of OS threads, exhausting kernel PID/thread limits and crashing the host.
+</Define>
+
+<Define term="Netpoller (epoll / kqueue / IOCP)">
+The runtime's asynchronous I/O event multiplexer built upon OS kernel notification APIs (`epoll` on Linux, `kqueue` on macOS, `IOCP` on Windows). Sockets are configured as non-blocking (`O_NONBLOCK`). **Why it matters:** when a goroutine performs network I/O, it registers its file descriptor with the netpoller and parks in user space (`_Gwaiting`) without blocking its OS thread. **Production hazard:** attempting to read regular local disk files (`os.File`) does **not** use the netpoller on Unix (regular files are always considered ready by `epoll`), triggering full thread-blocking syscall paths instead of user-space parking.
+</Define>
+
 When a goroutine enters a blocking syscall, the runtime performs a **P handoff**:
 
 <ExecTimeline
@@ -522,18 +552,22 @@ The result: **a goroutine blocked on network I/O consumes no OS thread.** You ca
   caption="Network goroutines park without blocking any thread. The netpoller uses epoll/kqueue — 100k waiting goroutines still use only GOMAXPROCS threads."
 />
 
-<UnderTheHood title="The netpoller internals and integration points">
+<UnderTheHood title="The netpoller internals, epoll edge-triggering, and physical machine reality">
 
 The netpoller lives in `runtime/netpoll.go` (platform-agnostic) and `runtime/netpoll_epoll.go` / `runtime/netpoll_kqueue.go` (platform specific). The key function is `netpoll(delay int64) gList` — it calls `epoll_wait` (or equivalent) with the given timeout and returns a list of goroutines that are now ready to run.
 
+### 1. Physical Machine Reality: Edge-Triggered epoll (`EPOLLET`)
+On Linux, the Go runtime registers network sockets with `epoll_create1` and uses **edge-triggered mode (`EPOLLET`)**.
+- In standard level-triggered mode, `epoll_wait` keeps waking up threads as long as data remains in the kernel socket buffer, creating CPU-wasting thundering herd storms.
+- In edge-triggered mode, the kernel notifies Go **only once** when state transitions from unready to ready. The runtime goroutine drains the socket until `EAGAIN` or `EWOULDBLOCK` is returned, minimizing context switches.
+
+### 2. Integration Points into Scheduler
 The netpoller is integrated into the scheduler at three points (as of Go 1.26):
 1. **`schedule()`** — each time a P picks a new goroutine to run, it may call `netpoll(0)` (non-blocking poll) to drain any ready network goroutines.
-2. **`sysmon`** — the background monitor thread (covered in the next section) calls `netpoll` periodically when no threads are running, ensuring network goroutines get unblocked even under low load.
+2. **`sysmon`** — the background monitor thread calls `netpoll` periodically when no threads are running, ensuring network goroutines get unblocked even under low load.
 3. **`findRunnable()`** — when a P is looking for work, it explicitly polls the netpoller after checking its local queue, the global queue, and before attempting to steal.
 
-The netpoller uses `EPOLLET` (edge-triggered epoll) on Linux for efficiency — it only wakes up once per readiness event rather than repeatedly while data is available.
-
-File I/O does NOT go through the netpoller on most platforms. `os.File.Read/Write` on a regular file goes through the blocking syscall + P handoff path. If you need non-blocking file I/O, use `io.Pipe` with a goroutine, or `aio` wrappers. Regular files on Linux are always "ready" from epoll's perspective (they don't support `O_NONBLOCK` in the network sense), so the runtime doesn't bother with the netpoller for them.
+File I/O does NOT go through the netpoller on most platforms. `os.File.Read/Write` on a regular file goes through the blocking syscall + P handoff path (`entersyscall`). Regular files on Linux are always "ready" from epoll's perspective (they don't support `O_NONBLOCK` in the network sense), so the runtime doesn't bother with the netpoller for them.
 
 </UnderTheHood>
 
@@ -578,6 +612,10 @@ func computeSettlement(entries []int64) int64 {
 In a server with `GOMAXPROCS=1`, calling this concurrently with HTTP handlers meant the HTTP handlers never ran until the computation finished. That's not acceptable.
 
 ### Async preemption (Go 1.14+)
+
+<Define term="Asynchronous Preemption & sysmon">
+**Asynchronous preemption** is Go's signal-based scheduler interruption mechanism (`SIGURG` on POSIX systems) coordinated by the background **`sysmon`** (system monitor) thread. `sysmon` runs without an assigned `P` on an OS thread; if it detects a goroutine executing continuously on a `P` for longer than 10ms without cooperative yield points, it sends a non-cooperative POSIX signal that forces the CPU to save the goroutine's registers and yield the processor. **Why it matters:** prevents compute-heavy arithmetic loops from starving I/O handlers and GC STW coordination. **Production hazard:** tight CGO loops or low-level assembly routines that mask POSIX signals cannot be asynchronously preempted, causing application-wide STW pauses to hang waiting for the thread.
+</Define>
 
 Go 1.14 introduced **asynchronous preemption**. The runtime can now stop a goroutine mid-instruction using OS signals (`SIGURG` on Unix). Here's how it works:
 
@@ -871,7 +909,9 @@ func main() {
 
 Capping the report pool at `GOMAXPROCS` raises an obvious question: if more goroutines stop helping past that point, *why*? You met the symptom back in the opening — "why didn't spawning 10,000 goroutines make it faster?" Here's the theory that answers it, and it's not a Go thing. It's arithmetic, and it's merciless.
 
-<Define term="Amdahl's law" since="The Go Scheduler (Part 2)">For a fixed task where fraction `p` is parallelizable and `1-p` is irreducibly serial, the maximum speedup on `n` cores is `1 / ((1-p) + p/n)`. As `n → ∞` the parallel term vanishes and speedup is capped at `1/(1-p)` — the serial fraction sets a hard ceiling no number of cores can beat.</Define>
+<Define term="Amdahl's law" since="The Go Scheduler (Part 2)">
+For a fixed workload where fraction `p` is parallelizable and `1-p` is strictly serial, the maximum speedup on `n` cores is `1 / ((1-p) + p/n)`. As `n → ∞`, the speedup asymptotes to `1/(1-p)`. **Why it matters:** the serial portion sets an unyielding theoretical ceiling on performance gains from adding CPU cores or goroutines. **Production hazard:** launching hundreds of goroutines against a workload bounded by a serial mutex lock or single database write channel produces negative speedup due to cache contention and scheduling overhead.
+</Define>
 
 Read that ceiling slowly: a task that is **95% parallel** can *never* run more than **20×** faster, no matter how many cores you throw at it — because `1/(1 - 0.95) = 20`. The serial 5% (parse the request, acquire one lock, write the final row) cannot be split, so eventually it's *all* that's left and it dominates. Drop to 90% parallel and the ceiling is 10×. At 75% it's 4×. The serial sliver, not the core count, decides your fate.
 
@@ -954,7 +994,9 @@ Look at the `95` row: at 1024 cores you're still under 20×, and the ceiling col
 
 Amdahl is a bleak picture, and for years it was used to argue parallel computing was a dead end. Then Gustafson and Barsis pointed out the hidden assumption: Amdahl holds the **problem size fixed**. In real systems you almost never do that — when you get more cores, you process *more data*, not the same data faster.
 
-<Define term="Gustafson's law" since="The Go Scheduler (Part 2)">If the problem grows with the resources (bigger datasets on bigger machines) while the serial work stays roughly constant, the *scaled* speedup is `n - (1-p)(n-1)`, which is close to linear in `n`. Amdahl assumes a fixed problem; Gustafson assumes a growing one — both are correct for the question each asks.</Define>
+<Define term="Gustafson's law" since="The Go Scheduler (Part 2)">
+When problem size scales dynamically with added compute capacity while serial overhead remains constant, the scaled speedup is `n - (1-p)(n-1)`, which scales near-linearly with processor count `n`. **Why it matters:** explains why expanding container CPU limits to process larger ingestion batches in the same target latency window works effectively. **Production hazard:** assuming Gustafson scaling applies to low-throughput point queries where latency is dominated by sequential network round-trips rather than compute volume.
+</Define>
 
 The intuition: the serial 5% in Amdahl's example was a *fixed* cost. But if you double the dataset, the parallel matrix-crunch doubles while the fixed setup stays the same — so the serial *fraction* shrinks, and the ceiling rises with it. A graphics engine is the textbook case: a faster GPU doesn't render last year's frame in half the time; it renders this year's frame with twice the detail. Same wall-clock budget, more work done.
 

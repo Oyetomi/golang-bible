@@ -1,0 +1,1295 @@
+---
+title: "eBPF & Kernel-Level Observability in Go"
+part: "appendix"
+order: 39
+type: "course"
+description: "Writing eBPF programs, compiling to BPF bytecode with clang, loading with cilium/ebpf, XDP packet filtering at the NIC, kprobes/uprobes, and ring buffer event streaming in Go."
+prerequisites: ["security-tooling-in-go"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Kernel Observability" title="eBPF & Kernel-Level Observability in Go">
+
+Here's the thing, sport. You think you understand what your Go service is doing because you put a logger in your middleware and an OpenTelemetry span around your database calls. That's adorable.
+
+Then Friday 4:15 PM hits. Meridian's core wire settlement engine is dropping 30% of incoming settlement confirmations. The CPU is sitting at 98% utilization in `softirq`, the Go pprof profile shows literally *nothing* happening inside your goroutines, and your application metrics insist everything is fine while $42 million in Fedwire transfers sit stuck in limbo. You are blind. Your runtime lives in user space, and the carnage is happening beneath you in the Linux kernel network stack.
+
+You don't fix that by adding another `slog.Info` call. You fix it by descending into the kernel itself.
+
+In this chapter, we take complete command of **eBPF (Extended Berkeley Packet Filter)** in Go. You will learn how to write in-kernel C programs, compile them to BPF bytecode with `clang`, load and attach them natively using `cilium/ebpf` and `bpf2go`, drop 100Gbps DDoS attacks at the NIC driver layer with **XDP**, trace kernel function latency with **kprobes** and **uprobes**, and stream telemetry directly into Go memory at zero-copy speeds with the **BPF ring buffer**. No guesswork. Pure kernel-level supremacy.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Why Kernel Tracing Trumps User Space", "eBPF Architecture & The Verifier", "Compiling & bpf2go Generation", "XDP: Dropping Packets at the NIC", "Kprobes & Uprobes: Latency Telemetry", "BPF Ring Buffer: Streaming to Go", "A Production Observability Engine"]} />
+
+<SpacedRecall
+  role={"detective"}
+  items={[
+    {
+      from: "Security tooling in Go (appendix, ch20)",
+      q: "Why do high-throughput user-space packet probers choke under heavy packet floods?",
+      options: [
+        "Go's garbage collector cannot handle byte slices",
+        "Every packet forces kernel socket buffer (sk_buff) allocation and expensive user-space context switches",
+        "Linux disables raw sockets when CPU usage exceeds 80%",
+        "TCP checksum calculation can only run in user space"
+      ],
+      answer: 1,
+      tie: "In user space, every packet traverses the entire kernel network stack, allocates an sk_buff, and copies bytes across the syscall boundary. eBPF with XDP runs right at the NIC driver before sk_buff allocation."
+    },
+    {
+      from: "Concurrency & Channels (part 1, ch4)",
+      q: "Why is a shared lockless circular ring buffer faster than per-event channel passing for kernel telemetry?",
+      options: [
+        "Channels require kernel mutex locks on every send and receive",
+        "A ring buffer uses memory-mapped pages (mmap) allowing zero-copy transfers between kernel and user space",
+        "Go channels cannot transport structs larger than 64 bytes",
+        "Ring buffers prevent goroutine preemption"
+      ],
+      answer: 1,
+      tie: "The modern BPF ring buffer maps contiguous kernel memory directly into your Go process space, bypassing per-event syscall overhead entirely."
+    },
+  ]}
+/>
+
+<PredictLab
+  prompt={"Network Byte Order: What does binary.BigEndian.Uint16([]byte{0x01, 0xBB}) yield?"}
+  role={"guard"}
+  code={`b := []byte{0x01, 0xBB}
+port := binary.BigEndian.Uint16(b)
+fmt.Println(port)`}
+  options={["443", "47873", "283", "8080"]}
+  answer={0}
+  output={`443`}
+  explain={"0x01 * 256 + 0xBB (187) = 256 + 187 = 443. All network wire protocols (IP, TCP, UDP) encode fields in Big Endian (most significant byte first). eBPF kernel filters parse packet headers in Big Endian, while x86_64 host memory is Little Endian."}
+/>
+
+## Why Kernel Tracing Trumps User Space
+
+Let me set the scene at Meridian Global Payments. Meridian processes tens of thousands of high-value interbank wire settlements per second. Each settlement requires a TLS-encrypted TCP handshake, an XML payload validation, a database transaction, and a confirmation callback.
+
+Under standard conditions, user-space APM tools report an average latency of 4.2ms. But during market opening, the 99.9th percentile latency explodes to 850ms. 
+
+<Scene
+  title="Meridian Wire Settlement: User Space Blindness vs Kernel Observability"
+  actors={[
+    { id: "nic", label: "NIC Driver" },
+    { id: "kern", label: "Kernel (TCP/IP)" },
+    { id: "go", label: "Go Wire App" },
+    { id: "bpf", label: "eBPF Probe" }
+  ]}
+  rows={2}
+  cols={4}
+  frames={[
+    {
+      caption: "A flood of 2,000,000 packets/sec hits the network interface. 90% are spoofed SYN-flood attack traffic.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "NIC RX Ring" },
+        { id: "A2", state: "idle", label: "sk_buff alloc" },
+        { id: "A3", state: "idle", label: "TCP Backlog" },
+        { id: "A4", state: "idle", label: "Go netpoll" },
+        { id: "B1", state: "idle", label: "XDP Hook" },
+        { id: "B2", state: "idle", label: "BPF Map" },
+        { id: "B3", state: "idle", label: "Ring Buffer" },
+        { id: "B4", state: "idle", label: "Go Tracer" }
+      ]
+    },
+    {
+      caption: "Without eBPF: The kernel allocates sk_buff for all 2M packets. Softirq spikes to 100%, socket queues drop valid transfers.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "bad", label: "NIC Overload" },
+        { id: "A2", state: "bad", label: "sk_buff OOM" },
+        { id: "A3", state: "bad", label: "Drops: 30%" },
+        { id: "A4", state: "bad", label: "Go Starved" },
+        { id: "B1", state: "idle", label: "Disabled" },
+        { id: "B2", state: "idle", label: "Empty" },
+        { id: "B3", state: "idle", label: "Empty" },
+        { id: "B4", state: "idle", label: "No Signal" }
+      ]
+    },
+    {
+      caption: "With XDP & eBPF: XDP program inspects headers in the NIC driver ring and drops malicious packets in 12ns. Valid wires stream to Go.",
+      beat: "solution",
+      cells: [
+        { id: "A1", state: "ok", label: "NIC Clean" },
+        { id: "A2", state: "ok", label: "sk_buff (Clean)" },
+        { id: "A3", state: "ok", label: "TCP 0 Drops" },
+        { id: "A4", state: "done", label: "Go 4.2ms P99" },
+        { id: "B1", state: "done", label: "XDP_DROP (90%)" },
+        { id: "B2", state: "done", label: "Drop Counter" },
+        { id: "B3", state: "done", label: "Latency Stream" },
+        { id: "B4", state: "done", label: "Realtime Stats" }
+      ]
+    }
+  ]}
+  caption="XDP discards hostile traffic at wire speed before the kernel allocates an sk_buff structure, while eBPF kprobes stream accurate socket latencies directly to Go."
+/>
+
+When you rely exclusively on user-space telemetry:
+1. **You cannot see kernel queue delays**: If a packet waits 300ms in the socket receive buffer (`SO_RCVBUF`) before Go's runtime netpoll calls `read()`, your application timer only measures from the moment `read()` returns. You miss the entire 300ms queue stall.
+2. **Context switch overhead destroys high packet rates**: A standard Linux system handling 1,000,000 packets per second spends over 60% of CPU cycles creating `sk_buff` structs, managing routing tables, and copying memory to user space.
+3. **Application crashes kill your visibility**: If a microservice panics or deadlocks, its internal metrics server dies with it. Kernel-level probes continue running unaffected.
+
+<Define term="eBPF (Extended Berkeley Packet Filter)">
+A safe, sandboxed virtual machine embedded inside the Linux kernel. It allows developers to execute custom bytecode in response to kernel events (network packets, system calls, function entries/exits, tracepoints) at native CPU speed without modifying kernel source code or loading dangerous kernel modules (`.ko`).
+</Define>
+
+<BeforeAfter
+  bad={`// NAIVE: User-space prober reading raw packets via pcap
+// Forces full sk_buff allocation, socket queues, and context switches
+func ReadPacketsNaive(handle *pcap.Handle) {
+    src := gopacket.NewPacketSource(handle, handle.LinkType())
+    for packet := range src.Packets() {
+        if isAttack(packet) {
+            // Dropping here is too late! CPU already wasted 2 microseconds
+            continue
+        }
+        process(packet)
+    }
+}`}
+  good={`// IDIOMATIC: Load in-kernel XDP filter via cilium/ebpf
+// Malicious packets are dropped in the NIC driver in ~10ns
+func AttachXDPGuard(ifaceName string) error {
+    spec, _ := loadXdpFilter()
+    objs := xdpFilterObjects{}
+    spec.LoadAndAssign(&objs, nil)
+    
+    // Attach to NIC driver hook
+    l, _ := link.AttachXDP(link.XDPOptions{
+        Program:   objs.XdpDropAttacks,
+        Interface: iface.Index,
+        Flags:     link.XDPDriverMode,
+    })
+    defer l.Close()
+    return nil
+}`}
+  badLabel="Naive User-Space Capture (pcap / raw socket)"
+  goodLabel="In-Kernel XDP Filter (cilium/ebpf)"
+/>
+
+---
+
+## eBPF Architecture & The Verifier
+
+The eBPF engine is not an interpreter; it is a full in-kernel computing subsystem. When your Go program loads eBPF bytecode, the Linux kernel subjects it to a draconian safety inspection before running it through a Just-In-Time (JIT) compiler.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        USER SPACE                           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                     Go Program                        │  │
+│  │   - cilium/ebpf loader                                │  │
+│  │   - ringbuf.Reader (consumes telemetry)               │  │
+│  │   - BPF Map management (updating blocklists)          │  │
+│  └──────────────────────────┬────────────────────────────┘  │
+│                             │ bpf() syscall                 │
+├─────────────────────────────┼───────────────────────────────┤
+│                        KERNEL SPACE                         │
+│                             ▼                               │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                   BPF Subsystem                       │  │
+│  │  1. In-Kernel Verifier (DAG static analysis)          │  │
+│  │  2. JIT Compiler (BPF Bytecode ➔ x86_64/ARM64)        │  │
+│  └───────────┬───────────────────────────────▲───────────┘  │
+│              │ attaches                      │ reads/writes │
+│              ▼                               ▼              │
+│  ┌───────────────────────┐       ┌───────────────────────┐  │
+│  │      Hook Points      │       │       BPF Maps        │  │
+│  │  - XDP (NIC Driver)   │◄─────►│  - HASH / ARRAY       │  │
+│  │  - kprobe / kretprobe │       │  - RINGBUF (mmap'd)   │  │
+│  │  - tracepoints        │       │  - LRU_HASH           │  │
+│  └───────────────────────┘       └───────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+<Define term="In-Kernel BPF Verifier">
+The Linux kernel's static analysis engine that proves an eBPF program is 100% memory-safe and guaranteed to terminate before executing. It simulates every possible code path, verifying that pointers never access uninitialized memory or out-of-bounds array indices, unbounded loops are forbidden, and kernel state cannot be corrupted.
+</Define>
+
+The verifier enforces ruthless constraints:
+- **No unbounded loops**: As of modern kernels (Linux 5.3+), bounded loops are permitted, but the verifier must mathematically prove they terminate within instruction limits (up to 1,000,000 verified complexity states).
+- **Mandatory Bounds Checking**: Every packet memory access `data + offset` must be explicitly guarded with a conditional branch checking against `data_end`. If you omit a single check, the verifier rejects the program with `invalid access to packet`.
+- **Restricted Stack Size**: An eBPF program has a strict 512-byte stack limit. Large structures must be stored in BPF maps or per-CPU scratch buffers.
+- **Helper Functions Only**: eBPF code cannot call arbitrary C standard library functions or kernel functions; it can only invoke blessed in-kernel helper functions (`bpf_ktime_get_ns()`, `bpf_map_lookup_elem()`, `bpf_ringbuf_submit()`).
+
+<UnderTheHood title="The BPF JIT, CO-RE & Go Runtime Synergy (Go 1.26 + Linux 6.x)">
+
+How does Go interact with kernel eBPF without CGO?
+
+Historically, developers used BCC (BPF Compiler Collection), which required dragging Python, LLVM, and a full C toolchain onto production servers.
+
+The modern paradigm is **BPF CO-RE (Compile Once – Run Everywhere)** backed by **BTF (BPF Type Format)**. The C code is compiled once into an ELF binary containing compact debug types. The pure-Go library `github.com/cilium/ebpf` parses this ELF file directly in Go user space, relocates kernel struct field offsets on the fly to match the host's running kernel, and executes the `sys_bpf` syscall (`syscall.Syscall(unix.SYS_BPF, ...)`) to load the verified bytecode.
+
+In Go 1.26, modern containerized microservices benefit from container-aware runtime integration. When Go processes trace kernel events via eBPF, memory-mapped BPF ring buffers provide non-blocking event consumption that avoids Go runtime scheduler thread thrashing.
+
+</UnderTheHood>
+
+---
+
+## Compiling & bpf2go Generation
+
+Instead of hand-writing raw bytecode or juggling complex Makefile scripts, the Go eBPF ecosystem uses `bpf2go`. `bpf2go` is a command-line tool shipped with `cilium/ebpf` that compiles C source code with `clang` and generates type-safe Go bindings.
+
+Let's look at how the C program and Go bindings fit together.
+
+### 1. The C eBPF Program (`probe.c`)
+
+Here is an eBPF program that monitors settlement transactions by intercepting IPv4 TCP connections:
+
+```c
+//go:build ignore
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/in.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+// Event structure streamed to Go user space
+struct wire_event_t {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 dst_port;
+    __u16 pkt_len;
+    __u64 timestamp_ns;
+};
+
+// BPF Map: Ring buffer for streaming events
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24); // 16 MB ring buffer
+} events SEC(".maps");
+
+// BPF Map: Hash map for IP allowlist
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);   // IPv4 address
+    __type(value, __u8);  // 1 = allowed, 0 = blocked
+} ip_filter SEC(".maps");
+
+SEC("xdp")
+int xdp_meridian_filter(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    // 1. Boundary check for Ethernet header
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+        return XDP_PASS;
+    }
+
+    // 2. Boundary check for IPv4 header
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    // 3. Lookup in Go-managed BPF hash map
+    __u32 src_ip = ip->saddr;
+    __u8 *allowed = bpf_map_lookup_elem(&ip_filter, &src_ip);
+    if (allowed && *allowed == 0) {
+        // Drop blocked IP at wire speed
+        return XDP_DROP;
+    }
+
+    // 4. Reserve space in Ring Buffer for telemetry
+    struct wire_event_t *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event) {
+        return XDP_PASS; // Ring buffer full, do not drop packet
+    }
+
+    event->src_ip = src_ip;
+    event->dst_ip = ip->daddr;
+    event->dst_port = 0;
+    event->pkt_len = bpf_ntohs(ip->tot_len);
+    event->timestamp_ns = bpf_ktime_get_ns();
+
+    bpf_ringbuf_submit(event, 0);
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+
+### 2. Generating Go Bindings
+
+To compile this into Go, you place a `go:generate` directive inside your Go package:
+
+```go
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf probe probe.c -- -I/usr/include/bpf -O2
+```
+
+Running `go generate ./...` creates two files:
+- `probe_bpf.o`: The compiled ELF BPF bytecode.
+- `probe_bpf.go`: Generated Go structs (`probeObjects`, `probePrograms`, `probeMaps`, `probeWireEventT`) containing embedded bytecode and type-safe map/program handles.
+
+<Define term="bpf2go">
+A code generation tool from the `cilium/ebpf` project that invokes `clang` to compile C eBPF source into bytecode, embeds the compiled ELF assets directly into `.go` source files, and creates type-safe Go structs matching BPF maps and program definitions.
+</Define>
+
+---
+
+## XDP: Dropping Packets at the NIC
+
+The **eXpress Data Path (XDP)** is the highest-performance packet processing hook in the Linux kernel. XDP attaches directly to the Network Interface Card (NIC) driver receive ring buffer.
+
+<ExecTimeline
+  title="Packet Pipeline: Linux Standard Path vs XDP Hook"
+  lanes={[
+    { id: "nic", label: "NIC Driver RX" },
+    { id: "xdp", label: "XDP eBPF Hook" },
+    { id: "skb", label: "Kernel Stack (sk_buff)" },
+    { id: "app", label: "Go Application" }
+  ]}
+  steps={[
+    { lane: "nic", label: "DMA Frame", note: "Packet arrives from physical cable into NIC RX ring memory", kind: "recv" },
+    { lane: "xdp", label: "Run eBPF", note: "XDP executes before kernel allocates sk_buff or initializes sockets", kind: "run" },
+    { lane: "xdp", label: "XDP_DROP", note: "Hostile packet dropped immediately — 0 bytes copied to kernel stack", kind: "done" },
+    { lane: "nic", label: "Valid Wire Frame", note: "Next packet: legitimate $10M settlement arrives", kind: "recv" },
+    { lane: "xdp", label: "XDP_PASS", note: "XDP approves packet, passes to Linux kernel stack", kind: "send" },
+    { lane: "skb", label: "Alloc sk_buff", note: "Kernel constructs sk_buff, routes to TCP socket backlog", kind: "run" },
+    { lane: "app", label: "netpoll Read", note: "Go runtime wakes up and reads wire settlement in user space", kind: "recv" }
+  ]}
+  caption="XDP acts as a sub-microsecond in-kernel firewall before packets touch memory-heavy kernel socket buffers."
+/>
+
+### XDP Return Actions
+
+An XDP program inspects packet memory and terminates by returning one of five integer codes:
+
+| Action | Code | Meaning |
+| :--- | :--- | :--- |
+| `XDP_DROP` | `1` | Discards the packet immediately at the driver level. Consumes &lt; 15 nanoseconds. |
+| `XDP_PASS` | `2` | Passes the packet up into the normal Linux network stack (`sk_buff` allocation). |
+| `XDP_TX` | `3` | Bounces the packet back out the same network interface it arrived on. |
+| `XDP_REDIRECT` | `4` | Bypasses kernel stack and forwards packet to another NIC, CPU core, or AF_XDP socket. |
+| `XDP_ABORTED` | `0` | Indicates an eBPF program error; drops packet and emits a tracepoint warning. |
+
+Let's look at how we parse network packets safely in Go models.
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+)
+
+// EthernetHeader models struct ethhdr (14 bytes)
+type EthernetHeader struct {
+	DstMAC    net.HardwareAddr
+	SrcMAC    net.HardwareAddr
+	EtherType uint16
+}
+
+// IPv4Header models struct iphdr (minimum 20 bytes)
+type IPv4Header struct {
+	VersionIHL uint8
+	TOS        uint8
+	TotalLen   uint16
+	ID         uint16
+	FlagsFrag  uint16
+	TTL        uint8
+	Protocol   uint8
+	Checksum   uint16
+	SrcIP      net.IP
+	DstIP      net.IP
+}
+
+// ParsePacketHeaders performs in-memory simulation of XDP verifier-safe parsing
+func ParsePacketHeaders(pkt []byte) (*EthernetHeader, *IPv4Header, error) {
+	// Verifier rule 1: Bounds check Ethernet header (14 bytes)
+	if len(pkt) < 14 {
+		return nil, nil, errors.New("packet smaller than Ethernet header")
+	}
+
+	eth := &EthernetHeader{
+		DstMAC:    net.HardwareAddr(pkt[0:6]),
+		SrcMAC:    net.HardwareAddr(pkt[6:12]),
+		EtherType: binary.BigEndian.Uint16(pkt[12:14]),
+	}
+
+	// Only handle IPv4 (0x0800)
+	if eth.EtherType != 0x0800 {
+		return eth, nil, nil
+	}
+
+	// Verifier rule 2: Bounds check IPv4 header (14 + 20 = 34 bytes)
+	if len(pkt) < 34 {
+		return eth, nil, errors.New("truncated IPv4 packet")
+	}
+
+	ipBytes := pkt[14:]
+	ihl := (ipBytes[0] & 0x0F) * 4 // Internet Header Length in bytes
+	if ihl < 20 || len(ipBytes) < int(ihl) {
+		return eth, nil, errors.New("invalid IHL size")
+	}
+
+	ip := &IPv4Header{
+		VersionIHL: ipBytes[0],
+		TOS:        ipBytes[1],
+		TotalLen:   binary.BigEndian.Uint16(ipBytes[2:4]),
+		ID:         binary.BigEndian.Uint16(ipBytes[4:6]),
+		FlagsFrag:  binary.BigEndian.Uint16(ipBytes[6:8]),
+		TTL:        ipBytes[8],
+		Protocol:   ipBytes[9],
+		Checksum:   binary.BigEndian.Uint16(ipBytes[10:12]),
+		SrcIP:      net.IP(ipBytes[12:16]),
+		DstIP:      net.IP(ipBytes[16:20]),
+	}
+
+	return eth, ip, nil
+}
+
+func main() {
+	// Raw synthetic Ethernet + IPv4 frame targeting Meridian wire port (TCP)
+	rawFrame := []byte{
+		// Dst MAC: 52:54:00:12:34:56
+		0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+		// Src MAC: 00:1A:2B:3C:4D:5E
+		0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E,
+		// EtherType: IPv4 (0x0800)
+		0x08, 0x00,
+		// IPv4 Header: Version 4, IHL 5 (20 bytes)
+		0x45, 0x00, 0x00, 0x3C,
+		0x1C, 0x7B, 0x40, 0x00,
+		0x40, 0x06, 0x00, 0x00, // TTL=64, Proto=TCP (6)
+		0xC0, 0xA8, 0x01, 0x64, // Src: 192.168.1.100
+		0x0A, 0x00, 0x00, 0x01, // Dst: 10.0.0.1
+	}
+
+	eth, ip, err := ParsePacketHeaders(rawFrame)
+	if err != nil {
+		fmt.Println("Parse error:", err)
+		return
+	}
+
+	fmt.Println("EtherType:", fmt.Sprintf("0x%04X", eth.EtherType))
+	fmt.Println("Source IP:", ip.SrcIP)
+	fmt.Println("Destination IP:", ip.DstIP)
+	fmt.Println("Protocol:", ip.Protocol)
+	fmt.Println("Total Length:", ip.TotalLen, "bytes")
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={"What happens if an eBPF program attempts to read packet memory without first checking if the offset is less than data_end?"}
+  options={[
+    "The program causes a kernel panic (kernel NULL pointer dereference)",
+    "The kernel verifier rejects the program at load time with an 'invalid access to packet' error",
+    "The packet is automatically dropped and marked as XDP_ABORTED",
+    "The Go loader silently ignores the instruction and continues execution"
+  ]}
+  answer={1}
+  explain="The in-kernel BPF verifier performs static bounds analysis. Any direct packet access not guarded by a conditional branch comparing pointer offsets against ctx->data_end is rejected before the code is ever attached."
+/>
+
+---
+
+## Kprobes & Uprobes: Latency Telemetry
+
+When diagnosing latency anomalies, packet inspection is only half the battle. You need to know how long functions take to execute inside the kernel and inside your Go binaries.
+
+<Define term="kprobe and kretprobe">
+**kprobe** (kernel probe) attaches to the entry of virtually any Linux kernel function to capture input arguments. **kretprobe** (kernel return probe) attaches to the function return to measure elapsed execution time and inspect return values.
+</Define>
+
+<Define term="uprobe and uretprobe">
+User-space probes that attach directly to symbol offsets inside compiled executable binaries (including Go application binaries) without recompiling or restarting the target service.
+</Define>
+
+```
+  Go Application (User Space)              Linux Kernel
+┌───────────────────────────────┐        ┌───────────────────────────────┐
+│ Meridian Wire Settlement      │        │ sys_enter_write / tcp_sendmsg │
+│                               │        │                               │
+│  [uprobe: ProcessSettlement]  │        │  [kprobe: tcp_sendmsg]        │
+│        │                      │        │        │                      │
+│        ▼ Record Start Time    │        │        ▼ Store Start TS       │
+│  (Business Logic Work)        │        │  (Kernel Socket Buffer Work)  │
+│        │                      │        │        │                      │
+│        ▼                      │        │        ▼                      │
+│  [uretprobe: Measure Latency] │        │  [kretprobe: Calculate Delta] │
+│        │                      │        │        │                      │
+└────────┼──────────────────────┘        └────────┼──────────────────────┘
+         │                                        │
+         └───────────────┬────────────────────────┘
+                         │ Submit event
+                         ▼
+             ┌───────────────────────┐
+             │ BPF Ring Buffer       │
+             └───────────────────────┘
+```
+
+### Tracing Kernel TCP Latency with Kprobes
+
+Consider tracing `tcp_sendmsg` in the kernel to measure how long socket writes block:
+
+```c
+// C kprobe snippet
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64); // PID + TGID
+    __type(value, __u64); // Timestamp (nanoseconds)
+} start_times SEC(".maps");
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(trace_tcp_sendmsg_enter) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start_times, &pid_tgid, &ts, BPF_ANY);
+    return 0;
+}
+
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(trace_tcp_sendmsg_exit) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 *start_ts = bpf_map_lookup_elem(&start_times, &pid_tgid);
+    if (!start_ts) {
+        return 0; // Missed entry
+    }
+
+    __u64 duration_ns = bpf_ktime_get_ns() - *start_ts;
+    bpf_map_delete_elem(&start_times, &pid_tgid);
+
+    // If duration exceeds 10ms (10,000,000 ns), stream alert to Go
+    if (duration_ns > 10000000) {
+        // write to ring buffer...
+    }
+    return 0;
+}
+```
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="kprobe (Entry)">Intercepts function calls before execution. Captures arguments (e.g. socket pointers, transfer amounts) and records nanosecond start timestamps.</ConceptCard>
+  <ConceptCard label="kretprobe (Return)">Traces function exit. Measures total elapsed duration and inspects return codes (e.g. bytes written or error numbers like -EAGAIN).</ConceptCard>
+  <ConceptCard label="uprobe (Go Binary)">Attaches to Go function symbols (e.g. `main.ProcessSettlement`). Traces application latency non-invasively in production without code modifications.</ConceptCard>
+  <Gotcha>⚠ Kprobe Symbol Inlining: The Linux kernel compiler frequently inlines small static functions. If a function is inlined, its symbol does not exist in /proc/kallsyms and kprobe attachment will fail. Always verify non-inlined kernel entrypoints!</Gotcha>
+</ConceptGrid>
+
+---
+
+## BPF Ring Buffer: Streaming to Go
+
+In legacy eBPF programs, streaming data to user space required `BPF_MAP_TYPE_PERF_EVENT_ARRAY`. That approach allocated per-CPU buffers, leading to memory fragmentation, wasted RAM on high-core servers, and out-of-order event delivery.
+
+Modern eBPF (Linux 5.8+) introduces the **BPF Ring Buffer** (`BPF_MAP_TYPE_RINGBUF`).
+
+<Define term="BPF Ring Buffer">
+A lockless multi-producer single-consumer circular queue allocated in kernel memory and mapped directly into user space via `mmap()`. It provides strictly ordered event delivery, variable-length event records, and zero-copy reservations.
+</Define>
+
+<ExecTimeline
+  title="Zero-Copy BPF Ring Buffer Event Flow"
+  lanes={[
+    { id: "kern", label: "Kernel eBPF Probe" },
+    { id: "ring", label: "Ring Buffer (mmap)" },
+    { id: "go", label: "Go ringbuf.Reader" }
+  ]}
+  steps={[
+    { lane: "kern", label: "bpf_ringbuf_reserve", note: "Allocates slot directly in shared ring memory (no temp stack copy)", kind: "run" },
+    { lane: "kern", label: "Populate Struct", note: "Writes PID, latency, settlement ID directly into slot", kind: "run" },
+    { lane: "kern", label: "bpf_ringbuf_submit", note: "Commits header and raises kernel epoll notification", kind: "send" },
+    { lane: "ring", label: "Ring Header Update", note: "Consumer tail pointer advances; event is visible in mmap space", kind: "run" },
+    { lane: "go", label: "epoll Wakeup", note: "Go runtime epoll wakes reader without spinning or polling", kind: "recv" },
+    { lane: "go", label: "Decode Record", note: "Reader parses binary struct and emits structured telemetry", kind: "done" }
+  ]}
+  caption="The BPF ring buffer enables high-frequency telemetry streaming with zero context switch overhead."
+/>
+
+### Consuming Ring Buffer Events in Go
+
+Here is how the Go user-space program reads from the BPF ring buffer using `cilium/ebpf/ringbuf`:
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/cilium/ebpf/ringbuf"
+)
+
+type WireTransferTelemetry struct {
+	TimestampNs uint64
+	TransferID  uint64
+	AmountCents uint64
+	DurationNs  uint64
+	PID         uint32
+	Status      uint32
+}
+
+func StreamTelemetry(ctx context.Context, rd *ringbuf.Reader) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		record, err := rd.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return nil
+			}
+			log.Printf("ringbuf read error: %v", err)
+			continue
+		}
+
+		var event WireTransferTelemetry
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+			log.Printf("failed to decode event: %v", err)
+			continue
+		}
+
+		latency := time.Duration(event.DurationNs) * time.Nanosecond
+		if latency > 10*time.Millisecond {
+			log.Printf("ALERT: Slow Settlement #%d (Amount: %d cents) took %v (PID: %d)",
+				event.TransferID, event.AmountCents, latency, event.PID)
+		}
+	}
+}
+```
+
+---
+
+## A Production Observability Engine
+
+Let's assemble a complete, production-grade observability engine in Go. This architecture:
+1. Manages kernel lifecycle with `cilium/ebpf`.
+2. Attaches dynamic probes.
+3. Updates BPF maps at runtime to block abusive IPs.
+4. Streams and aggregates high-frequency telemetry events.
+5. Handles clean teardown on `SIGINT`/`SIGTERM`.
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// In-memory simulation of complete BPF Map + Ring Buffer pipeline
+type ObservabilityEngine struct {
+	mu           sync.RWMutex
+	blockedIPs   map[uint32]bool
+	ringBuffer   chan []byte
+	totalDrops   atomic.Uint64
+	totalEvents  atomic.Uint64
+	slowSettlers atomic.Uint64
+}
+
+func NewObservabilityEngine(bufferCapacity int) *ObservabilityEngine {
+	return &ObservabilityEngine{
+		blockedIPs: make(map[uint32]bool),
+		ringBuffer: make(chan []byte, bufferCapacity),
+	}
+}
+
+// BlockIP updates the BPF Map from Go user space
+func (oe *ObservabilityEngine) BlockIP(ipStr string) error {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return fmt.Errorf("invalid IPv4: %s", ipStr)
+	}
+	ipKey := binary.BigEndian.Uint32(ip)
+
+	oe.mu.Lock()
+	oe.blockedIPs[ipKey] = true
+	oe.mu.Unlock()
+	return nil
+}
+
+// SimulateInKernelXDP simulates the driver-level eBPF XDP hook
+func (oe *ObservabilityEngine) SimulateInKernelXDP(srcIP net.IP, transferID uint64, amount uint64, durationNs uint64) bool {
+	ipKey := binary.BigEndian.Uint32(srcIP.To4())
+
+	oe.mu.RLock()
+	isBlocked := oe.blockedIPs[ipKey]
+	oe.mu.RUnlock()
+
+	if isBlocked {
+		oe.totalDrops.Add(1)
+		return false // XDP_DROP
+	}
+
+	// XDP_PASS: Emit event to ring buffer
+	eventBytes := make([]byte, 40)
+	binary.LittleEndian.PutUint64(eventBytes[0:8], uint64(time.Now().UnixNano()))
+	binary.LittleEndian.PutUint64(eventBytes[8:16], transferID)
+	binary.LittleEndian.PutUint64(eventBytes[16:24], amount)
+	binary.LittleEndian.PutUint64(eventBytes[24:32], durationNs)
+	binary.BigEndian.PutUint32(eventBytes[32:36], ipKey)
+	binary.LittleEndian.PutUint32(eventBytes[36:40], 1) // status = SUCCESS
+
+	select {
+	case oe.ringBuffer <- eventBytes:
+		oe.totalEvents.Add(1)
+	default:
+		// Ring buffer backpressure
+	}
+	return true
+}
+
+// ConsumeTelemetry runs in Go user space
+func (oe *ObservabilityEngine) ConsumeTelemetry(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case raw := <-oe.ringBuffer:
+			if len(raw) < 40 {
+				continue
+			}
+			transferID := binary.LittleEndian.Uint64(raw[8:16])
+			amount := binary.LittleEndian.Uint64(raw[16:24])
+			durationNs := binary.LittleEndian.Uint64(raw[24:32])
+			srcIPRaw := binary.BigEndian.Uint32(raw[32:36])
+
+			ip := make(net.IP, 4)
+			binary.BigEndian.PutUint32(ip, srcIPRaw)
+
+			if durationNs > 10_000_000 { // > 10ms
+				oe.slowSettlers.Add(1)
+				fmt.Printf("[KERNEL TRACE] LATENCY SPIKE: Transfer #%d ($%.2f) from %s took %v\n",
+					transferID, float64(amount)/100.0, ip.String(), time.Duration(durationNs))
+			}
+		}
+	}
+}
+```
+
+---
+
+## Exercises
+
+<Exercise n={1} title="BPF Map Key & Endianness Serialization" level="easy">
+
+Write a Go helper function `EncodeIPFilterKey(ipStr string) (uint32, error)` that parses an IPv4 string and returns the 32-bit integer in big-endian network byte order, as required by the Linux kernel BPF hash map key.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+)
+
+// EncodeIPFilterKey converts an IPv4 address string into a big-endian uint32
+// suitable for BPF map lookups matching kernel struct iphdr.saddr.
+func EncodeIPFilterKey(ipStr string) (uint32, error) {
+	parsed := net.ParseIP(ipStr)
+	if parsed == nil {
+		return 0, errors.New("invalid IP format")
+	}
+	ipv4 := parsed.To4()
+	if ipv4 == nil {
+		return 0, errors.New("not an IPv4 address")
+	}
+	return binary.BigEndian.Uint32(ipv4), nil
+}
+
+func main() {
+	key, err := EncodeIPFilterKey("192.168.1.1")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("BPF Key: 0x%08X\n", key)
+}
+```
+
+The Linux kernel networking stack represents all IP addresses in network byte order (Big Endian). Using `binary.BigEndian.Uint32` guarantees that a Go user-space map update matches what the in-kernel `iphdr->saddr` field evaluates during packet filtering.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="XDP Packet Bounds Checker & Header Decoupler" level="medium">
+
+Implement a Go function `ValidateAndExtractTCPPayload(packet []byte) (srcIP net.IP, dstPort uint16, payload []byte, err error)` that replicates the verifier safety checks required before accessing TCP payload memory. Return errors if packet bounds are breached.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+)
+
+func ValidateAndExtractTCPPayload(packet []byte) (net.IP, uint16, []byte, error) {
+	// 1. Ethernet header check (14 bytes)
+	if len(packet) < 14 {
+		return nil, 0, nil, errors.New("packet smaller than Ethernet header")
+	}
+	etherType := binary.BigEndian.Uint16(packet[12:14])
+	if etherType != 0x0800 {
+		return nil, 0, nil, errors.New("non-IPv4 packet")
+	}
+
+	// 2. IPv4 header check (14 + 20 bytes min)
+	if len(packet) < 34 {
+		return nil, 0, nil, errors.New("truncated IPv4 header")
+	}
+	ipStart := 14
+	ihl := int(packet[ipStart]&0x0F) * 4
+	if ihl < 20 || len(packet) < ipStart+ihl {
+		return nil, 0, nil, errors.New("invalid IHL")
+	}
+
+	protocol := packet[ipStart+9]
+	if protocol != 6 { // TCP
+		return nil, 0, nil, errors.New("non-TCP packet")
+	}
+	srcIP := net.IP(packet[ipStart+12 : ipStart+16])
+
+	// 3. TCP header check (ipStart + ihl + 20 bytes min)
+	tcpStart := ipStart + ihl
+	if len(packet) < tcpStart+20 {
+		return nil, 0, nil, errors.New("truncated TCP header")
+	}
+
+	dstPort := binary.BigEndian.Uint16(packet[tcpStart+2 : tcpStart+4])
+	dataOffset := int((packet[tcpStart+12] >> 4) & 0x0F) * 4
+	if dataOffset < 20 || len(packet) < tcpStart+dataOffset {
+		return nil, 0, nil, errors.New("invalid TCP data offset")
+	}
+
+	payloadStart := tcpStart + dataOffset
+	payload := packet[payloadStart:]
+	return srcIP, dstPort, payload, nil
+}
+
+func main() {
+	// Synthesize a valid Ethernet + IP + TCP packet with payload
+	pkt := make([]byte, 58)
+	binary.BigEndian.PutUint16(pkt[12:14], 0x0800) // EtherType IPv4
+	pkt[14] = 0x45                                 // Version 4, IHL 5 (20 bytes)
+	pkt[23] = 6                                    // Proto TCP
+	copy(pkt[26:30], net.ParseIP("10.0.1.50").To4())
+	copy(pkt[30:34], net.ParseIP("10.0.1.1").To4())
+	binary.BigEndian.PutUint16(pkt[36:38], 8080)   // DstPort 8080
+	pkt[46] = 0x50                                 // TCP Data Offset 5 (20 bytes)
+	copy(pkt[54:], []byte("WIRE"))                 // 4-byte payload
+
+	src, port, payload, err := ValidateAndExtractTCPPayload(pkt)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Source: %s, Port: %d, Payload: %s\n", src, port, string(payload))
+}
+```
+
+Just like the Linux BPF verifier, every offset calculation (`ihl * 4` and `dataOffset * 4`) must be mathematically validated against total packet length before advancing pointers.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="BPF Ring Buffer Binary Event Decoder" level="hard">
+
+Write a high-throughput binary event decoder `DecodeKernelRecord(raw []byte) (*WireEvent, error)` that unpacks an 8-byte aligned C kernel event struct without allocating intermediary strings or buffers.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"time"
+)
+
+type WireEvent struct {
+	Timestamp   time.Time
+	TransferID  uint64
+	AmountCents uint64
+	Duration    time.Duration
+	SourceIP    net.IP
+	PID         uint32
+	Status      uint32
+}
+
+// C struct layout in kernel:
+// struct wire_event {
+//     __u64 timestamp_ns;  // offset 0..8
+//     __u64 transfer_id;   // offset 8..16
+//     __u64 amount_cents;  // offset 16..24
+//     __u64 duration_ns;   // offset 24..32
+//     __u32 src_ip;        // offset 32..36 (Big Endian)
+//     __u32 pid;           // offset 36..40 (Little Endian)
+//     __u32 status;        // offset 40..44
+//     __u32 _pad;          // offset 44..48 (alignment)
+// };
+
+func DecodeKernelRecord(raw []byte) (*WireEvent, error) {
+	if len(raw) < 48 {
+		return nil, errors.New("record size mismatch: expected at least 48 bytes")
+	}
+
+	tsNs := binary.LittleEndian.Uint64(raw[0:8])
+	transferID := binary.LittleEndian.Uint64(raw[8:16])
+	amount := binary.LittleEndian.Uint64(raw[16:24])
+	durNs := binary.LittleEndian.Uint64(raw[24:32])
+	srcIPRaw := binary.BigEndian.Uint32(raw[32:36])
+	pid := binary.LittleEndian.Uint32(raw[36:40])
+	status := binary.LittleEndian.Uint32(raw[40:44])
+
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, srcIPRaw)
+
+	return &WireEvent{
+		Timestamp:   time.Unix(0, int64(tsNs)),
+		TransferID:  transferID,
+		AmountCents: amount,
+		Duration:    time.Duration(durNs) * time.Nanosecond,
+		SourceIP:    ip,
+		PID:         pid,
+		Status:      status,
+	}, nil
+}
+
+func main() {
+	buf := make([]byte, 48)
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(time.Now().UnixNano()))
+	binary.LittleEndian.PutUint64(buf[8:16], 987654321)
+	binary.LittleEndian.PutUint64(buf[16:24], 5000000) // $50,000.00
+	binary.LittleEndian.PutUint64(buf[24:32], 15000000) // 15ms
+	binary.BigEndian.PutUint32(buf[32:36], 0x7F000001)  // 127.0.0.1
+	binary.LittleEndian.PutUint32(buf[36:40], 4120)
+	binary.LittleEndian.PutUint32(buf[40:44], 1)
+
+	ev, err := DecodeKernelRecord(buf)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Decoded Transfer #%d: $%.2f, Duration: %v, IP: %s\n",
+		ev.TransferID, float64(ev.AmountCents)/100, ev.Duration, ev.SourceIP)
+}
+```
+
+The C compiler on 64-bit Linux aligns 64-bit integers on 8-byte boundaries. When packing mixed 32-bit and 64-bit integers, the struct includes trailing alignment padding. Struct unpacking in Go must account for exact field offsets and differing endianness (Network Big Endian for IPs vs Host Little Endian for timestamps and counts).
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Logarithmic Latency Histogram Aggregator" level="hard">
+
+Simulate an in-kernel BPF logarithmic histogram accumulator in Go. Implement `RecordLatency(dur time.Duration)` and `PrintHistogram()` where latency values are bucketed exponentially by powers of two (2^k microseconds), matching the behavior of `bpftool` and `bcc` histogram maps.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/bits"
+	"sync/atomic"
+	"time"
+)
+
+// Log2Histogram implements a lock-free power-of-two histogram accumulator
+type Log2Histogram struct {
+	// Buckets 0..63 representing [2^i, 2^(i+1)) microseconds
+	buckets [64]atomic.Uint64
+}
+
+func (h *Log2Histogram) RecordLatency(dur time.Duration) {
+	us := uint64(dur.Microseconds())
+	if us == 0 {
+		h.buckets[0].Add(1)
+		return
+	}
+	// Calculate log2 floor using leading zeros count
+	bucket := 64 - bits.LeadingZeros64(us)
+	if bucket >= 64 {
+		bucket = 63
+	}
+	h.buckets[bucket].Add(1)
+}
+
+func (h *Log2Histogram) PrintHistogram() {
+	fmt.Printf("%-18s : %-10s %s\n", "Latency Range (µs)", "Count", "Distribution")
+	for i := 0; i < 30; i++ {
+		count := h.buckets[i].Load()
+		if count == 0 {
+			continue
+		}
+		var low, high uint64
+		if i == 0 {
+			low, high = 0, 1
+		} else {
+			low = 1 << (i - 1)
+			high = (1 << i) - 1
+		}
+		stars := ""
+		for s := uint64(0); s < count && s < 40; s++ {
+			stars += "*"
+		}
+		fmt.Printf("[%8d -> %8d] : %-10d %s\n", low, high, count, stars)
+	}
+}
+
+func main() {
+	hist := &Log2Histogram{}
+	// Simulate wire settlement latency events
+	hist.RecordLatency(500 * time.Microsecond)
+	hist.RecordLatency(800 * time.Microsecond)
+	hist.RecordLatency(1200 * time.Microsecond)
+	hist.RecordLatency(1500 * time.Microsecond)
+	hist.RecordLatency(4500 * time.Microsecond)
+	hist.RecordLatency(25000 * time.Microsecond) // 25ms spike
+
+	hist.PrintHistogram()
+}
+```
+
+In-kernel BPF maps like `BPF_MAP_TYPE_ARRAY` use `bpf_log2l()` to index histogram buckets in constant time O(1). In Go, `bits.LeadingZeros64` compiles directly to the single-cycle x86 `BSR` / `LZCNT` instruction.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## Recap
+
+- **eBPF** executes sandboxed, JIT-compiled bytecode directly inside the Linux kernel in response to system events, avoiding user-space context switches.
+- The **in-kernel verifier** guarantees safety by statically checking every branch, ensuring bounds checks on all packet pointers, and preventing unbounded loops.
+- **`bpf2go`** and `cilium/ebpf` compile C source to BPF bytecode and generate type-safe pure-Go loaders without requiring CGO or external runtime tools.
+- **XDP** hooks into the NIC driver receive ring to filter or drop hostile traffic at wire speed before the kernel allocates `sk_buff` structs.
+- **Kprobes and Uprobes** intercept kernel and user-space function entry/return points to measure latency and trace production behavior non-invasively.
+- The **BPF Ring Buffer** maps memory directly into user space for lockless, high-throughput, ordered event streaming into Go applications.
+
+---
+
+<Lab
+  title="The Wire Telemetry Desync Hunt"
+  archetype="fix-it"
+  difficulty="hard"
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  hints={[
+    "Inspect the byte offsets in DecodeKernelRecord. The kernel struct has 8-byte alignment rules: uint64 fields must sit on 8-byte multiples.",
+    "Notice the IP address endianness: network packet headers store IP addresses in Big Endian (binary.BigEndian), not Little Endian.",
+    "Check the Duration calculation: the kernel measures time in nanoseconds. Ensure your Duration conversion multiplies or casts to time.Duration correctly."
+  ]}
+  flag="GO{ebpf_ringbuf_alignment_and_varint_offset}"
+  starter={`package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"time"
+)
+
+// Kernel C struct layout:
+// struct wire_telemetry_t {
+//     __u64 timestamp_ns; // offset 0..8
+//     __u64 transfer_id;  // offset 8..16
+//     __u64 amount_cents; // offset 16..24
+//     __u64 duration_ns;  // offset 24..32
+//     __u32 src_ip;       // offset 32..36 (Network Big Endian)
+//     __u32 dst_ip;       // offset 36..40 (Network Big Endian)
+//     __u32 pid;          // offset 40..44 (Host Little Endian)
+//     __u32 status;       // offset 44..48 (Host Little Endian)
+// };
+
+type DecodedTelemetry struct {
+	Timestamp   time.Time
+	TransferID  uint64
+	AmountCents uint64
+	Duration    time.Duration
+	SourceIP    net.IP
+	DestIP      net.IP
+	PID         uint32
+	Status      uint32
+}
+
+// BUGGY IMPLEMENTATION: Has offset misalignment and endianness bugs.
+// Fix this function so it correctly unpacks the 48-byte kernel event.
+func DecodeKernelTelemetry(raw []byte) (*DecodedTelemetry, error) {
+	if len(raw) < 48 {
+		return nil, errors.New("raw slice too small")
+	}
+
+	// BUG 1: Timestamp reading wrong offset
+	ts := binary.LittleEndian.Uint64(raw[0:8])
+	
+	// BUG 2: Offset errors on transfer ID and amount
+	transferID := binary.LittleEndian.Uint64(raw[8:16])
+	amount := binary.LittleEndian.Uint64(raw[16:24])
+	durNs := binary.LittleEndian.Uint64(raw[24:32])
+
+	// BUG 3: Endianness bug: IP addresses in network packets are BigEndian!
+	srcRaw := binary.LittleEndian.Uint32(raw[32:36])
+	dstRaw := binary.LittleEndian.Uint32(raw[36:40])
+
+	pid := binary.LittleEndian.Uint32(raw[40:44])
+	status := binary.LittleEndian.Uint32(raw[44:48])
+
+	srcIP := make(net.IP, 4)
+	binary.BigEndian.PutUint32(srcIP, srcRaw)
+
+	dstIP := make(net.IP, 4)
+	binary.BigEndian.PutUint32(dstIP, dstRaw)
+
+	return &DecodedTelemetry{
+		Timestamp:   time.Unix(0, int64(ts)),
+		TransferID:  transferID,
+		AmountCents: amount,
+		Duration:    time.Duration(durNs) * time.Nanosecond,
+		SourceIP:    srcIP,
+		DestIP:      dstIP,
+		PID:         pid,
+		Status:      status,
+	}, nil
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+
+func packKernelRecord(ts uint64, id uint64, amount uint64, durNs uint64, srcIPStr, dstIPStr string, pid uint32, status uint32) []byte {
+	buf := make([]byte, 48)
+	binary.LittleEndian.PutUint64(buf[0:8], ts)
+	binary.LittleEndian.PutUint64(buf[8:16], id)
+	binary.LittleEndian.PutUint64(buf[16:24], amount)
+	binary.LittleEndian.PutUint64(buf[24:32], durNs)
+
+	src := net.ParseIP(srcIPStr).To4()
+	dst := net.ParseIP(dstIPStr).To4()
+	binary.BigEndian.PutUint32(buf[32:36], binary.BigEndian.Uint32(src))
+	binary.BigEndian.PutUint32(buf[36:40], binary.BigEndian.Uint32(dst))
+
+	binary.LittleEndian.PutUint32(buf[40:44], pid)
+	binary.LittleEndian.PutUint32(buf[44:48], status)
+	return buf
+}
+
+func main() {
+	sample := packKernelRecord(
+		1700000000000000000,
+		99001122,
+		1499500, // $14,995.00
+		4200000, // 4.2ms
+		"192.168.10.5",
+		"10.0.0.1",
+		12345,
+		1, // Success
+	)
+
+	decoded, err := DecodeKernelTelemetry(sample)
+	if err != nil {
+		fmt.Printf("FAIL: unexpected decode error: %v\n", err)
+		return
+	}
+
+	ok := true
+	if decoded.TransferID != 99001122 {
+		fmt.Printf("FAIL: TransferID = %d, want 99001122\n", decoded.TransferID)
+		ok = false
+	}
+	if decoded.AmountCents != 1499500 {
+		fmt.Printf("FAIL: AmountCents = %d, want 1499500\n", decoded.AmountCents)
+		ok = false
+	}
+	if decoded.Duration != 4200*time.Microsecond {
+		fmt.Printf("FAIL: Duration = %v, want 4.2ms\n", decoded.Duration)
+		ok = false
+	}
+	if decoded.SourceIP.String() != "192.168.10.5" {
+		fmt.Printf("FAIL: SourceIP = %s, want 192.168.10.5\n", decoded.SourceIP.String())
+		ok = false
+	}
+	if decoded.DestIP.String() != "10.0.0.1" {
+		fmt.Printf("FAIL: DestIP = %s, want 10.0.0.1\n", decoded.DestIP.String())
+		ok = false
+	}
+	if decoded.PID != 12345 {
+		fmt.Printf("FAIL: PID = %d, want 12345\n", decoded.PID)
+		ok = false
+	}
+	if decoded.Status != 1 {
+		fmt.Printf("FAIL: Status = %d, want 1\n", decoded.Status)
+		ok = false
+	}
+
+	if ok {
+		fmt.Println("Telemetry verified: Transfer #99001122 | $14,995.00 | 4.2ms | 192.168.10.5 -> 10.0.0.1")
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+>
+
+Meridian's telemetry engine is receiving corrupted settlement metrics from the in-kernel probe. Fix the endianness unpacker for network IP addresses and ensure exact alignment matches the 48-byte kernel C struct layout. When the decoded struct matches the test vector, `ALL CHECKS PASS` will print and unlock the flag.
+
+</Lab>
+
+<Recap>
+- **Kernel-Level Observability**: eBPF runs sandboxed, JIT-compiled bytecode directly inside the Linux kernel, giving microsecond-level telemetry and 100Gbps XDP packet processing with zero user-space context switch penalties.
+- **The BPF Verifier**: Enforces strict invariants before loading: no unbounded loops, mandatory pointer boundary checks, bounded stack frames (512 bytes), and type safety.
+- **Probes**: `kprobes`/`kretprobes` attach dynamically to kernel functions; `uprobes` attach to Go user-space function symbols; `tracepoints` attach to stable static kernel hooks.
+- **Lockless Ring Buffer**: `BPF_MAP_TYPE_RINGBUF` maps memory via `mmap()`, delivering ordered, variable-length event records directly to Go user space without per-CPU memory fragmentation.
+- **Pure Go Tooling**: `cilium/ebpf` and `bpf2go` compile, bundle, and load BPF programs into the kernel without runtime CGO dependencies.
+</Recap>
+
+<Scoreboard
+  streak={9}
+  items={[
+    { label: "Understood user space vs kernel space observability limitations", kind: "concept", points: 10, done: true },
+    { label: "Mastered the in-kernel BPF verifier constraints", kind: "mechanism", points: 15, done: true },
+    { label: "Configured bpf2go compilation and Go struct generation", kind: "tooling", points: 15, done: true },
+    { label: "Implemented XDP driver packet filtering and drop actions", kind: "networking", points: 20, done: true },
+    { label: "Traced latency with kprobes, kretprobes, and uprobes", kind: "telemetry", points: 20, done: true },
+    { label: "Streamed events via the lockless BPF Ring Buffer", kind: "mechanism", points: 20, done: true },
+    { label: "Fixed the kernel ring buffer struct decoder", kind: "lab", points: 95, done: false }
+  ]}
+  flag={{ label: "GO{ebpf_ringbuf_alignment_and_varint_offset}", captured: false, points: 95 }}
+/>
+
+Look at you, sport. While ordinary developers are still scratching their heads over why their user-space loggers didn't catch that latency spike, you're executing compiled bytecode right in the NIC driver and intercepting kernel syscalls with zero-copy ring buffers. You're not just observing the machine; you *are* the machine. It's no *me*, but… it's undeniably impressive. Now take this power and make sure Meridian never drops a settlement again.

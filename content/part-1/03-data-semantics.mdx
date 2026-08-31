@@ -112,7 +112,7 @@ That's a value/pointer semantics bug. I've seen it a dozen times. It always come
 ### The Copy: what value semantics actually means
 
 <Define term="Value semantics">
-A variable holds the **value itself**, not a reference to it. Assignment and function calls copy every byte. Mutations to the copy are invisible to the original. **Why it matters:** small, immutable types are safe to share freely — the caller can never be surprised by a callee that modifies its own copy.
+A variable holds the **value itself**, not a reference to it. Assignment and function calls perform a shallow byte-for-byte copy of the data. Mutations to the copy are completely invisible to the original. **Why it matters:** small, immutable types can be shared freely across function boundaries and concurrent goroutines without defensive copies or mutex locking — the caller is physically immune to callee mutations. **Production hazard:** attempting to mutate state via a value receiver or value parameter silently modifies a temporary stack copy, leading to "ghost writes" where business logic succeeds in memory but changes evaporate the moment the function returns.
 </Define>
 
 In Go, **assignment copies.** Full stop. When you write `b := a`, Go copies every byte of `a` into `b`. They share nothing. Mutating `b` cannot affect `a`. This is **value semantics** — the name says it: you're working with the *value*, not with a reference to the original.
@@ -175,7 +175,7 @@ Every field gets duplicated. The two variables occupy different addresses in mem
 ### The Pointer: what pointer semantics actually means
 
 <Define term="Pointer semantics">
-A variable holds an **address** pointing at a value elsewhere in memory. Assignment copies the address, not the data, so both sides share the same underlying value. Mutations through a pointer are visible to every holder of that address. **Why it matters:** required when a type is large (copying is expensive), has a managed lifecycle, or must be mutated by multiple parts of the program — but it introduces shared mutable state, which demands discipline.
+A variable holds a **memory address** (8 bytes on 64-bit architectures) referencing a value located elsewhere on the stack or heap. Assignment copies only the 8-byte address, not the underlying payload, so both references share the same physical memory. Mutations through any dereferenced pointer (`*p = val` or `p.Field = val`) are instantly visible to all holders of that address. **Why it matters:** essential when an entity has unique identity, must manage its own lifecycle (e.g. `sync.Mutex`, file handles), or is large enough that copying would incur severe memory bandwidth penalties. **Production hazard:** sharing pointers across concurrent goroutines without synchronization creates dangerous data races and memory corruption; passing pointers also forces local variables to escape to the heap, multiplying GC overhead.
 </Define>
 
 A pointer holds an address — where in memory a value lives. When you assign a pointer, you copy the address, not the value. Both variables now *point at the same underlying data*. Mutating through one is visible through the other.
@@ -358,7 +358,7 @@ Go 1.25/1.26 note: the compiler stack-allocates slice backing stores in more sit
 Now the part that trips up even experienced engineers. Your `Transaction` struct doesn't just *hold* your fields — it lays them out in memory according to rigid rules, and those rules can silently make your struct larger than you think.
 
 <Define term="Struct alignment and padding">
-**Alignment** is the requirement that a value of size N start at a memory address divisible by N — e.g., an `int64` must sit at a multiple-of-8 address. **Padding** is the invisible zero-bytes the compiler inserts between struct fields to satisfy alignment. The compiler never reorders your fields; it pads between them as declared. **Why it matters:** poor field ordering can silently inflate a struct's size by 40–60%, increasing memory use, GC pressure, and cache misses — with no warning from the compiler.
+**Alignment** is the CPU architecture's requirement that a value of size N start at a memory address divisible by N — e.g., an 8-byte `int64` must sit at an address ending in a multiple of 8. **Padding** is the invisible zero-byte buffer the Go compiler inserts between struct fields to satisfy alignment constraints. The compiler never reorders your fields; it pads between them strictly as declared. **Why it matters:** optimal field ordering allows packing more struct instances into CPU cache lines and cuts RAM usage by 20–50%. **Production hazard:** naive field ordering (interleaving `bool` and `int64`) silently inflates struct footprint by 40–60%, multiplying heap allocation volume, thrashing L1 cache lines, and forcing garbage collection cycles to run twice as often under high request throughput.
 </Define>
 
 ### What alignment is and why the hardware demands it
@@ -585,11 +585,15 @@ Here's where the philosophy kicks in. Most engineers model data the way they'd m
 The hardware hates this. And the garbage collector hates it even more.
 
 <Define term="Garbage collector (GC)" since="Performance Engineering (Part 2, Chapter 10)">
-The **garbage collector** is the part of the Go runtime — shipped inside every binary you build — that finds heap memory your program can no longer reach and reclaims it automatically, so you never call `free`. It works by periodically tracing every live pointer. Why it matters here: every heap allocation is future GC work, and every pointer is something the GC must chase. A million tiny objects behind a million pointers means a million traces; one contiguous slice of structs is a single object. As of Go 1.26 the default collector is the Green Tea design, which scans small objects in memory-adjacent batches — but no collector can make pointer-chained spaghetti cheap.
+The **garbage collector** is the runtime subsystem — statically linked into every Go binary — that tracks and reclaims unused heap memory automatically without manual `free()` calls. It uses a concurrent tri-color mark-sweep algorithm. **Why it matters:** every pointer on the heap is a node the GC must traverse during its mark phase; contiguous slices of structs require scanning only one object, whereas slices of pointers (`[]*T`) force the GC to follow millions of individual heap references. **Production hazard:** excessive heap pointer allocations increase GC mark duration, trigger runtime CPU assists (stealing 25% of application goroutine CPU time), and cause p99 latency spikes in high-throughput APIs.
 </Define>
 
 <Define term="Data-oriented design — AoS vs SoA">
-**Data-oriented design** means shaping data structures around how they are *accessed*, not just how they are modeled. The two layouts are: **Array of Structs (AoS)** — `[]Transaction`, each element holds all fields together; and **Struct of Arrays (SoA)** — parallel slices per field (`[]int64` for amounts, `[]bool` for flags). **Why it matters:** when a hot loop touches only a subset of fields (e.g., just `Amount` across 1M records), SoA loads only the needed field into cache — 8 amounts per 64-byte cache line vs. ~2 full structs. Wrong layout = 10–50× slower without touching the algorithm.
+**Data-oriented design** means organizing memory layout around physical hardware access patterns rather than conceptual object hierarchies. The two primary layouts are: **Array of Structs (AoS)** — `[]Transaction`, where all fields of an entity sit adjacent in memory; and **Struct of Arrays (SoA)** — parallel slices (`[]int64` for amounts, `[]bool` for flags). **Why it matters:** when a hot loop touches only one field across millions of records, SoA fills 100% of each 64-byte L1 cache line with useful data (e.g. 8 amounts per cache line) rather than loading unneeded fields. **Production hazard:** using pointer-chasing object graphs for bulk data processing causes continuous L1 D-cache misses, stalling CPU execution by 10× to 50× on DRAM memory bus roundtrips.
+</Define>
+
+<Define term="CPU Cache Line (L1/L2/L3) & False Sharing" since="Performance Engineering (Part 2, Chapter 10)">
+A **cache line** is the fixed 64-byte block of contiguous memory that a CPU loads or invalidates between main RAM and L1/L2/L3 caches in a single bus transaction. **Why it matters:** sequentially reading contiguous arrays triggers the CPU's hardware prefetcher, achieving ~1ns L1 access latency. **Production hazard:** **False sharing** occurs when two distinct goroutines running on separate CPU cores write to independent variables located inside the same 64-byte cache line. The CPU cache coherence protocol (MESI) constantly invalidates the cache line across cores, causing severe memory bus stalls without triggering the Go race detector.
 </Define>
 
 ### The scenario: scanning a million transactions
@@ -740,29 +744,38 @@ Data-oriented design isn't "always use SoA." It's "design data around how it's a
 This section gave you the first, usable taste of why data layout matters. The complete story — CPU cache hierarchies, cache-line size, false sharing between goroutines, branch prediction, and using `pprof` + `go tool trace` to measure all of it — lives in **Part 2, Chapter 10: Performance Engineering**. That's where we'll take a running service, profile it, watch the flame graphs, and apply everything you just learned here to real hot paths. Consider this chapter the *vocabulary*; Part 2 is the *practice*.
 
 <Define term="Escape analysis — stack vs heap" since="Performance Engineering (Part 2, Chapter 10)">
-**Escape analysis** is the compiler pass that decides whether a value lives on the **stack** (cheap: a pointer bump, no GC) or the **heap** (allocated by the runtime, tracked and collected by the GC). A value "escapes" to the heap when it must outlive the function that created it — returned by address, stored in a heap struct, passed to a goroutine closure, or boxed into an `any`. **Why it matters:** taking a pointer when you didn't need to can silently push a value to the heap, adding GC pressure and destroying cache locality. Use `go build -gcflags="-m" ./...` to see every escape decision.
+**Escape analysis** is the static compiler pass that determines whether a variable's lifetime is strictly bounded by its declaring function's stack frame or if its reference escapes to the outer program, requiring **heap allocation**. A variable escapes if its address is returned, stored in a long-lived heap struct, captured by an escaping closure, or passed to an interface/`any` parameter. **Why it matters:** stack allocation costs a single instruction (`sub $size, %rsp`) and requires zero GC tracking; heap allocation requires invoking the runtime allocator (`mallocgc`), writing GC metadata, and later scanning the object in mark phases. **Production hazard:** blindly passing pointers for small structs pushes thousands of short-lived objects to the heap, creating massive GC pause cycles and destroying L1 CPU cache locality.
 </Define>
 
-<UnderTheHood title="Stack vs heap — where does your data actually live?">
+<UnderTheHood title="Stack vs heap — where does your data actually live in physical hardware?">
 
-Every goroutine starts with a small stack (about 2 KB in current Go implementations) that grows dynamically. Local variables that don't outlive their declaring function can live entirely on the stack — allocation is extremely cheap, often just a stack-pointer adjustment, with no GC involvement. The exact instruction sequence is architecture- and compiler-dependent.
+To write high-performance Go, you must visualize what the physical CPU and memory subsystem do:
 
-The heap is where data lives when it *must* outlive the function that created it, or when the compiler cannot prove it doesn't escape. Heap allocation calls into the runtime allocator, the GC must scan and eventually collect the memory, and the address is effectively random (poor cache locality for scattered small allocations).
+### 1. The Physical Hardware Memory Hierarchy
+When a CPU executes instructions, memory access latencies differ by orders of magnitude:
+- **CPU Registers:** ~0.5 ns (0–1 cycle)
+- **L1 Data Cache (32–64 KB per core):** ~1 ns (4 cycles)
+- **L2 Cache (512 KB–1 MB per core):** ~3–4 ns (12–14 cycles)
+- **L3 Cache (16–64 MB shared across cores):** ~10–20 ns (40–60 cycles)
+- **Main DRAM:** ~60–100 ns (200–300 cycles)
 
-**Escape analysis** decides which is which. The compiler runs escape analysis during compilation — you can see its decisions with `go build -gcflags="-m" ./...`. Common escape triggers:
+When a goroutine loops over a contiguous `[]Transaction` slice, hardware prefetchers notice the sequential memory stride and pull the next 64-byte cache lines into L1 before the instructions even request them. In contrast, looping over `[]*Transaction` (pointers to heap structs) forces the CPU to wait ~100ns per item on DRAM pointer dereferences.
 
-- Taking the address of a local variable and returning it: `return &x`
-- Storing a pointer in a slice or map that outlives the function
-- Passing a value to an `any` parameter (may box it on the heap)
-- Passing a value to a goroutine closure
+### 2. Stack Allocation vs Heap Allocation Mechanics
+Every goroutine starts with a small 2 KB stack that grows dynamically. 
+- **Stack allocation** is purely an adjustment of the stack pointer register `RSP`. The memory is hot in L1 cache because the current function is already using adjacent stack bytes. When the function returns, `add $size, %rsp` instantaneously frees all local variables — zero CPU cycles spent scanning, zero fragmentation.
+- **Heap allocation** (`runtime.mallocgc`) must find an available memory span in the thread's local `mcache`, search size-class bins, update runtime bitmaps for pointer scanning, and register the object with the garbage collector.
 
-**As of Go 1.25/1.26**, the compiler stack-allocates some slice backing stores in more situations than before — so some short-lived slices that previously escaped to the heap now stay on the stack. The full treatment of escape analysis and when to exploit this lives in **Part 2, Chapter 10: Performance Engineering**.
+### 3. The Deep "Why": Why Go Omitted C++ Move Semantics & Destructors
+C++ and Rust achieve zero-cost abstractions using complex ownership models, move constructors (`std::move`), and deterministic RAII destructors. Why did Go reject this?
+1. **Cognitive Overhead and Simplicity:** Move semantics in C++ introduce rvalue references (`&&`), universal references, and subtle use-after-move bugs. Go designers prioritized readable, uniform semantics: assignment is **always** a shallow bitwise copy (`MOVQ` / `memmove`).
+2. **Predictable Escape Analysis + GC:** Instead of forcing the programmer to hand-tune move constructors or manage lifetime annotations, Go's compiler automatically keeps non-escaping data on the stack, while the concurrent GC safely handles everything that escapes. You get 90% of bare-metal C performance with 10% of the cognitive overhead.
 
-The key insight: `[]Transaction` — a slice of structs — has one backing array with all elements packed contiguously. If the slice escapes, that backing array is **one** heap allocation. `[]*Transaction` with N separately allocated elements requires one backing array for the pointers plus N individual struct allocations scattered at random addresses. The GC must track all of those object allocations separately.
+**As of Go 1.25/1.26**, the compiler stack-allocates slice backing stores in more situations than before — so some short-lived slices that previously escaped to the heap now stay on the stack.
 
-**Go 1.26 GC note:** Go 1.26 made the Green Tea GC the default collector, improving locality and scalability for marking/scanning many small objects. Contiguous layouts like `[]Transaction` produce fewer, larger allocations — meaning less work for the GC regardless of which collector version is running. The full GC tuning story is in **Part 2, Chapter 10**.
+The key insight: `[]Transaction` — a slice of structs — has one backing array with all elements packed contiguously. If the slice escapes, that backing array is **one** heap allocation. `[]*Transaction` with N separately allocated elements requires one backing array for the pointers plus N individual struct allocations scattered at random addresses.
 
-Full escape analysis treatment: **Part 2, Chapter 10**. If you want a preview right now, run `go build -gcflags="-m" ./...` on your own code and read what escapes.
+**Go 1.26 GC note:** Go 1.26 made the Green Tea GC the default collector, improving locality and scalability for marking/scanning many small objects. Contiguous layouts like `[]Transaction` produce fewer, larger allocations — meaning less work for the GC regardless of which collector version is running. Full escape analysis treatment: **Part 2, Chapter 10**.
 
 </UnderTheHood>
 
