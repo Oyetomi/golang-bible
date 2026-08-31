@@ -29,6 +29,14 @@ export const metadata: Metadata = {
   title: "The Go Bible — forged by the greatest Go engineer alive",
   description:
     "A visualization-heavy, Boot.dev-style Go course: from syntax to senior production engineer to fintech specialist.",
+  icons: {
+    icon: [
+      { url: "/favicon.svg", type: "image/svg+xml" },
+      { url: "/icon.svg", type: "image/svg+xml" }
+    ],
+    shortcut: "/favicon.svg",
+    apple: "/icon.svg"
+  }
 };
 
 export default function RootLayout({
