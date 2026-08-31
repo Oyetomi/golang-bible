@@ -1,0 +1,1488 @@
+---
+title: "Embedded SSH Servers & Subprocess I/O Streaming in Go"
+part: "appendix"
+order: 46
+type: "course"
+description: "Embedding native SSH servers with golang.org/x/crypto/ssh, public key verification, PTY allocation, robust subprocess execution with os/exec, zero-copy io.Pipe streaming, and Git smart wire protocol (pkt-line)."
+prerequisites: ["networking-web-fundamentals"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Infrastructure & Tooling Internals" title="Embedded SSH Servers & Subprocess I/O Streaming in Go">
+
+Here's the thing, sport. Most developers think SSH is just a Linux daemon you install with `apt-get install openssh-server` and pray nobody forgets the root password to. When they need Git repository hosting or an internal administrative console, they cobble together shell scripts, write messy `/etc/passwd` entries, and shell out blindly. 
+
+That is how amateurs build infrastructure. And when those naive shell-outs stall on a filled Linux kernel pipe buffer or leak subprocesses like an open fire hydrant, they throw their hands up and blame the operating system.
+
+At **Meridian Financial Services**, we don't delegate our security boundary or our Git transport layer to a 30-year-old C daemon running as root. We embed native SSH servers directly inside our Go binaries using `golang.org/x/crypto/ssh` — the exact architectural pattern pioneered by **Gitea**, **Charm's Wish**, and **Soft Serve**.
+
+By the end of this chapter, you will master the full stack: authenticating client cryptographic keys in-memory against your database, allocating pseudo-terminals (PTYs) on demand, orchestrating subprocesses with `os/exec` without ever deadlocking on OS kernel pipes, streaming gigabytes of data using zero-copy `io.Pipe` and recycled buffer pools, and speaking Git's raw smart wire protocol (`pkt-line`) byte-by-byte. You're in the big leagues now. Try to keep up.
+
+</HeroCard>
+
+<ChapterTabs tabs={["Embedded SSH Server in Go (crypto/ssh)", "Subprocess Execution & Pipeline Streaming (os/exec)", "Zero-Copy io.Pipe & Buffer Pools", "Git Wire Protocol & pkt-line Framing"]} />
+
+<SpacedRecall
+  role={"operator"}
+  items={[
+    {
+      from: "Networking & Web Fundamentals (part 2, ch01)",
+      q: "What is the primary contract of net.Conn in Go's network stack?",
+      options: ["It implements io.Reader and io.Writer over a full-duplex byte stream", "It buffers the entire payload in memory before sending", "It spawns a new OS thread for every incoming packet", "It converts TCP streams into JSON strings automatically"],
+      answer: 0,
+      tie: "An SSH connection in Go is layered directly on top of a net.Conn stream. The crypto/ssh package negotiates encryption and multiplexes multiple virtual channels over that single stream."
+    },
+    {
+      from: "Concurrency & Goroutines (part 1, ch04)",
+      q: "What happens if a goroutine reads synchronously from a pipe whose writer is waiting on the reader to exit?",
+      options: ["The runtime automatically expands the buffer indefinitely", "A circular deadlock occurs, freezing both goroutines forever", "The OS terminates the process with SIGSEGV", "The reader receives an EOF immediately"],
+      answer: 1,
+      tie: "Kernel pipe buffers are finite (default 64KB on Linux). If you don't drain subprocess stdout and stderr concurrently, your pipeline locks solid."
+    },
+    {
+      from: "Data Semantics & Memory Layout (part 1, ch03)",
+      q: "Why is sync.Pool essential when streaming high-bandwidth network streams in Go?",
+      options: ["It bypasses the Linux kernel entirely", "It recycles large []byte transfer buffers, eliminating garbage collector heap churn", "It encrypts memory buffers using AES-GCM", "It converts slices into immutable strings"],
+      answer: 1,
+      tie: "Allocating 64KB buffers on every Git clone or SSH channel read triggers frequent GC mark phases. Recycling buffers via sync.Pool keeps throughput deterministic."
+    }
+  ]}
+/>
+
+<PredictLab
+  prompt={"In Git's pkt-line protocol, what is the exact string payload represented by the 4-byte hex prefix '000a' followed by 'hello\\n'?"}
+  role={"scientist"}
+  code={`package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	prefix := "000a"
+	totalLen, _ := strconv.ParseInt(prefix, 16, 32)
+	payloadLen := int(totalLen) - 4
+	raw := "000ahello\n"
+	payload := raw[4 : 4+payloadLen]
+
+	fmt.Printf("Total: %d, PayloadLen: %d, Content: %q\n", totalLen, payloadLen, payload)
+}`}
+  options={[
+    "Total: 10, PayloadLen: 6, Content: \"hello\\n\"",
+    "Total: 10, PayloadLen: 10, Content: \"hello\\n\"",
+    "Total: 4, PayloadLen: 0, Content: \"\"",
+    "Total: 16, PayloadLen: 12, Content: \"hello\\n\""
+  ]}
+  answer={0}
+  output={`Total: 10, PayloadLen: 6, Content: "hello\n"`}
+  explain={"In Git's pkt-line wire format, the 4-hex-digit prefix encodes the TOTAL length of the packet including the 4 prefix bytes. '000a' in hex is 10 in decimal. Subtracting 4 header bytes leaves 6 bytes of payload: 'h', 'e', 'l', 'l', 'o', '\\n'."}
+/>
+
+<Scene
+  title="The Gitea Pattern: Git Clone over an Embedded SSH Server"
+  actors={[
+    { id: "client", label: "Git Client (Developer)", role: "captain" },
+    { id: "ssh", label: "Embedded SSH Server (Go)", role: "operator" },
+    { id: "git", label: "git-upload-pack (Child Subproc)", role: "guard" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "Step 1: Developer initiates 'git clone ssh://git@bastion:2222/meridian/core.git'. Client presents Ed25519 public key. Go server queries database in PublicKeyCallback; auth succeeds without touching /etc/passwd.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "Client PubKey Sent" },
+        { id: "A2", state: "active", label: "In-Memory Auth OK" },
+        { id: "A3", state: "idle", label: "Git Subproc Idle" }
+      ]
+    },
+    {
+      caption: "Step 2: Client opens 'session' channel and requests exec: 'git-upload-pack /meridian/core.git'. Go SSH server verifies tenant permissions and spawns git-upload-pack using os/exec with sandboxed pipes.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "Channel 'session'" },
+        { id: "A2", state: "active", label: "os/exec.Command" },
+        { id: "A3", state: "active", label: "git-upload-pack Spawned" }
+      ]
+    },
+    {
+      caption: "Step 3 (The Hazard): Naive server buffers entire packfile in RAM. A 2GB repository push causes out-of-memory crash (OOM killer kills bastion daemon).",
+      beat: "problem",
+      cells: [
+        { id: "B1", state: "bad", label: "Client Blocked" },
+        { id: "B2", state: "bad", label: "Heap OOM Spike (2GB)" },
+        { id: "B3", state: "bad", label: "Subprocess Pipe Stalled" }
+      ]
+    },
+    {
+      caption: "Step 4 (The Solution): Zero-Copy io.Pipe & sync.Pool. Subprocess stdout streams directly into SSH channel using recycled 64KB buffers. Zero heap explosion; wire speed streaming.",
+      beat: "solution",
+      cells: [
+        { id: "C1", state: "done", label: "Wire Streaming" },
+        { id: "C2", state: "done", label: "io.CopyBuffer (64KB Pool)" },
+        { id: "C3", state: "done", label: "Subproc Exit 0" }
+      ]
+    }
+  ]}
+  caption="The embedded Go SSH server acts as a zero-allocation, cryptographically secured gateway connecting remote developers to sandboxed Git subprocesses."
+/>
+
+## Embedded SSH Server in Go (crypto/ssh)
+
+Why embed an SSH server inside a Go application instead of relying on the host operating system's OpenSSH daemon (`sshd`)?
+
+In traditional systems, supporting Git over SSH or an internal interactive admin CLI required:
+1. Creating real UNIX user accounts in `/etc/passwd` or configuring complex PAM / LDAP modules.
+2. Writing public keys into `~/.ssh/authorized_keys` files on the host filesystem, risking race conditions and file permission errors.
+3. Granting the process root privileges so `sshd` can switch user IDs (`setuid`/`setgid`).
+4. Relying on brittle `AuthorizedKeysCommand` scripts that shell out to verify tokens.
+
+<Define term="Embedded SSH Server">
+An **embedded SSH server** is a full SSH protocol implementation compiled directly into your Go binary using `golang.org/x/crypto/ssh`. It listens on a TCP port, negotiates transport encryption (Diffie-Hellman/Curve25519), authenticates users against internal memory, databases, or HashiCorp Vault, and routes requests to pure Go handlers or sandboxed child processes without needing root privileges or host OS accounts.
+</Define>
+
+<Define term="Public Key Authentication">
+**Public key authentication** is an asymmetric cryptographic handshake where the client proves possession of a private key corresponding to a registered public key. In Go's `crypto/ssh`, the server provides a `PublicKeyCallback` function that receives the client's `ssh.PublicKey`, validates its signature, and attaches identity metadata (such as User ID, Organization, and Permissions) to the session context.
+</Define>
+
+### Anatomy of an Embedded SSH Server
+
+Let's inspect how an embedded SSH server is wired up in production systems like Gitea:
+
+```go title="ssh_server.go"
+package main
+
+import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+
+	"golang.org/x/crypto/ssh"
+)
+
+// ServerConfig configures the embedded SSH bastion.
+type BastionServer struct {
+	config *ssh.ServerConfig
+}
+
+func NewBastionServer(hostPrivateKeyPEM []byte) (*BastionServer, error) {
+	config := &ssh.ServerConfig{
+		// PublicKeyCallback is invoked when a client presents an SSH key.
+		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			slog.Info("Authenticating SSH client",
+				"user", conn.User(),
+				"remote_addr", conn.RemoteAddr().String(),
+				"key_type", key.Type(),
+			)
+
+			// In a real system, query PostgreSQL / Redis for this public key.
+			// Return permissions or metadata to attach to the connection.
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"user-id": "usr_meridian_42",
+					"role":    "developer",
+				},
+			}, nil
+		},
+		// Reject plain text passwords for maximum security.
+		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			return nil, errors.New("password authentication disabled: public key required")
+		},
+	}
+
+	// Parse host private key (so clients can verify the server's identity)
+	signer, err := ssh.ParsePrivateKey(hostPrivateKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse host private key: %w", err)
+	}
+	config.AddHostKey(signer)
+
+	return &BastionServer{config: config}, nil
+}
+```
+
+### Handling Channels and Requests
+
+SSH is a **multiplexed protocol**. A single encrypted TCP connection carries multiple independent, bidirectional virtual **channels** (e.g., `"session"`, `"direct-tcpip"` for port forwarding).
+
+Within a `"session"` channel, the client can issue distinct out-of-band **requests**:
+- `"pty-req"`: Requests a pseudo-terminal (specifies terminal dimensions and terminal emulation mode like `xterm-256color`).
+- `"window-change"`: Notifies the server that the user resized their terminal window (columns and rows).
+- `"env"`: Passes environment variables (`LC_ALL`, `TERM`).
+- `"exec"`: Requests one-shot command execution (e.g., `git-upload-pack 'repo.git'`).
+- `"shell"`: Requests an interactive shell session.
+
+<Define term="PTY (Pseudo-Terminal)">
+A **pseudo-terminal (PTY)** is a bidirectional software interface provided by the operating system kernel that emulates a physical hardware terminal. It consists of a master descriptor (controlled by the server) and a slave descriptor (attached to the child process). The PTY kernel driver handles line discipline, echo control, terminal control characters (`Ctrl+C` sending `SIGINT`), and window resize signals (`SIGWINCH`).
+</Define>
+
+Here is how the SSH server accepts incoming connections and dispatches channels:
+
+```go title="channel_dispatcher.go"
+func (b *BastionServer) HandleConnection(nConn net.Conn) {
+	defer nConn.Close()
+
+	// Perform SSH handshake and key exchange
+	sshConn, channels, requests, err := ssh.NewServerConn(nConn, b.config)
+	if err != nil {
+		slog.Error("SSH handshake failed", "err", err)
+		return
+	}
+	defer sshConn.Close()
+
+	// Discard global out-of-band requests (e.g. keepalives)
+	go ssh.DiscardRequests(requests)
+
+	// Iterate over channels initiated by the client
+	for newChannel := range channels {
+		// We only accept standard session channels
+		if newChannel.ChannelType() != "session" {
+			newChannel.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			continue
+		}
+
+		channel, requests, err := newChannel.Accept()
+		if err != nil {
+			slog.Error("Could not accept channel", "err", err)
+			return
+		}
+
+		go b.handleSession(channel, requests, sshConn.Permissions)
+	}
+}
+
+func (b *BastionServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, perms *ssh.Permissions) {
+	defer ch.Close()
+
+	for req := range reqs {
+		switch req.Type {
+		case "exec":
+			// Payload is a 32-bit big-endian length followed by the command string
+			if len(req.Payload) < 4 {
+				req.Reply(false, nil)
+				return
+			}
+			cmdLen := int(req.Payload[0])<<24 | int(req.Payload[1])<<16 | int(req.Payload[2])<<8 | int(req.Payload[3])
+			if len(req.Payload) < 4+cmdLen {
+				req.Reply(false, nil)
+				return
+			}
+			cmdStr := string(req.Payload[4 : 4+cmdLen])
+			req.Reply(true, nil) // Acknowledge command acceptance
+
+			slog.Info("Executing SSH command", "cmd", cmdStr, "user", perms.Extensions["user-id"])
+			// Run command pipeline and stream stdout/stderr back into ch
+			return
+
+		case "pty-req":
+			// Terminal allocation requested
+			req.Reply(true, nil)
+
+		case "shell":
+			req.Reply(true, nil)
+
+		default:
+			// Reject unknown requests
+			req.Reply(false, nil)
+		}
+	}
+}
+```
+
+Now let's see a complete, self-contained Go playground that demonstrates SSH host key parsing and cryptographic public key fingerprint generation using standard library packages:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"strings"
+)
+
+// GenerateEphemeralHostKey generates an Ed25519 keypair for an in-memory SSH server.
+func GenerateEphemeralHostKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pub, priv, nil
+}
+
+// ComputeSSHFingerprint calculates the standard OpenSSH SHA256 base64 fingerprint.
+func ComputeSSHFingerprint(pubKeyBytes []byte) string {
+	hash := sha256.Sum256(pubKeyBytes)
+	b64 := base64.StdEncoding.EncodeToString(hash[:])
+	return "SHA256:" + strings.TrimRight(b64, "=")
+}
+
+func main() {
+	pub, _, err := GenerateEphemeralHostKey()
+	if err != nil {
+		panic(err)
+	}
+
+	fingerprint := ComputeSSHFingerprint(pub)
+	fmt.Printf("Generated Ephemeral Server Key (Ed25519)\n")
+	fmt.Printf("Raw Public Key Bytes: %d bytes\n", len(pub))
+	fmt.Printf("Host Key Fingerprint: %s\n", fingerprint)
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={"Why does an embedded Go SSH server eliminate the need for host OS user accounts in /etc/passwd?"}
+  options={[
+    "Because Go compiles to machine code and bypasses the Linux kernel entirely",
+    "Because PublicKeyCallback validates credentials in memory and routes requests to Go goroutines rather than spawning an OS shell under a setuid user",
+    "Because SSH keys don't require any validation in Go",
+    "Because the Go runtime automatically modifies /etc/shadow on startup"
+  ]}
+  answer={1}
+  explain="In an embedded Go SSH server, authentication is handled in Go memory via PublicKeyCallback. The server directly controls what commands or virtual filesystems the authenticated user can access, without ever needing root permissions or OS accounts."
+/>
+
+## Subprocess Execution & Pipeline Streaming (os/exec)
+
+When an authenticated client requests `git-upload-pack '/meridian/core.git'`, the Go SSH server must invoke the Git binary on the host machine and bridge its standard input, standard output, and standard error directly to the remote SSH channel.
+
+In Go, subprocess execution is managed by the standard library's `os/exec` package.
+
+<Define term="os/exec">
+**`os/exec`** is Go's standard library package for launching external operating system processes. It wraps low-level operating system system calls (`fork`, `clone`, `execve` on POSIX systems, and `CreateProcess` on Windows) with Go's `io.Reader` and `io.Writer` stream abstractions.
+</Define>
+
+<Define term="Subprocess Deadlock">
+A **subprocess deadlock** is a concurrency defect where a parent process and child subprocess freeze waiting on each other. It occurs when a child fills a kernel pipe buffer (e.g. 64KB on Linux) on standard error while the parent is blocking waiting to read standard output, or when the parent calls `cmd.Wait()` before completely draining stdout and stderr pipes.
+</Define>
+
+### The Catastrophic Subprocess Deadlock Footgun
+
+Let's dissect the number one bug that brings down production Git bastions:
+
+<BeforeAfter
+  bad={`// DEADLOCK HAZARD: Sequential reading of pipes!
+cmd := exec.Command("git-upload-pack", repoPath)
+stdout, _ := cmd.StdoutPipe()
+stderr, _ := cmd.StderrPipe()
+cmd.Start()
+
+// If the child writes >64KB to stderr (e.g. progress logs),
+// the OS pipe buffer fills. The child blocks on write(stderr).
+// Meanwhile, Go blocks here waiting for stdout EOF!
+outBytes, _ := io.ReadAll(stdout)
+errBytes, _ := io.ReadAll(stderr)
+cmd.Wait()`}
+  good={`// SAFE: Concurrent pipe draining with WaitGroup!
+cmd := exec.CommandContext(ctx, "git-upload-pack", repoPath)
+stdout, _ := cmd.StdoutPipe()
+stderr, _ := cmd.StderrPipe()
+cmd.Start()
+
+var wg sync.WaitGroup
+wg.Go(func() { io.Copy(clientChannel, stdout) })
+wg.Go(func() { io.Copy(clientChannel.Stderr(), stderr) })
+
+// Wait for all pipe data to drain BEFORE calling cmd.Wait()
+wg.Wait()
+cmd.Wait()`}
+  badLabel="Deadlocks when stderr > 64KB"
+  goodLabel="Deadlock-Free Concurrent Pipe Streaming"
+/>
+
+Why does the bad version hang forever?
+1. Under Linux, anonymous pipes created by `pipe2()` have a default buffer capacity of **64 KB** (16 pages of 4096 bytes).
+2. When the child subprocess writes data faster than the parent consumes it, the pipe buffer fills up.
+3. Subsequent `write()` syscalls by the child will **block indefinitely in the Linux kernel** until space becomes available.
+4. If your Go code calls `io.ReadAll(stdout)` first, but the child process is busy writing diagnostic or progress logs to `stderr`, the child freezes in kernel space waiting for stderr buffer space.
+5. Your Go program freezes waiting for stdout to close. **Both processes wait for each other. Deadlock.**
+
+### Subprocess Lifecycle Execution Timeline
+
+Here is the exact lifecycle sequence required for leak-free, deadlock-free subprocess orchestration:
+
+<ExecTimeline
+  title="Safe Subprocess Pipe Streaming Lifecycle"
+  lanes={[
+    { id: "parent", label: "Go Parent Process" },
+    { id: "pipes", label: "OS Kernel Pipes (stdout/stderr)" },
+    { id: "child", label: "Git Child Subprocess" }
+  ]}
+  steps={[
+    { lane: "parent", kind: "run", label: "exec.CommandContext()", note: "Configure command with execution timeout context and sandboxed environment variables." },
+    { lane: "parent", kind: "spawn", label: "cmd.StdoutPipe() & StderrPipe()", note: "Create OS pipe pairs (pipe2 syscall with O_CLOEXEC flag set)." },
+    { lane: "child", kind: "spawn", label: "cmd.Start() -> clone/execve", note: "Kernel forks child process, assigns file descriptors, and executes git binary." },
+    { lane: "parent", kind: "spawn", label: "wg.Go() concurrent drainers", note: "Spawn two concurrent goroutines to drain stdout and stderr simultaneously." },
+    { lane: "pipes", kind: "send", label: "io.CopyBuffer streaming", note: "Child writes chunks to pipe; Go drainers immediately forward to network socket." },
+    { lane: "child", kind: "done", label: "Child exits -> closes write FDs", note: "Child process terminates with exit status 0, closing write ends of pipes." },
+    { lane: "parent", kind: "done", label: "wg.Wait() -> cmd.Wait()", note: "Drainers receive EOF and finish; parent reaps zombie child process cleanly." }
+  ]}
+  caption="Proper ordering: cmd.Start() -> concurrent pipe readers -> wg.Wait() -> cmd.Wait(). Never invert this sequence."
+/>
+
+### Sandboxing and Environment Sanitization
+
+When executing subprocesses on behalf of remote SSH clients, never inherit the parent process's environment variables (`os.Environ()`). Secrets, database passwords, and API keys stored in environment variables could be leaked if the child process errors out or dumps diagnostic information.
+
+```go title="sandbox_exec.go"
+func BuildSecureGitCommand(ctx context.Context, repoPath string, gitSubcommand string, clientArgs []string) (*exec.Cmd, error) {
+	// Whitelist allowed subcommands strictly
+	switch gitSubcommand {
+	case "git-upload-pack", "git-receive-pack", "git-upload-archive":
+		// Allowed
+	default:
+		return nil, fmt.Errorf("forbidden git subcommand: %q", gitSubcommand)
+	}
+
+	cmd := exec.CommandContext(ctx, gitSubcommand, repoPath)
+
+	// Set working directory to the target repository
+	cmd.Dir = repoPath
+
+	// Sanitize environment: only provide minimal necessary variables
+	cmd.Env = []string{
+		"PATH=/usr/bin:/usr/local/bin:/bin",
+		"GIT_DIR=" + repoPath,
+		"GIT_HTTP_EXPORT_ALL=1",
+		"LANG=C",
+	}
+
+	return cmd, nil
+}
+```
+
+Let's test subprocess execution and concurrent output capture with a runnable playground:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os/exec"
+	"sync"
+	"time"
+)
+
+// SafeCapture runs a subprocess and captures stdout and stderr concurrently without deadlock.
+func SafeCapture(ctx context.Context, name string, args ...string) (stdout []byte, stderr []byte, exitCode int, err error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, -1, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, -1, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, -1, err
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	var wg sync.WaitGroup
+
+	// Concurrently drain both pipes
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(&outBuf, stdoutPipe)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(&errBuf, stderrPipe)
+	}()
+
+	// Wait for pipe readers to reach EOF before calling Wait()
+	wg.Wait()
+
+	if waitErr := cmd.Wait(); waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			return outBuf.Bytes(), errBuf.Bytes(), exitErr.ExitCode(), waitErr
+		}
+		return outBuf.Bytes(), errBuf.Bytes(), -1, waitErr
+	}
+
+	return outBuf.Bytes(), errBuf.Bytes(), 0, nil
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	out, errOut, code, err := SafeCapture(ctx, "echo", "Meridian Bastion Subprocess Engine Active")
+	if err != nil {
+		fmt.Printf("Execution failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Exit Code: %d\n", code)
+	fmt.Printf("Stdout: %s", string(out))
+	fmt.Printf("Stderr: %s\n", string(errOut))
+}
+```
+
+</GoPlayground>
+
+## Zero-Copy io.Pipe & Buffer Pools
+
+In a high-throughput code forge handling thousands of concurrent developers cloning multi-gigabyte repositories, memory efficiency is paramount.
+
+If you buffer data in memory using `bytes.Buffer` or `io.ReadAll`, a single `git clone` of a 2 GB repository allocates 2 GB on the heap. Ten concurrent clones will consume 20 GB of RAM, causing severe GC mark assist pauses and triggering the Linux Out-Of-Memory (OOM) killer.
+
+<Define term="io.Pipe">
+**`io.Pipe()`** is a synchronous in-memory pipe primitive provided by Go's standard library. It creates an interconnected `*io.PipeReader` and `*io.PipeWriter`. Writes to the `PipeWriter` block until an active read on the `PipeReader` consumes the exact bytes. It uses zero intermediate heap buffering.
+</Define>
+
+<ConceptGrid cols={3}>
+  <ConceptCard label="Synchronous I/O">`io.Pipe` transfers bytes directly between goroutine call stacks without allocating internal queue buffers.</ConceptCard>
+  <ConceptCard label="Backpressure Propagation">If the client network connection slows down, `PipeWriter.Write()` blocks, immediately pausing the child subprocess producer.</ConceptCard>
+  <ConceptCard label="Zero Intermediate RAM">A 100 GB Git repository streams through the same 64 KB memory window without growing the heap.</ConceptCard>
+  <Gotcha>Never read and write from an `io.Pipe` in the same goroutine! Because `Write()` blocks until `Read()` consumes the data, a single goroutine performing both operations will deadlock itself instantly.</Gotcha>
+</ConceptGrid>
+
+### Memory Recycling with sync.Pool and io.CopyBuffer
+
+Instead of allowing `io.Copy` to allocate an un-recycled 32 KB buffer on every invocation, production systems maintain a `sync.Pool` of fixed-size 64 KB byte slices (`[]byte`):
+
+```go title="stream_pool.go"
+var bufferPool = sync.Pool{
+	New: func() any {
+		// Allocate aligned 64KB buffer
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
+
+// StreamZeroCopy transfers data from src to dst using a pooled 64KB buffer.
+func StreamZeroCopy(dst io.Writer, src io.Reader) (int64, error) {
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+
+	// io.CopyBuffer uses our pooled slice instead of allocating on the heap
+	return io.CopyBuffer(dst, src, *bufPtr)
+}
+```
+
+### Auditing Streams with io.MultiWriter and Crypto Hashing
+
+In enterprise bastion architectures, compliance regulations require generating an audit hash (e.g. SHA-256) of every Git push payload in real time as it traverses the network, without storing the payload on disk or buffering it in memory.
+
+Go's `io.MultiWriter` duplicates a write stream to multiple destinations simultaneously:
+
+```go title="audit_tee.go"
+func StreamWithAudit(dstChildStdin io.Writer, clientChannel io.Reader) ([32]byte, int64, error) {
+	hasher := sha256.New()
+
+	// MultiWriter sends incoming bytes to both the child subprocess AND the SHA-256 hasher
+	teeWriter := io.MultiWriter(dstChildStdin, hasher)
+
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+
+	bytesCopied, err := io.CopyBuffer(teeWriter, clientChannel, *bufPtr)
+	if err != nil {
+		return [32]byte{}, bytesCopied, err
+	}
+
+	var sum [32]byte
+	copy(sum[:], hasher.Sum(nil))
+	return sum, bytesCopied, nil
+}
+```
+
+Let's run a demonstration of zero-allocation pipe streaming with concurrent auditing and backpressure in pure Go:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+)
+
+var pool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+func main() {
+	// Simulated incoming network stream (e.g., Git packfile from developer)
+	rawInput := "PACK\x00\x00\x00\x02\x00\x00\x00\x05commit-payload-data-here"
+	src := strings.NewReader(rawInput)
+
+	// In-memory pipe representing child process stdin
+	pr, pw := io.Pipe()
+	hasher := sha256.New()
+
+	// MultiWriter streams to pipe and computes SHA256 simultaneously
+	mw := io.MultiWriter(pw, hasher)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Simulated child process reader goroutine
+	var receivedBytes int
+	go func() {
+		defer wg.Done()
+		buf := pool.Get().(*[]byte)
+		defer pool.Put(buf)
+
+		for {
+			n, err := pr.Read(*buf)
+			if n > 0 {
+				receivedBytes += n
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				fmt.Printf("Read error: %v\n", err)
+				return
+			}
+		}
+	}()
+
+	// Stream from source into MultiWriter
+	streamBuf := pool.Get().(*[]byte)
+	copied, err := io.CopyBuffer(mw, src, *streamBuf)
+	pool.Put(streamBuf)
+
+	// Close the writer so the reader receives io.EOF
+	pw.Close()
+
+	if err != nil {
+		panic(err)
+	}
+
+	wg.Wait()
+
+	hashHex := hex.EncodeToString(hasher.Sum(nil))
+	fmt.Printf("Stream completed successfully!\n")
+	fmt.Printf("Bytes Transferred: %d bytes\n", copied)
+	fmt.Printf("Consumer Received: %d bytes\n", receivedBytes)
+	fmt.Printf("Real-Time Audit SHA-256: %s\n", hashHex)
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={"Why does io.Pipe() guarantee that parent and child never exhaust system memory during multi-gigabyte transfers?"}
+  options={[
+    "Because io.Pipe() stores data on an encrypted temporary disk swap file",
+    "Because Write() blocks until Read() consumes the chunk, creating immediate backpressure with zero queue buffering",
+    "Because io.Pipe() uses Gzip compression automatically",
+    "Because Go's Garbage Collector runs on every Write() call"
+  ]}
+  answer={1}
+  explain="io.Pipe() is completely synchronous. The writer goroutine blocks until the reader goroutine copies the bytes out. Data is never buffered in a queue on the heap, so backpressure propagates instantly."
+/>
+
+## Git Wire Protocol & pkt-line Framing
+
+When Git communicates over SSH or HTTP (the "Smart Transfer Protocol"), it does not exchange raw text lines or arbitrary JSON payloads. It speaks a binary-safe, length-prefixed framing protocol called **pkt-line** (Packet-Line).
+
+<Define term="pkt-line Framing">
+**`pkt-line` framing** is Git's universal network framing protocol (RFC Git Protocol v1 & v2). Every packet begins with a 4-byte hexadecimal length prefix indicating the total packet size (including the 4 prefix bytes). The maximum payload size is 65520 bytes (total length 65524 / `fff4`). Special 4-byte sentinel prefixes control stream state: `0000` (Flush), `0001` (Delimiter), and `0002` (Response End).
+</Define>
+
+<Define term="Smart Git Protocol">
+The **Smart Git Protocol** is Git's network exchange mechanism implemented by `git-upload-pack` (fetch/clone) and `git-receive-pack` (push). It begins with an initial reference and capability advertisement framed in pkt-line packets, followed by a negotiation phase (want/have commands), and concludes with a multiplexed sideband packfile data stream.
+</Define>
+
+### Structure of pkt-line Packets
+
+Let's examine how Git frames different data types:
+
+```text
+┌─────────────────┬────────────────────────────────────────────────────────┐
+│ Hex Prefix (4B) │ Payload (0 to 65516 bytes)                             │
+├─────────────────┼────────────────────────────────────────────────────────┤
+│ 000a            │ "hello\n" (total length: 4 prefix + 6 data = 10 / 0xa) │
+│ 003f            │ "a1b2c3... HEAD\x00multi_ack thin-pack side-band-64k\n"  │
+│ 0000            │ Flush packet (signals end of section / ref list)       │
+│ 0001            │ Delimiter packet (used in Git Protocol v2)             │
+│ 0002            │ Response End packet (used in Git Protocol v2)          │
+└─────────────────┴────────────────────────────────────────────────────────┘
+```
+
+### Sideband Multiplexing (Band 1, Band 2, Band 3)
+
+During `git clone` and `git push`, the server enables the `side-band` or `side-band-64k` capability. Instead of sending raw packfile bytes, the server sends pkt-lines where the first payload byte indicates the **channel/band**:
+
+- **Band 1 (`0x01` - Primary Data)**: Raw Git packfile binary bytes.
+- **Band 2 (`0x02` - Progress Messages)**: Informational text displayed on the developer's terminal (e.g., `"Compressing objects: 100% (42/42), done.\n"`).
+- **Band 3 (`0x03` - Error Messages)**: Severe error or reject notice, causing the client to abort immediately.
+
+```go title="sideband_writer.go"
+type SidebandChannel byte
+
+const (
+	BandData     SidebandChannel = 1
+	BandProgress SidebandChannel = 2
+	BandError    SidebandChannel = 3
+)
+
+// WriteSideband writes a chunk to the specified sideband channel formatted as a pkt-line.
+func WriteSideband(w io.Writer, band SidebandChannel, payload []byte) error {
+	totalLen := len(payload) + 5 // 4 bytes hex + 1 byte band ID
+	if totalLen > 65524 {
+		return errors.New("sideband packet exceeds 65524 bytes")
+	}
+
+	header := fmt.Sprintf("%04x%c", totalLen, band)
+	if _, err := io.WriteString(w, header); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+```
+
+### Deep Engineering: Under the Hood
+
+<UnderTheHood title="SSH Handshake, Key Exchange, PTY Window Resizing & OS Syscall Pipes">
+
+Let's pull back the curtain and inspect the mechanical reality operating at the Linux kernel and network socket boundaries.
+
+#### 1. RFC 4253 SSH Transport Layer & Modern Key Exchange (Go 1.26)
+When an SSH client connects to your Go server:
+1. **Version Exchange:** Both sides exchange identification strings (e.g. `SSH-2.0-Go` and `SSH-2.0-OpenSSH_9.6`).
+2. **KEXINIT:** Both peers exchange supported cryptographic primitives: Key Exchange algorithms (`curve25519-sha256`, `diffie-hellman-group14-sha256`, and modern Post-Quantum hybrid algorithms), Ciphers (`chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`), and MACs.
+3. **Diffie-Hellman / ECDH Exchange:** Ephemeral keys are generated; the shared secret $K$ is computed. The server signs the exchange hash $H$ using its host private key to prove identity.
+4. **NEWKEYS:** Both sides switch symmetric ciphers. All subsequent frames are authenticated and encrypted.
+
+#### 2. Unix Pseudo-Terminals (PTY), termios & TIOCSWINSZ
+When an interactive terminal session is requested:
+1. The server opens `/dev/ptmx` to acquire a master pseudo-terminal file descriptor.
+2. It grants access and unlocks the corresponding slave descriptor (`/dev/pts/N`).
+3. The child process's file descriptors `0`, `1`, and `2` are attached to the slave descriptor via `dup2()`.
+4. When the remote client resizes their window, an SSH `"window-change"` message delivers the new row and column count. The Go server issues an `ioctl(masterFd, TIOCSWINSZ, &ws)` syscall. The Linux kernel immediately sends a `SIGWINCH` (Window Change) signal to the child process's foreground process group, prompting full-screen CLI programs (like `vim` or `htop`) to redraw their UI.
+
+#### 3. Linux Kernel Pipe Internals (`pipe2`) & Buffer Capacity
+When `cmd.StdoutPipe()` is invoked:
+1. Go calls the `pipe2(fds, O_CLOEXEC)` system call.
+2. The Linux kernel allocates a `struct pipe_inode_info` ring buffer containing 16 pages ($16 \times 4096 = 65,536$ bytes).
+3. If the writer writes when the buffer is full, the kernel puts the writing task into the `TASK_INTERRUPTIBLE` sleep state.
+4. If the reader closes its descriptor while the writer is writing, the kernel issues a `SIGPIPE` signal (which terminates naive C programs, but Go's runtime ignores `SIGPIPE` and converts it into `syscall.EPIPE`).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LINUX KERNEL PIPE RING BUFFER (64 KB)                    │
+│                                                                             │
+│   Child Subprocess (git) ──────► [ Page 0 ][ Page 1 ] ... [ Page 15 ] ─────► Go Runtime (io.Copy)
+│     (write syscall)                  ▲                           │             (read syscall)
+│                                      └────── 16 Pages Max ───────┘                          │
+│                                                                                             ▼
+│                                                                                   SSH Encrypted Stream
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4. Modern Go 1.25 / 1.26 Concurrency Primitives
+In modern Go (Go 1.25+ and Go 1.26), subprocess management and concurrency use:
+- **`sync.WaitGroup.Go(func())`** (Go 1.25): Spawns goroutines directly bound to the wait group without manual `wg.Add(1)` and `defer wg.Done()`.
+- **`errors.AsType[T](err)`** (Go 1.26): Type-safe generic error inspection for `*exec.ExitError`.
+- **`Green Tea GC` (Go 1.26 default):** Delivers ultra-low allocation pause times when recycling network and subprocess buffers.
+
+</UnderTheHood>
+
+Let's test an industrial-grade, zero-allocation Git pkt-line encoder and parser in Go:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// PktLineEncoder formats payloads into Git pkt-line framing.
+type PktLineEncoder struct {
+	w io.Writer
+}
+
+func NewPktLineEncoder(w io.Writer) *PktLineEncoder {
+	return &PktLineEncoder{w: w}
+}
+
+func (e *PktLineEncoder) WriteLine(payload []byte) error {
+	totalLen := len(payload) + 4
+	if totalLen > 65524 {
+		return errors.New("packet exceeds maximum pkt-line length of 65524 bytes")
+	}
+	header := fmt.Sprintf("%04x", totalLen)
+	if _, err := io.WriteString(e.w, header); err != nil {
+		return err
+	}
+	_, err := e.w.Write(payload)
+	return err
+}
+
+func (e *PktLineEncoder) WriteFlush() error {
+	_, err := io.WriteString(e.w, "0000")
+	return err
+}
+
+// PktLineDecoder parses pkt-line streams.
+type PktLineDecoder struct {
+	r io.Reader
+}
+
+func NewPktLineDecoder(r io.Reader) *PktLineDecoder {
+	return &PktLineDecoder{r: r}
+}
+
+// ReadPacket returns (payload, isFlush, error).
+func (d *PktLineDecoder) ReadPacket() ([]byte, bool, error) {
+	var prefix [4]byte
+	if _, err := io.ReadFull(d.r, prefix[:]); err != nil {
+		return nil, false, err
+	}
+
+	prefixStr := string(prefix[:])
+	if prefixStr == "0000" {
+		return nil, true, nil // Flush packet
+	}
+
+	var length int
+	if _, err := fmt.Sscanf(prefixStr, "%04x", &length); err != nil {
+		return nil, false, fmt.Errorf("malformed hex length prefix %q: %w", prefixStr, err)
+	}
+
+	if length < 4 {
+		return nil, false, fmt.Errorf("invalid length prefix %d < 4", length)
+	}
+
+	payloadLen := length - 4
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(d.r, payload); err != nil {
+		return nil, false, err
+	}
+
+	return payload, false, nil
+}
+
+func main() {
+	var wire bytes.Buffer
+	enc := NewPktLineEncoder(&wire)
+
+	// Simulate Git initial ref advertisement
+	enc.WriteLine([]byte("7a8b9c0d1e2f refs/heads/main\x00multi_ack side-band-64k\n"))
+	enc.WriteLine([]byte("4f5e6d7c8b9a refs/heads/feature-auth\n"))
+	enc.WriteFlush()
+
+	fmt.Printf("Raw Wire Output:\n%s\n", wire.String())
+
+	// Decode from wire buffer
+	dec := NewPktLineDecoder(&wire)
+	for {
+		payload, isFlush, err := dec.ReadPacket()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		if isFlush {
+			fmt.Println("--- FLUSH PACKET RECEIVED (0000) ---")
+			break
+		}
+		fmt.Printf("Decoded Packet: %q\n", string(payload))
+	}
+}
+```
+
+</GoPlayground>
+
+---
+
+## Hands-On Exercises
+
+Practice makes perfect. Below are four targeted exercises covering packet framing, subprocess lifecycle management, zero-copy buffer pooling, and SSH key validation.
+
+### Exercise 1: Git pkt-line Scanner with Delimiter & End Support
+
+<Exercise n={1} title="Implement Git Protocol v2 Packet Scanner" level="easy">
+
+Extend the pkt-line decoder to support all three Git sentinel packets:
+1. Flush: `0000` (`isFlush = true`)
+2. Delimiter: `0001` (`isDelim = true`)
+3. Response End: `0002` (`isEnd = true`)
+
+<Solution>
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+)
+
+type PacketType int
+
+const (
+	PacketData PacketType = iota
+	PacketFlush
+	PacketDelim
+	PacketEnd
+)
+
+type GitPacket struct {
+	Type    PacketType
+	Payload []byte
+}
+
+func ReadGitV2Packet(r io.Reader) (*GitPacket, error) {
+	var prefix [4]byte
+	if _, err := io.ReadFull(r, prefix[:]); err != nil {
+		return nil, err
+	}
+
+	s := string(prefix[:])
+	switch s {
+	case "0000":
+		return &GitPacket{Type: PacketFlush}, nil
+	case "0001":
+		return &GitPacket{Type: PacketDelim}, nil
+	case "0002":
+		return &GitPacket{Type: PacketEnd}, nil
+	}
+
+	var length int
+	if _, err := fmt.Sscanf(s, "%04x", &length); err != nil {
+		return nil, fmt.Errorf("invalid hex prefix %q: %w", s, err)
+	}
+	if length < 4 {
+		return nil, fmt.Errorf("invalid packet length %d < 4", length)
+	}
+
+	payload := make([]byte, length-4)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+
+	return &GitPacket{Type: PacketData, Payload: payload}, nil
+}
+
+func main() {
+	raw := []byte("0014command=ls-refs\n0001000bref-prefix 0000")
+	buf := bytes.NewReader(raw)
+
+	for {
+		pkt, err := ReadGitV2Packet(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		switch pkt.Type {
+		case PacketData:
+			fmt.Printf("DATA: %q\n", string(pkt.Payload))
+		case PacketDelim:
+			fmt.Println("SENTINEL: DELIM (0001)")
+		case PacketFlush:
+			fmt.Println("SENTINEL: FLUSH (0000)")
+		case PacketEnd:
+			fmt.Println("SENTINEL: END (0002)")
+		}
+	}
+}
+```
+
+</Solution>
+</Exercise>
+
+### Exercise 2: Subprocess Execution with Stderr Redirection & Timeout
+
+<Exercise n={2} title="Subprocess Runner with Combined Streaming & Context" level="medium">
+
+Write a helper `RunSubprocessWithTimeout` that executes a command, enforces a `context.Context` timeout, concurrently drains stdout and stderr into separate string buffers, and returns the exit code properly without deadlocking if stderr produces large outputs.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os/exec"
+	"sync"
+	"time"
+)
+
+type ExecutionResult struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int
+	TimedOut bool
+}
+
+func RunSubprocessWithTimeout(ctx context.Context, cmdName string, args ...string) (*ExecutionResult, error) {
+	cmd := exec.CommandContext(ctx, cmdName, args...)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(&stdoutBuf, stdoutPipe)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(&stderrBuf, stderrPipe)
+	}()
+
+	wg.Wait()
+	waitErr := cmd.Wait()
+
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	exitCode := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	return &ExecutionResult{
+		Stdout:   stdoutBuf.String(),
+		Stderr:   stderrBuf.String(),
+		ExitCode: exitCode,
+		TimedOut: timedOut,
+	}, nil
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res, err := RunSubprocessWithTimeout(ctx, "sh", "-c", "echo 'standard out'; echo 'standard error' >&2")
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Exit Code: %d\n", res.ExitCode)
+	fmt.Printf("Stdout: %q\n", res.Stdout)
+	fmt.Printf("Stderr: %q\n", res.Stderr)
+}
+```
+
+</Solution>
+</Exercise>
+
+### Exercise 3: Zero-Copy Bandwidth Counting Tee Pipe
+
+<Exercise n={3} title="Bandwidth-Accounting Zero-Copy Pipe" level="medium">
+
+Create a custom `CountingWriter` that wraps an `io.Writer` and atomically counts total transferred bytes, combined with `io.Pipe()` and a `sync.Pool` of 64KB buffers.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+type CountingWriter struct {
+	w     io.Writer
+	count atomic.Int64
+}
+
+func NewCountingWriter(w io.Writer) *CountingWriter {
+	return &CountingWriter{w: w}
+}
+
+func (cw *CountingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.count.Add(int64(n))
+	return n, err
+}
+
+func (cw *CountingWriter) BytesWritten() int64 {
+	return cw.count.Load()
+}
+
+func main() {
+	pr, pw := io.Pipe()
+	cw := NewCountingWriter(pw)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Consumer goroutine
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1024)
+		for {
+			_, err := pr.Read(buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Producer
+	src := strings.NewReader("The quick brown fox jumps over the lazy dog.")
+	io.Copy(cw, src)
+	pw.Close()
+
+	wg.Wait()
+	fmt.Printf("Total Bytes Tracked: %d bytes\n", cw.BytesWritten())
+}
+```
+
+</Solution>
+</Exercise>
+
+### Exercise 4: OpenSSH Authorized Keys Parser & Fingerprint Generator
+
+<Exercise n={4} title="Parse OpenSSH Keys & Compute SHA256 Fingerprint" level="hard">
+
+Write a pure Go parser that reads a standard OpenSSH `authorized_keys` line (`ssh-ed25519 AAAAC3NzaC... dev@company.com`), decodes the base64 public key payload, and returns the key type, SHA-256 fingerprint, and comment.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+type AuthorizedKeyInfo struct {
+	KeyType     string
+	Fingerprint string
+	Comment     string
+}
+
+func ParseAuthorizedKey(line string) (*AuthorizedKeyInfo, error) {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 2 {
+		return nil, errors.New("invalid authorized_keys format: expected at least key type and base64 blob")
+	}
+
+	keyType := fields[0]
+	rawB64 := fields[1]
+	comment := ""
+	if len(fields) > 2 {
+		comment = strings.Join(fields[2:], " ")
+	}
+
+	keyBytes, err := base64.StdEncoding.DecodeString(rawB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 key: %w", err)
+	}
+
+	hash := sha256.Sum256(keyBytes)
+	fpB64 := base64.StdEncoding.EncodeToString(hash[:])
+	fingerprint := "SHA256:" + strings.TrimRight(fpB64, "=")
+
+	return &AuthorizedKeyInfo{
+		KeyType:     keyType,
+		Fingerprint: fingerprint,
+		Comment:     comment,
+	}, nil
+}
+
+func main() {
+	sampleKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG5t3G2y6K0X9vF3cQ7zL1wE4uM8pP2rS5vT7yU9aB0c admin@meridian.internal"
+	info, err := ParseAuthorizedKey(sampleKey)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Key Type: %s\n", info.KeyType)
+	fmt.Printf("Fingerprint: %s\n", info.Fingerprint)
+	fmt.Printf("Comment: %s\n", info.Comment)
+}
+```
+
+</Solution>
+</Exercise>
+
+---
+
+<Lab
+  title="The Rogue Bastion: Gitea Git Wire Protocol & Subprocess Pipe Repair"
+  archetype="fix-it"
+  difficulty="hard"
+  points={100}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  flag="GO{pkt_line_stream_zero_copy_ssh_pipe_mastered}"
+  hints={[
+    "In EncodePktLine, the total length includes the 4-byte hex prefix! If len(data) == 0, return []byte(\"0000\").",
+    "In DecodePktLine, check for prefix string \"0000\" first and return (nil, true, nil) to signal a Flush packet.",
+    "In StreamSubprocessSafe, spawn two separate goroutines with sync.WaitGroup to drain stdout and stderr concurrently BEFORE calling cmd.Wait()."
+  ]}
+>
+
+The Meridian Git code forge has encountered severe stability issues:
+1. `EncodePktLine` and `DecodePktLine` have off-by-4 slice indexing bugs and fail to recognize flush packets (`0000`), breaking `git clone` capability negotiation.
+2. `StreamSubprocessSafe` reads stdout sequentially and blocks on `cmd.Wait()` before reading stderr, deadlocking the server whenever Git emits large progress diagnostics.
+
+Fix both components in the starter below and execute the verification harness to earn your flag.
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os/exec"
+	"sync"
+	"time"
+)
+
+// EncodePktLine encodes payload into Git pkt-line framing.
+// A 0-length payload must produce the flush packet "0000".
+// For non-empty payloads, total length = len(data) + 4.
+func EncodePktLine(data []byte) []byte {
+	if len(data) == 0 {
+		return []byte("0000")
+	}
+	totalLen := len(data) + 4
+	if totalLen > 65524 {
+		panic("packet exceeds maximum pkt-line length")
+	}
+	hexPrefix := fmt.Sprintf("%04x", totalLen)
+	res := make([]byte, totalLen)
+	copy(res[:4], hexPrefix)
+	copy(res[4:], data)
+	return res
+}
+
+// DecodePktLine reads exactly one pkt-line from r.
+// Returns (payload, isFlush, error).
+func DecodePktLine(r io.Reader) ([]byte, bool, error) {
+	prefix := make([]byte, 4)
+	if _, err := io.ReadFull(r, prefix); err != nil {
+		return nil, false, err
+	}
+	prefixStr := string(prefix)
+	if prefixStr == "0000" {
+		return nil, true, nil // Flush packet
+	}
+
+	var length int
+	if _, err := fmt.Sscanf(prefixStr, "%04x", &length); err != nil {
+		return nil, false, fmt.Errorf("invalid hex prefix: %w", err)
+	}
+	if length < 4 {
+		return nil, false, fmt.Errorf("invalid length %d < 4", length)
+	}
+
+	payloadLen := length - 4
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, false, err
+	}
+	return payload, false, nil
+}
+
+// StreamSubprocessSafe executes a command and concurrently streams stdout and stderr
+// into the provided buffers without deadlocking on OS kernel pipe buffers.
+func StreamSubprocessSafe(ctx context.Context, name string, args []string, stdoutDst, stderrDst io.Writer) (int, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return -1, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return -1, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return -1, err
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(stdoutDst, stdoutPipe)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(stderrDst, stderrPipe)
+	}()
+
+	// Wait for pipe readers to complete BEFORE calling cmd.Wait()
+	wg.Wait()
+
+	waitErr := cmd.Wait()
+	exitCode := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	return exitCode, waitErr
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	allOK := true
+
+	// Check 1: Pkt-line encoding
+	enc := EncodePktLine([]byte("want a1b2c3d4e5f6\n"))
+	if string(enc) != "0016want a1b2c3d4e5f6\n" {
+		fmt.Printf("FAIL Check 1: Expected '0016want a1b2c3d4e5f6\\n', got %q\n", string(enc))
+		allOK = false
+	} else {
+		fmt.Println("PASS Check 1: Pkt-line encoding verified")
+	}
+
+	// Check 2: Flush packet encoding
+	flushEnc := EncodePktLine(nil)
+	if string(flushEnc) != "0000" {
+		fmt.Printf("FAIL Check 2: Expected '0000', got %q\n", string(flushEnc))
+		allOK = false
+	} else {
+		fmt.Println("PASS Check 2: Flush encoding verified")
+	}
+
+	// Check 3: Pkt-line decoding
+	stream := bytes.NewReader([]byte("000ahello\n0000"))
+	p1, isFlush1, err1 := DecodePktLine(stream)
+	if err1 != nil || isFlush1 || string(p1) != "hello\n" {
+		fmt.Printf("FAIL Check 3: Packet 1 decode failed: p=%q, flush=%v, err=%v\n", p1, isFlush1, err1)
+		allOK = false
+	} else {
+		fmt.Println("PASS Check 3: Packet 1 decode verified")
+	}
+
+	p2, isFlush2, err2 := DecodePktLine(stream)
+	if err2 != nil || !isFlush2 || p2 != nil {
+		fmt.Printf("FAIL Check 3b: Flush decode failed: p=%q, flush=%v, err=%v\n", p2, isFlush2, err2)
+		allOK = false
+	} else {
+		fmt.Println("PASS Check 3b: Flush decode verified")
+	}
+
+	// Check 4: Subprocess streaming execution
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	code, err := StreamSubprocessSafe(ctx, "echo", []string{"Meridian Bastion OK"}, &stdoutBuf, &stderrBuf)
+	if err != nil || code != 0 || stdoutBuf.String() != "Meridian Bastion OK\n" {
+		fmt.Printf("FAIL Check 4: Subprocess failed: code=%d, out=%q, err=%v\n", code, stdoutBuf.String(), err)
+		allOK = false
+	} else {
+		fmt.Println("PASS Check 4: Subprocess pipe streaming verified")
+	}
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}
+```
+
+</Lab>
+
+---
+
+<Recap>
+
+- **Embedded SSH Architecture (Gitea Pattern)**: Embedding `golang.org/x/crypto/ssh` turns your Go application into a secure, self-contained bastion. In-memory `PublicKeyCallback` eliminates host OS user accounts (`/etc/passwd`) and disk-based `authorized_keys` synchronization.
+- **Multiplexed SSH Channels**: A single encrypted TCP connection carries multiple `"session"` channels. Channels accept out-of-band requests including `"pty-req"` (pseudo-terminals), `"window-change"` (`TIOCSWINSZ`), and `"exec"` (Git commands).
+- **Deadlock-Free Subprocess Execution (`os/exec`)**: OS kernel pipes have a finite 64 KB capacity. You MUST drain `stdout` and `stderr` concurrently using goroutines. Never call `cmd.Wait()` before the pipe reading goroutines complete.
+- **Zero-Copy Streaming with `io.Pipe` and `sync.Pool`**: Use `io.Pipe()` for synchronous, unbuffered data streaming with immediate backpressure. Recycle 64 KB buffers via `sync.Pool` with `io.CopyBuffer` to eliminate GC allocation spikes during gigabyte-scale Git clones.
+- **Git Smart Wire Protocol (`pkt-line`)**: Git frames all wire messages with a 4-hex-digit length prefix (max length 65524). Special sentinel packets (`0000` Flush, `0001` Delim, `0002` End) control protocol negotiation and sideband multiplexing (Band 1 Data, Band 2 Progress, Band 3 Errors).
+
+</Recap>
+
+<Scoreboard
+  streak={46}
+  items={[
+    { label: "Concept Check — Embedded SSH & In-Memory Auth", kind: "quiz", points: 10, done: false },
+    { label: "Predict Lab — Git pkt-line Hex Length Parsing", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Git Protocol v2 Packet Scanner", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — Subprocess Runner with Stderr Drain", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3 — Zero-Copy Counting Pipe", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4 — SSH Authorized Keys Parser & Fingerprint", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — The Rogue Bastion: Git Wire Protocol & Subprocess Pipe Repair", captured: false, points: 100 }}
+/>
+
+Look at that, sport. You've just replaced fragile system daemons, root shell scripts, and clunky OpenSSH setups with a pure, high-performance, embedded Go bastion. Your Git repositories stream at wire speed, your subprocesses never choke on kernel pipe buffers, and your authentication runs entirely in memory without ever touching an OS account. I knew you had it in you. Now go build something worthy of the name.
