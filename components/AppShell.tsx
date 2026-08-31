@@ -5,6 +5,8 @@ import { Sidebar } from "@/components/nav/Sidebar";
 import { CodeEnhancer } from "@/components/CodeEnhancer";
 import { Search } from "@/components/Search";
 import { Ribbon } from "@/components/Ribbon";
+import { GamificationHeader } from "@/components/gamification/GamificationHeader";
+import { GopherCompanion } from "@/components/gamification/GopherCompanion";
 
 /* Collapsible app shell. Collapsing the sidebar hands the whole viewport to the
    content column so code, animations, and playgrounds get maximum width.
@@ -51,6 +53,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         {collapsed ? "»" : "«"}
       </button>
       <main className="content">
+        <GamificationHeader />
         {children}
         <footer className="site-foot">
           Gopher mascot inspired by the Go gopher, designed by{" "}
@@ -60,6 +63,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           (CC BY 4.0).
         </footer>
       </main>
+      <GopherCompanion />
       <CodeEnhancer />
       <Search />
       <Ribbon />

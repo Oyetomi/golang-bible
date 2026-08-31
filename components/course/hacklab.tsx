@@ -1,6 +1,9 @@
 "use client";
 
 import { useMemo, useState, type ReactNode } from "react";
+import { recordLab } from "@/lib/gamification";
+import { playFlag } from "@/lib/sound";
+import { triggerConfetti } from "@/lib/confetti";
 
 /* ════════════════════════════════════════════
    HackLab — an interactive, browser-only attack
@@ -28,6 +31,18 @@ export function HackLab({ title, category = "Server-Side", mode, flag }: HackLab
   const [solved, setSolved] = useState(false);
   const scenario = SCENARIOS[mode];
 
+  const handleSetSolved = (val: boolean | ((prev: boolean) => boolean)) => {
+    setSolved((prev) => {
+      const next = typeof val === "function" ? val(prev) : val;
+      if (next && !prev) {
+        recordLab(title, flag);
+        playFlag();
+        triggerConfetti();
+      }
+      return next;
+    });
+  };
+
   return (
     <div className="hacklab">
       <div className="hl-head">
@@ -52,7 +67,7 @@ export function HackLab({ title, category = "Server-Side", mode, flag }: HackLab
 
       <div className="hl-panel">
         {tab === "goal" && scenario.goal}
-        {tab === "lab" && scenario.lab(solved, setSolved)}
+        {tab === "lab" && scenario.lab(solved, handleSetSolved)}
         {tab === "exploit" && scenario.exploit}
         {tab === "report" && scenario.report(solved, flag)}
       </div>

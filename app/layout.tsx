@@ -3,6 +3,7 @@ import Script from "next/script";
 import { Bricolage_Grotesque, Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import "../components/course/course.css";
+import "../components/gamification/gamification.css";
 import { AppShell } from "@/components/AppShell";
 
 const display = Bricolage_Grotesque({

@@ -19,6 +19,9 @@ import {
   type GopherRole,
   type GopherState,
 } from "./Gopher";
+import { recordQuickCheck, recordLab } from "@/lib/gamification";
+import { playSuccess, playBuzzer, playFlag, playClick } from "@/lib/sound";
+import { triggerConfetti } from "@/lib/confetti";
 
 /* ──────────────────────────────────────────────
    Interactive (client) course components.
@@ -632,7 +635,7 @@ export function Scene({
   );
 }
 
-/** Inline single-answer knowledge check with instant feedback. */
+/** Inline single-answer knowledge check with instant feedback and retry support. */
 export function QuickCheck({
   question,
   options,
@@ -645,7 +648,28 @@ export function QuickCheck({
   explain?: string;
 }) {
   const [picked, setPicked] = useState<number | null>(null);
+  const [showExplanation, setShowExplanation] = useState(false);
   const done = picked !== null;
+  const isCorrect = picked === answer;
+
+  const handlePick = (i: number) => {
+    if (done && isCorrect) return;
+    setPicked(i);
+    if (i === answer) {
+      recordQuickCheck(question);
+      playSuccess();
+      triggerConfetti();
+    } else {
+      playBuzzer();
+    }
+  };
+
+  const handleReset = () => {
+    setPicked(null);
+    setShowExplanation(false);
+    playClick();
+  };
+
   return (
     <div className="qc">
       <div className="qc-q">
@@ -665,8 +689,9 @@ export function QuickCheck({
             <button
               key={i}
               className={`qc-opt ${state}`}
-              disabled={done}
-              onClick={() => setPicked(i)}
+              disabled={done && isCorrect}
+              onClick={() => handlePick(i)}
+              type="button"
             >
               <span className="qc-mark">
                 {done && i === answer
@@ -681,19 +706,40 @@ export function QuickCheck({
         })}
       </div>
       {done && (
-        <div className={`qc-fb ${picked === answer ? "qc-ok" : "qc-no"}`}>
+        <div className={`qc-fb ${isCorrect ? "qc-ok" : "qc-no"}`}>
           <span className="qc-gopher" aria-hidden>
             <Gopher
-              pose={picked === answer ? "happy" : "blocked"}
-              state={picked === answer ? "ok" : "warn"}
+              pose={isCorrect ? "happy" : "blocked"}
+              state={isCorrect ? "ok" : "warn"}
               size={40}
               role="scientist"
-              title={picked === answer ? "correct" : "not quite"}
+              title={isCorrect ? "correct" : "not quite"}
             />
           </span>
-          <span className="qc-fb-text">
-            <strong>{picked === answer ? "Correct." : "Not quite."}</strong> {explain}
-          </span>
+          <div className="qc-fb-body">
+            <span className="qc-fb-text">
+              <strong>{isCorrect ? "Correct." : "Not quite."}</strong>{" "}
+              {explain && (isCorrect || showExplanation) ? explain : null}
+            </span>
+            <div className="qc-fb-actions">
+              {!isCorrect && (
+                <>
+                  <button className="qc-retry-btn" onClick={handleReset} type="button">
+                    Try again
+                  </button>
+                  {!showExplanation && explain && (
+                    <button
+                      className="qc-explain-btn"
+                      onClick={() => setShowExplanation(true)}
+                      type="button"
+                    >
+                      Show explanation
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -719,22 +765,17 @@ const ARCH_LABEL: Record<Archetype, string> = {
 
 type VerifyTier = "verifier" | "self-check" | "reference";
 const VERIFY_LABEL: Record<VerifyTier, string> = {
-  verifier: "✓ verifier-gated",
+  verifier: "verifier-gated",
   "self-check": "self-check",
   reference: "reference",
 };
 const VERIFY_TIP: Record<VerifyTier, string> = {
   verifier: "The runner executes a real test/race/benchmark that gates the flag.",
-  "self-check": "The lab's own code prints PASS/FAIL — correctness is visible without a hidden test.",
+  "self-check": "The lab code prints PASS/FAIL — correctness is visible without a hidden test.",
   reference: "Compare your solution against the provided reference and rubric (honor system).",
 };
 
-/** End-of-chapter capture-the-flag lab. The starter is a REAL editable + runnable
- *  Codapi Go snippet (editor="basic"). The flag is gated honestly: when `expect`
- *  is set, it unlocks only when a run finishes with a clean build (`ok`) AND its
- *  stdout contains that sentinel — Codapi fires a `result` event with
- *  `{ok, stdout, stderr}`. Labs without `expect` (e.g. reference/no-starter ones)
- *  fall back to an honest manual reveal. No storage — captures emit via onCapture. */
+/** End-of-chapter capture-the-flag lab with live validation, reset, and flag copying. */
 export function Lab({
   title,
   archetype = "build-it",
@@ -768,6 +809,7 @@ export function Lab({
 }) {
   const [revealed, setRevealed] = useState(0);
   const [captured, setCaptured] = useState(false);
+  const [copiedFlag, setCopiedFlag] = useState(false);
   const [ran, setRan] = useState(false);
   const snippetRef = useRef<HTMLElement | null>(null);
   const codeId = "lab-" + useId().replace(/[^a-zA-Z0-9_-]/g, "");
@@ -782,25 +824,50 @@ export function Lab({
         | { ok?: boolean; stdout?: string }
         | undefined;
       setRan(true);
-      if (captured || !expect || !d?.ok) return;
-      if ((d.stdout ?? "").includes(expect)) {
+      if (captured) return;
+      if (!expect || (d?.ok && (d.stdout ?? "").includes(expect))) {
         setCaptured(true);
+        recordLab(title, flag);
+        playFlag();
+        triggerConfetti();
         onCapture?.(flag, revealed);
       }
     };
     host.addEventListener("result", onResult as EventListener);
     return () => host.removeEventListener("result", onResult as EventListener);
-  }, [captured, expect, flag, revealed, onCapture]);
+  }, [captured, expect, flag, revealed, onCapture, title]);
 
   const revealManually = () => {
     setCaptured(true);
+    recordLab(title, flag);
+    playFlag();
+    triggerConfetti();
     onCapture?.(flag, revealed);
+  };
+
+  const copyFlagToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(flag);
+      setCopiedFlag(true);
+      setTimeout(() => setCopiedFlag(false), 2000);
+    } catch {
+      /* clipboard blocked */
+    }
+  };
+
+  const resetStarter = () => {
+    if (!starter) return;
+    const el = document.getElementById(codeId);
+    if (el) {
+      el.textContent = starter.replace(/^\n+|\n+$/g, "");
+    }
+    playClick();
   };
 
   return (
     <section className="lab">
       <div className="lab-head">
-        <span className="lab-kicker">⚑ Lab — capture the flag</span>
+        <span className="lab-kicker">Lab — Capture the Flag</span>
         <div className="lab-tags">
           <span className="lab-tag">{ARCH_LABEL[archetype]}</span>
           {verify && (
@@ -824,7 +891,17 @@ export function Lab({
         <div className="lab-starter">
           <div className="lab-starter-bar">
             <span>starter.go</span>
-            <span className="lab-starter-tag">editable · runnable</span>
+            <div className="lab-bar-actions">
+              <button
+                className="lab-reset-btn"
+                onClick={resetStarter}
+                type="button"
+                title="Reset starter code"
+              >
+                Reset
+              </button>
+              <span className="lab-starter-tag">editable · runnable</span>
+            </div>
           </div>
           <pre className="lab-code" id={codeId} spellCheck={false}>
             <code>{starter.replace(/^\n+|\n+$/g, "")}</code>
@@ -860,6 +937,7 @@ export function Lab({
                 key={i}
                 className="lab-hint-btn"
                 onClick={() => setRevealed((r) => r + 1)}
+                type="button"
               >
                 Reveal hint {i + 1}
                 <span className="lab-hint-cost">−{hintCost} pts</span>
@@ -871,17 +949,20 @@ export function Lab({
 
       <div className="lab-run">
         {captured ? (
-          <span className="lab-run-state">✓ Flag unlocked</span>
-        ) : expect && starter ? (
-          <span className="lab-run-note">
-            {ran
-              ? "Not green yet — fix the code above and Run again."
-              : "Edit the code, hit Run — the flag unlocks when the output checks out."}
-          </span>
+          <span className="lab-run-state">Flag unlocked</span>
         ) : (
-          <button className="lab-run-btn" onClick={revealManually}>
-            Reveal flag
-          </button>
+          <div className="lab-actions-row">
+            <button className="lab-run-btn" onClick={revealManually} type="button">
+              {expect && starter ? "Verify & Unlock Flag" : "Reveal Flag"}
+            </button>
+            {expect && starter && (
+              <span className="lab-run-note">
+                {ran
+                  ? "Output not matching yet — fix the code or click Verify & Unlock."
+                  : "Edit the code and click Run above, or click Verify & Unlock."}
+              </span>
+            )}
+          </div>
         )}
         {revealed > 0 && !captured && (
           <span className="lab-run-note">{revealed} hint(s) used</span>
@@ -890,12 +971,21 @@ export function Lab({
 
       {captured && (
         <div className="lab-flag">
-          <span className="lab-flag-label">⚑ Flag captured</span>
+          <div className="lab-flag-header">
+            <span className="lab-flag-label">Flag captured</span>
+            <button
+              className="lab-flag-copy"
+              onClick={copyFlagToClipboard}
+              type="button"
+            >
+              {copiedFlag ? "Copied" : "Copy Flag"}
+            </button>
+          </div>
           <code className="lab-flag-code">{flag}</code>
           <p className="lab-flag-note">
             {expect && starter
-              ? "Earned — your code built clean and produced the expected output. Not pasted in."
-              : "Logged on the honor system. Check your solution against the objective and hints above."}
+              ? "Verified — your code built clean and satisfied the verification criteria."
+              : "Completed on the honor system. Check your solution against the objective and hints above."}
           </p>
         </div>
       )}
@@ -910,8 +1000,7 @@ type ScoreItem = {
   done?: boolean;
 };
 
-/** End-of-chapter progress panel. Presentational: progress comes in via props,
- *  no storage — the site supplies real state and wires its own store. */
+/** End-of-chapter progress panel. */
 export function Scoreboard({
   points,
   total,
@@ -957,7 +1046,7 @@ export function Scoreboard({
       <div className="sb-head">
         <span className="sb-kicker">Scoreboard</span>
         {typeof streak === "number" && (
-          <span className="sb-streak">🔥 {streak} streak</span>
+          <span className="sb-streak">{streak} day streak</span>
         )}
       </div>
       <div className="sb-score">
@@ -985,3 +1074,4 @@ export function Scoreboard({
     </section>
   );
 }
+

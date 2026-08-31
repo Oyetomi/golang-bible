@@ -2,24 +2,18 @@
 
 import { useState } from "react";
 import { Gopher, type GopherRole } from "@/components/course/Gopher";
+import { recordQuickCheck } from "@/lib/gamification";
+import { playBuzzer, playClick, playSuccess } from "@/lib/sound";
+import { triggerConfetti } from "@/lib/confetti";
 
-/* ════════════════════════════════════════════
-   PredictLab — the universal interactive beat
-   for non-security chapters: predict what a Go
-   snippet does, "run" it (a gopher scurries on
-   the playground), then the real output reveals
-   and a gopher reacts — happy if you called it,
-   teaching pose if you didn't. Active recall +
-   a payoff, in every chapter.
-   ════════════════════════════════════════════ */
 type PredictLabProps = {
-  prompt?: string; // the question, default "What does this print?"
-  code: string; // the snippet to reason about
-  options: string[]; // candidate outputs
-  answer: number; // index of the correct option
-  output: string; // the real stdout revealed on "run"
-  explain: string; // the why
-  role?: GopherRole; // dress the gopher for the topic
+  prompt?: string;
+  code: string;
+  options: string[];
+  answer: number;
+  output: string;
+  explain: string;
+  role?: GopherRole;
 };
 
 type Phase = "predict" | "running" | "revealed";
@@ -40,8 +34,22 @@ export function PredictLab({
     if (phase !== "predict") return;
     setPicked(i);
     setPhase("running");
-    // a beat of "running on the playground" before the reveal
-    window.setTimeout(() => setPhase("revealed"), 850);
+    window.setTimeout(() => {
+      setPhase("revealed");
+      if (i === answer) {
+        recordQuickCheck(prompt);
+        playSuccess();
+        triggerConfetti();
+      } else {
+        playBuzzer();
+      }
+    }, 600);
+  };
+
+  const handleRetry = () => {
+    setPicked(null);
+    setPhase("predict");
+    playClick();
   };
 
   const correct = picked === answer;
@@ -73,6 +81,7 @@ export function PredictLab({
               className={`pl-opt ${state} ${picked === i && phase !== "revealed" ? "picked" : ""}`}
               disabled={phase !== "predict"}
               onClick={() => pick(i)}
+              type="button"
             >
               <span className="pl-mark">
                 {phase === "revealed" && i === answer
@@ -117,9 +126,16 @@ export function PredictLab({
                 title={correct ? "called it" : "not quite"}
               />
             </span>
-            <span className="pl-fb-text">
-              <strong>{correct ? "You called it." : "Not quite."}</strong> {explain}
-            </span>
+            <div className="pl-fb-body">
+              <span className="pl-fb-text">
+                <strong>{correct ? "You called it." : "Not quite."}</strong> {explain}
+              </span>
+              {!correct && (
+                <button className="pl-retry-btn" onClick={handleRetry} type="button">
+                  Try again
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}

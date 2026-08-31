@@ -6,6 +6,7 @@ import { PredictLab } from "@/components/course/predictlab";
 import { SpacedRecall } from "@/components/course/spacedrecall";
 import { Golings } from "@/components/course/golings";
 import { CodeWalk } from "@/components/course/CodeWalk";
+import { ELI5, MentalModel } from "@/components/course/ELI5";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -52,6 +53,8 @@ export const mdxComponents = {
   UnderTheHood: S.UnderTheHood,
   Callout: S.Callout,
   Define: S.Define,
+  ELI5,
+  MentalModel,
   // Practice
   QuickCheck: C.QuickCheck,
   Exercise: S.Exercise,
