@@ -16,11 +16,12 @@ export default function Home() {
         </h1>
         <div className="hero-intro">
           <p>
-            Three parts and an interview-prep appendix. Seventy chapters. Zero
+            Three core tracks and a comprehensive systems & DS&amp;A appendix. {chapters.length} flagship chapters. Zero
             hand-waving. We go from your very first <code>package main</code> all
-            the way to a concurrency-safe, audited, double-entry fintech ledger —
+            the way to high-concurrency systems, distributed Raft consensus, eBPF
+            kernel tracing, Kubernetes operators, and audited double-entry ledgers —
             and we explain every machine underneath it. Every concept gets a real
-            scenario and a visual you can actually watch run.
+            scenario and an interactive visual you can actually watch run.
           </p>
         </div>
       </section>
