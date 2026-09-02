@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/assets/logo.svg" width="128" height="128" alt="The Go Bible">
+  <img src=".github/assets/gopher-logo.svg" width="128" height="128" alt="The Go Bible">
 </p>
 
 <h1 align="center">The Go Bible</h1>
