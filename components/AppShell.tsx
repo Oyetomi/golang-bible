@@ -6,6 +6,7 @@ import { CodeEnhancer } from "@/components/CodeEnhancer";
 import { Search } from "@/components/Search";
 import { GamificationHeader } from "@/components/gamification/GamificationHeader";
 import { GopherCompanion } from "@/components/gamification/GopherCompanion";
+import { QuickScratchpad } from "@/components/course/QuickScratchpad";
 
 /* Collapsible app shell. Collapsing the sidebar hands the whole viewport to the
    content column so code, animations, and playgrounds get maximum width.
@@ -63,6 +64,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </footer>
       </main>
       <GopherCompanion />
+      <QuickScratchpad />
       <CodeEnhancer />
       <Search />
     </div>

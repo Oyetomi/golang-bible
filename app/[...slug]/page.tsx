@@ -3,6 +3,7 @@ import { chapters, chapterByHref } from "@/lib/manifest";
 import { renderChapter, chapterExists } from "@/lib/content";
 import { ComingSoon } from "@/components/course/server";
 import { ChapterPagination } from "@/components/nav/ChapterPagination";
+import { ReaderBar } from "@/components/course/ReaderBar";
 
 export const dynamicParams = true;
 
@@ -69,6 +70,7 @@ export default async function ChapterPage({
 
   return (
     <article className="prose">
+      <ReaderBar />
       {content}
       <ChapterPagination prev={prev} next={next} />
     </article>
