@@ -22,9 +22,26 @@ export async function generateMetadata({
   params: Promise<{ slug: string[] }>;
 }) {
   const { slug } = await params;
-  const ch = chapterByHref("/" + slug.join("/"));
+  const href = "/" + slug.join("/");
+  const ch = chapterByHref(href);
   if (!ch) return {};
-  return { title: `${ch.title} — The Go Bible`, description: ch.description };
+  const title = `${ch.title} — The Go Bible`;
+  return {
+    title,
+    description: ch.description,
+    openGraph: {
+      title,
+      description: ch.description,
+      type: "article",
+      url: href,
+      siteName: "The Go Bible",
+    },
+    twitter: {
+      card: "summary_large_image",
+      title,
+      description: ch.description,
+    },
+  };
 }
 
 export default async function ChapterPage({

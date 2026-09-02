@@ -26,7 +26,11 @@ const mono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "The Go Bible — forged by the greatest Go engineer alive",
+  metadataBase: new URL("https://golangbible.dev"),
+  title: {
+    default: "The Go Bible — forged by the greatest Go engineer alive",
+    template: "%s — The Go Bible",
+  },
   description:
     "A visualization-heavy, Boot.dev-style Go course: from syntax to senior production engineer to fintech specialist.",
   icons: {
@@ -36,7 +40,30 @@ export const metadata: Metadata = {
     ],
     shortcut: "/favicon.svg",
     apple: "/icon.svg"
-  }
+  },
+  openGraph: {
+    title: "The Go Bible",
+    description:
+      "A visualization-heavy, Boot.dev-style Go course: from syntax to senior production engineer to fintech specialist.",
+    url: "https://golangbible.dev",
+    siteName: "The Go Bible",
+    locale: "en_US",
+    type: "website",
+    images: [
+      {
+        url: "/icon.svg",
+        width: 128,
+        height: 128,
+        alt: "The Go Bible Logo",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary",
+    title: "The Go Bible",
+    description:
+      "A visualization-heavy, Boot.dev-style Go course: from syntax to senior production engineer to fintech specialist.",
+  },
 };
 
 export default function RootLayout({
