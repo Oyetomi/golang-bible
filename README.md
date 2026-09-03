@@ -14,7 +14,7 @@
   <img alt="Next.js" src="https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white">
   <img alt="React" src="https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white">
   <img alt="MDX" src="https://img.shields.io/badge/MDX-content-FCB32C?logo=mdx&logoColor=black">
-  <img alt="Chapters" src="https://img.shields.io/badge/chapters-114%20flagship-f5b13d">
+  <img alt="Chapters" src="https://img.shields.io/badge/chapters-117%20flagship-f5b13d">
   <img alt="Visuals" src="https://img.shields.io/badge/visual--engine-interactive-10B981">
 </p>
 
@@ -26,7 +26,7 @@
 
 The running domain throughout the book is **Meridian Trust & Clearing**, a realistic high-throughput fintech infrastructure handling racing payments, double-entry ledgers, Kafka outbox relays, and distributed consensus — eliminating `foo`/`bar` fluff.
 
-- **114 Flagship Chapters** across 4 comprehensive tracks.
+- **117 Flagship Chapters** across 4 comprehensive tracks.
 - **Interactive Visual Engines** — Step through algorithms, memory layouts, GMP scheduler run queues, and distributed sagas in real time.
 - **Runnable Sandboxes** — In-browser Go code execution via Codapi with execution trace breakdowns and instant resets.
 - **Gamified Learning** — 50 XP player levels, daily streaks, 20 achievement badges, and retro Web Audio sound effects.
@@ -34,14 +34,14 @@ The running domain throughout the book is **Meridian Trust & Clearing**, a reali
 
 ---
 
-## The 4 Flagship Tracks (114 Chapters)
+## The 4 Flagship Tracks (117 Chapters)
 
 | Track | Focus | Topics & Systems | Chapters |
 | :--- | :--- | :--- | :---: |
 | **Part 1: The Go Language** | Zero to Production Backend | Fundamentals, Value/Pointer Semantics, CSP Concurrency, Generics, Testing/TDD, REST APIs, SQL Databases, Redis, Microservices, Docker, Standalone Binaries, CI/CD | **28** |
 | **Part 2: Production-Grade Engineering** | High-Scale Systems Architecture | GMP Runtime Scheduler, Advanced Concurrency, Memory Profiling & pprof, Tracing & OpenTelemetry, Reliability Patterns, River Background Jobs, Sharding, LSM Storage Engines, Raft Consensus | **24** |
 | **Part 3: Fintech & Mission-Critical Systems** | Distributed Financial Capstone | Exact Monetary Math, Double-Entry Ledgers, ACID Isolation, Transactional Outbox, In-Process Event Buses, Distributed Sagas, Kafka Event Streaming, Watermill, Stripe Webhooks, ISO 20022 | **15** |
-| **Appendix: Master Systems & Interview Prep** | Specialized Deep Dives & DS&A | DS&A & Top 75 LeetCode in Go, Top 100 Go Production Mistakes, OWASP & Web Exploitation, eBPF & Kernel Observability, Monotonic Fencing Locks, Zero-Alloc Ring Buffers, Wasm/WASI Plugins, Kubernetes Operators, ReBAC/OpenFGA, Ent Graph ORM, Embedded SSH Servers | **46** |
+| **Appendix: Master Systems & Interview Prep** | Specialized Deep Dives, AI & DS&A | DS&A & Top 75 LeetCode in Go, Top 100 Go Production Mistakes, OWASP & Web Exploitation, eBPF & Kernel Observability, Monotonic Fencing Locks, Zero-Alloc Ring Buffers, Wasm/WASI Plugins, Kubernetes Operators, ReBAC/OpenFGA, Ent Graph ORM, Embedded SSH, Uber Geospatial Dispatch, Autonomous AI Agents, Enterprise MCP, Vector Databases & RAG | **50** |
 
 ---
 
@@ -102,10 +102,10 @@ pnpm dev
 ### Build & Verification Commands
 
 ```bash
-pnpm build            # Build search index and generate static Next.js pages (122 pages)
-pnpm validate         # Validate manifest and all 114 authored chapters
-pnpm lint-mdx         # Parse and compile-check all 114 MDX chapter files
-pnpm search-index     # Rebuild the 2,100+ entry client search index
+pnpm build            # Build search index and generate static Next.js pages (125 pages)
+pnpm validate         # Validate manifest and all 117 authored chapters
+pnpm lint-mdx         # Parse and compile-check all 117 MDX chapter files
+pnpm search-index     # Rebuild the 2,200+ entry client search index
 ```
 
 ---
@@ -114,11 +114,11 @@ pnpm search-index     # Rebuild the 2,100+ entry client search index
 
 ```
 golang-bible/
-├── content/                 # 114 authored MDX chapters + manifest
+├── content/                 # 117 authored MDX chapters + manifest
 │   ├── part-1/              # 28 Chapters: Language & Backend Fundamentals
 │   ├── part-2/              # 24 Chapters: Systems Engineering & Reliability
 │   ├── part-3/              # 15 Chapters: Fintech Architecture & Ledgers
-│   ├── appendix/            # 47 Chapters: DS&A, Kernel, Security & Enterprise
+│   ├── appendix/            # 50 Chapters: DS&A, Kernel, Security & AI Systems
 │   ├── _manifest.json       # Source of truth for routes, order & prerequisites
 │   └── _AUTHORING_CONTRACT.md
 ├── app/                     # Next.js App Router (layout, pages, icon.svg)
