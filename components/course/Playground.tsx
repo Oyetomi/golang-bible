@@ -152,10 +152,30 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
     host.addEventListener("run", onRun);
     host.addEventListener("result", onResult as EventListener);
 
-    return () => {
-      host.removeEventListener("run", onRun);
-      host.removeEventListener("result", onResult as EventListener);
+  }, [selector]);
+
+  // Keyboard shortcut: Cmd+Enter or Ctrl+Enter to trigger run
+  useEffect(() => {
+    const el = readEl();
+    if (!el) return;
+    const container = el.closest(".ply");
+    if (!container) return;
+
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        if (container.contains(document.activeElement) || container.matches(":hover")) {
+          e.preventDefault();
+          const host = snippetRef.current;
+          const btn = (host?.shadowRoot?.querySelector("button") || host?.querySelector("button")) as HTMLButtonElement | null;
+          if (btn) {
+            btn.click();
+          }
+        }
+      }
     };
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [selector]);
 
   const copy = async () => {

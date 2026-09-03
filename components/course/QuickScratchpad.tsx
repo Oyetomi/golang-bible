@@ -73,7 +73,24 @@ export function QuickScratchpad() {
             Got an idea while reading? Test any Go code snippet right here without losing your place.
           </p>
 
-          <div className="codapi-wrap">
+          <div className="codapi-wrap gb-ide-window">
+            <div className="gb-ide-bar">
+              <div className="gb-ide-left">
+                <span className="gb-ide-dots">
+                  <i className="gb-dot-r"></i>
+                  <i className="gb-dot-y"></i>
+                  <i className="gb-dot-g"></i>
+                </span>
+                <div className="gb-ide-tab">
+                  <span className="gb-ide-folder">📁 scratchpad / </span>
+                  <span className="gb-ide-file">📄 main.go</span>
+                </div>
+              </div>
+              <div className="gb-ide-right">
+                <span className="ply-kbd-hint">⌘Enter to run</span>
+                <span className="gb-ide-lang">GO 1.26</span>
+              </div>
+            </div>
             <pre className="codapi-pre">
               <code className="language-go">
 {`package main

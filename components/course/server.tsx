@@ -147,13 +147,35 @@ export function UnderTheHood({
    so it goes through the same rehype-pretty-code/Shiki pipeline as prose code
    (identical formatting) with no JS-template-literal escaping pitfalls. We give
    the code wrapper an id and point Codapi's runner at it via selector. */
-export function GoPlayground({ children }: { children?: ReactNode }) {
+export function GoPlayground({
+  title = "main.go",
+  folder = "playground/",
+  children,
+}: {
+  title?: string;
+  folder?: string;
+  children?: ReactNode;
+}) {
   const id = `ply-${++plyCounter}`;
   return (
-    <div className="ply">
-      <div className="ply-bar">
-        <span className="ply-go">▶ Go Playground</span>
-        <span className="ply-hint">runnable</span>
+    <div className="ply gb-ide-window">
+      <div className="ply-ide-bar">
+        <div className="gb-ide-left">
+          <span className="gb-ide-dots">
+            <i className="gb-dot-r" />
+            <i className="gb-dot-y" />
+            <i className="gb-dot-g" />
+          </span>
+          <div className="gb-ide-tab">
+            <span className="gb-ide-folder">📁 {folder}</span>
+            <span className="gb-ide-file">📄 {title}</span>
+          </div>
+        </div>
+        <div className="gb-ide-right">
+          <span className="ply-kbd-hint">⌘Enter to run</span>
+          <span className="gb-ide-lang">GO 1.26</span>
+          <span className="ply-hint">runnable</span>
+        </div>
       </div>
       <div className="ply-code" id={id}>
         {children}

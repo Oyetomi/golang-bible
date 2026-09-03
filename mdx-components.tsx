@@ -7,6 +7,7 @@ import { SpacedRecall } from "@/components/course/spacedrecall";
 import { Golings } from "@/components/course/golings";
 import { CodeWalk } from "@/components/course/CodeWalk";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
+import { ProjectCode } from "@/components/course/ProjectCode";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -20,6 +21,7 @@ export const mdxComponents = {
   // Code & comparison
   BeforeAfter: S.BeforeAfter,
   GoPlayground: S.GoPlayground,
+  ProjectCode,
   // Visual explainers
   ExecTimeline: C.ExecTimeline,
   Scene: C.Scene,
