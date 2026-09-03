@@ -14,7 +14,7 @@
   <img alt="Next.js" src="https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white">
   <img alt="React" src="https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white">
   <img alt="MDX" src="https://img.shields.io/badge/MDX-content-FCB32C?logo=mdx&logoColor=black">
-  <img alt="Chapters" src="https://img.shields.io/badge/chapters-113%20flagship-f5b13d">
+  <img alt="Chapters" src="https://img.shields.io/badge/chapters-114%20flagship-f5b13d">
   <img alt="Visuals" src="https://img.shields.io/badge/visual--engine-interactive-10B981">
 </p>
 
@@ -26,7 +26,7 @@
 
 The running domain throughout the book is **Meridian Trust & Clearing**, a realistic high-throughput fintech infrastructure handling racing payments, double-entry ledgers, Kafka outbox relays, and distributed consensus — eliminating `foo`/`bar` fluff.
 
-- **113 Flagship Chapters** across 4 comprehensive tracks.
+- **114 Flagship Chapters** across 4 comprehensive tracks.
 - **Interactive Visual Engines** — Step through algorithms, memory layouts, GMP scheduler run queues, and distributed sagas in real time.
 - **Runnable Sandboxes** — In-browser Go code execution via Codapi with execution trace breakdowns and instant resets.
 - **Gamified Learning** — 50 XP player levels, daily streaks, 20 achievement badges, and retro Web Audio sound effects.
@@ -34,7 +34,7 @@ The running domain throughout the book is **Meridian Trust & Clearing**, a reali
 
 ---
 
-## The 4 Flagship Tracks (113 Chapters)
+## The 4 Flagship Tracks (114 Chapters)
 
 | Track | Focus | Topics & Systems | Chapters |
 | :--- | :--- | :--- | :---: |
@@ -102,9 +102,9 @@ pnpm dev
 ### Build & Verification Commands
 
 ```bash
-pnpm build            # Build search index and generate static Next.js pages (118 pages)
-pnpm validate         # Validate manifest and all 113 authored chapters
-pnpm lint-mdx         # Parse and compile-check all 113 MDX chapter files
+pnpm build            # Build search index and generate static Next.js pages (122 pages)
+pnpm validate         # Validate manifest and all 114 authored chapters
+pnpm lint-mdx         # Parse and compile-check all 114 MDX chapter files
 pnpm search-index     # Rebuild the 2,100+ entry client search index
 ```
 
@@ -114,11 +114,11 @@ pnpm search-index     # Rebuild the 2,100+ entry client search index
 
 ```
 golang-bible/
-├── content/                 # 113 authored MDX chapters + manifest
+├── content/                 # 114 authored MDX chapters + manifest
 │   ├── part-1/              # 28 Chapters: Language & Backend Fundamentals
 │   ├── part-2/              # 24 Chapters: Systems Engineering & Reliability
 │   ├── part-3/              # 15 Chapters: Fintech Architecture & Ledgers
-│   ├── appendix/            # 46 Chapters: DS&A, Kernel, Security & Enterprise
+│   ├── appendix/            # 47 Chapters: DS&A, Kernel, Security & Enterprise
 │   ├── _manifest.json       # Source of truth for routes, order & prerequisites
 │   └── _AUTHORING_CONTRACT.md
 ├── app/                     # Next.js App Router (layout, pages, icon.svg)

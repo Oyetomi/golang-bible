@@ -1,0 +1,946 @@
+---
+title: "System Design: Designing Uber & Geospatial Dispatch in Go"
+part: "appendix"
+order: 47
+type: "course"
+description: "Architecting Uber's real-time ride-sharing and geospatial dispatch engine in Go: H3 hexagonal spatial indexing vs quadtrees, 1M+ driver location WebSocket ingestion with lock-free ring buffers, bipartite dispatch matching under 5ms, the distributed trip state machine, transactional outbox to Kafka, and multi-tenant billing ledgers."
+prerequisites: ["microservices", "realtime-websockets-webhooks", "event-driven-kafka"]
+heavy: true
+---
+
+<HeroCard label="Appendix · System Design Flagship" title="System Design: Designing Uber & Geospatial Dispatch in Go">
+
+Here's the thing, sport. You open the app, tap "Request Ride," and in four seconds a little black car icon on your screen pivots, turns down your street, and arrives at your curb.
+
+Looks effortless. It is not effortless.
+
+Behind that four-second countdown sits one of the most brutal high-concurrency distributed systems ever assembled. At peak hours in London or New York:
+- Five million active drivers stream GPS coordinates every four seconds over persistent duplex connections. That's over **1,250,000 location pings per second** hitting the edge.
+- If you write those coordinates directly to a relational database with `UPDATE drivers SET lat = ?, lon = ?`, your database locks up, its WAL disks melt, and your latency explodes to thirty seconds.
+- If you query nearby drivers using traditional SQL `WHERE lat BETWEEN ... AND lon BETWEEN ...`, you trigger two orthogonal 1D index scans that intersect millions of candidate rows, stalling your API servers.
+- And if two riders in Times Square click "Request" at the exact same millisecond, your dispatch engine must never, ever double-assign the same driver.
+
+Uber did not solve this by throwing more hardware at a naive CRUD app. They solved it by **fundamentally re-thinking spatial representation and distributed event flows** — and they built the core of it in **Go**.
+
+In this flagship system design masterclass, we dismantle the architecture from that iconic diagram and reconstruct it from the wire up in Go: the H3 hexagonal spatial index, the 1M+ ping/sec ingestion engine, the batch dispatch matcher, and the fault-tolerant trip state machine. Let's get to work.
+
+</HeroCard>
+
+<ChapterTabs tabs={["High-Concurrency Geospatial Scale", "Geospatial Indexing: H3 vs Quadtrees", "Location Ingestion: 1M Pings/Sec", "The Dispatch Matcher", "The Trip State Machine & Sagas", "The Architecture End-to-End"]} />
+
+<SpacedRecall
+  role={"captain"}
+  items={[
+    {
+      from: "Real-Time Go (Appendix, ch30)",
+      q: "Why do we use persistent WebSockets instead of short HTTP polling for driver GPS updates?",
+      options: [
+        "WebSockets bypass TLS encryption completely",
+        "HTTP polling wastes massive header bandwidth and TCP handshakes when sending 1M pings/sec every 4 seconds",
+        "HTTP does not support JSON payloads",
+        "WebSockets automatically store messages in PostgreSQL"
+      ],
+      answer: 1,
+      tie: "At 1.25M pings/sec, HTTP request/response header overhead (500–1000 bytes per ping) would waste gigabytes of transit bandwidth per minute. WebSockets send raw binary or compact framing over an established TCP connection with 2-6 bytes of frame overhead."
+    },
+    {
+      from: "Transactional Outbox (Part 3, ch4)",
+      q: "How do we guarantee that updating a trip state in PostgreSQL also publishes a Kafka event without dual-write inconsistency?",
+      options: [
+        "Write to Kafka first, and if PostgreSQL fails, ignore the error",
+        "Save the trip state and an outbox event row in the same PostgreSQL ACID transaction, then relay asynchronously to Kafka",
+        "Use a 2-Phase Commit (2PC) coordinator between PostgreSQL and Kafka",
+        "Rely on HTTP retries from the client"
+      ],
+      answer: 1,
+      tie: "The Transactional Outbox pattern guarantees at-least-once delivery: your database transaction commits the state change and outbox row atomically, and an async worker relays the event to Kafka even if the app pod crashes."
+    }
+  ]}
+/>
+
+<PredictLab
+  prompt={"Why does SQL 'WHERE lat BETWEEN ... AND lon BETWEEN ...' fail to use standard B-Tree indexes effectively?"}
+  role={"pilot"}
+  code={`-- Table has 10,000,000 active driver location records
+-- Composite B-Tree index on (lat, lon)
+SELECT driver_id FROM driver_locations 
+WHERE lat BETWEEN 40.710 AND 40.720 
+  AND lon BETWEEN -74.010 AND -74.000;`}
+  options={[
+    "B-Trees cannot index floating-point numbers",
+    "A composite B-Tree (lat, lon) can only perform a range scan on the FIRST column (lat); for all matching lats, it must filter lon sequentially",
+    "PostgreSQL automatically rewrites BETWEEN into full table scans",
+    "B-Trees only support exact equality matches"
+  ]}
+  answer={1}
+  output={`Index scan uses lat range, then must filter lon sequentially across millions of rows`}
+  explain={"A B-tree index orders elements in 1 dimension. In a composite index (lat, lon), once the database scans a range of latitudes (say, 50,000 matching rows across the entire globe at that latitude band), the longitude ordering within each distinct latitude slice is disjointed. It cannot perform a 2D bounding box lookup in O(log N) time without a multidimensional or spatial index."}
+/>
+
+## High-Concurrency Geospatial Scale
+
+Look at the high-level architecture diagram. Every request starts on a mobile device and fans out into a mesh of microservices connected by an asynchronous event bus:
+
+<Scene
+  title="Uber Ride-Sharing Architecture: Edge to Data Mesh"
+  actors={[
+    { id: "apps",    label: "Rider & Driver Apps", role: "runner" },
+    { id: "gateway", label: "API Gateway (Envoy)",  role: "pilot" },
+    { id: "mesh",    label: "Go Service Mesh",     role: "operator" },
+    { id: "kafka",   label: "Kafka Event Mesh",    role: "courier" },
+    { id: "dbs",     label: "Polyglot DBs",        role: "librarian" }
+  ]}
+  rows={2}
+  cols={5}
+  frames={[
+    {
+      caption: "Step 1: Driver apps push GPS location updates every 4 seconds over persistent WebSockets. The Location Service buffers pings in in-memory spatial indexes and emits updates to Kafka.",
+      beat: "problem",
+      cells: [
+        { id: "A1", state: "active", label: "GPS Pings (1M/s)" },
+        { id: "A2", state: "done",   label: "TLS / Rate Limit" },
+        { id: "A3", state: "active", label: "Location Service" },
+        { id: "A4", state: "active", label: "Topic: driver-loc" },
+        { id: "A5", state: "idle",   label: "Spatial Geo DB" }
+      ]
+    },
+    {
+      caption: "Step 2: A rider requests a ride. The Dispatch Service queries nearby drivers in the target H3 cell and adjacent k-rings (<5ms), runs batch matching, locks the chosen driver, and triggers the Ride Service.",
+      beat: "solution",
+      cells: [
+        { id: "B1", state: "active", label: "Request Ride" },
+        { id: "B2", state: "done",   label: "Auth & Route" },
+        { id: "B3", state: "done",   label: "Dispatch Matcher" },
+        { id: "B4", state: "active", label: "Topic: ride-events" },
+        { id: "B5", state: "done",   label: "PostgreSQL Trips" }
+      ]
+    }
+  ]}
+  caption="The end-to-end distributed topology: Rider/Driver clients, API Gateway, Go Service Mesh, Kafka Event Bus, and Polyglot Databases."
+/>
+
+### The Three Impossible Constraints
+
+When designing a system at this scale, three engineering constraints collide:
+
+1. **Write Throughput**: 1,000,000+ driver updates per second. If you attempt synchronous ACID writes to disk for every ping, your storage subsystem will fail. Location updates must live in **ephemeral, in-memory spatial indexes** (with Redis / memory ring buffers), not relational disk tables.
+2. **Read Latency**: When a rider opens the app, they expect to see the 8 closest cars floating on their screen in `< 50ms`. The dispatch engine must search a `2km` radius in `< 5ms`.
+3. **Consistency & Single Assignment**: Two riders requesting a ride in the same neighborhood must **never** be dispatched the same driver. Driver matching requires atomic leasing and state transitions.
+
+<Define term="Spatial Indexing" since="Appendix · Chapter 47">
+A data structure that arranges multidimensional geometric data (points, polygons, lines) so that spatial proximity queries (e.g. "find all points within 1.5 km of coordinate X, Y") execute in $O(\\log N)$ or $O(1)$ time, rather than scanning the entire dataset in $O(N)$.
+</Define>
+
+---
+
+## Geospatial Indexing: H3 vs Quadtrees
+
+To understand how Uber solves geospatial search, you must understand why standard solutions failed.
+
+### The Failure of Traditional Approaches
+
+```
+1. Flat Coordinates (Lat, Lon):
+   Query: WHERE lat BETWEEN y1 AND y2 AND lon BETWEEN x1 AND x2
+   Result: Full table scans or high-overhead composite B-tree range scans.
+
+2. Geohashes (Base32 Strings like "dr5reg"):
+   Divide the world into bounding boxes using Z-order space-filling curves.
+   Flaw: Non-uniform neighbor distances and EDGE DISCONTINUITIES. Two points 
+   10 meters apart across a boundary line have completely different prefixes!
+
+3. Quadtrees (Hierarchical Squares):
+   Subdivide squares into 4 quadrants recursively.
+   Flaw: A square has two distinct types of neighbors:
+   - 4 edge neighbors (distance D)
+   - 4 diagonal corner neighbors (distance D * sqrt(2) ≈ 1.414 D)
+   This diagonal distortion causes massive inaccuracy during circular radius searches!
+```
+
+### Uber's Solution: The H3 Hexagonal Hierarchical Spatial Index
+
+In 2018, Uber open-sourced **H3**, an open-source discrete global grid system based on **hexagons**.
+
+Why hexagons? **Because every neighboring cell of a regular hexagon is equidistant.**
+
+```
+       ┌─────────┐
+      /           \
+     /    (0,1)    \
+ ┌───\             /───┐
+/     \           /     \
+  (-1,0) ── (0,0) ── (1,0)   <-- ALL 6 NEIGHBORS HAVE EXACTLY
+\     /   CENTER  \     /        THE SAME CENTER-TO-CENTER
+ └───/             \───┘         DISTANCE (D)!
+     \    (0,-1)   /
+      \           /
+       └─────────┘
+```
+
+A hexagon has exactly **6 neighbors**, and the distance from its center to every neighbor's center is identical. There are no diagonal corners. This property makes finding all drivers within radius $R$ as simple as computing the **$k$-ring** (concentric rings of hexagons) around the rider's cell.
+
+<Define term="H3 Index" since="Appendix · Chapter 47">
+A 64-bit unsigned integer (`uint64`) that uniquely identifies any hexagonal cell on Earth at one of 16 hierarchical resolutions (from Resolution 0 covering continents down to Resolution 15 covering less than 1 square meter).
+</Define>
+
+### The Structure of a 64-bit H3 Index
+
+An H3 index is not a string; it is a packed **64-bit unsigned integer** (`uint64`). This enables Go programs to store millions of coordinates in flat memory arrays and use fast bitwise operations:
+
+```
+ 63 62 59 58   55 54      51 50                                          0
+┌──┬─────┬───────┬──────────┬─────────────────────────────────────────────┐
+│R │Mode │ Res   │Base Cell │ Directional child digits (3 bits each x 15) │
+│1b│ 4b  │  4b   │  7 bits  │ 45 bits (3 bits per resolution step)        │
+└──┴─────┴───────┴──────────┴─────────────────────────────────────────────┘
+```
+
+Because an H3 cell is a 64-bit integer:
+1. **$O(1)$ Hash Map Lookups**: In Go, `map[uint64]*Cell` uses standard fast integer hashing.
+2. **Zero Allocation**: No strings or heap allocations when passing coordinates between goroutines.
+3. **Hierarchical Zooming**: To find the parent cell at a coarser resolution, you simply bit-shift and mask.
+
+---
+
+## Location Ingestion: 1M Pings/Sec
+
+Now let's build the **Location Ingestion Service**.
+
+When 1,000,000 drivers send updates every 4 seconds, the location service receives **250,000 to 1,250,000 pings per second**.
+
+### Decoupling Ingestion from Storage
+
+The golden rule of high-throughput systems: **Never let the hot write path touch the disk.**
+
+```
+[Driver Mobile App]
+        │
+        │ WebSocket Ping: {driver_id: "DRV-901", lat: 40.7128, lon: -74.0060, speed: 24.5}
+        ▼
+[Location Ingestion Worker (Go)]
+        │
+        ├─▶ 1. Compute H3 Cell ID (Resolution 8: ~0.7 km²)
+        ├─▶ 2. Update In-Memory Sharded Spatial Index (sync.RWMutex)
+        └─▶ 3. Emit to Kafka Partition (keyed by city_id or H3 parent cell)
+                │
+                ▼
+        [Downstream Consumers] (Trip tracking, fraud, analytics, ETA history)
+```
+
+---
+
+## The Dispatch Matcher
+
+The **Dispatch Matcher** is the heart of Uber. Its job is simple: **Given a rider's pickup location, find the best available driver and assign the trip in `< 5ms`.**
+
+<ExecTimeline
+  title="The Dispatch Matching Cycle"
+  lanes={[
+    { id: "rider",    label: "Rider Service" },
+    { id: "dispatch", label: "Dispatch Matcher" },
+    { id: "driver",   label: "Driver Service" },
+    { id: "kafka",    label: "Kafka Outbox" }
+  ]}
+  steps={[
+    { lane: "rider",    kind: "send",  label: "RequestTrip()", note: "Rider requests trip at Lat: 40.7128, Lon: -74.0060" },
+    { lane: "dispatch", kind: "run",   label: "H3 Cell Lookup", note: "Pickup maps to H3 cell 0x882a100d31fffff. Expand k-ring=2." },
+    { lane: "dispatch", kind: "run",   label: "Query Available", note: "Filter drivers in ring: 14 candidates online, status=AVAILABLE." },
+    { lane: "dispatch", kind: "run",   label: "Batch Scoring", note: "Calculate ETA matrix: distance, road geometry, driver rating." },
+    { lane: "dispatch", kind: "send",  label: "Atomic Lease", note: "Acquire atomic lock on Driver-42: status -> OFFERED (30s TTL)." },
+    { lane: "kafka",    kind: "spawn", label: "Emit TripMatched", note: "Transactional outbox publishes event to Kafka topic 'trip-events'." },
+    { lane: "driver",   kind: "recv",  label: "Push Offer", note: "WebSocket pushes trip offer countdown to Driver-42's phone." }
+  ]}
+  caption="The stepped lifecycle of dispatch matching: Spatial lookup -> candidate scoring -> atomic lease -> Kafka outbox emission."
+/>
+
+### Greedy Matching vs Batch Matching
+
+Most naive implementations use **Greedy Matching**: when a ride request comes in, immediately grab the single closest driver and assign them.
+
+**Why Greedy Matching Fails at Scale:**
+Greedy matching leads to **supply cannibalization**.
+
+Imagine two riders:
+- **Rider A** is 2 minutes away from Driver 1. Driver 2 is 10 minutes away.
+- **Rider B** is 3 minutes away from Driver 1. There are NO other drivers near Rider B.
+
+If Rider A requests first, greedy matching gives Driver 1 to Rider A. 
+Now Rider B has **no driver**, resulting in a 25-minute wait or cancellation!
+If the system instead **batched** requests over a 3-second window, it could assign Driver 2 to Rider A (wait: 10 mins) and Driver 1 to Rider B (wait: 3 mins), achieving a far better global balance.
+
+---
+
+## The Trip State Machine & Sagas
+
+A trip is not a static database row; it is a **finite state machine** that progresses through distinct phases over 20 to 60 minutes:
+
+```
+[REQUESTED] ──▶ [MATCHED] ──▶ [EN_ROUTE] ──▶ [ARRIVED] ──▶ [IN_PROGRESS] ──▶ [COMPLETED] ──▶ [SETTLED]
+     │              │             │             │
+     ▼              ▼             ▼             ▼
+ [CANCELLED]   [CANCELLED]   [CANCELLED]   [CANCELLED]
+ (no fee)      (re-dispatch) (cancellation fee applied)
+```
+
+### The Transactional Outbox Pattern in Ride State Transitions
+
+When the state changes (e.g. from `REQUESTED` to `MATCHED`), multiple systems need to know:
+1. The **Trip DB** must persist the new state and assigned `driver_id`.
+2. The **Notification Service** must push an APNS/FCM alert to the rider.
+3. The **Kafka message bus** must stream the event to ETA predictors, surge pricing calculators, and billing aggregators.
+
+If your code executes `db.Exec(...)` and then calls `kafkaProducer.Publish(...)`, a crash between the two lines causes a **dual-write failure**: the trip is marked matched in the database, but Kafka never gets the event, so the driver's phone never rings!
+
+---
+
+<UnderTheHood title="Uber H3 Bit-Packing & Math: Why Hexagons Rule Geospatial Systems">
+
+Let's look under the hood at the mathematics of Uber's H3 coordinate representation.
+
+### The Icosahedron Projection
+H3 starts by projecting the spherical Earth onto an **icosahedron** (a regular polyhedron with 20 triangular faces).
+Each icosahedron face contains regular hexagonal tessellations.
+
+Because an exact sphere cannot be tiled exclusively with regular hexagons without distortion, H3 strategically introduces **12 pentagons** (located at the icosahedron vertices, mostly positioned over remote oceanic locations). Every other cell on Earth is a true hexagon.
+
+### 16 Hierarchical Resolutions
+H3 defines resolutions from 0 (coarse continent-level) down to 15 (sub-meter level):
+
+| Resolution | Average Hexagon Area | Edge Length | Real-World Analog |
+| :---: | :---: | :---: | :--- |
+| **0** | 4,250,546 km² | 1,107 km | Continents / Large Oceans |
+| **4** | 11,004 km² | 57 km | Metropolitan Area (Greater NYC) |
+| **7** | 5.16 km² | 1.22 km | City Neighborhood (SoHo / Financial District) |
+| **8** | 0.737 km² | 461 m | **Uber Dispatch Cell** (Optimal search radius) |
+| **9** | 0.105 km² | 174 m | Street / Building Complex |
+| **12** | 307 m² | 9.4 m | Individual Intersection / House Lot |
+
+### Finding Neighbors with Bitwise Masking
+In H3, neighboring cells share identical prefix bits. When an engineer queries `H3.KRing(originCell, 1)`, H3 does not calculate trigonometric sine and cosine functions. It walks the precomputed discrete index tree, evaluating coordinates in **sub-microsecond CPU time**.
+
+In Go benchmarks, querying a 1-ring neighbor set (7 hexagons) takes **less than 120 nanoseconds**, compared to 4 milliseconds for a PostGIS SQL query. That is a **33,000× speedup**.
+
+</UnderTheHood>
+
+---
+
+## Runnable Code: In-Memory Spatial Matcher
+
+Here is a self-contained, runnable Go simulation of the core Uber spatial indexing and driver dispatch matching loop:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"sort"
+	"sync"
+)
+
+// Simplified discrete spatial cell (representing an H3 resolution bucket).
+// Combines quantized latitude and longitude into an integer key.
+func CellKey(lat, lon float64) uint64 {
+	const scale = 200.0 // ~500m precision
+	y := int64(math.Floor((lat + 90.0) * scale))
+	x := int64(math.Floor((lon + 180.0) * scale))
+	return (uint64(y) << 32) | (uint64(x) & 0xFFFFFFFF)
+}
+
+// GetKRing returns the cell and its 8 immediate surrounding neighbor cells.
+func GetKRing(center uint64) []uint64 {
+	y := int64(center >> 32)
+	x := int64(center & 0xFFFFFFFF)
+
+	var ring []uint64
+	for dy := int64(-1); dy <= 1; dy++ {
+		for dx := int64(-1); dx <= 1; dx++ {
+			ring = append(ring, (uint64(y+dy)<<32)|(uint64(x+dx)&0xFFFFFFFF))
+		}
+	}
+	return ring
+}
+
+type Driver struct {
+	ID        string
+	Lat       float64
+	Lon       float64
+	Available bool
+}
+
+type SpatialDispatchEngine struct {
+	mu      sync.RWMutex
+	drivers map[string]Driver
+	cells   map[uint64]map[string]bool // cellKey -> set of driver IDs
+}
+
+func NewEngine() *SpatialDispatchEngine {
+	return &SpatialDispatchEngine{
+		drivers: make(map[string]Driver),
+		cells:   make(map[uint64]map[string]bool),
+	}
+}
+
+func (e *SpatialDispatchEngine) UpdateLocation(d Driver) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if old, exists := e.drivers[d.ID]; exists {
+		oldCell := CellKey(old.Lat, old.Lon)
+		delete(e.cells[oldCell], d.ID)
+	}
+
+	e.drivers[d.ID] = d
+	cell := CellKey(d.Lat, d.Lon)
+	if e.cells[cell] == nil {
+		e.cells[cell] = make(map[string]bool)
+	}
+	e.cells[cell][d.ID] = true
+}
+
+func (e *SpatialDispatchEngine) MatchNearest(riderLat, riderLon float64) (*Driver, float64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	centerCell := CellKey(riderLat, riderLon)
+	ring := GetKRing(centerCell)
+
+	type Candidate struct {
+		driver Driver
+		dist   float64
+	}
+	var candidates []Candidate
+
+	for _, cell := range ring {
+		for drvID := range e.cells[cell] {
+			drv := e.drivers[drvID]
+			if !drv.Available {
+				continue
+			}
+
+			// Local Euclidean distance approximation in meters
+			dLat := (drv.Lat - riderLat) * 111000
+			dLon := (drv.Lon - riderLon) * 85000
+			dist := math.Sqrt(dLat*dLat + dLon*dLon)
+
+			if dist <= 2000 { // within 2km
+				candidates = append(candidates, Candidate{driver: drv, dist: dist})
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil, 0, fmt.Errorf("no available drivers nearby")
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].dist < candidates[j].dist
+	})
+
+	best := candidates[0].driver
+	best.Available = false
+	e.drivers[best.ID] = best
+
+	return &best, candidates[0].dist, nil
+}
+
+func main() {
+	engine := NewEngine()
+
+	// Seed drivers in Manhattan (near Times Square: 40.7580, -73.9855)
+	engine.UpdateLocation(Driver{ID: "DRV-101", Lat: 40.7595, Lon: -73.9840, Available: true}) // ~200m away
+	engine.UpdateLocation(Driver{ID: "DRV-202", Lat: 40.7540, Lon: -73.9890, Available: true}) // ~550m away
+	engine.UpdateLocation(Driver{ID: "DRV-303", Lat: 40.7800, Lon: -73.9700, Available: true}) // 2.8km away (out of range)
+
+	// Rider requests pickup at Times Square
+	matched, dist, err := engine.MatchNearest(40.7580, -73.9855)
+	if err != nil {
+		fmt.Println("Dispatch error:", err)
+		return
+	}
+
+	fmt.Printf("MATCH SUCCESS: Assigned %s (Distance: %.1f meters)\n", matched.ID, dist)
+	fmt.Printf("Driver %s is now locked (Available=%v)\n", matched.ID, matched.Available)
+}
+```
+
+</GoPlayground>
+
+---
+
+## The Architecture End-to-End
+
+Now let's pull all these modules together into the complete production topology:
+
+```
+                  ┌──────────────────────┐
+                  │ Mobile Clients       │
+                  │ (Rider & Driver App) │
+                  └──────────┬───────────┘
+                             │ HTTPS / WSS
+                             ▼
+                  ┌──────────────────────┐
+                  │ API Gateway (Envoy)  │
+                  │ TLS, Rate Limiting   │
+                  └──────────┬───────────┘
+                             │ gRPC
+                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Go Microservice Mesh                                             │
+│                                                                  │
+│  ┌───────────────────┐               ┌────────────────────────┐  │
+│  │ Location Service  │               │ Dispatch Engine        │  │
+│  │ 1M pings/s in-mem │               │ Batch Bipartite Match  │  │
+│  └─────────┬─────────┘               └───────────┬────────────┘  │
+│            │                                     │               │
+│            │ Event Pub                           │ Event Pub     │
+│            ▼                                     ▼               │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ Kafka Event Mesh (Partitioned by City / H3 Cell)           │  │
+│  └─────────────────────────┬──────────────────────────────────┘  │
+│                            │                                     │
+│  ┌─────────────────────────┼──────────────────────────────────┐  │
+│  │                         │                                  │  │
+│  ▼                         ▼                                  ▼  │
+│ ┌────────────────┐   ┌────────────────┐             ┌──────────┐ │
+│ │ Ride Service   │   │ Payment Svc    │             │ Notif Svc│ │
+│ │ Trip Lifecycle │   │ Double-Entry   │             │ APNS/FCM │ │
+│ └───────┬────────┘   └───────┬────────┘             └──────────┘ │
+└─────────┼────────────────────┼───────────────────────────────────┘
+          │                    │
+          ▼                    ▼
+   ┌──────────────┐     ┌──────────────┐
+   │ PostgreSQL   │     │ PostgreSQL   │
+   │ Trips Store  │     │ Ledger DB    │
+   └──────────────┘     └──────────────┘
+```
+
+### The 4 Key Takeaways for System Design Interviews
+
+1. **Decouple Fast Streams from Slow Disks**: High-frequency driver location writes (`1M/s`) stay in in-memory spatial indexes and Kafka; persistent databases only record significant state transitions (`Matched`, `Completed`).
+2. **Hexagons Beat Squares**: Use H3 hexagonal indexing because regular hexagons have 6 identical-distance neighbors, avoiding diagonal search distortion.
+3. **Batch Matching Beats Greedy**: Waiting 3 seconds to match all rides in a neighborhood simultaneously produces a globally optimal ETA and prevents supply starvation.
+4. **Outbox Pattern for Distributed State**: When a trip changes state, use an atomic transaction on the database to update the row and write the outbox event, guaranteeing at-least-once delivery to Kafka.
+
+---
+
+## Practice Exercises
+
+<Exercise n={1} title="Zero-Allocation Haversine Distance" level="easy">
+
+Write a function `FastDistance(lat1, lon1, lat2, lon2 float64) float64` that computes distance in meters using flat math with zero heap allocations.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+)
+
+func FastDistance(lat1, lon1, lat2, lon2 float64) float64 {
+	const earthRadius = 6371000.0 // meters
+	const rad = math.Pi / 180.0
+
+	dLat := (lat2 - lat1) * rad
+	dLon := (lon2 - lon1) * rad
+
+	rLat1 := lat1 * rad
+	rLat2 := lat2 * rad
+
+	sinDLat := math.Sin(dLat / 2)
+	sinDLon := math.Sin(dLon / 2)
+
+	a := sinDLat*sinDLat + sinDLon*sinDLon*math.Cos(rLat1)*math.Cos(rLat2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	return earthRadius * c
+}
+
+func main() {
+	dist := FastDistance(40.7128, -74.0060, 40.7580, -73.9855)
+	fmt.Printf("Distance: %.1f meters\n", dist)
+}
+```
+
+This implementation operates entirely with scalar float64 values on the stack, ensuring zero garbage collector allocations in the hot dispatch loop.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Concurrent Location Shard Registry" level="medium">
+
+Implement a thread-safe `DriverRegistry` that supports concurrent `SetLocation(id, lat, lon)` and `GetRadius(lat, lon, maxMeters)` without deadlocks.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"sync"
+)
+
+type Location struct {
+	Lat float64
+	Lon float64
+}
+
+type DriverRegistry struct {
+	mu      sync.RWMutex
+	drivers map[string]Location
+}
+
+func NewDriverRegistry() *DriverRegistry {
+	return &DriverRegistry{drivers: make(map[string]Location)}
+}
+
+func (r *DriverRegistry) SetLocation(id string, lat, lon float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.drivers[id] = Location{Lat: lat, Lon: lon}
+}
+
+func (r *DriverRegistry) GetRadius(centerLat, centerLon, maxMeters float64) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var matched []string
+	for id, loc := range r.drivers {
+		dLat := (loc.Lat - centerLat) * 111000
+		dLon := (loc.Lon - centerLon) * 85000
+		if math.Sqrt(dLat*dLat+dLon*dLon) <= maxMeters {
+			matched = append(matched, id)
+		}
+	}
+	return matched
+}
+
+func main() {
+	reg := NewDriverRegistry()
+	reg.SetLocation("DRV-1", 40.7128, -74.0060)
+	reg.SetLocation("DRV-2", 40.7140, -74.0050)
+	reg.SetLocation("DRV-3", 40.7900, -73.9500)
+
+	nearby := reg.GetRadius(40.7130, -74.0055, 500)
+	fmt.Printf("Nearby drivers: %v\n", nearby)
+}
+```
+
+Using `sync.RWMutex` allows multiple concurrent reader goroutines to scan nearby locations simultaneously while synchronizing write updates.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Batch Dispatch Matching Window" level="hard">
+
+Implement a Go dispatch batcher that collects ride requests for 200ms using a ticker, matches available drivers to riders in order of proximity, and flushes matched pairs.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"math"
+	"sync"
+)
+
+type RideRequest struct {
+	RiderID string
+	Lat     float64
+	Lon     float64
+}
+
+type Dispatcher struct {
+	mu       sync.Mutex
+	requests []RideRequest
+	drivers  map[string]struct{ Lat, Lon float64 }
+}
+
+func (d *Dispatcher) AddRequest(req RideRequest) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.requests = append(d.requests, req)
+}
+
+func (d *Dispatcher) FlushBatch() map[string]string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	matches := make(map[string]string)
+	assignedDrivers := make(map[string]bool)
+
+	for _, req := range d.requests {
+		var bestDrv string
+		bestDist := math.MaxFloat64
+
+		for drvID, drvLoc := range d.drivers {
+			if assignedDrivers[drvID] {
+				continue
+			}
+			dLat := (drvLoc.Lat - req.Lat) * 111000
+			dLon := (drvLoc.Lon - req.Lon) * 85000
+			dist := math.Sqrt(dLat*dLat + dLon*dLon)
+
+			if dist < bestDist {
+				bestDist = dist
+				bestDrv = drvID
+			}
+		}
+
+		if bestDrv != "" {
+			matches[req.RiderID] = bestDrv
+			assignedDrivers[bestDrv] = true
+		}
+	}
+
+	d.requests = nil
+	return matches
+}
+
+func main() {
+	disp := &Dispatcher{
+		drivers: map[string]struct{ Lat, Lon float64 }{
+			"D-1": {Lat: 40.710, Lon: -74.000},
+			"D-2": {Lat: 40.720, Lon: -74.010},
+		},
+	}
+
+	disp.AddRequest(RideRequest{RiderID: "R-1", Lat: 40.711, Lon: -74.001})
+	disp.AddRequest(RideRequest{RiderID: "R-2", Lat: 40.719, Lon: -74.009})
+
+	results := disp.FlushBatch()
+	for rider, driver := range results {
+		fmt.Printf("Matched Rider %s to Driver %s\n", rider, driver)
+	}
+}
+```
+
+Batching decouples individual incoming requests from instant locks, allowing the dispatcher to evaluate global assignments.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Trip State Machine Transitions" level="hard">
+
+Write a thread-safe trip state machine struct `TripFSM` that validates state transitions (`Requested -> Matched -> EnRoute -> InProgress -> Completed`) and rejects invalid transitions (e.g. `Requested -> Completed`) with an error.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type State string
+
+const (
+	Requested  State = "REQUESTED"
+	Matched    State = "MATCHED"
+	EnRoute    State = "EN_ROUTE"
+	InProgress State = "IN_PROGRESS"
+	Completed  State = "COMPLETED"
+	Cancelled  State = "CANCELLED"
+)
+
+var validTransitions = map[State]map[State]bool{
+	Requested:  {Matched: true, Cancelled: true},
+	Matched:    {EnRoute: true, Cancelled: true},
+	EnRoute:    {InProgress: true, Cancelled: true},
+	InProgress: {Completed: true},
+	Completed:  {},
+	Cancelled:  {},
+}
+
+type TripFSM struct {
+	mu    sync.RWMutex
+	state State
+}
+
+func NewTripFSM() *TripFSM {
+	return &TripFSM{state: Requested}
+}
+
+func (f *TripFSM) Transition(target State) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if !validTransitions[f.state][target] {
+		return fmt.Errorf("illegal transition from %s to %s", f.state, target)
+	}
+	f.state = target
+	return nil
+}
+
+func (f *TripFSM) Current() State {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.state
+}
+
+func main() {
+	fsm := NewTripFSM()
+	fmt.Println("Initial:", fsm.Current())
+
+	if err := fsm.Transition(Matched); err != nil {
+		fmt.Println("Error:", err)
+	}
+	fmt.Println("After Match:", fsm.Current())
+
+	if err := fsm.Transition(Completed); err != nil {
+		fmt.Println("Expected Error Caught:", err)
+	}
+}
+```
+
+The transition lookup table enforces valid edge navigation, preventing invalid state mutations across concurrent worker threads.
+
+</Solution>
+
+</Exercise>
+
+---
+
+<Recap>
+
+- **Geospatial Scale**: 1M+ driver location updates per second cannot be written directly to relational databases. They must be buffered in in-memory spatial indexes and published to Kafka.
+- **Uber's H3**: Hexagonal hierarchical spatial indexing divides the Earth into 6-neighbor cells packed into 64-bit integers (`uint64`), enabling $O(1)$ spatial lookups and eliminating diagonal corner distortion.
+- **Batch Dispatch Matching**: Accumulating ride requests over 3-second windows allows optimal bipartite matching, preventing greedy supply cannibalization.
+- **Transactional Outbox Pattern**: Committing trip state and an outbox event in a single PostgreSQL ACID transaction guarantees at-least-once event delivery to Kafka without distributed 2-Phase Commit failures.
+
+</Recap>
+
+---
+
+## The Lab: Geospatial Dispatch Matcher
+
+Build a self-contained spatial dispatch matcher that assigns nearest available drivers to riders within distance constraints and prevents double-booking.
+
+<Lab
+  title="Uber Dispatch Matcher"
+  archetype="pilot"
+  difficulty="medium"
+  points={100}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Implement spatial cell bucketing and nearest-neighbor driver matching in Go. Ensure drivers outside the search threshold are rejected and matched drivers are atomically locked so they cannot be double-booked. When all tests pass, print ALL CHECKS PASS."
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"sync"
+)
+
+type DriverLocation struct {
+	ID        string
+	Lat       float64
+	Lon       float64
+	Available bool
+}
+
+type Dispatcher struct {
+	mu      sync.Mutex
+	drivers map[string]DriverLocation
+}
+
+func NewDispatcher() *Dispatcher {
+	return &Dispatcher{
+		drivers: make(map[string]DriverLocation),
+	}
+}
+
+func (d *Dispatcher) RegisterDriver(drv DriverLocation) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.drivers[drv.ID] = drv
+}
+
+// TODO: MatchDriver finds the closest AVAILABLE driver within maxMeters of riderLat, riderLon.
+// If found:
+// 1. Mark driver.Available = false in d.drivers
+// 2. Return driver.ID and distance
+// If no available driver is within maxMeters, return errors.New("no driver found")
+func (d *Dispatcher) MatchDriver(riderLat, riderLon float64, maxMeters float64) (string, float64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// TODO: Replace this stub with real distance calculation and matching
+	return "", 0, errors.New("not implemented")
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	disp := NewDispatcher()
+
+	// Register 3 drivers in NYC
+	disp.RegisterDriver(DriverLocation{ID: "DRV-1", Lat: 40.7580, Lon: -73.9855, Available: true})  // Times Square
+	disp.RegisterDriver(DriverLocation{ID: "DRV-2", Lat: 40.7520, Lon: -73.9775, Available: true})  // Grand Central (~800m away)
+	disp.RegisterDriver(DriverLocation{ID: "DRV-3", Lat: 40.7061, Lon: -74.0092, Available: false}) // Wall St (Unavailable)
+
+	// Test 1: Rider at Times Square (exact match with DRV-1)
+	id1, dist1, err := disp.MatchDriver(40.7580, -73.9855, 1000)
+	if err != nil || id1 != "DRV-1" {
+		fmt.Printf("FAIL test 1: expected DRV-1, got %s (err: %v)\n", id1, err)
+		return
+	}
+
+	// Test 2: Second rider at Times Square. DRV-1 is now booked! Next closest is DRV-2.
+	id2, dist2, err := disp.MatchDriver(40.7580, -73.9855, 1500)
+	if err != nil || id2 != "DRV-2" {
+		fmt.Printf("FAIL test 2: expected DRV-2 (DRV-1 should be booked), got %s\n", id2)
+		return
+	}
+
+	// Test 3: Third rider at Times Square. Both DRV-1 and DRV-2 are booked. DRV-3 is unavailable.
+	_, _, err = disp.MatchDriver(40.7580, -73.9855, 2000)
+	if err == nil {
+		fmt.Println("FAIL test 3: expected error when no drivers are available")
+		return
+	}
+
+	_ = dist1
+	_ = dist2
+	fmt.Println("ALL CHECKS PASS")
+}
+`}
+  hints={[
+    "Distance approximation: dLat = (lat2 - lat1) * 111000, dLon = (lon2 - lon1) * 85000, dist = math.Sqrt(dLat*dLat + dLon*dLon).",
+    "Loop over all drivers in d.drivers. If d.Available is true and dist <= maxMeters, collect them into a slice.",
+    "Sort candidates by distance ascending. Take candidates[0], set d.drivers[id].Available = false, and return."
+  ]}
+  flag="GO{UB3R_D1SP4TCH_H3X4G0N_M4TCH3D}"
+/>
+
+<Scoreboard
+  streak={47}
+  items={[
+    { label: "Predict Lab — 2D SQL indexing failure", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — Zero-Allocation Haversine", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — Concurrent Location Sharding", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3 — Batch Dispatch Matching", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 4 — Trip State Machine Transitions", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Uber Dispatch Matcher", captured: false, points: 100 }}
+/>
+
+---
+
+That is how you build Uber in Go, sport. Not with hand-waving or toy CRUD tables, but with hexagonal spatial indices, 1M ping/sec memory buffers, atomic dispatch leases, and outbox event streams. Now go build something that moves the physical world.
