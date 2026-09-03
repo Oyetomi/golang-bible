@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { addXP } from "@/lib/gamification";
 import { playClick, playSuccess } from "@/lib/sound";
 import { Gopher } from "@/components/course/Gopher";
+import { formatGo } from "@/lib/gofmt";
 
 interface StepInsight {
   title: string;
@@ -97,6 +98,7 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
   const [fontRem, setFontRem] = useState(1.02);
   const [codeHTML, setCodeHTML] = useState("");
   const [snippetCode, setSnippetCode] = useState("");
+  const [gofmtToast, setGofmtToast] = useState(false);
 
   const starterCodeRef = useRef<string>("");
   const starterHTMLRef = useRef<string>("");
@@ -108,6 +110,63 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
     setFontRem((f) => Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round((f + d) * 100) / 100)));
 
   const readEl = () => (typeof document !== "undefined" ? document.querySelector(selector) : null);
+
+  const clearErrors = () => {
+    const el = readEl();
+    if (!el) return;
+    el.querySelectorAll(".gb-line-error").forEach((node) => {
+      node.classList.remove("gb-line-error");
+    });
+    el.querySelectorAll(".gb-inline-diagnostic").forEach((node) => {
+      node.remove();
+    });
+  };
+
+  const renderErrors = (stderr: string) => {
+    clearErrors();
+    const el = readEl();
+    if (!el) return;
+
+    const regex = /(?:(?:\.\/)?[\w\-./\\]+\.go|main|prog):(\d+)(?::(\d+))?:\s*(.+)/g;
+    let match: RegExpExecArray | null;
+    const lineElements = Array.from(el.querySelectorAll("[data-line]"));
+
+    while ((match = regex.exec(stderr)) !== null) {
+      const lineNum = parseInt(match[1], 10);
+      const colNum = match[2] ? parseInt(match[2], 10) : 1;
+      const msg = match[3];
+
+      const targetLine = lineElements[lineNum - 1] as HTMLElement | undefined;
+      if (targetLine) {
+        targetLine.classList.add("gb-line-error");
+
+        const diag = document.createElement("div");
+        diag.className = "gb-inline-diagnostic";
+        diag.innerHTML = `
+          <span class="gb-diag-icon">✕</span>
+          <span class="gb-diag-loc">L${lineNum}:${colNum}</span>
+          <span class="gb-diag-msg">${msg.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</span>
+        `;
+        targetLine.insertAdjacentElement("afterend", diag);
+      }
+    }
+  };
+
+  const handleGofmt = () => {
+    const el = readEl();
+    if (!el) return;
+    const currentText = (el.textContent ?? "").replace(/\n+$/, "");
+    const { formatted, changed } = formatGo(currentText);
+    if (changed) {
+      const codeEl = el.querySelector("code") || el;
+      codeEl.textContent = formatted;
+      setSnippetCode(formatted);
+      clearErrors();
+      playClick();
+    }
+    setGofmtToast(true);
+    setTimeout(() => setGofmtToast(false), 1400);
+  };
 
   // Capture original starter code & html on mount
   useEffect(() => {
@@ -126,6 +185,7 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
     if (!host) return;
 
     const onRun = () => {
+      clearErrors();
       playClick();
       addXP(10, "Ran code snippet");
     };
@@ -134,8 +194,16 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
       const d = (e as CustomEvent).detail as
         | { ok?: boolean; stdout?: string; stderr?: string }
         | undefined;
+      const stderr = d?.stderr ?? "";
       const stdout = (d?.stdout ?? "").toLowerCase();
-      const isOk = d?.ok !== false && !d?.stderr;
+      const isOk = d?.ok !== false && !stderr;
+
+      if (!isOk && stderr) {
+        renderErrors(stderr);
+      } else {
+        clearErrors();
+      }
+
       const containsSuccess =
         stdout.includes("pass") ||
         stdout.includes("success") ||
@@ -152,9 +220,13 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
     host.addEventListener("run", onRun);
     host.addEventListener("result", onResult as EventListener);
 
+    return () => {
+      host.removeEventListener("run", onRun);
+      host.removeEventListener("result", onResult as EventListener);
+    };
   }, [selector]);
 
-  // Keyboard shortcut: Cmd+Enter or Ctrl+Enter to trigger run
+  // Keyboard shortcuts: Cmd+Enter (Run) & Cmd+S (gofmt)
   useEffect(() => {
     const el = readEl();
     if (!el) return;
@@ -162,15 +234,17 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
     if (!container) return;
 
     const onKey = (e: KeyboardEvent) => {
+      const isInside = container.contains(document.activeElement) || container.matches(":hover");
+      if (!isInside) return;
+
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-        if (container.contains(document.activeElement) || container.matches(":hover")) {
-          e.preventDefault();
-          const host = snippetRef.current;
-          const btn = (host?.shadowRoot?.querySelector("button") || host?.querySelector("button")) as HTMLButtonElement | null;
-          if (btn) {
-            btn.click();
-          }
-        }
+        e.preventDefault();
+        const host = snippetRef.current;
+        const btn = (host?.shadowRoot?.querySelector("button") || host?.querySelector("button")) as HTMLButtonElement | null;
+        if (btn) btn.click();
+      } else if ((e.metaKey || e.ctrlKey) && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        handleGofmt();
       }
     };
 
@@ -236,6 +310,11 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
         sandbox: "go",
         selector,
       })}
+      {gofmtToast && (
+        <div className="gb-gofmt-toast">
+          ⚡ gofmt applied
+        </div>
+      )}
       <div className="ply-actions">
         <button
           className={`ply-iconbtn ply-explain-toggle ${showExplainer ? "active" : ""}`}
@@ -266,6 +345,18 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
             <path d="M3 3v5h5" />
           </svg>
           {resetDone ? "Reset" : "Reset"}
+        </button>
+
+        <button
+          className="ply-iconbtn ply-format-btn"
+          onClick={handleGofmt}
+          type="button"
+          title="Format with gofmt (⌘S / Ctrl+S)"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: "inline-block", verticalAlign: "middle", marginRight: "4px" }}>
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+          </svg>
+          Format
         </button>
 
         <button
