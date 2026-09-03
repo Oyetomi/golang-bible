@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { highlightGo } from "@/lib/highlight";
 
 export interface ProjectFile {
   name: string;
@@ -107,7 +108,7 @@ export function ProjectCode({
             background: "var(--bg-card, #090a0f)",
           }}
         >
-          <code>{current.code.trim()}</code>
+          <code dangerouslySetInnerHTML={{ __html: highlightGo(current.code.trim()) }} />
         </pre>
       </div>
     </div>

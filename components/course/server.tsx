@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { CSSProperties, ReactNode } from "react";
 import { PlaygroundRunner } from "@/components/course/Playground";
+import { highlightGo } from "@/lib/highlight";
 
 let plyCounter = 0;
 
@@ -52,7 +53,7 @@ function CodeWindow({
         <span className={`cw-tag cw-tag-${tone}`}>{label}</span>
       </div>
       <pre className="cw-code">
-        <code>{code.replace(/^\n+|\n+$/g, "")}</code>
+        <code dangerouslySetInnerHTML={{ __html: highlightGo(code.replace(/^\n+|\n+$/g, "")) }} />
       </pre>
     </div>
   );

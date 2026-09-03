@@ -22,6 +22,8 @@ import {
 import { recordQuickCheck, recordLab } from "@/lib/gamification";
 import { playSuccess, playBuzzer, playFlag, playClick } from "@/lib/sound";
 import { triggerConfetti } from "@/lib/confetti";
+import { highlightGo } from "@/lib/highlight";
+import { formatGo } from "@/lib/gofmt";
 
 /* ──────────────────────────────────────────────
    Interactive (client) course components.
@@ -804,6 +806,8 @@ export function Lab({
   const [revealed, setRevealed] = useState(0);
   const [captured, setCaptured] = useState(false);
   const [copiedFlag, setCopiedFlag] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [gofmtToast, setGofmtToast] = useState(false);
   const [ran, setRan] = useState(false);
   const snippetRef = useRef<HTMLElement | null>(null);
   const codeId = "lab-" + useId().replace(/[^a-zA-Z0-9_-]/g, "");
@@ -853,9 +857,22 @@ export function Lab({
     if (!starter) return;
     const el = document.getElementById(codeId);
     if (el) {
-      el.textContent = starter.replace(/^\n+|\n+$/g, "");
+      el.innerHTML = `<code>${highlightGo(starter.replace(/^\n+|\n+$/g, ""))}</code>`;
     }
     playClick();
+  };
+
+  const handleGofmt = () => {
+    const el = document.getElementById(codeId);
+    if (!el) return;
+    const text = el.textContent ?? "";
+    const { formatted, changed } = formatGo(text);
+    if (changed) {
+      el.innerHTML = `<code>${highlightGo(formatted)}</code>`;
+      playClick();
+    }
+    setGofmtToast(true);
+    setTimeout(() => setGofmtToast(false), 1400);
   };
 
   return (
@@ -882,23 +899,62 @@ export function Lab({
       {children && <div className="lab-brief">{children}</div>}
 
       {starter && (
-        <div className="lab-starter">
-          <div className="lab-starter-bar">
-            <span>starter.go</span>
-            <div className="lab-bar-actions">
+        <div className="lab-starter gb-ide-window" style={{ position: "relative" }}>
+          {gofmtToast && (
+            <div className="gb-gofmt-toast">
+              ⚡ gofmt applied
+            </div>
+          )}
+          <div className="lab-starter-bar gb-ide-bar">
+            <div className="gb-ide-left">
+              <span className="gb-ide-dots">
+                <i className="gb-dot-r" />
+                <i className="gb-dot-y" />
+                <i className="gb-dot-g" />
+              </span>
+              <div className="gb-ide-tab">
+                <span className="gb-ide-folder">📁 lab / </span>
+                <span className="gb-ide-file">📄 starter.go</span>
+              </div>
+            </div>
+            <div className="gb-ide-right">
               <button
                 className="lab-reset-btn"
                 onClick={resetStarter}
                 type="button"
                 title="Reset starter code"
               >
-                Reset
+                ↺ Reset
               </button>
-              <span className="lab-starter-tag">editable · runnable</span>
+              <button
+                className="lab-reset-btn"
+                onClick={handleGofmt}
+                type="button"
+                title="Format with gofmt (⌘S / Ctrl+S)"
+              >
+                ⚡ Format
+              </button>
+              <button
+                className="gb-ide-copy"
+                onClick={async () => {
+                  const el = document.getElementById(codeId);
+                  if (el) {
+                    await navigator.clipboard.writeText(el.textContent ?? "");
+                    setCopiedCode(true);
+                    setTimeout(() => setCopiedCode(false), 1400);
+                  }
+                }}
+                type="button"
+                aria-label="Copy code"
+              >
+                {copiedCode ? "Copied ✓" : "Copy"}
+              </button>
+              <span className="gb-ide-lang">GO 1.26</span>
+              <span className="ply-hint">runnable</span>
             </div>
           </div>
           <pre className="lab-code" id={codeId} spellCheck={false}>
-            <code>{starter.replace(/^\n+|\n+$/g, "")}</code>
+            <code dangerouslySetInnerHTML={{ __html: highlightGo(starter.replace(/^\n+|\n+$/g, "")) }} />
           </pre>
           <div className="lab-snippet">
             {createElement("codapi-snippet", {

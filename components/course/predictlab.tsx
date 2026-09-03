@@ -5,6 +5,7 @@ import { Gopher, type GopherRole } from "@/components/course/Gopher";
 import { recordQuickCheck } from "@/lib/gamification";
 import { playBuzzer, playClick, playSuccess } from "@/lib/sound";
 import { triggerConfetti } from "@/lib/confetti";
+import { highlightGo } from "@/lib/highlight";
 
 type PredictLabProps = {
   prompt?: string;
@@ -62,7 +63,7 @@ export function PredictLab({
       </div>
 
       <pre className="pl-code">
-        <code>{code}</code>
+        <code dangerouslySetInnerHTML={{ __html: highlightGo(code) }} />
       </pre>
 
       <div className="pl-opts">

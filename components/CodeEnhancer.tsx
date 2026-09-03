@@ -28,7 +28,10 @@ export function CodeEnhancer() {
         pre.closest(".cw") ||
         pre.closest(".codapi-pre") ||
         pre.closest(".pl-code") ||
-        pre.closest(".proj-code")
+        pre.closest(".proj-code") ||
+        pre.closest(".lab") ||
+        pre.closest(".lab-starter") ||
+        pre.closest(".hacklab")
       ) {
         pre.dataset.enhanced = "1";
         continue;

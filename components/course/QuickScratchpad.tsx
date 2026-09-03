@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { formatGo } from "@/lib/gofmt";
+import { highlightGo } from "@/lib/highlight";
 
 export function QuickScratchpad() {
   const [isOpen, setIsOpen] = useState(false);
@@ -193,8 +194,10 @@ export function QuickScratchpad() {
               </div>
             </div>
             <pre className="codapi-pre">
-              <code className="language-go">
-{`package main
+              <code
+                className="language-go"
+                dangerouslySetInnerHTML={{
+                  __html: highlightGo(`package main
 
 import (
 	"fmt"
@@ -211,8 +214,9 @@ func main() {
 	}()
 
 	fmt.Println("Received:", <-ch)
-}`}
-              </code>
+}`),
+                }}
+              />
             </pre>
             {/* Codapi widget auto-hooks into pre > code */}
           </div>
