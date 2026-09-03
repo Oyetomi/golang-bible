@@ -857,7 +857,8 @@ export function Lab({
     if (!starter) return;
     const el = document.getElementById(codeId);
     if (el) {
-      el.innerHTML = `<code>${highlightGo(starter.replace(/^\n+|\n+$/g, ""))}</code>`;
+      const codeEl = el.querySelector("code") || el;
+      codeEl.innerHTML = highlightGo(starter.replace(/^\n+|\n+$/g, ""));
     }
     playClick();
   };
@@ -866,11 +867,10 @@ export function Lab({
     const el = document.getElementById(codeId);
     if (!el) return;
     const text = el.textContent ?? "";
-    const { formatted, changed } = formatGo(text);
-    if (changed) {
-      el.innerHTML = `<code>${highlightGo(formatted)}</code>`;
-      playClick();
-    }
+    const { formatted } = formatGo(text);
+    const codeEl = el.querySelector("code") || el;
+    codeEl.innerHTML = highlightGo(formatted);
+    playClick();
     setGofmtToast(true);
     setTimeout(() => setGofmtToast(false), 1400);
   };

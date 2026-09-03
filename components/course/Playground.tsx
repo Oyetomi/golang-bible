@@ -6,6 +6,7 @@ import { addXP } from "@/lib/gamification";
 import { playClick, playSuccess } from "@/lib/sound";
 import { Gopher } from "@/components/course/Gopher";
 import { formatGo } from "@/lib/gofmt";
+import { highlightGo } from "@/lib/highlight";
 
 interface StepInsight {
   title: string;
@@ -156,14 +157,12 @@ export function PlaygroundRunner({ selector }: { selector: string }) {
     const el = readEl();
     if (!el) return;
     const currentText = (el.textContent ?? "").replace(/\n+$/, "");
-    const { formatted, changed } = formatGo(currentText);
-    if (changed) {
-      const codeEl = el.querySelector("code") || el;
-      codeEl.textContent = formatted;
-      setSnippetCode(formatted);
-      clearErrors();
-      playClick();
-    }
+    const { formatted } = formatGo(currentText);
+    const codeEl = el.querySelector("code") || el;
+    codeEl.innerHTML = highlightGo(formatted);
+    setSnippetCode(formatted);
+    clearErrors();
+    playClick();
     setGofmtToast(true);
     setTimeout(() => setGofmtToast(false), 1400);
   };

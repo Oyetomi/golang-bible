@@ -53,11 +53,9 @@ export function QuickScratchpad() {
     if (!codeEl) return;
 
     const currentText = codeEl.textContent ?? "";
-    const { formatted, changed } = formatGo(currentText);
-    if (changed) {
-      codeEl.textContent = formatted;
-      clearErrors();
-    }
+    const { formatted } = formatGo(currentText);
+    codeEl.innerHTML = highlightGo(formatted);
+    clearErrors();
     setGofmtToast(true);
     setTimeout(() => setGofmtToast(false), 1400);
   };
