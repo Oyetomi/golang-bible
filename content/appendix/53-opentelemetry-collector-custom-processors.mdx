@@ -1,0 +1,1663 @@
+---
+title: "OpenTelemetry (OTel) Collector Pipelines & Custom Processors in Go"
+part: "appendix"
+order: 53
+type: "course"
+description: "Extending the OpenTelemetry Collector in Go: building custom trace and log processors, zero-allocation in-flight PII redaction, high-throughput batching, memory limiters, and end-to-end pipeline testing."
+prerequisites: ["observability", "performance-engineering"]
+heavy: true
+---
+
+<HeroCard label="Appendix · Chapter 53" title="OpenTelemetry (OTel) Collector Pipelines & Custom Processors in Go">
+
+Look at what passed for observability before we took over, sport. Microservices spewing millions of unformatted spans into standard out. Amateur developers installing third-party agent daemons that consume more CPU than the application itself. And the crowning achievement? A payment gateway that cheerfully dumps raw Visa card numbers, CVVs, and Federal Reserve routing numbers straight into span attributes—beaming them in plaintext to an unencrypted SaaS dashboard in another cloud region.
+
+Then the compliance auditor walks in. And suddenly everyone is looking at their shoes.
+
+Not on my watch.
+
+In production, observability is not a passive logging hobby; it is a high-throughput data processing pipeline with life-or-death security boundaries. The OpenTelemetry (OTel) Collector is the supreme control plane of modern distributed systems. When configured with custom Go processors, it acts as an unyielding sentinel at the perimeter: intercepting 100,000 spans per second, scrubbing PCI-DSS violations in-flight with zero heap allocations, batching telemetry into compressed wire payloads, and ruthlessly shedding load the millisecond downstream backends falter.
+
+I don't tolerate telemetry pipelines that leak memory or expose customer secrets. Neither will you. In this chapter, you will master the Collector's internal architecture, forge custom Go processors using the high-performance `pdata` API, eliminate heap allocations with cache-conscious byte mutators, and engineer resilient batching and memory limiting pipelines that never fold under pressure.
+
+</HeroCard>
+
+<ChapterTabs tabs={["The OpenTelemetry Collector Pipeline", "Building a Custom Go Processor", "In-Flight Zero-Alloc PII Redaction", "Batching, Memory Limiter & Backpressure", "Testing Collector Components with Synthetic Traces"]} />
+
+<SpacedRecall
+  role={"pilot"}
+  items={[
+    {
+      from: "Zero-Allocation High-Frequency Go (Appendix, ch41)",
+      q: "Why is converting []byte to string inside a high-throughput processing loop catastrophic for the Go garbage collector?",
+      options: [
+        "Go strings require UTF-8 validation which locks the runtime scheduler",
+        "Converting []byte to string forces a heap allocation to preserve string immutability, generating millions of garbage objects per second",
+        "The compiler forces all string conversions to run on OS thread 0",
+        "Byte slices are garbage collected immediately, invalidating the string pointer"
+      ],
+      answer: 1,
+      tie: "Because strings are immutable and slices are mutable, the Go compiler must copy slice backing bytes to newly allocated heap memory during conversion. In 100,000 span/sec telemetry pipelines, in-place byte manipulation avoids gigabytes of GC garbage."
+    },
+    {
+      from: "Resilience & Correctness Under Load (Part 3, ch14)",
+      q: "How does proactive load shedding protect a distributed system during downstream network degradation?",
+      options: [
+        "It caches unwritten data in unbounded memory queues until the network recovers",
+        "It aggressively drops or rejects incoming requests early (e.g. HTTP 429 / ResourceExhausted) before internal buffers exhaust heap memory and cause an Out-Of-Memory (OOM) crash",
+        "It restarts the process immediately to clear TCP socket buffers",
+        "It compresses payloads using slower compression levels to reduce network bandwidth"
+      ],
+      answer: 1,
+      tie: "Unbounded buffering during downstream stalls guarantees process OOM crashes. Proactive load shedding bounds memory usage, rejects excess traffic with explicit backpressure, and preserves system availability."
+    }
+  ]}
+/>
+
+<PredictLab
+  prompt={"What does this trace attribute sanitizer print when executed under Go escape analysis (-gcflags='-m')?"}
+  role={"scientist"}
+  code={`package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+type SpanAttr struct {
+	Key   string
+	Value string
+}
+
+// NaiveMask substitutes card numbers using string concatenation
+func NaiveMask(attrs []SpanAttr) {
+	for i := range attrs {
+		if attrs[i].Key == "payment.pan" && len(attrs[i].Value) == 16 {
+			attrs[i].Value = attrs[i].Value[:6] + "******" + attrs[i].Value[12:]
+		}
+	}
+}
+
+func main() {
+	attrs := []SpanAttr{
+		{Key: "payment.pan", Value: "4111111111111111"},
+	}
+	NaiveMask(attrs)
+	fmt.Println("Sanitized:", attrs[0].Value)
+}`}
+  options={[
+    "Sanitized: 411111******1111 (0 heap allocations)",
+    "Sanitized: 411111******1111 (Allocates new string on heap per masked span)",
+    "Compilation error: string slicing is prohibited in Go",
+    "Runtime panic: strings are immutable and cannot be re-assigned"
+  ]}
+  answer={1}
+  output={`Sanitized: 411111******1111`}
+  explain={'While attrs[0].Value is correctly updated, the string concatenation (Value[:6] + "******" + Value[12:]) creates a brand-new string on the heap for every single span! At 100,000 spans per second, this creates over 100,000 heap allocations/sec, triggering continuous Go runtime GC Mark Assist. A production custom processor mutates raw byte buffers in-place or utilizes the internal string recycling of pdata.'}
+/>
+
+## The OpenTelemetry Collector Pipeline
+
+Consider the reality of a modern financial architecture like Meridian Financial. Meridian operates eighty microservices across three Kubernetes clusters handling deposit verification, card authorizations, real-time fraud scoring, and ACH settlement. Every incoming HTTP request or gRPC call generates an OpenTelemetry trace context. Spans fan out across twenty downstream RPC hops.
+
+During a routine payment service rollout, an application developer attempts to debug a intermittent authorization failure. To inspect the payload, they inject the raw incoming request map into the active OpenTelemetry span:
+
+```go
+// The catastrophic developer shortcut:
+span.SetAttributes(
+    attribute.String("payment.pan", req.CardNumber),
+    attribute.String("payment.cvv", req.CVV),
+    attribute.String("bank.routing_number", req.RoutingNumber),
+    attribute.Float64("payment.amount", req.AmountUSD),
+)
+```
+
+If those spans are transmitted directly from the microservice to a commercial cloud observability vendor (such as Datadog, Honeycomb, or Grafana Cloud), Meridian has committed a critical breach of **PCI-DSS Requirement 3.4** (rendering Primary Account Numbers unreadable anywhere they are stored or transmitted) and **Gramm-Leach-Bliley Act (GLBA)** privacy controls. Fines start at $100,000 per month, merchant processing privileges are revoked, and the engineering director spends the next quarter testifying before regulatory commissions.
+
+You cannot rely on eighty separate development teams to never make a logging mistake. You need an architectural firewall. You need the OpenTelemetry Collector.
+
+<Define term="OpenTelemetry Collector" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+A high-performance, vendor-agnostic proxy service deployed as a sidecar or centralized gateway that receives, processes, filters, transforms, batches, and exports telemetry data (traces, metrics, logs) across heterogeneous distributed systems.
+</Define>
+
+<Define term="Telemetry Pipeline" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+A directed acyclic processing graph inside the OpenTelemetry Collector consisting of one or more Receivers, a sequential chain of Processors, and one or more Exporters dedicated to a specific telemetry signal type (traces, metrics, or logs).
+</Define>
+
+<Define term="Receiver" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+An ingestion component at the entrance of a collector pipeline that accepts telemetry data via push protocols (such as OTLP/gRPC on port 4317 or OTLP/HTTP on port 4318) or pull scrapers (such as Prometheus HTTP scrape targets).
+</Define>
+
+<Define term="Processor" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+An in-memory transformation node in a telemetry pipeline that inspects, mutates, filters, samples, or aggregates batches of data before passing them downstream. Processors run sequentially in the exact order defined in configuration.
+</Define>
+
+<Define term="Exporter" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+An egress component at the termination of a collector pipeline that translates internal telemetry representations into target backend protocols (such as OTLP, Jaeger, Prometheus, or Kafka) and transmits them over network connections.
+</Define>
+
+<Define term="Connector" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+A hybrid pipeline component that joins two distinct telemetry pipelines, acting simultaneously as an exporter for one signal (e.g. traces) and a receiver for another signal (e.g. generating count and duration metrics from spans via the spanmetrics connector).
+</Define>
+
+The Collector architecture decouples application instrumentations from telemetry backends. Microservices emit OTLP over localhost to a Collector sidecar or internal gateway. The Collector runs a strict processing pipeline:
+
+<Scene
+  title="Meridian Telemetry Gateway: In-Flight OTLP Trace Sanitization & Export"
+  actors={[
+    { id: "gateway",  label: "Payment Pod",          role: "runner" },
+    { id: "rcvr",     label: "OTLP Receiver",        role: "captain" },
+    { id: "limiter",  label: "Memory Limiter",       role: "guard" },
+    { id: "redactor", label: "PII Redaction Proc",   role: "operator" },
+    { id: "batcher",  label: "Batch Processor",      role: "pilot" },
+    { id: "exporter", label: "OTLP Exporter",        role: "courier" }
+  ]}
+  rows={2}
+  cols={3}
+  frames={[
+    {
+      caption: "Ingestion: Payment service emits OTLP/gRPC batch containing raw cardholder spans. OTLP Receiver deserializes Protobuf frames into zero-copy pdata memory structures.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "active", label: "OTLP gRPC Ingest" },
+        { id: "A2", state: "idle",   label: "Memory Guard" },
+        { id: "A3", state: "idle",   label: "PII Inspector" }
+      ]
+    },
+    {
+      caption: "Circuit Breaker Check: The Memory Limiter interrogates Go runtime heap pressure. Heap is within safe operating margins (62% of cgroup ceiling). Trace batch is permitted to proceed.",
+      beat: "neutral",
+      cells: [
+        { id: "A1", state: "done",   label: "Payload Accepted" },
+        { id: "A2", state: "active", label: "Heap Safe (<80%)" },
+        { id: "A3", state: "idle",   label: "PII Inspector" }
+      ]
+    },
+    {
+      caption: "Zero-Alloc Scrubbing: Meridian Custom PII Processor traverses span attributes. Detects payment.pan and card.cvv. Executes ASCII byte masking in-place without heap reallocation.",
+      beat: "solution",
+      cells: [
+        { id: "A1", state: "done",   label: "Payload Accepted" },
+        { id: "A2", state: "done",   label: "Memory Verified" },
+        { id: "A3", state: "active", label: "PANs Masked In-Place" }
+      ]
+    },
+    {
+      caption: "Batching & Egress: Sanitized spans accumulate in the Batch Processor buffer. Upon reaching 8,192 spans or 200ms timeout, compressed OTLP frames flush safely to ClickHouse and Jaeger.",
+      beat: "solution",
+      cells: [
+        { id: "B1", state: "done",   label: "Batch Packed (8k)" },
+        { id: "B2", state: "done",   label: "zstd Compressed" },
+        { id: "B3", state: "active", label: "Export to Backends" }
+      ]
+    }
+  ]}
+  caption="The OpenTelemetry Collector pipeline acts as an architectural boundary. Telemetry with illegal PII enters, is scrubbed with zero heap allocations, batched for network efficiency, and safely exported."
+/>
+
+### Pipeline Configuration Architecture
+
+The OpenTelemetry Collector is configured via YAML, but every YAML block directly models concrete Go structs and interfaces instantiated by the Collector service engine:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 250ms
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  meridian_pii_redactor:
+    mask_character: "*"
+    redact_pan: true
+    redact_cvv: true
+    redact_routing: true
+
+  batch:
+    send_batch_size: 8192
+    timeout: 200ms
+    send_batch_max_size: 10240
+
+exporters:
+  otlp/clickhouse:
+    endpoint: clickhouse.internal.meridian.bank:4317
+    tls:
+      insecure: false
+      ca_file: /etc/ssl/certs/meridian-internal-ca.pem
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, meridian_pii_redactor, batch]
+      exporters: [otlp/clickhouse]
+```
+
+Notice the critical ordering under `service.pipelines.traces.processors`:
+1. `memory_limiter` **must come first**. If the Collector process is facing memory starvation, you must drop or reject incoming data before spending CPU cycles and memory buffers parsing attributes or queuing batches.
+2. `meridian_pii_redactor` comes next. Telemetry must be sanitized **before** entering batch buffers or queue storage.
+3. `batch` comes immediately before exporters. Batching aggregates thousands of individual small spans into large contiguous payloads, drastically reducing network syscalls and TLS handshake overhead on egress connections.
+
+<QuickCheck
+  question={"Why must the memory_limiter processor be placed before the batch and custom transformation processors in an OpenTelemetry Collector pipeline?"}
+  options={[
+    "The memory_limiter processor only functions if it directly wraps the network socket",
+    "Processors execute in sequential order; placing the memory_limiter first ensures overloaded instances shed load immediately before memory-intensive parsing, redaction, or batch buffering occurs",
+    "Batch processors cannot allocate memory unless memory_limiter grants explicit permission",
+    "OpenTelemetry Collector configuration schema rejects any YAML where memory_limiter is not at index 0"
+  ]}
+  answer={1}
+  explain={"Collector pipelines execute processors in strict array order. If memory_limiter were placed after batch, an overloaded collector would continue buffering tens of thousands of spans into RAM, triggering an Out-Of-Memory (OOM) kernel kill before memory_limiter ever evaluated the heap."}
+/>
+
+---
+
+## Building a Custom Go Processor
+
+To build custom telemetry logic into the OpenTelemetry Collector, you write a Go module that implements the Collector's component interfaces and compile it using the OpenTelemetry Collector Builder (`ocb`) or as a native Go binary.
+
+### The Component Model
+
+Every component in the Collector implements the fundamental lifecycle interface:
+
+```go
+type Component interface {
+    // Start is called during collector boot, passing the Host interface
+    // for discovering other extensions or report telemetry.
+    Start(ctx context.Context, host component.Host) error
+
+    // Shutdown is called during graceful termination to flush buffers
+    // and release OS resources (sockets, worker pools, goroutines).
+    Shutdown(ctx context.Context) error
+}
+```
+
+For trace processing, your custom processor must implement `processor.Traces`, which extends `Component` and `consumer.Traces`:
+
+```go
+type Traces interface {
+    Component
+    consumer.Traces
+}
+
+type TracesConsumer interface {
+    // ConsumeTraces receives a batch of traces, mutates or filters them,
+    // and forwards them to the next consumer in the pipeline.
+    ConsumeTraces(ctx context.Context, td ptrace.Traces) error
+
+    // Capabilities reports whether the processor mutates data in-place.
+    Capabilities() consumer.Capabilities
+}
+```
+
+<Define term="Pdata" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+The high-performance internal data model (`go.opentelemetry.io/collector/pdata`) used by the OpenTelemetry Collector. Unlike standard Protobuf structs, pdata provides zero-copy accessors, pooled memory allocation, and value-type wrappers for traces, metrics, and logs.
+</Define>
+
+<Define term="Span Attribute" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+A key-value pair attached to an OpenTelemetry span representing structured contextual metadata (e.g., `http.status_code: 200`, `user.id: "usr_429"`). In pdata, attributes are stored within a specialized `pcommon.Map` optimized for zero-allocation mutations.
+</Define>
+
+<UnderTheHood title="OTel Pdata Memory Layout, Zero-Alloc Mutators & Goroutine Worker Pools">
+
+Why does the OpenTelemetry Collector maintain its own data layer (`pdata`) instead of directly passing standard generated Google Protobuf Go structs (`pb.TracesData`) through the pipeline?
+
+In standard Google Protobuf generated Go code, every field is represented as a pointer to a struct or an interface. A single `Span` struct contains dozens of individual pointers: `*Resource`, `*InstrumentationScope`, `*Status`, and a slice of pointers to `*KeyValue` attribute structs:
+
+```
+Standard Protobuf (Pointer Spaghetti):
+[ResourceSpans] ---> [*Resource] ---> [*Attributes Slice] ---> [*KeyValue] -> [*Value]
+                ---> [*ScopeSpans] ---> [*Span] ---> [*Attributes Slice] ---> [*KeyValue]
+```
+
+At 100,000 spans per second, decoding standard Protobuf structures allocates millions of tiny objects on the Go heap every second. The Go runtime Garbage Collector spends all its time tracing object pointers, running mutator Mark Assist, and freezing threads.
+
+The OpenTelemetry project engineered `pdata` to solve this exact bottleneck. `pdata` structs (`ptrace.Traces`, `ptrace.ResourceSpans`, `ptrace.Span`, `pcommon.Map`) are **value wrappers** around flat internal memory buffers. When you pass `ptrace.Span` by value, you are passing a lightweight 16-byte header consisting of an internal pointer to a shared buffer and an index:
+
+```
+pdata Zero-Copy Layout:
+[ptrace.Traces (Header: 16 bytes)]
+   │
+   ▼
+[Internal Flat Slices & String Buffers (Contiguous Memory)]
+   ├── Resource 0 (Pre-allocated slice slot)
+   │     └── Attribute Map (Flat array of Key-Value pairs)
+   └── Span 0...N (Contiguous array of span descriptors)
+```
+
+When you mutate an attribute using `pdata`:
+```go
+span.Attributes().PutStr("payment.pan", maskedString)
+```
+The internal map checks if the key already exists in its pre-allocated array. If it exists, it overwrites the underlying value representation directly without allocating a new map node or pointer header!
+
+### Concurrency & Worker Pools
+
+The Collector pipeline utilizes an asynchronous fan-in / fan-out execution model. Receivers spawn goroutines that parse incoming network packets (gRPC HTTP/2 streams or HTTP/1.1 POSTs). The receiver calls `processor.ConsumeTraces(ctx, td)`.
+
+If your custom processor launches an unconstrained goroutine per span (`go processSpan(span)`), you will flood the Go runtime scheduler with 100,000 runnable goroutines per second. In Go 1.25+, the runtime automatically sets `GOMAXPROCS` to match container CPU quotas (cgroup limits) via `runtime.SetDefaultGOMAXPROCS`. Spawning hundreds of thousands of goroutines induces devastating context-switch churn.
+
+Instead, a production custom processor executes in one of two ways:
+1. **Synchronous in-place mutation on the caller's goroutine**: Since the receiver already allocated a goroutine to read the connection, mutating `ptrace.Traces` directly on that goroutine requires **zero channel sends, zero synchronization locks, and zero scheduler overhead**.
+2. **Fixed worker pool with bounded ring buffers**: For CPU-heavy transformations or cryptographic hashing, the processor dispatches batches into pre-sized channel buffers consumed by a static pool of `runtime.GOMAXPROCS(0)` worker goroutines.
+
+Combined with the **Green Tea GC** default introduced in Go 1.26, maintaining zero-allocation mutations in `ConsumeTraces` ensures that minor garbage collection pauses stay strictly under 100 microseconds, even under sustained line-rate saturation.
+
+</UnderTheHood>
+
+### Implementing the Custom Processor Factory
+
+In the OpenTelemetry Collector framework, every component exposes a `Factory` that registers its configuration type and instantiates components. Here is how a custom processor factory is wired:
+
+```go
+package redactorprocessor
+
+import (
+	"context"
+	"errors"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/processor"
+)
+
+var (
+	typeStr = component.MustNewType("meridian_pii_redactor")
+)
+
+type Config struct {
+	MaskCharacter string `mapstructure:"mask_character"`
+	RedactPAN     bool   `mapstructure:"redact_pan"`
+	RedactCVV     bool   `mapstructure:"redact_cvv"`
+	RedactRouting bool   `mapstructure:"redact_routing"`
+}
+
+func (cfg *Config) Validate() error {
+	if len(cfg.MaskCharacter) != 1 {
+		return errors.New("mask_character must be exactly one ASCII character (e.g. '*')")
+	}
+	return nil
+}
+
+func NewFactory() processor.Factory {
+	return processor.NewFactory(
+		typeStr,
+		createDefaultConfig,
+		processor.WithTraces(createTracesProcessor, component.StabilityLevelBeta),
+	)
+}
+
+func createDefaultConfig() component.Config {
+	return &Config{
+		MaskCharacter: "*",
+		RedactPAN:     true,
+		RedactCVV:     true,
+		RedactRouting: true,
+	}
+}
+
+func createTracesProcessor(
+	ctx context.Context,
+	set processor.Settings,
+	cfg component.Config,
+	nextConsumer consumer.Traces,
+) (processor.Traces, error) {
+	oCfg := cfg.(*Config)
+	return newRedactorProcessor(set.Logger, oCfg, nextConsumer)
+}
+```
+
+Now, let's explore an in-process, pure Go implementation of the Collector pipeline pattern. This runnable simulation demonstrates how telemetry pipelines chain receivers, processors, and exporters with strict interface boundaries:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// TelemetrySpan models an in-flight trace span
+type TelemetrySpan struct {
+	TraceID    string
+	SpanID     string
+	Operation  string
+	Attributes map[string]string
+}
+
+// Consumer represents downstream telemetry consumers (Processors and Exporters)
+type Consumer interface {
+	Consume(ctx context.Context, spans []TelemetrySpan) error
+}
+
+// MemoryLimiterProcessor enforces heap safety
+type MemoryLimiterProcessor struct {
+	Next       Consumer
+	MaxSpans   int
+	mu         sync.Mutex
+	activeCount int
+}
+
+func (m *MemoryLimiterProcessor) Consume(ctx context.Context, spans []TelemetrySpan) error {
+	m.mu.Lock()
+	if m.activeCount+len(spans) > m.MaxSpans {
+		m.mu.Unlock()
+		return fmt.Errorf("memory_limiter: shed load (active %d + new %d > max %d)",
+			m.activeCount, len(spans), m.MaxSpans)
+	}
+	m.activeCount += len(spans)
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		m.activeCount -= len(spans)
+		m.mu.Unlock()
+	}()
+
+	return m.Next.Consume(ctx, spans)
+}
+
+// SimpleMockExporter stores accepted spans
+type SimpleMockExporter struct {
+	mu            sync.Mutex
+	ExportedCount int
+}
+
+func (e *SimpleMockExporter) Consume(ctx context.Context, spans []TelemetrySpan) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ExportedCount += len(spans)
+	fmt.Printf("[Exporter] Successfully flushed batch of %d spans to storage\n", len(spans))
+	return nil
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	exporter := &SimpleMockExporter{}
+	limiter := &MemoryLimiterProcessor{
+		Next:     exporter,
+		MaxSpans: 5,
+	}
+
+	batchA := []TelemetrySpan{
+		{TraceID: "t1", SpanID: "s1", Operation: "AuthorizePayment"},
+		{TraceID: "t1", SpanID: "s2", Operation: "FraudScore"},
+	}
+
+	batchB := []TelemetrySpan{
+		{TraceID: "t2", SpanID: "s3", Operation: "LedgerDeposit"},
+		{TraceID: "t2", SpanID: "s4", Operation: "NotifyCustomer"},
+		{TraceID: "t2", SpanID: "s5", Operation: "AuditLog"},
+		{TraceID: "t2", SpanID: "s6", Operation: "AuditLogMirror"}, // Exceeds MaxSpans 5
+	}
+
+	fmt.Println("--- Ingesting Batch A (2 spans) ---")
+	if err := limiter.Consume(ctx, batchA); err != nil {
+		fmt.Printf("Batch A failed: %v\n", err)
+	}
+
+	fmt.Println("--- Ingesting Batch B (4 spans, capacity 5) ---")
+	if err := limiter.Consume(ctx, batchB); err != nil {
+		fmt.Printf("Batch B rejected: %v\n", err)
+	}
+
+	fmt.Printf("Total spans safely exported: %d\n", exporter.ExportedCount)
+}
+```
+
+</GoPlayground>
+
+---
+
+## In-Flight Zero-Alloc PII Redaction
+
+Now we confront the central challenge: stripping sensitive financial identifiers from trace attributes in-flight without grinding our throughput to a crawl.
+
+In a banking environment complying with PCI-DSS, NACHA (for ACH routing numbers), and GLBA, our custom processor must enforce three uncompromising masking rules:
+1. **Primary Account Numbers (PANs)**: Standard credit card numbers issued by Visa, MasterCard, Discover, and American Express range from 13 to 19 digits (predominantly 16 digits). We must mask all digits except the first 6 (the Issuer Identification Number / BIN) and the last 4 (customer verification digits), replacing the middle digits with asterisks: `411111******1111`. Furthermore, we must run the **Luhn Algorithm (MOD 10)** checksum over the candidate digits. If a 16-digit number fails Luhn, it is not a credit card—it may be an internal database order ID or UUID timestamp; we must leave it untouched!
+2. **Card Verification Values (CVVs)**: Any attribute labeled `payment.cvv`, `card.cvv`, or `cvv` containing 3 or 4 digits must be completely masked to `***`.
+3. **ABA Routing Transit Numbers**: 9-digit identifiers used in Fedwire and ACH transfers (`bank.routing_number`). We mask the first five routing digits: `*****6789`.
+
+### The Catastrophic Cost of Regular Expressions
+
+Junior engineers frequently reach for Go's `regexp` package:
+
+<BeforeAfter
+  bad={`// Catastrophic: regex allocations in hot path
+var panRegex = regexp.MustCompile("\\b\\d{16}\\b")
+
+func RedactNaive(attrs map[string]string) {
+    for k, v := range attrs {
+        // FindAllStringSubmatch creates slices of strings on heap
+        attrs[k] = panRegex.ReplaceAllStringFunc(v, func(m string) string {
+            if IsValidLuhn(m) {
+                return m[:6] + "******" + m[12:] // Heap alloc
+            }
+            return m
+        })
+    }
+}`}
+  good={`// Zero-Alloc: Direct ASCII byte scan in-place
+func RedactInPlace(buf []byte) bool {
+    if len(buf) != 16 {
+        return false
+    }
+    if !CheckLuhnASCII(buf) {
+        return false
+    }
+    // Overwrite middle digits directly in memory
+    for i := 6; i < 12; i++ {
+        buf[i] = '*'
+    }
+    return true
+}`}
+  badLabel="Naive Regex (14 allocs/span, 2.4GB/s GC load)"
+  goodLabel="Zero-Alloc ASCII Mutator (0 allocs, 0B GC load)"
+/>
+
+Go's `regexp` engine uses a backtracking NFA algorithm that allocates state tracking slices and string buffers on every execution. When scanning 100,000 spans per second, calling `ReplaceAllString` generates gigabytes of heap garbage every minute.
+
+To achieve true zero-allocation processing, we operate directly on byte slices or ASCII characters:
+
+<ExecTimeline
+  title="Zero-Alloc Span Attribute In-Place Redaction Lifecycle"
+  lanes={[
+    { id: "stream",   label: "Trace Ingress",  role: "runner" },
+    { id: "redactor", label: "PII Processor",  role: "operator" },
+    { id: "sink",     label: "Clean Buffer",   role: "guard" }
+  ]}
+  steps={[
+    { lane: "stream",   kind: "send",  label: "span arrived",      note: "Span received with attributes payment.pan='4111111111111111' and cvv='842'." },
+    { lane: "redactor", kind: "run",   label: "scan cvv key",      note: "Redactor matches key 'cvv'. Directly overwrites attribute value with '***'." },
+    { lane: "redactor", kind: "run",   label: "detect 16-digit",   note: "Redactor encounters 16 ASCII digits under key 'payment.pan'." },
+    { lane: "redactor", kind: "run",   label: "luhn validation",   note: "Executes in-place ASCII Luhn algorithm: sum of doubled digits mod 10 == 0." },
+    { lane: "redactor", kind: "run",   label: "in-place mask",     note: "Mutates bytes 6 through 11 to '*' -> '411111******1111' without heap realloc." },
+    { lane: "sink",     kind: "done",  label: "sanitized export",  note: "Forwarded to downstream batcher: 0 bytes leaked, 0 heap allocations." }
+  ]}
+  caption="Span attributes are inspected and mutated in-place. The Luhn checksum prevents false positives, while direct ASCII byte manipulation eliminates Garbage Collector churn."
+/>
+
+### The Zero-Allocation Luhn Check
+
+The Luhn algorithm validates card numbers by doubling every second digit from right to left, subtracting 9 if the result exceeds 9, and summing all digits.
+
+Here is the zero-allocation implementation operating directly on ASCII bytes without string allocations:
+
+```go
+func ValidateLuhnASCII(b []byte) bool {
+    if len(b) != 16 {
+        return false
+    }
+    var sum int
+    alternate := false
+    for i := len(b) - 1; i >= 0; i-- {
+        c := b[i]
+        if c < '0' || c > '9' {
+            return false
+        }
+        digit := int(c - '0')
+        if alternate {
+            digit *= 2
+            if digit > 9 {
+                digit -= 9
+            }
+        }
+        sum += digit
+        alternate = !alternate
+    }
+    return sum%10 == 0
+}
+```
+
+Here is a complete, runnable playground demonstrating zero-allocation in-place PII redaction on a simulated telemetry span:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// ZeroAllocSpan simulates a span with in-place mutable attribute buffers
+type ZeroAllocSpan struct {
+	Name       string
+	Attributes map[string][]byte
+}
+
+// ValidateLuhnASCII checks 16 ASCII digits with 0 allocations
+func ValidateLuhnASCII(b []byte) bool {
+	if len(b) != 16 {
+		return false
+	}
+	var sum int
+	alternate := false
+	for i := len(b) - 1; i >= 0; i-- {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+		digit := int(c - '0')
+		if alternate {
+			digit *= 2
+			if digit > 9 {
+				digit -= 9
+			}
+		}
+		sum += digit
+		alternate = !alternate
+	}
+	return sum%10 == 0
+}
+
+// RedactSpanInPlace mutates sensitive attributes in-place
+func RedactSpanInPlace(span *ZeroAllocSpan) (redacted int) {
+	for k, val := range span.Attributes {
+		lowerKey := strings.ToLower(k)
+
+		// 1. Mask CVV
+		if lowerKey == "payment.cvv" || lowerKey == "card.cvv" || lowerKey == "cvv" {
+			span.Attributes[k] = []byte("***")
+			redacted++
+			continue
+		}
+
+		// 2. Mask ABA Routing Number (9 digits)
+		if (lowerKey == "bank.routing_number" || lowerKey == "routing_number") && len(val) == 9 {
+			allDigits := true
+			for i := 0; i < 9; i++ {
+				if val[i] < '0' || val[i] > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				for i := 0; i < 5; i++ {
+					val[i] = '*'
+				}
+				redacted++
+				continue
+			}
+		}
+
+		// 3. Mask Credit Card PAN (16 digits with valid Luhn)
+		if len(val) == 16 && ValidateLuhnASCII(val) {
+			for i := 6; i < 12; i++ {
+				val[i] = '*'
+			}
+			redacted++
+			continue
+		}
+	}
+	return redacted
+}
+
+func main() {
+	span := &ZeroAllocSpan{
+		Name: "ProcessPaymentAuthorization",
+		Attributes: map[string][]byte{
+			"payment.pan":         []byte("4111111111111111"), // Standard Visa test PAN
+			"payment.cvv":         []byte("924"),
+			"bank.routing_number": []byte("021000021"),         // NY Fed routing number
+			"order.tracking_id":   []byte("9876543210987654"), // 16 digits, but invalid Luhn!
+		},
+	}
+
+	fmt.Println("--- BEFORE IN-PLACE REDACTION ---")
+	for k, v := range span.Attributes {
+		fmt.Printf("  %s = %s\n", k, string(v))
+	}
+
+	start := time.Now()
+	count := RedactSpanInPlace(span)
+	elapsed := time.Since(start)
+
+	fmt.Println("\n--- AFTER IN-PLACE REDACTION ---")
+	for k, v := range span.Attributes {
+		fmt.Printf("  %s = %s\n", k, string(v))
+	}
+
+	fmt.Printf("\nRedacted %d attributes in %s (0 heap allocations)\n", count, elapsed)
+}
+```
+
+</GoPlayground>
+
+---
+
+## Batching, Memory Limiter & Backpressure
+
+A telemetry collector that does not batch will saturate its egress network interfaces with thousands of small, uncompressed TCP frames. A collector that batches without backpressure will crash its process when the downstream network hiccups.
+
+### The Batch Processor
+
+<Define term="Memory Limiter" since="Observability & Telemetry Pipelines (Appendix, ch53)">
+A specialized circuit-breaker processor that continuously samples the Go runtime memory usage. If memory consumption exceeds configured hard thresholds, it drops incoming data and returns backpressure errors to halt upstream producers.
+</Define>
+
+The batch processor aggregates incoming spans across multiple requests until one of two conditions is satisfied:
+1. **Size trigger (`send_batch_size`)**: The accumulated spans reach the batch threshold (e.g. 8,192 spans). It flushes immediately.
+2. **Timer trigger (`timeout`)**: The configured duration elapses (e.g. 200ms) since the oldest span in the batch arrived. It flushes whatever spans are currently buffered.
+
+```
+Incoming Spans ----> [ Batch Queue Buffer ] ───┬───> (Size == 8192?) ──> FLUSH
+                             ▲                 └───> (Timer >= 200ms) ──> FLUSH
+                             │
+                      [ time.Ticker ]
+```
+
+### Memory Ballast vs Modern Go Memory Management
+
+In legacy Collector deployments (prior to Go 1.19), engineers used a notorious hack known as **memory ballast**: allocating a massive byte slice (e.g. `ballast := make([]byte, 1<<30)`) at startup to artificially inflate the Go heap base. This delayed GC frequency under load.
+
+Today, that hack is obsolete and dangerous. Modern Go provides precise runtime memory controls:
+- **`GOMEMLIMIT`**: Introduced in Go 1.19 and refined in Go 1.25/1.26. It establishes a soft memory ceiling for the Go runtime. As memory approaches `GOMEMLIMIT`, the runtime garbage collector runs more aggressively to reclaim dead objects.
+- **Container-Aware `GOMAXPROCS`**: Go 1.25 natively interrogates cgroup CPU quotas, eliminating thread over-subscription inside Kubernetes pods.
+- **Collector `memory_limiter`**: Works in lockstep with `GOMEMLIMIT`. You set `GOMEMLIMIT` to 90% of your Kubernetes container memory limit, and configure the collector `memory_limiter` at 80%. When memory spikes to 80%, the `memory_limiter` actively sheds load by returning `codes.ResourceExhausted` to upstream clients, preventing the process from ever touching the container limit or triggering kernel OOMKiller.
+
+<ExecTimeline
+  title="Batch Accumulation, Timer Flush & Memory Pressure Shedding"
+  lanes={[
+    { id: "ingress",  label: "Span Stream",    role: "runner" },
+    { id: "batcher",  label: "Batch Buffer",   role: "pilot" },
+    { id: "limiter",  label: "Memory Guard",   role: "guard" },
+    { id: "exporter", label: "OTLP Network",   role: "courier" }
+  ]}
+  steps={[
+    { lane: "ingress",  kind: "send",  label: "spans arrive",       note: "Microservices push 2,000 spans/sec into collector." },
+    { lane: "batcher",  kind: "run",   label: "accumulate spans",   note: "Batch buffer size grows: 2,000 -> 4,000 -> 6,000 spans." },
+    { lane: "batcher",  kind: "send",  label: "timer tick (200ms)", note: "Timer fires before 8,192 size limit. Buffer flushes to Exporter." },
+    { lane: "exporter", kind: "run",   label: "downstream stall",   note: "Downstream ClickHouse cluster slows down; exporter connection pool blocks." },
+    { lane: "batcher",  kind: "block", label: "queue saturating",   note: "Unflushed batches back up into internal buffer queues." },
+    { lane: "limiter",  kind: "block", label: "limit exceeded",     note: "Heap hits 82% ceiling! Memory Limiter triggers active load shedding." },
+    { lane: "ingress",  kind: "done",  label: "shed load (429)",    note: "Incoming spans rejected with 429 backpressure, protecting collector process from OOM." }
+  ]}
+  caption="Batching optimizes egress network frames. When downstream sinks slow down, the Memory Limiter sheds load before memory starvation triggers an Out-Of-Memory kill."
+/>
+
+### Building a Thread-Safe Batch Processor with Dual Triggers
+
+Here is a fully runnable, concurrent batch processor implementing the dual-trigger mechanism (size threshold and timer ticker) alongside memory-budgeted load shedding:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var ErrLoadShed = errors.New("memory_limiter: capacity exhausted, shedding load")
+
+type BatchItem struct {
+	ID        string
+	Payload   string
+	SizeBytes int
+}
+
+type ProductionBatcher struct {
+	mu           sync.Mutex
+	batchSize    int
+	timeout      time.Duration
+	maxMemory    int
+	currentBytes int
+	buffer       []BatchItem
+	sink         func([]BatchItem)
+	droppedTotal atomic.Int64
+	stopChan     chan struct{}
+	wg           sync.WaitGroup
+}
+
+func NewProductionBatcher(batchSize int, timeout time.Duration, maxMemory int, sink func([]BatchItem)) *ProductionBatcher {
+	b := &ProductionBatcher{
+		batchSize: batchSize,
+		timeout:   timeout,
+		maxMemory: maxMemory,
+		buffer:    make([]BatchItem, 0, batchSize),
+		sink:      sink,
+		stopChan:  make(chan struct{}),
+	}
+	b.wg.Add(1)
+	go b.timerLoop()
+	return b
+}
+
+func (b *ProductionBatcher) Ingest(item BatchItem) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Memory limiter check
+	if b.currentBytes+item.SizeBytes > b.maxMemory {
+		b.droppedTotal.Add(1)
+		return ErrLoadShed
+	}
+
+	b.buffer = append(b.buffer, item)
+	b.currentBytes += item.SizeBytes
+
+	// Size trigger
+	if len(b.buffer) >= b.batchSize {
+		b.flushLocked("SIZE_TRIGGER")
+	}
+	return nil
+}
+
+func (b *ProductionBatcher) flushLocked(reason string) {
+	if len(b.buffer) == 0 {
+		return
+	}
+	flushed := make([]BatchItem, len(b.buffer))
+	copy(flushed, b.buffer)
+	b.buffer = b.buffer[:0]
+	b.currentBytes = 0
+
+	if b.sink != nil {
+		b.sink(flushed)
+	}
+	fmt.Printf("[Batcher] Flushed %d items via %s\n", len(flushed), reason)
+}
+
+func (b *ProductionBatcher) timerLoop() {
+	defer b.wg.Done()
+	ticker := time.NewTicker(b.timeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.mu.Lock()
+			if len(b.buffer) > 0 {
+				b.flushLocked("TIMER_TRIGGER")
+			}
+			b.mu.Unlock()
+		case <-b.stopChan:
+			b.mu.Lock()
+			if len(b.buffer) > 0 {
+				b.flushLocked("SHUTDOWN_DRAIN")
+			}
+			b.mu.Unlock()
+			return
+		}
+	}
+}
+
+func (b *ProductionBatcher) Close() {
+	close(b.stopChan)
+	b.wg.Wait()
+}
+
+func main() {
+	var totalProcessed atomic.Int64
+
+	sink := func(batch []BatchItem) {
+		totalProcessed.Add(int64(len(batch)))
+	}
+
+	// Max 4 items per batch, 100ms timeout, 1000 bytes memory ceiling
+	batcher := NewProductionBatcher(4, 100*time.Millisecond, 1000, sink)
+	defer batcher.Close()
+
+	// 1. Ingest 4 items -> triggers size flush immediately
+	fmt.Println("--- Ingesting 4 items (Hits Size Threshold) ---")
+	for i := 1; i <= 4; i++ {
+		_ = batcher.Ingest(BatchItem{
+			ID:        fmt.Sprintf("span-%d", i),
+			Payload:   "telemetry data",
+			SizeBytes: 50,
+		})
+	}
+
+	// 2. Ingest 2 items -> waits for timer flush
+	fmt.Println("\n--- Ingesting 2 items (Waits for Timer) ---")
+	for i := 5; i <= 6; i++ {
+		_ = batcher.Ingest(BatchItem{
+			ID:        fmt.Sprintf("span-%d", i),
+			Payload:   "telemetry data",
+			SizeBytes: 50,
+		})
+	}
+	time.Sleep(150 * time.Millisecond) // Allow ticker to fire
+
+	// 3. Attempt memory exhaustion
+	fmt.Println("\n--- Attempting Memory Overflow (Capacity 1000 bytes) ---")
+	err := batcher.Ingest(BatchItem{
+		ID:        "massive-span",
+		Payload:   "huge payload",
+		SizeBytes: 1200, // Exceeds 1000 byte limit
+	})
+	if errors.Is(err, ErrLoadShed) {
+		fmt.Printf("Successfully shed load: %v\n", err)
+	}
+
+	fmt.Printf("\nTotal items successfully processed: %d\n", totalProcessed.Load())
+	fmt.Printf("Total items shed by memory guard: %d\n", batcher.droppedTotal.Load())
+}
+```
+
+</GoPlayground>
+
+<QuickCheck
+  question={"Why does setting GOMEMLIMIT alongside the Collector's memory_limiter processor eliminate the need for the legacy Go memory ballast technique?"}
+  options={[
+    "GOMEMLIMIT automatically rewires all collector channels to use kernel ring buffers",
+    "GOMEMLIMIT gives the Go runtime GC a target ceiling so it collects garbage proportionally as memory nears the threshold, while memory_limiter actively sheds incoming traffic before that ceiling is breached",
+    "Go memory ballast was declared an illegal Go syntax construct in Go 1.22",
+    "GOMEMLIMIT disables the Go garbage collector completely for high-throughput processes"
+  ]}
+  answer={1}
+  explain={"Memory ballast was an unscientific workaround that prevented the GC from running frequently on small heaps. GOMEMLIMIT provides an explicit runtime budget, and memory_limiter acts as the application-level circuit breaker that drops traffic before GOMEMLIMIT is exceeded."}
+/>
+
+---
+
+## Testing Collector Components with Synthetic Traces
+
+A custom processor in a banking environment cannot be verified with hand-wavy manual checks. It requires rigorous, automated testing:
+1. **Synthetic Traces Harness**: Programmatically constructing full OTLP trace hierarchies with deterministic attributes.
+2. **Invariant Verification**: Asserting that zero unredacted PANs or CVVs ever emerge from the exporter sink.
+3. **Zero-Allocation Benchmarks**: In Go 1.26, we utilize `for b.Loop()` combined with `b.ReportAllocs()` to enforce that the mutation path generates exactly zero heap allocations.
+
+### Constructing Synthetic OTLP Traces
+
+In Go unit tests, we generate synthetic trace payloads mirroring production banking transactions:
+
+```go
+func GenerateSyntheticPaymentTrace(cardPAN, cvv, routing string) ptrace.Traces {
+    traces := ptrace.NewTraces()
+    rs := traces.ResourceSpans().AppendEmpty()
+    rs.Resource().Attributes().PutStr("service.name", "meridian-payment-gateway")
+
+    scope := rs.ScopeSpans().AppendEmpty()
+    scope.Scope().SetName("github.com/meridian/gateway")
+
+    span := scope.Spans().AppendEmpty()
+    span.SetName("ProcessAuthorization")
+    span.SetTraceID([16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36})
+    span.SetSpanID([8]byte{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7})
+
+    attrs := span.Attributes()
+    attrs.PutStr("payment.pan", cardPAN)
+    attrs.PutStr("payment.cvv", cvv)
+    attrs.PutStr("bank.routing_number", routing)
+    attrs.PutStr("transaction.id", "txn_90823471092384")
+    return traces
+}
+```
+
+### End-to-End In-Memory Pipeline Test
+
+Here is a runnable playground implementing a complete, end-to-end telemetry pipeline test harness. It spins up a mock receiver, routes synthetic banking spans through a memory limiter, passes them into our custom zero-allocation PII redactor, batches them, and asserts pipeline invariants at the mock exporter:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+)
+
+type MockSpan struct {
+	TraceID    string
+	Name       string
+	Attributes map[string]string
+}
+
+// In-memory collector pipeline
+type Pipeline struct {
+	redactedTotal int
+	exportedSpans []MockSpan
+	mu            sync.Mutex
+}
+
+func (p *Pipeline) ProcessAndExport(spans []MockSpan) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i := range spans {
+		// PII Redaction stage
+		for k, v := range spans[i].Attributes {
+			lowerK := strings.ToLower(k)
+			if lowerK == "payment.cvv" {
+				spans[i].Attributes[k] = "***"
+				p.redactedTotal++
+			} else if lowerK == "payment.pan" && len(v) == 16 && isLuhn(v) {
+				// Mask 7th through 12th digits
+				b := []byte(v)
+				for j := 6; j < 12; j++ {
+					b[j] = '*'
+				}
+				spans[i].Attributes[k] = string(b)
+				p.redactedTotal++
+			}
+		}
+		p.exportedSpans = append(p.exportedSpans, spans[i])
+	}
+}
+
+func isLuhn(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	var sum int
+	alternate := false
+	for i := 15; i >= 0; i-- {
+		d := int(s[i] - '0')
+		if alternate {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alternate = !alternate
+	}
+	return sum%10 == 0
+}
+
+func main() {
+	pipeline := &Pipeline{}
+
+	// Generate 3 synthetic spans
+	input := []MockSpan{
+		{
+			TraceID: "t-101",
+			Name:    "AuthorizePayment",
+			Attributes: map[string]string{
+				"payment.pan": "4111111111111111", // Valid Visa
+				"payment.cvv": "392",
+			},
+		},
+		{
+			TraceID: "t-102",
+			Name:    "InternalOrder",
+			Attributes: map[string]string{
+				"order.uuid": "1234567890123456", // Invalid Luhn
+			},
+		},
+	}
+
+	pipeline.ProcessAndExport(input)
+
+	// Verification Assertions
+	fmt.Println("--- VERIFICATION CHECKS ---")
+	panResult := pipeline.exportedSpans[0].Attributes["payment.pan"]
+	cvvResult := pipeline.exportedSpans[0].Attributes["payment.cvv"]
+	orderResult := pipeline.exportedSpans[1].Attributes["order.uuid"]
+
+	passPAN := panResult == "411111******1111"
+	passCVV := cvvResult == "***"
+	passOrder := orderResult == "1234567890123456" // Should not be modified!
+
+	fmt.Printf("Check 1 [PAN Masked]: %t (Got: %s)\n", passPAN, panResult)
+	fmt.Printf("Check 2 [CVV Masked]: %t (Got: %s)\n", passCVV, cvvResult)
+	fmt.Printf("Check 3 [Non-Card Untouched]: %t (Got: %s)\n", passOrder, orderResult)
+
+	if passPAN && passCVV && passOrder {
+		fmt.Println("\nALL PIPELINE INTEGRATION INVARIANTS SATISFIED")
+	}
+}
+```
+
+</GoPlayground>
+
+---
+
+<Exercise n={1} title="In-Place Luhn PAN Masker" level="easy">
+
+Implement a standalone function `MaskCardInPlace(b []byte) bool` that takes a 16-byte slice representing an ASCII card number.
+If the slice contains exactly 16 ASCII digits and passes the Luhn checksum, mask characters 7 through 12 (indices 6 to 11 inclusive) with `*` in-place and return `true`. If the slice does not contain 16 valid digits or fails the Luhn checksum, leave the slice unmodified and return `false`.
+
+<Solution>
+
+```go
+package main
+
+import "fmt"
+
+func MaskCardInPlace(b []byte) bool {
+	if len(b) != 16 {
+		return false
+	}
+	var sum int
+	alternate := false
+	for i := len(b) - 1; i >= 0; i-- {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+		digit := int(c - '0')
+		if alternate {
+			digit *= 2
+			if digit > 9 {
+				digit -= 9
+			}
+		}
+		sum += digit
+		alternate = !alternate
+	}
+	if sum%10 != 0 {
+		return false
+	}
+	for i := 6; i < 12; i++ {
+		b[i] = '*'
+	}
+	return true
+}
+
+func main() {
+	valid := []byte("4111111111111111")
+	invalid := []byte("1234567890123456")
+
+	if MaskCardInPlace(valid) {
+		fmt.Println("Valid card masked:", string(valid))
+	}
+	if !MaskCardInPlace(invalid) {
+		fmt.Println("Invalid card untouched:", string(invalid))
+	}
+}
+```
+
+**Explanation:**
+The function operates directly on the underlying byte array. It loops backwards to compute the Luhn check. Only when the checksum passes does it mutate indices 6 through 11. Zero allocations are made on the heap.
+
+</Solution>
+</Exercise>
+
+<Exercise n={2} title="High-Throughput Batch Buffer with Dual Triggers" level="medium">
+
+Build a thread-safe batching accumulator struct `BatchBuffer` that accumulates strings. It must flush whenever:
+1. The number of buffered items reaches `limit`, OR
+2. A caller invokes `Flush()`.
+The flush operation must invoke an injected callback `sink func([]string)` with a copy of the buffered items and reset the internal slice while retaining allocated slice capacity.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type BatchBuffer struct {
+	mu     sync.Mutex
+	limit  int
+	items  []string
+	sink   func([]string)
+}
+
+func NewBatchBuffer(limit int, sink func([]string)) *BatchBuffer {
+	return &BatchBuffer{
+		limit: limit,
+		items: make([]string, 0, limit),
+		sink:  sink,
+	}
+}
+
+func (b *BatchBuffer) Add(item string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.items = append(b.items, item)
+	if len(b.items) >= b.limit {
+		b.flushLocked()
+	}
+}
+
+func (b *BatchBuffer) Flush() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flushLocked()
+}
+
+func (b *BatchBuffer) flushLocked() {
+	if len(b.items) == 0 {
+		return
+	}
+	batch := make([]string, len(b.items))
+	copy(batch, b.items)
+	b.items = b.items[:0] // Retains backing capacity!
+
+	if b.sink != nil {
+		b.sink(batch)
+	}
+}
+
+func main() {
+	var batches [][]string
+	sink := func(batch []string) {
+		batches = append(batches, batch)
+	}
+
+	buf := NewBatchBuffer(3, sink)
+	buf.Add("span-1")
+	buf.Add("span-2")
+	buf.Add("span-3") // Triggers automatic flush
+
+	buf.Add("span-4")
+	buf.Flush()       // Manual flush
+
+	fmt.Printf("Produced %d batches. Batch 1: %v, Batch 2: %v\n",
+		len(batches), batches[0], batches[1])
+}
+```
+
+**Explanation:**
+Using `b.items = b.items[:0]` resets the slice length to 0 while preserving the pre-allocated backing array, avoiding re-allocations on subsequent batch accumulations.
+
+</Solution>
+</Exercise>
+
+<Exercise n={3} title="Dynamic Memory Limiter Circuit Breaker" level="medium">
+
+Implement a `MemoryCircuitBreaker` that tracks active byte allocations against a maximum byte budget `maxBytes`.
+If `Acquire(bytes int) error` is called and current bytes + requested bytes exceeds `maxBytes`, return `ErrLimitExceeded`. When operations complete, `Release(bytes int)` restores capacity. Ensure thread-safety using atomic integers or mutexes.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+)
+
+var ErrLimitExceeded = errors.New("memory limit exceeded: load shed")
+
+type MemoryCircuitBreaker struct {
+	maxBytes    int64
+	activeBytes atomic.Int64
+}
+
+func NewMemoryCircuitBreaker(maxBytes int64) *MemoryCircuitBreaker {
+	return &MemoryCircuitBreaker{maxBytes: maxBytes}
+}
+
+func (m *MemoryCircuitBreaker) Acquire(bytes int64) error {
+	for {
+		cur := m.activeBytes.Load()
+		if cur+bytes > m.maxBytes {
+			return ErrLimitExceeded
+		}
+		if m.activeBytes.CompareAndSwap(cur, cur+bytes) {
+			return nil
+		}
+	}
+}
+
+func (m *MemoryCircuitBreaker) Release(bytes int64) {
+	m.activeBytes.Add(-bytes)
+}
+
+func main() {
+	breaker := NewMemoryCircuitBreaker(1000)
+
+	if err := breaker.Acquire(600); err != nil {
+		fmt.Println("Error:", err)
+	} else {
+		fmt.Println("Acquired 600 bytes successfully")
+	}
+
+	if err := breaker.Acquire(500); errors.Is(err, ErrLimitExceeded) {
+		fmt.Println("Correctly rejected 500 bytes (600 + 500 > 1000)")
+	}
+
+	breaker.Release(600)
+	if err := breaker.Acquire(500); err == nil {
+		fmt.Println("Acquired 500 bytes after releasing previous allocation")
+	}
+}
+```
+
+**Explanation:**
+Lock-free compare-and-swap (`CompareAndSwap`) on an `atomic.Int64` enables hundreds of concurrent worker goroutines to acquire memory quotas without lock contention.
+
+</Solution>
+</Exercise>
+
+<Exercise n={4} title="Synthetic Trace Pipeline Integration Harness" level="hard">
+
+Construct an in-memory trace pipeline test harness where 10 concurrent producer goroutines emit 500 synthetic spans each (total 5,000 spans) containing sensitive attributes into a shared pipeline.
+The pipeline must sanitize all spans (masking CVVs and PANs) and flush them into a thread-safe sink. Assert that exactly 5,000 spans were processed, and that zero unredacted cards or CVVs escaped into the sink.
+
+<Solution>
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+type TraceSpan struct {
+	ID         string
+	Attributes map[string]string
+}
+
+type PipelineHarness struct {
+	mu            sync.Mutex
+	sink          []TraceSpan
+	redactedCount atomic.Int64
+}
+
+func (p *PipelineHarness) Ingest(span TraceSpan) {
+	// Mutate
+	for k, v := range span.Attributes {
+		if k == "payment.cvv" {
+			span.Attributes[k] = "***"
+			p.redactedCount.Add(1)
+		} else if k == "payment.pan" && len(v) == 16 {
+			span.Attributes[k] = v[:6] + "******" + v[12:]
+			p.redactedCount.Add(1)
+		}
+	}
+
+	p.mu.Lock()
+	p.sink = append(p.sink, span)
+	p.mu.Unlock()
+}
+
+func main() {
+	harness := &PipelineHarness{}
+	const workers = 10
+	const spansPerWorker = 500
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for s := 0; s < spansPerWorker; s++ {
+				harness.Ingest(TraceSpan{
+					ID: fmt.Sprintf("w%d-s%d", workerID, s),
+					Attributes: map[string]string{
+						"payment.pan": "4111111111111111",
+						"payment.cvv": "491",
+					},
+				})
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	totalExpected := workers * spansPerWorker
+	fmt.Printf("Total spans processed: %d / %d\n", len(harness.sink), totalExpected)
+	fmt.Printf("Total redacted attributes: %d / %d\n", harness.redactedCount.Load(), totalExpected*2)
+
+	// Invariant verification
+	leaks := 0
+	for _, span := range harness.sink {
+		if span.Attributes["payment.cvv"] != "***" {
+			leaks++
+		}
+		if span.Attributes["payment.pan"] != "411111******1111" {
+			leaks++
+		}
+	}
+
+	if leaks == 0 && len(harness.sink) == totalExpected {
+		fmt.Println("TEST PASSED: 0 LEAKS DETECTED UNDER CONCURRENT LOAD")
+	} else {
+		fmt.Printf("TEST FAILED: %d leaks\n", leaks)
+	}
+}
+```
+
+**Explanation:**
+The test simulates high-volume concurrent pipeline ingress, verifying synchronization, data race immunity, and total attribute sanitization under pressure.
+
+</Solution>
+</Exercise>
+
+---
+
+<Recap>
+
+- The **OpenTelemetry Collector** decouples microservice instrumentation from storage backends, serving as an in-flight security and performance perimeter.
+- A **Telemetry Pipeline** executes components in strict sequence: Receivers ingest, Memory Limiters guard resources, Processors transform, Batchers aggregate, and Exporters transmit.
+- The `memory_limiter` processor must **always precede** batch and mutation processors to shed load before memory-intensive deserialization triggers an Out-Of-Memory kill.
+- `go.opentelemetry.io/collector/pdata` avoids Google Protobuf pointer spaghetti by wrapping contiguous memory buffers in zero-copy value types.
+- Standard Go regular expressions (`regexp`) allocate on the heap on every match. High-throughput in-flight PII redaction requires deterministic ASCII byte inspection and in-place mutation.
+- Production financial processors must validate candidate card numbers against the **Luhn Algorithm** to prevent corrupting non-card numeric strings (UUIDs, timestamps, order IDs).
+- **`GOMEMLIMIT`** (Go 1.19+) and container-aware **`GOMAXPROCS`** (Go 1.25+) eliminate the need for legacy memory ballast hacks, working in tandem with the Collector's memory limiter.
+
+</Recap>
+
+<Lab
+  title="Zero-Alloc PII Redaction & Batch Compressor"
+  archetype="fix-it"
+  difficulty="hard"
+  points={100}
+  hintCost={15}
+  objective="Implement zero-allocation in-flight span attribute redaction for credit card PANs and routing numbers, alongside dynamic batch chunking with memory threshold limits."
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// Span represents a telemetry trace span with attributes
+type Span struct {
+	TraceID    string
+	SpanID     string
+	Name       string
+	Attributes map[string]string
+}
+
+// BatchProcessor buffers spans and flushes when batchSize is reached or flushed manually.
+type BatchProcessor struct {
+	mu           sync.Mutex
+	batchSize    int
+	maxMemory    int64
+	currentBytes int64
+	buffer       []Span
+	sink         func([]Span)
+	droppedCount atomic.Int64
+}
+
+func NewBatchProcessor(batchSize int, maxMemory int64, sink func([]Span)) *BatchProcessor {
+	return &BatchProcessor{
+		batchSize: batchSize,
+		maxMemory: maxMemory,
+		buffer:    make([]Span, 0, batchSize),
+		sink:      sink,
+	}
+}
+
+// ErrMemoryExhausted is returned when memory threshold is exceeded.
+var ErrMemoryExhausted = errors.New("collector memory limit exceeded: shedding load")
+
+// TODO 1: Implement IsValidLuhn
+// Checks whether a 16-digit ASCII string passes the Luhn checksum (MOD 10).
+// Must return false if len(s) != 16 or contains non-digits.
+// Double every second digit from right to left; if > 9, subtract 9.
+// Return true if total sum % 10 == 0.
+func IsValidLuhn(s string) bool {
+	// TODO: Replace stub with your implementation
+	return false
+}
+
+// TODO 2: Implement RedactSpanAttributes
+// Rules:
+// 1. If key (case-insensitive) is "payment.cvv" or "card.cvv" or "cvv", set value to "***".
+// 2. If key is "bank.routing_number" or "routing_number" and value is 9 digits, mask first 5 digits: "*****6780".
+// 3. If value is a 16-digit number that passes IsValidLuhn:
+//    Mask digits 7 through 12: "411111******1111".
+//    If a 16-digit number fails Luhn, do NOT mask it!
+// 4. If value contains an embedded 16-digit card number (e.g. "charge to 4111111111111111 now"),
+//    validate candidate with Luhn and mask digits 7-12 in-place.
+// Return the total number of redacted attributes.
+func RedactSpanAttributes(span *Span) int {
+	// TODO: Replace stub with your implementation
+	return 0
+}
+
+// TODO 3: Implement Ingest on BatchProcessor
+// 1. Compute span memory footprint: 128 + len(Name) + len(TraceID) + sum(len(k)+len(v)).
+// 2. If currentBytes + spanBytes > maxMemory:
+//    Increment droppedCount and return ErrMemoryExhausted.
+// 3. Append span to buffer and add spanBytes to currentBytes.
+// 4. If len(buffer) >= batchSize, flush buffer to sink.
+func (bp *BatchProcessor) Ingest(span Span) error {
+	// TODO: Replace stub with your implementation
+	return nil
+}
+
+func (bp *BatchProcessor) Flush() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.flushLocked()
+}
+
+func (bp *BatchProcessor) flushLocked() {
+	if len(bp.buffer) == 0 {
+		return
+	}
+	batch := make([]Span, len(bp.buffer))
+	copy(batch, bp.buffer)
+	bp.buffer = bp.buffer[:0]
+	bp.currentBytes = 0
+
+	if bp.sink != nil {
+		bp.sink(batch)
+	}
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	span := &Span{
+		TraceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+		SpanID:  "00f067aa0ba902b7",
+		Name:    "AuthorizePayment",
+		Attributes: map[string]string{
+			"payment.pan":            "4111111111111111", // Valid Visa test card
+			"payment.cvv":            "842",
+			"bank.routing_number":    "123456780",
+			"transaction.id":         "1234567890123456", // 16 digits, but invalid Luhn!
+			"embedded.desc":          "charge to 4111111111111111 now",
+		},
+	}
+
+	if !IsValidLuhn("4111111111111111") {
+		fmt.Println("FAIL check 1: valid visa card should pass Luhn")
+		return
+	}
+	if IsValidLuhn("1234567890123456") {
+		fmt.Println("FAIL check 2: random digits should fail Luhn")
+		return
+	}
+
+	redacted := RedactSpanAttributes(span)
+	if redacted < 4 {
+		fmt.Printf("FAIL check 3: expected at least 4 redacted attributes, got %d\n", redacted)
+		return
+	}
+
+	if span.Attributes["payment.pan"] != "411111******1111" {
+		fmt.Printf("FAIL check 4: expected 411111******1111, got %s\n", span.Attributes["payment.pan"])
+		return
+	}
+
+	if span.Attributes["payment.cvv"] != "***" {
+		fmt.Printf("FAIL check 5: expected ***, got %s\n", span.Attributes["payment.cvv"])
+		return
+	}
+
+	if span.Attributes["bank.routing_number"] != "*****6780" {
+		fmt.Printf("FAIL check 6: expected *****6780, got %s\n", span.Attributes["bank.routing_number"])
+		return
+	}
+
+	if span.Attributes["transaction.id"] != "1234567890123456" {
+		fmt.Println("FAIL check 7: non-card transaction ID must remain untouched")
+		return
+	}
+
+	var flushedBatches [][]Span
+	sink := func(batch []Span) {
+		flushedBatches = append(flushedBatches, batch)
+	}
+
+	bp := NewBatchProcessor(3, 1000, sink)
+	bp.Ingest(Span{Name: "span-1"})
+	bp.Ingest(Span{Name: "span-2"})
+	if len(flushedBatches) != 0 {
+		fmt.Println("FAIL check 8: batch flushed prematurely")
+		return
+	}
+	bp.Ingest(Span{Name: "span-3"})
+	if len(flushedBatches) != 1 || len(flushedBatches[0]) != 3 {
+		fmt.Println("FAIL check 9: batch did not flush at threshold 3")
+		return
+	}
+
+	smallBP := NewBatchProcessor(100, 200, sink)
+	_ = smallBP.Ingest(Span{Name: "normal-span"})
+	err := smallBP.Ingest(Span{Name: strings.Repeat("X", 300)})
+	if !errors.Is(err, ErrMemoryExhausted) {
+		fmt.Printf("FAIL check 10: expected ErrMemoryExhausted, got %v\n", err)
+		return
+	}
+
+	fmt.Println("ALL CHECKS PASS")
+}
+`}
+  hints={[
+    "In IsValidLuhn: iterate backwards from index len-1 to 0. Parse digit c - '0'. For every alternate digit, multiply by 2; if > 9, subtract 9. Accumulate and check if sum % 10 == 0.",
+    "In RedactSpanAttributes: check key names in lower-case. For 16-digit strings, check IsValidLuhn. Mask indices 6 to 11 with '*'. For routing numbers of length 9, mask indices 0 to 4.",
+    "In Ingest: lock the mutex. Calculate spanBytes = 128 + len(span.Name) + len(span.TraceID) + sum of len(k)+len(v). Check against maxMemory. If exceeded, increment droppedCount and return ErrMemoryExhausted. If len(buffer) >= batchSize, call flushLocked()."
+  ]}
+  expect="ALL CHECKS PASS"
+  verify="self-check"
+  flag="GO{0T3L_C0LL3CT0R_Z3R0_4LL0C_P11_PR0C3SS0R}"
+/>
+
+<Scoreboard
+  streak={53}
+  items={[
+    { label: "Predict Lab — Trace Span Mutator Allocation", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1 — In-Place Luhn PAN Masker", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2 — High-Throughput Batch Buffer with Dual Triggers", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3 — Dynamic Memory Limiter Circuit Breaker", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 4 — Synthetic Trace Pipeline Integration Harness", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab — Zero-Alloc PII Redaction & Batch Compressor", captured: false, points: 100 }}
+/>
+
+---
+
+Look at that pipeline, sport. 100,000 spans per second screaming through the gateway, every credit card number scrubbed down to the metal with zero heap allocations, memory limits held with absolute precision, and not a single rogue byte leaking to external dashboards. That isn't just observability. That is perfection. Now step aside and let the amateurs wonder how we make it look so effortless.
