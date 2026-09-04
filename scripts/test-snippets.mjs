@@ -4,6 +4,25 @@ import os from "os";
 import { execSync } from "child_process";
 
 const CONTENT_DIR = "content";
+// The corpus targets this Go release; GOTOOLCHAIN=auto fetches it when the
+// local toolchain is older. Bump here and in the README badge together.
+const GO_VERSION = "1.26";
+const WITH_MODULES = process.argv.includes("--with-modules");
+
+/**
+ * True when a snippet imports anything outside the standard library. Stdlib
+ * import paths never carry a dot in their first segment, so `github.com/...`,
+ * `golang.org/x/...` and `entgo.io/...` all separate cleanly from `net/http`.
+ * These snippets need the module proxy, so they build in their own tier rather
+ * than blocking a hermetic run.
+ */
+function needsModules(code) {
+  for (const m of code.matchAll(/^\s*(?:[\w.]+\s+)?"([^"]+)"/gm)) {
+    const first = m[1].split("/")[0];
+    if (first.includes(".")) return true;
+  }
+  return false;
+}
 const REPORT_ONLY = process.argv.includes("--report-only") || !process.argv.includes("--strict");
 
 // Scan all .mdx files
@@ -23,7 +42,10 @@ function getMdxFiles(dir) {
 // Temporary directory for builds
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-snippet-test-"));
 const goModPath = path.join(tmpDir, "go.mod");
-fs.writeFileSync(goModPath, "module snippettest\n\ngo 1.24\n");
+fs.writeFileSync(goModPath, `module snippettest
+
+go ${GO_VERSION}
+`);
 
 console.log(`[test-snippets] Scratchpad directory: ${tmpDir}`);
 console.log(`[test-snippets] Mode: ${REPORT_ONLY ? "REPORT ONLY (non-blocking)" : "STRICT (blocking)"}`);
@@ -33,7 +55,9 @@ let totalSnippets = 0;
 let totalPackageMain = 0;
 let skippedCount = 0;
 let passedCount = 0;
+let moduleTierCount = 0;
 let failedSnippets = [];
+let moduleTierFailures = [];
 
 for (const file of files) {
   const content = fs.readFileSync(file, "utf8");
@@ -83,6 +107,12 @@ for (const file of files) {
           continue;
         }
 
+        const thirdParty = needsModules(code);
+        if (thirdParty && !WITH_MODULES) {
+          moduleTierCount++;
+          continue;
+        }
+
         // Test compilation
         const snippetFile = path.join(tmpDir, "main.go");
         fs.writeFileSync(snippetFile, code);
@@ -99,11 +129,9 @@ for (const file of files) {
           const detail = stderr
             .split("\n")
             .filter((l) => l.trim() && !l.startsWith("#"))[0];
-          failedSnippets.push({
-            file,
-            line: startLine,
-            error: detail || "compile error",
-          });
+          const failure = { file, line: startLine, error: detail || "compile error" };
+          if (thirdParty) moduleTierFailures.push(failure);
+          else failedSnippets.push(failure);
         }
       }
       continue;
@@ -125,6 +153,11 @@ console.log(`Total Go snippets found:          ${totalSnippets}`);
 console.log(`Standalone (package main):        ${totalPackageMain}`);
 console.log(`Fragments (functions/structs):    ${totalSnippets - totalPackageMain} (not standalone)`);
 console.log(`Skipped (intentional/anti-pat):   ${skippedCount}`);
+console.log(
+  WITH_MODULES
+    ? `Third-party tier (built):         ${moduleTierFailures.length} failed`
+    : `Third-party tier (deferred):      ${moduleTierCount} (run --with-modules)`
+);
 console.log(`Passed 'go build':                ${passedCount}`);
 console.log(`Failed 'go build':                ${failedSnippets.length}`);
 console.log("=======================================================\n");
@@ -136,6 +169,16 @@ if (failedSnippets.length > 0) {
   }
   if (failedSnippets.length > 20) {
     console.log(`  ... and ${failedSnippets.length - 20} more failures.`);
+  }
+}
+
+if (WITH_MODULES && moduleTierFailures.length > 0) {
+  console.log("\nThird-party tier failures (never blocking):");
+  for (const f of moduleTierFailures.slice(0, 20)) {
+    console.log(`  • ${f.file}:${f.line} -> ${f.error}`);
+  }
+  if (moduleTierFailures.length > 20) {
+    console.log(`  ... and ${moduleTierFailures.length - 20} more.`);
   }
 }
 
