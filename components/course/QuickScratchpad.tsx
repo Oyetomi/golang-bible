@@ -1,5 +1,7 @@
 "use client";
 
+import { KbdHint } from "@/components/course/Playground";
+
 import { useEffect, useRef, useState } from "react";
 import { formatGo } from "@/lib/gofmt";
 import { highlightGo } from "@/lib/highlight";
@@ -187,7 +189,7 @@ export function QuickScratchpad() {
                 >
                   ⚡ Format
                 </button>
-                <span className="ply-kbd-hint">⌘Enter to run</span>
+                <KbdHint />
                 <span className="gb-ide-lang">GO 1.26</span>
               </div>
             </div>

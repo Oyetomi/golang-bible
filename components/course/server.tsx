@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { CSSProperties, ReactNode } from "react";
-import { PlaygroundRunner } from "@/components/course/Playground";
+import { PlaygroundRunner, KbdHint } from "@/components/course/Playground";
 import { highlightGo } from "@/lib/highlight";
 
 let plyCounter = 0;
@@ -173,9 +173,8 @@ export function GoPlayground({
           </div>
         </div>
         <div className="gb-ide-right">
-          <span className="ply-kbd-hint">⌘Enter to run</span>
+          <KbdHint />
           <span className="gb-ide-lang">GO 1.26</span>
-          <span className="ply-hint">runnable</span>
         </div>
       </div>
       <div className="ply-code" id={id}>

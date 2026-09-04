@@ -950,7 +950,6 @@ export function Lab({
                 {copiedCode ? "Copied ✓" : "Copy"}
               </button>
               <span className="gb-ide-lang">GO 1.26</span>
-              <span className="ply-hint">runnable</span>
             </div>
           </div>
           <pre className="lab-code" id={codeId} spellCheck={false}>

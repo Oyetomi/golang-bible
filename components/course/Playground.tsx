@@ -8,6 +8,22 @@ import { Gopher } from "@/components/course/Gopher";
 import { formatGo } from "@/lib/gofmt";
 import { highlightGo } from "@/lib/highlight";
 
+/* The run shortcut differs by platform, so the hint resolves after mount —
+   the server render keeps the mac label and the client corrects it. */
+export function KbdHint() {
+  const [isMac, setIsMac] = useState(true);
+
+  useEffect(() => {
+    setIsMac(/mac|iphone|ipad|ipod/i.test(navigator.userAgent));
+  }, []);
+
+  return (
+    <span className="ply-kbd-hint">
+      {isMac ? "\u2318" : "Ctrl+"}Enter to run
+    </span>
+  );
+}
+
 interface StepInsight {
   title: string;
   desc: string;
