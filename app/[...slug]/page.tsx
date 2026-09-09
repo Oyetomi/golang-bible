@@ -26,12 +26,15 @@ export async function generateMetadata({
   const href = "/" + slug.join("/");
   const ch = chapterByHref(href);
   if (!ch) return {};
-  const title = `${ch.title} — The Go Bible`;
+  // The root layout applies a "%s — The Go Bible" template, so the bare
+  // chapter title goes to `title`; the social cards get the full string
+  // because no template is applied to them.
+  const socialTitle = `${ch.title} — The Go Bible`;
   return {
-    title,
+    title: ch.title,
     description: ch.description,
     openGraph: {
-      title,
+      title: socialTitle,
       description: ch.description,
       type: "article",
       url: href,
@@ -39,7 +42,7 @@ export async function generateMetadata({
     },
     twitter: {
       card: "summary_large_image",
-      title,
+      title: socialTitle,
       description: ch.description,
     },
   };
