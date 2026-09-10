@@ -66,14 +66,14 @@ export default async function ChapterPage({
     );
   }
 
-  const { content } = await renderChapter(chapter.path);
+  const { content, stats } = await renderChapter(chapter.path);
   const currentIndex = chapters.findIndex((c) => c.href === chapter.href);
   const prev = currentIndex > 0 ? chapters[currentIndex - 1] : null;
   const next = currentIndex < chapters.length - 1 ? chapters[currentIndex + 1] : null;
 
   return (
     <article className="prose">
-      <ReaderBar />
+      <ReaderBar wordCount={stats.words} animCount={stats.anims} />
       {content}
       <ChapterPagination prev={prev} next={next} />
     </article>

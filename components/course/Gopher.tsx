@@ -421,27 +421,27 @@ function RoleGear({ role }: { role: GopherRole }) {
           <path d="M62 22 l0.9 2 2 0.9 -2 0.9 -0.9 2 -0.9 -2 -2 -0.9 2 -0.9 z" fill="#facc15" />
         </g>
       );
-    case "reader": // you — a beard, and a mug in green-white-green
+    case "reader": // you — a chin beard, and a mug in green-white-green
       return (
         <g className="gph-gear">
-          {/* Beard framing the snout: outer sweep down, inner sweep back up, so
-              the buck teeth stay visible inside it. */}
+          {/* Sized for a 44px render. A jaw-wide crescent turned to mud there,
+              and a thin band reads as a smile — a beard is mass, so this is a
+              solid chin patch below the teeth in a warm tone that separates
+              from the outline instead of merging with it. */}
           <path
-            d="M20 32 C20 54.5, 44 54.5, 44 32 C42 43, 22 43, 20 32 Z"
-            fill="#2f2a26"
+            d="M25.5 41 C25.5 53.5, 38.5 53.5, 38.5 41 Z"
+            fill="#4a4038"
             stroke="var(--gph-line)"
-            strokeWidth="0.9"
+            strokeWidth="0.8"
           />
-          <path d="M21 31 q1.4 5 2.2 7.4" stroke="#2f2a26" strokeWidth="2.6" strokeLinecap="round" fill="none" />
-          <path d="M43 31 q-1.4 5 -2.2 7.4" stroke="#2f2a26" strokeWidth="2.6" strokeLinecap="round" fill="none" />
-          {/* Mug */}
-          <rect x="48" y="34" width="11.5" height="12" rx="1.6" fill="#0f172a" stroke="#94a3b8" strokeWidth="1.2" />
-          <rect x="48.6" y="34.6" width="3.4" height="10.8" fill="#008751" />
-          <rect x="52" y="34.6" width="3.5" height="10.8" fill="#f8fafc" />
-          <rect x="55.5" y="34.6" width="3.4" height="10.8" fill="#008751" />
-          <path d="M59.5 37 q3.4 0.4 3.4 3 t-3.4 3" fill="none" stroke="#94a3b8" strokeWidth="1.3" />
-          <path d="M51.5 31.6 q1.4 -2 0 -3.6" fill="none" stroke="#cbd5e1" strokeWidth="1" strokeLinecap="round" opacity="0.75" />
-          <path d="M55.5 31.6 q1.4 -2 0 -3.6" fill="none" stroke="#cbd5e1" strokeWidth="1" strokeLinecap="round" opacity="0.55" />
+          <path d="M23.6 34.5 q1 4 2 6.4" stroke="#4a4038" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+          <path d="M40.4 34.5 q-1 4 -2 6.4" stroke="#4a4038" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+          {/* Mug, tucked in so it does not ride off the body edge */}
+          <rect x="47" y="35" width="10" height="10.5" rx="1.5" fill="#0f172a" stroke="#94a3b8" strokeWidth="1.1" />
+          <rect x="47.6" y="35.6" width="2.9" height="9.3" fill="#008751" />
+          <rect x="50.5" y="35.6" width="3" height="9.3" fill="#f8fafc" />
+          <rect x="53.5" y="35.6" width="2.9" height="9.3" fill="#008751" />
+          <path d="M57 37.6 q2.8 0.4 2.8 2.6 t-2.8 2.6" fill="none" stroke="#94a3b8" strokeWidth="1.2" />
         </g>
       );
     case "smith": // anvil + hammer — the compiler, linker, stenciling

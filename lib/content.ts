@@ -31,8 +31,26 @@ export async function chapterExists(relPath: string): Promise<boolean> {
   }
 }
 
+/** Prose words a reader actually reads: JSX props, fenced code and MDX
+ *  expressions are stripped, so the estimate reflects reading, not file size. */
+export function proseStats(source: string) {
+  const body = source
+    .replace(/^---[\s\S]*?---/, "")           // frontmatter
+    .replace(/```[\s\S]*?```/g, "")           // fenced code
+    .replace(/<([A-Z][A-Za-z0-9]*)[^>]*\/>/g, "") // self-closing components incl. props
+    .replace(/<\/?[A-Za-z][^>]*>/g, "")        // remaining tags and their props
+    .replace(/\{[^{}]*\}/g, "");              // stray MDX expressions
+
+  const words = body.split(/\s+/).filter((w) => /[A-Za-z0-9]/.test(w)).length;
+  const anims = (
+    source.match(/<(ExecTimeline|Scene|[A-Z][A-Za-z]*Anim|AlgoGrid|CodeWalk|HackLab|PredictLab)\b/g) ?? []
+  ).length;
+  return { words, anims };
+}
+
 export async function renderChapter(relPath: string) {
   const source = await fs.readFile(path.join(CONTENT_DIR, relPath), "utf8");
+  const stats = proseStats(source);
   const { content, frontmatter } = await compileMDX<Frontmatter>({
     source,
     // GoPlayground is an async server component; the MDXComponents type is
@@ -48,5 +66,5 @@ export async function renderChapter(relPath: string) {
       },
     },
   });
-  return { content, frontmatter };
+  return { content, frontmatter, stats };
 }
