@@ -77,6 +77,22 @@ if (WITH_MODULES) {
 console.log(`[test-snippets] Scratchpad directory: ${tmpDir}`);
 console.log(`[test-snippets] Mode: ${REPORT_ONLY ? "REPORT ONLY (non-blocking)" : "STRICT (blocking)"}`);
 
+// The first snippet of a run would otherwise absorb the cost of populating a
+// cold build cache — on a fresh CI runner that alone can exceed a per-snippet
+// timeout, and the failure then points at whichever chapter happened to sort
+// first. Pay it once, here, where it belongs to nobody's snippet.
+try {
+  fs.writeFileSync(path.join(tmpDir, "main.go"), "package main\n\nfunc main() {}\n");
+  execSync(VET ? "go vet main.go" : "go build -o /dev/null main.go", {
+    cwd: tmpDir,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 300000,
+  });
+  console.log("[test-snippets] build cache warmed");
+} catch {
+  console.log("[test-snippets] cache warm-up skipped");
+}
+
 const files = getMdxFiles(CONTENT_DIR);
 let totalSnippets = 0;
 let totalPackageMain = 0;
@@ -159,14 +175,17 @@ for (const file of files) {
             // A stdlib build is quick, but a snippet pulling a large dependency
             // tree can exceed a short budget on a cold module cache and get
             // reported as a compile failure it is not.
-            timeout: thirdParty ? 120000 : 15000,
+            timeout: thirdParty ? 120000 : 60000,
           });
           passedCount++;
         } catch (err) {
           const stderr = err.stderr ? err.stderr.toString() : err.message;
-          const detail = stderr
-            .split("\n")
-            .filter((l) => l.trim() && !l.startsWith("#"))[0];
+          const timedOut = err.killed === true || err.signal === "SIGTERM";
+          const detail = timedOut
+            ? `timed out after ${thirdParty ? 120 : 60}s (not a compile failure)`
+            : stderr
+                .split("\n")
+                .filter((l) => l.trim() && !l.startsWith("#"))[0];
           const failure = { file, line: startLine, error: detail || "compile error" };
           if (thirdParty) moduleTierFailures.push(failure);
           else failedSnippets.push(failure);
