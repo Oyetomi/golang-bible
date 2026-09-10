@@ -140,3 +140,40 @@ Frontmatter unchanged: yes
 ```
 
 If you fetched **zero** sources, you did the pass wrong — go back and fetch. The deliverable is *verified* claims, not re-read ones.
+
+---
+
+## Already verified — do not redo
+
+Version attributions were audited in full on **2026-09-10** against the primary
+release notes (`go.dev/doc/go1.24`, `go1.25`, `go1.26`), per the cardinal rule
+above. **331 attribution claims scanned across all 120 chapters. Zero errors
+found.**
+
+Confirmed correct, with the release each feature actually shipped in:
+
+| feature | release | 
+| --- | --- |
+| `signal.NotifyContext` | 1.16 |
+| `GOMEMLIMIT` | 1.19 |
+| multi-error wrapping, `errors.Join` | 1.20 |
+| `cmp.Ordered`, `sync.OnceValue`, `slices`/`maps` | 1.21 |
+| per-iteration loop variables, `cmp.Or` | 1.22 |
+| range-over-func, `iter.Seq` | 1.23 |
+| `testing.B.Loop`, `tests` vet analyzer | 1.24 |
+| `testing/synctest`, `sync.WaitGroup.Go`, `waitgroup`/`hostport` vet passes, `net/http.CrossOriginProtection`, cgroup-aware `GOMAXPROCS`, Green Tea GC as experiment | 1.25 |
+| Green Tea GC as default, `t.ArtifactDir`, `errors.AsType`, `net.Dialer.DialTCP` family, `io.ReadAll` 2× rewrite, pprof flame-graph default, self-referential generic constraints, `go fix` as modernizer home, `go mod init` writing `go 1.(N-1).0` | 1.26 |
+| generic methods (type parameters on methods) | 1.27 |
+
+The last row was verified by compiling one, not from the notes: a generic method
+builds under a `go 1.27` directive and is rejected under `go 1.26` with
+`method must have no type parameters`. The gate is the module's `go` directive,
+not the installed toolchain.
+
+Re-run the inventory with `node scripts/audit-version-claims.mjs`. It reports
+items for review rather than gating, because one sentence may legitimately name
+several releases — every item it currently reports has been checked and cleared.
+
+**This closes the version-attribution class only.** Numeric claims about
+internals (buffer sizes, thresholds, pause targets) and mechanism descriptions
+remain unaudited, and are where the remaining risk sits.
