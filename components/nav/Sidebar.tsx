@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { partGroups } from "@/lib/manifest";
@@ -11,6 +11,20 @@ export function Sidebar() {
   const pathname = usePathname();
   const groups = partGroups();
   const [completed, setCompleted] = useState<Set<string>>(new Set());
+  const railRef = useRef<HTMLElement | null>(null);
+
+  // With 120 chapters the rail is ~5000px tall. Landing on a late one left it
+  // parked at the top with the current chapter far below the fold, so the
+  // reader had no idea where they were. Bring it into view — centred, and
+  // without animation on first paint so it does not read as a jump.
+  useEffect(() => {
+    const rail = railRef.current;
+    const active = rail?.querySelector<HTMLElement>(".sidebar-link.active");
+    if (!rail || !active) return;
+
+    const target = active.offsetTop - rail.clientHeight / 2 + active.offsetHeight / 2;
+    rail.scrollTo({ top: Math.max(0, target), behavior: "auto" });
+  }, [pathname]);
 
   useEffect(() => {
     const update = () => {
@@ -29,7 +43,7 @@ export function Sidebar() {
   }, []);
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" ref={railRef}>
       <Link href="/" className="sidebar-brand">
         <svg className="sidebar-mark" viewBox="0 0 64 64" width="26" height="26" aria-hidden="true" focusable="false">
           <defs>
