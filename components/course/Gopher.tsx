@@ -53,19 +53,27 @@ export type GopherRole =
   | "kernel" // microchip + eBPF probe — kernel, ebpf, xdp, kprobe, syscall
   | "locksmith" // golden master key + keyring — locks, mutexes, redlock, lease, fencing
   | "pilot" // aviator goggles + radar — proxy, router, load balancer, service mesh, gateway
-  | "alchemist"; // transmutation flask + spark — zero-alloc, arena, SIMD, wasm, wasi, binary
+  | "alchemist" // transmutation flask + spark — zero-alloc, arena, SIMD, wasm, wasi, binary
+  | "browser" // window chrome — the user agent itself, the untrusted leg of a flow
+  | "maestro" // baton — main(), the entry point, a dispatcher conducting the rest
+  | "reader" // mug — you, the engineer at the keyboard
+  | "smith"; // anvil + hammer — the compiler, linker, stenciling, codegen
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/attacker|adversary|malicious|intruder|\bthief\b|\bmallory\b|burglar|exfiltrat|\bidor\b|\bbola\b/i, "thief"],
+  [/\bbrowser\b|user.?agent|\bua\b|address.?bar/i, "browser"],
+  [/\bmain\(\)|\bmain goroutine\b|entry.?point|dispatcher/i, "maestro"],
+  [/\byou\b|\bengineer\b|\bdeveloper\b|\breader\b|\bhuman\b/i, "reader"],
+  [/\bcompiler\b|\blinker\b|stencil|monomorph|codegen|\bdictionary\b|\bast\b/i, "smith"],
   [/ebpf|\bbpf\b|xdp|kprobe|uprobe|syscall|kernel|tracepoint/i, "kernel"],
   [/lock|mutex|redlock|lease|fencing|semaphore|rwmutex|deadlock/i, "locksmith"],
-  [/architect|ddd|hexagonal|clean.?arch|domain.?driven/i, "architect"],
+  [/architect|ddd|hexagonal|clean.?arch|domain.?driven|bounded.?context|port.?and.?adapter|layered|module.?boundar/i, "architect"],
   [/zero.?alloc|arena|simd|wasm|wasi|binary|transmute|bit.?twiddl|unsafe/i, "alchemist"],
   [/proxy|router|\blb\b|mesh|gateway|load.?balanc|ingress|envoy|traefik/i, "pilot"],
   [/ledger|audit|complian|book|journal|entry/i, "scribe"],
   [/money|pay|charge|transfer|balance|account|bank|fintech|settle|coin|card/i, "banker"],
-  [/auth|secur|secret|tls|token|jwt|password|vault|cred/i, "guard"],
+  [/auth|secur|secret|tls|token|jwt|password|vault|cred|\bkms\b|\bhsm\b|keyring|certificate/i, "guard"],
   [/debug|trace|profil|pprof|fraud|detect|search|find|inspect|delve|dlv/i, "detective"],
   [/produc/i, "producer"],
   [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream/i, "courier"],
@@ -83,7 +91,7 @@ const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/worker|pool|process|batch|job|task/i, "worker"],
   [/lab|flag|ctf|race|goroutine/i, "runner"],
   [/analytic|metric|dashboard|observ|telemetry|slo|monitor/i, "analyst"],
-  [/net|http|grpc|server|client|request|api|dns|socket|conn/i, "operator"],
+  [/net|http|grpc|server|client|request|api|dns|socket|conn|handler|middleware|endpoint|route/i, "operator"],
 ];
 
 /** Best-effort role from a free-text label ("ledger svc" → scribe). */
@@ -391,6 +399,60 @@ function RoleGear({ role }: { role: GopherRole }) {
           <path d="M56 25 l1 2.2 2.2 1 -2.2 1 -1 2.2 -1 -2.2 -2.2 -1 2.2 -1 z" fill="#facc15" />
           <circle cx="50" cy="27" r="0.9" fill="#c084fc" />
           <circle cx="61" cy="28" r="0.8" fill="#facc15" />
+        </g>
+      );
+    case "browser": // a window with chrome — the user agent itself
+      return (
+        <g className="gph-gear">
+          <rect x="46" y="28" width="17" height="14" rx="2" fill="#0f172a" stroke="#64748b" strokeWidth="1.3" />
+          <path d="M46 32.5 h17" stroke="#64748b" strokeWidth="1.1" />
+          <circle cx="48.6" cy="30.3" r="0.85" fill="#ef4444" />
+          <circle cx="51.2" cy="30.3" r="0.85" fill="#f59e0b" />
+          <circle cx="53.8" cy="30.3" r="0.85" fill="#22c55e" />
+          <line x1="48.5" y1="36" x2="60" y2="36" stroke="#38bdf8" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="48.5" y1="39" x2="56.5" y2="39" stroke="#334155" strokeWidth="1.2" strokeLinecap="round" />
+        </g>
+      );
+    case "maestro": // baton — main(), the entry point conducting everything else
+      return (
+        <g className="gph-gear">
+          <line x1="47" y1="47" x2="62" y2="26" stroke="#e2e8f0" strokeWidth="2.2" strokeLinecap="round" />
+          <circle cx="46.6" cy="47.8" r="2.4" fill="#94a3b8" stroke="var(--gph-line)" strokeWidth="1" />
+          <path d="M62 22 l0.9 2 2 0.9 -2 0.9 -0.9 2 -0.9 -2 -2 -0.9 2 -0.9 z" fill="#facc15" />
+        </g>
+      );
+    case "reader": // you — a beard, and a mug in green-white-green
+      return (
+        <g className="gph-gear">
+          {/* Beard framing the snout: outer sweep down, inner sweep back up, so
+              the buck teeth stay visible inside it. */}
+          <path
+            d="M20 32 C20 54.5, 44 54.5, 44 32 C42 43, 22 43, 20 32 Z"
+            fill="#2f2a26"
+            stroke="var(--gph-line)"
+            strokeWidth="0.9"
+          />
+          <path d="M21 31 q1.4 5 2.2 7.4" stroke="#2f2a26" strokeWidth="2.6" strokeLinecap="round" fill="none" />
+          <path d="M43 31 q-1.4 5 -2.2 7.4" stroke="#2f2a26" strokeWidth="2.6" strokeLinecap="round" fill="none" />
+          {/* Mug */}
+          <rect x="48" y="34" width="11.5" height="12" rx="1.6" fill="#0f172a" stroke="#94a3b8" strokeWidth="1.2" />
+          <rect x="48.6" y="34.6" width="3.4" height="10.8" fill="#008751" />
+          <rect x="52" y="34.6" width="3.5" height="10.8" fill="#f8fafc" />
+          <rect x="55.5" y="34.6" width="3.4" height="10.8" fill="#008751" />
+          <path d="M59.5 37 q3.4 0.4 3.4 3 t-3.4 3" fill="none" stroke="#94a3b8" strokeWidth="1.3" />
+          <path d="M51.5 31.6 q1.4 -2 0 -3.6" fill="none" stroke="#cbd5e1" strokeWidth="1" strokeLinecap="round" opacity="0.75" />
+          <path d="M55.5 31.6 q1.4 -2 0 -3.6" fill="none" stroke="#cbd5e1" strokeWidth="1" strokeLinecap="round" opacity="0.55" />
+        </g>
+      );
+    case "smith": // anvil + hammer — the compiler, linker, stenciling
+      return (
+        <g className="gph-gear">
+          <path d="M47 43 h14 l-2 3.4 h-10 z" fill="#475569" stroke="var(--gph-line)" strokeWidth="1.1" />
+          <path d="M46.5 38.5 h13 q3.5 0 3.5 2 l-2 2.5 h-14 z" fill="#64748b" stroke="var(--gph-line)" strokeWidth="1.1" />
+          <line x1="52" y1="33" x2="57" y2="25" stroke="#b08868" strokeWidth="2.2" strokeLinecap="round" />
+          <rect x="54.5" y="21.5" width="8" height="4.4" rx="1.2" fill="#9aa3b5" stroke="var(--gph-line)" strokeWidth="1" transform="rotate(-28 58.5 23.7)" />
+          <circle cx="50.5" cy="36.5" r="0.9" fill="#facc15" />
+          <circle cx="54" cy="35" r="0.7" fill="#fb923c" />
         </g>
       );
   }
