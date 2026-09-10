@@ -63,7 +63,7 @@ Audit effort follows risk. These chapters carry the most load-bearing internals 
 | Channels (`hchan`, sudog queues, direct send) | `go.dev/src/runtime/chan.go` |
 | Maps (Swiss Tables since 1.24, buckets, load factor) | `go.dev/src/runtime/map.go` (and `map_swiss` / `internal/runtime/maps`) |
 | Generics implementation | `go.dev/blog/intro-generics` + "Generics implementation: GC Shapes" design doc |
-| What's new / version attribution | `go.dev/doc/go1.24`, `go1.25`, `go1.26`, and `go.dev/doc/devel/release` |
+| What's new / version attribution | `go.dev/doc/go1.24`, `go1.25`, `go1.26`, `go1.27`, and `go.dev/doc/devel/release` |
 | Money / consistency / idempotency / exactly-once | standard distributed-systems concepts; for currency, integer-minor-unit convention |
 
 If WebFetch can't reach a source, say so in the log and **downgrade** the claim rather than passing it.
@@ -106,7 +106,7 @@ This list isn't exhaustive — it's the high-frequency set. New confident number
    - Fixable with confidence → edit in place.
    - WRONG but you're not certain of the *right* answer → **do not guess**. Leave an MDX flag comment exactly where it is: `{/* ACCURACY: claim "<X>" looks wrong vs <source> — needs human check */}` and note it in the log.
    - Keep the edit minimal. Don't rewrite the surrounding paragraph or change the persona.
-6. **Version-pin** any internals claim that doesn't already name its Go version (baseline Go 1.26). Behavior that changed → name the version it changed in.
+6. **Version-pin** any internals claim that doesn't already name its Go version (baseline Go 1.27). Behavior that changed → name the version it changed in.
 7. **`<ExecTimeline>` / `<Scene>` internals animations** — verify the *steps* match reality (e.g. a scheduler animation's order of operations, a GC animation's phases). A pretty animation of a wrong mechanism is the worst case. If it abstracts real complexity, that's fine — but it must not be *wrong*; add a one-line "simplified" note if needed.
 
 ---
@@ -163,16 +163,30 @@ Confirmed correct, with the release each feature actually shipped in:
 | `testing.B.Loop`, `tests` vet analyzer | 1.24 |
 | `testing/synctest`, `sync.WaitGroup.Go`, `waitgroup`/`hostport` vet passes, `net/http.CrossOriginProtection`, cgroup-aware `GOMAXPROCS`, Green Tea GC as experiment | 1.25 |
 | Green Tea GC as default, `t.ArtifactDir`, `errors.AsType`, `net.Dialer.DialTCP` family, `io.ReadAll` 2× rewrite, pprof flame-graph default, self-referential generic constraints, `go fix` as modernizer home, `go mod init` writing `go 1.(N-1).0` | 1.26 |
-| generic methods (type parameters on methods) | 1.27 |
+| generic methods, `bytes.CutLast`/`strings.CutLast`, `crypto/uuid`, `encoding/json/v2`, unbuffered `time` channels with `asynctimerchan` removed | 1.27 |
 
-The last row was verified by compiling one, not from the notes: a generic method
-builds under a `go 1.27` directive and is rejected under `go 1.26` with
-`method must have no type parameters`. The gate is the module's `go` directive,
-not the installed toolchain.
+Generic methods were first verified by compiling one, before the 1.27 notes were
+consulted: the method form builds under a `go 1.27` directive and is rejected
+under `go 1.26` with `method must have no type parameters`. The gate is the
+module's `go` directive, not the installed toolchain — worth remembering when a
+feature "does not work" on a machine with a new Go.
 
 Re-run the inventory with `node scripts/audit-version-claims.mjs`. It reports
 items for review rather than gating, because one sentence may legitimately name
 several releases — every item it currently reports has been checked and cleared.
+
+### Retarget to Go 1.27 — 2026-09-10
+
+The corpus moved from Go 1.26 to 1.27. Retargeting did **not** invalidate the
+1.26 attributions above — "as of Go 1.26, X" stays true in 1.27 — but it did
+surface two stale claims, both about timers:
+
+- `part-2/04` said an abandoned `time.After` timer "is still held, still
+  consuming memory". True before Go 1.23, false since: an unreferenced timer is
+  collectable before it fires. It also contradicted `appendix/24`, which had the
+  change right. The remaining cost is the per-call allocation, not a leak.
+- `appendix/24` offered `GODEBUG=asynctimerchan=1` as a way back to the old
+  buffered timer channels. **Removed permanently in Go 1.27.**
 
 ### Numeric internals — audited 2026-09-10
 
