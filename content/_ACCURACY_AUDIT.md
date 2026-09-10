@@ -174,6 +174,30 @@ Re-run the inventory with `node scripts/audit-version-claims.mjs`. It reports
 items for review rather than gating, because one sentence may legitimately name
 several releases — every item it currently reports has been checked and cleared.
 
-**This closes the version-attribution class only.** Numeric claims about
-internals (buffer sizes, thresholds, pause targets) and mechanism descriptions
-remain unaudited, and are where the remaining risk sits.
+### Numeric internals — audited 2026-09-10
+
+Checked against `go.dev/doc/gc-guide` and the release notes. **Three defects
+found and fixed**, all the same shape: a specific pause figure stated as a
+guarantee.
+
+- `appendix/52` claimed Green Tea keeps pauses "strictly below 50 microseconds"
+- `appendix/53` claimed "minor garbage collection pauses stay strictly under
+  100 microseconds" — and *minor* is generational vocabulary that does not apply
+- `part-2/10` claimed "Predictable Low-Latency STW Pauses (<1ms)"
+
+Go publishes **no pause-time bound**. Pauses scale with `GOMAXPROCS` and are
+usually dominated by the time taken to stop running goroutines, and the
+collector is **concurrent, non-generational mark-and-sweep** — there is no minor
+or major cycle. All three now say what is measurable instead of what was
+asserted.
+
+Verified correct and left alone: map internals (Swiss Table groups of 8 slots
+plus control bytes, correctly scoped to Go 1.24+), slice growth (stated as
+"doubles small, transitions toward ~1.25x" — the stale "1024 threshold" form
+does not appear anywhere), the 2 KB starting goroutine stack, the every-61st-tick
+global runqueue check, the 64-byte cache line, and the container-aware
+`GOMAXPROCS` default at 1.25 with its `GODEBUG` opt-out.
+
+**Still unaudited:** mechanism descriptions — prose explaining how the scheduler,
+the memory model or escape analysis behave. Those need per-claim source reading
+and are where the remaining risk sits.
