@@ -94,6 +94,26 @@ for (const c of manifest) {
 
   const solutions = (body.match(/<Solution/g) || []).length;
   if (solutions < 3) W(`${c.path}: ${solutions} <Solution> block(s) — expect 3–5 exercises`);
+
+  // ChapterTabs navigates by resolving each label to a heading. A label that
+  // matches nothing leaves an inert tab — it renders, highlights, and does
+  // nothing when clicked, which is invisible until someone tries it. The
+  // component falls back to a prefix match, so mirror that here.
+  const tabsBlock = body.match(/<ChapterTabs[^>]*tabs=\{\[([\s\S]*?)\]\}/);
+  if (tabsBlock) {
+    const norm = (v) => v.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const headings = [...body.matchAll(/^#{2,3} (.+)$/gm)].map((m) =>
+      norm(m[1].replace(/[`*_]/g, ""))
+    );
+    const labels = [...tabsBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    const dead = labels.filter((l) => {
+      const want = norm(l);
+      return !headings.some((h) => h === want || h.startsWith(want) || h.includes(want));
+    });
+    if (dead.length) {
+      W(`${c.path}: ${dead.length} ChapterTabs label(s) match no heading — ${dead.join(", ")}`);
+    }
+  }
 }
 
 // ── Report ────────────────────────────────────────────
