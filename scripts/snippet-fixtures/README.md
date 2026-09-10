@@ -8,10 +8,12 @@ versions instead of whatever the proxy serves that day.
 `go.mod` declares the same Go release as `GO_VERSION` in `test-snippets.mjs`,
 and CI pins every snippet job to it. Keep all three in step.
 
-A dependency can drag the directive past that release — `github.com/enetx/surf`
-once forced 1.27. When `go get` bumps the `go` line, either raise the pinned
-version everywhere or drop the dependency and mark the snippets that import it
-`noverify`.
+A dependency can drag the directive past the pinned release. `github.com/enetx/surf`
+did exactly that: it required 1.27 while the corpus targeted 1.26, so it was
+dropped and its one snippet marked `noverify`. When the corpus moved to 1.27 it
+came back and that snippet is verified again. When `go get` bumps the `go` line,
+either raise the pinned version everywhere or drop the dependency — never let the
+fixture and the content target drift apart silently.
 
 ## Adding a dependency
 

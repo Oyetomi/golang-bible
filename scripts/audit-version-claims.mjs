@@ -14,7 +14,7 @@ import fs from "fs";
 import path from "path";
 
 const CONTENT_DIR = "content";
-const TARGET = "1.26"; // keep in step with GO_VERSION in test-snippets.mjs
+const TARGET = "1.27"; // keep in step with GO_VERSION in test-snippets.mjs
 
 /** feature → release that introduced it. Confirmed against the release notes
  *  on 2026-09-10; re-check rather than trusting this table blindly. */

@@ -174,7 +174,7 @@ export function GoPlayground({
         </div>
         <div className="gb-ide-right">
           <KbdHint />
-          <span className="gb-ide-lang">GO 1.26</span>
+          <span className="gb-ide-lang">GO 1.27</span>
         </div>
       </div>
       <div className="ply-code" id={id}>

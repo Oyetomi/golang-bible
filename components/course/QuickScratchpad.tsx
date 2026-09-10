@@ -190,7 +190,7 @@ export function QuickScratchpad() {
                   ⚡ Format
                 </button>
                 <KbdHint />
-                <span className="gb-ide-lang">GO 1.26</span>
+                <span className="gb-ide-lang">GO 1.27</span>
               </div>
             </div>
             <pre className="codapi-pre">

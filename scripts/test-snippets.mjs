@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 const CONTENT_DIR = "content";
 // The corpus targets this Go release; GOTOOLCHAIN=auto fetches it when the
 // local toolchain is older. Bump here and in the README badge together.
-const GO_VERSION = "1.26";
+const GO_VERSION = "1.27";
 const WITH_MODULES = process.argv.includes("--with-modules");
 // `go vet` implies a compile, so this replaces the build rather than adding a
 // pass. Anti-pattern chapters and `noverify` blocks are already excluded, which
