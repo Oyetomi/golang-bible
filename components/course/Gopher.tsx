@@ -53,19 +53,27 @@ export type GopherRole =
   | "kernel" // microchip + eBPF probe — kernel, ebpf, xdp, kprobe, syscall
   | "locksmith" // golden master key + keyring — locks, mutexes, redlock, lease, fencing
   | "pilot" // aviator goggles + radar — proxy, router, load balancer, service mesh, gateway
-  | "alchemist"; // transmutation flask + spark — zero-alloc, arena, SIMD, wasm, wasi, binary
+  | "alchemist" // transmutation flask + spark — zero-alloc, arena, SIMD, wasm, wasi, binary
+  | "browser" // window chrome — the user agent itself, the untrusted leg of a flow
+  | "maestro" // baton — main(), the entry point, a dispatcher conducting the rest
+  | "reader" // mug — you, the engineer at the keyboard
+  | "smith"; // anvil + hammer — the compiler, linker, stenciling, codegen
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/attacker|adversary|malicious|intruder|\bthief\b|\bmallory\b|burglar|exfiltrat|\bidor\b|\bbola\b/i, "thief"],
+  [/\bbrowser\b|user.?agent|\bua\b|address.?bar/i, "browser"],
+  [/\bmain\(\)|\bmain goroutine\b|entry.?point|dispatcher/i, "maestro"],
+  [/\byou\b|\bengineer\b|\bdeveloper\b|\breader\b|\bhuman\b/i, "reader"],
+  [/\bcompiler\b|\blinker\b|stencil|monomorph|codegen|\bdictionary\b|\bast\b/i, "smith"],
   [/ebpf|\bbpf\b|xdp|kprobe|uprobe|syscall|kernel|tracepoint/i, "kernel"],
   [/lock|mutex|redlock|lease|fencing|semaphore|rwmutex|deadlock/i, "locksmith"],
-  [/architect|ddd|hexagonal|clean.?arch|domain.?driven/i, "architect"],
+  [/architect|ddd|hexagonal|clean.?arch|domain.?driven|bounded.?context|port.?and.?adapter|layered|module.?boundar/i, "architect"],
   [/zero.?alloc|arena|simd|wasm|wasi|binary|transmute|bit.?twiddl|unsafe/i, "alchemist"],
   [/proxy|router|\blb\b|mesh|gateway|load.?balanc|ingress|envoy|traefik/i, "pilot"],
   [/ledger|audit|complian|book|journal|entry/i, "scribe"],
   [/money|pay|charge|transfer|balance|account|bank|fintech|settle|coin|card/i, "banker"],
-  [/auth|secur|secret|tls|token|jwt|password|vault|cred/i, "guard"],
+  [/auth|secur|secret|tls|token|jwt|password|vault|cred|\bkms\b|\bhsm\b|keyring|certificate/i, "guard"],
   [/debug|trace|profil|pprof|fraud|detect|search|find|inspect|delve|dlv/i, "detective"],
   [/produc/i, "producer"],
   [/kafka|queue|topic|broker|publish|subscrib|event|message|webhook|notif|mail|outbox|stream/i, "courier"],
@@ -83,7 +91,7 @@ const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
   [/worker|pool|process|batch|job|task/i, "worker"],
   [/lab|flag|ctf|race|goroutine/i, "runner"],
   [/analytic|metric|dashboard|observ|telemetry|slo|monitor/i, "analyst"],
-  [/net|http|grpc|server|client|request|api|dns|socket|conn/i, "operator"],
+  [/net|http|grpc|server|client|request|api|dns|socket|conn|handler|middleware|endpoint|route/i, "operator"],
 ];
 
 /** Best-effort role from a free-text label ("ledger svc" → scribe). */
@@ -391,6 +399,60 @@ function RoleGear({ role }: { role: GopherRole }) {
           <path d="M56 25 l1 2.2 2.2 1 -2.2 1 -1 2.2 -1 -2.2 -2.2 -1 2.2 -1 z" fill="#facc15" />
           <circle cx="50" cy="27" r="0.9" fill="#c084fc" />
           <circle cx="61" cy="28" r="0.8" fill="#facc15" />
+        </g>
+      );
+    case "browser": // a window with chrome — the user agent itself
+      return (
+        <g className="gph-gear">
+          <rect x="46" y="28" width="17" height="14" rx="2" fill="#0f172a" stroke="#64748b" strokeWidth="1.3" />
+          <path d="M46 32.5 h17" stroke="#64748b" strokeWidth="1.1" />
+          <circle cx="48.6" cy="30.3" r="0.85" fill="#ef4444" />
+          <circle cx="51.2" cy="30.3" r="0.85" fill="#f59e0b" />
+          <circle cx="53.8" cy="30.3" r="0.85" fill="#22c55e" />
+          <line x1="48.5" y1="36" x2="60" y2="36" stroke="#38bdf8" strokeWidth="1.2" strokeLinecap="round" />
+          <line x1="48.5" y1="39" x2="56.5" y2="39" stroke="#334155" strokeWidth="1.2" strokeLinecap="round" />
+        </g>
+      );
+    case "maestro": // baton — main(), the entry point conducting everything else
+      return (
+        <g className="gph-gear">
+          <line x1="47" y1="47" x2="62" y2="26" stroke="#e2e8f0" strokeWidth="2.2" strokeLinecap="round" />
+          <circle cx="46.6" cy="47.8" r="2.4" fill="#94a3b8" stroke="var(--gph-line)" strokeWidth="1" />
+          <path d="M62 22 l0.9 2 2 0.9 -2 0.9 -0.9 2 -0.9 -2 -2 -0.9 2 -0.9 z" fill="#facc15" />
+        </g>
+      );
+    case "reader": // you — a chin beard, and a mug in green-white-green
+      return (
+        <g className="gph-gear">
+          {/* Sized for a 44px render. A jaw-wide crescent turned to mud there,
+              and a thin band reads as a smile — a beard is mass, so this is a
+              solid chin patch below the teeth in a warm tone that separates
+              from the outline instead of merging with it. */}
+          <path
+            d="M25.5 41 C25.5 53.5, 38.5 53.5, 38.5 41 Z"
+            fill="#4a4038"
+            stroke="var(--gph-line)"
+            strokeWidth="0.8"
+          />
+          <path d="M23.6 34.5 q1 4 2 6.4" stroke="#4a4038" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+          <path d="M40.4 34.5 q-1 4 -2 6.4" stroke="#4a4038" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+          {/* Mug, tucked in so it does not ride off the body edge */}
+          <rect x="47" y="35" width="10" height="10.5" rx="1.5" fill="#0f172a" stroke="#94a3b8" strokeWidth="1.1" />
+          <rect x="47.6" y="35.6" width="2.9" height="9.3" fill="#008751" />
+          <rect x="50.5" y="35.6" width="3" height="9.3" fill="#f8fafc" />
+          <rect x="53.5" y="35.6" width="2.9" height="9.3" fill="#008751" />
+          <path d="M57 37.6 q2.8 0.4 2.8 2.6 t-2.8 2.6" fill="none" stroke="#94a3b8" strokeWidth="1.2" />
+        </g>
+      );
+    case "smith": // anvil + hammer — the compiler, linker, stenciling
+      return (
+        <g className="gph-gear">
+          <path d="M47 43 h14 l-2 3.4 h-10 z" fill="#475569" stroke="var(--gph-line)" strokeWidth="1.1" />
+          <path d="M46.5 38.5 h13 q3.5 0 3.5 2 l-2 2.5 h-14 z" fill="#64748b" stroke="var(--gph-line)" strokeWidth="1.1" />
+          <line x1="52" y1="33" x2="57" y2="25" stroke="#b08868" strokeWidth="2.2" strokeLinecap="round" />
+          <rect x="54.5" y="21.5" width="8" height="4.4" rx="1.2" fill="#9aa3b5" stroke="var(--gph-line)" strokeWidth="1" transform="rotate(-28 58.5 23.7)" />
+          <circle cx="50.5" cy="36.5" r="0.9" fill="#facc15" />
+          <circle cx="54" cy="35" r="0.7" fill="#fb923c" />
         </g>
       );
   }
