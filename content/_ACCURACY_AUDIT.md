@@ -212,6 +212,36 @@ does not appear anywhere), the 2 KB starting goroutine stack, the every-61st-tic
 global runqueue check, the 64-byte cache line, and the container-aware
 `GOMAXPROCS` default at 1.25 with its `GODEBUG` opt-out.
 
-**Still unaudited:** mechanism descriptions — prose explaining how the scheduler,
-the memory model or escape analysis behave. Those need per-claim source reading
-and are where the remaining risk sits.
+### Mechanism descriptions — audited 2026-09-10
+
+Scanned for the claims most often stated wrongly in Go writing, then read each
+hit. **Three defects found and fixed**, all internal contradictions rather than
+isolated errors — the corpus had the right answer elsewhere and the wrong one in
+one place.
+
+- `part-2/06` called a channel a **"lock-free channel queue"**. `runtime.hchan`
+  holds a mutex, which `appendix/41` and `part-2/07` both state correctly. The
+  Actor pattern's benefit is not the absence of a lock but the absence of
+  contention on your data — one goroutine owns the state.
+- `part-1/04`'s select caption said **"first ready wins, ties broken randomly"**,
+  implying an ordering with a tie-break. There is no ordering: among ready cases
+  the choice is uniformly random. Five other places in the same chapter said this
+  correctly.
+- `appendix/40` illustrated the Kleppmann lease hazard with a seven-second
+  stop-the-world GC pause. That is a JVM figure. Go's collector is concurrent
+  with brief pauses, so the hazard reaches a Go service through cgroup
+  throttling, hypervisor descheduling, steal time or a stalled syscall instead.
+  Added a callout saying so, because the hazard is real and the mechanism was
+  misleading.
+
+Checked and found correct, left alone: `GOMAXPROCS` described as the maximum
+number of OS threads **executing Go code** (the canonical wording, and the
+qualifier is what makes it right), goroutines never equated with threads,
+work-stealing taking half a queue, interfaces as two words, escape analysis,
+map iteration order, string immutability, and the happens-before framing across
+52 mentions.
+
+**Still unaudited:** the long-tail of per-chapter internals prose that no pattern
+scan reaches — anything phrased unusually enough to evade a keyword. That
+residue needs chapter-by-chapter reading, which is the modernization audit's job
+rather than this one's.
