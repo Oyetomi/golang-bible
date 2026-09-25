@@ -1,0 +1,1236 @@
+---
+title: "Containers from Scratch: Namespaces, cgroups & Layers in Go"
+part: 4
+order: 1
+type: "course"
+description: "Build a working container runtime in ~150 lines of Go: namespaces change what a process sees, cgroups limit what it uses, overlayfs stacks image layers, and what all of it means for Go programs running in containers."
+prerequisites: ["docker-containerization"]
+---
+
+<HeroCard label="Part 4 · Chapter 1" title="Containers from Scratch">
+
+Welcome to Part 4, sport. Infrastructure. This is where engineers who *use* platforms turn into engineers who *understand* them, and when something breaks at 3am, only the second kind can fix it.
+
+In this chapter you'll build a container runtime. It's small, about 150 lines of Go, but it's real: it gives a process its own hostname, its own process numbering, its own filesystem, and hard limits on memory, CPU, and process count, enforced by the Linux kernel. Docker, containerd, runc, and Kubernetes all build on these same kernel features. After this chapter, `docker run` stops being magic. You'll know what it actually does.
+
+We'll go slowly, one idea per stop. Here's the route. If you lose track, come back here:
+
+1. **What a container really is.** It's a normal process with two kinds of restriction. Nothing more.
+2. **Namespaces.** Restriction #1: what the process can *see*.
+3. **The filesystem.** How the process gets its own `/`, and how image layers stack into one.
+4. **cgroups.** Restriction #2: how much the process can *use*.
+5. **gobox.** All of it together in one Go program you can run.
+6. **Go inside containers.** What this means for *your* Go services: GOMAXPROCS, PID 1, signals, and zombies.
+
+</HeroCard>
+
+<ChapterTabs tabs={["What a Container Really Is", "Namespaces: What a Process Can See", "The Filesystem: chroot and Image Layers", "cgroups: What a Process Can Use", "gobox: The Whole Runtime", "Go Inside Containers"]} />
+
+<Scene
+  title="Three services on one machine, no walls"
+  actors={[
+    { id: "ledger", label: "ledger service" },
+    { id: "report", label: "report job" },
+    { id: "api", label: "public API" }
+  ]}
+  cells={[
+    { id: "A1", label: "hostname" },
+    { id: "A2", label: "process list" },
+    { id: "A3", label: "files /" },
+    { id: "A4", label: "RAM 8 GiB" },
+    { id: "A5", label: "CPU ×8" }
+  ]}
+  rows={1}
+  cols={5}
+  frames={[
+    { caption: "Meridian runs three services on one Linux machine as plain processes. They share everything: one hostname, one process list, one filesystem, all the RAM, all the CPUs.", beat: "neutral" },
+    { caption: "The public API gets hacked. It can list every process on the box, read the ledger's config files, and see the ledger's database password in its environment.", beat: "problem", actors: [{ id: "api", state: "bad" }, { id: "ledger", state: "warn" }], cells: [{ id: "A2", state: "bad", label: "sees ledger" }, { id: "A3", state: "bad", label: "reads secrets" }] },
+    { caption: "Then the month-end report job leaks memory and eats all 8 GiB. The kernel's OOM killer picks a victim, and it picks the ledger.", beat: "problem", actors: [{ id: "report", state: "bad" }, { id: "ledger", state: "bad" }], cells: [{ id: "A4", state: "bad", label: "RAM 8/8 GiB" }] },
+    { caption: "With containers, each service gets its own view (namespaces): its own process list and its own filesystem. The hacked API sees only itself.", beat: "solution", actors: [{ id: "api", state: "warn" }, { id: "ledger", state: "ok" }], cells: [{ id: "A2", state: "done", label: "own list" }, { id: "A3", state: "done", label: "own /" }] },
+    { caption: "Each also gets a budget (cgroups). The report job is capped at 1 GiB. When it leaks, only the report job is killed. The ledger keeps running.", beat: "solution", actors: [{ id: "report", state: "warn" }, { id: "ledger", state: "ok" }, { id: "api", state: "ok" }], cells: [{ id: "A4", state: "done", label: "1 GiB cap" }, { id: "A5", state: "done", label: "½ core cap" }] }
+  ]}
+  caption="Containers fix two separate problems: what a process can SEE (namespaces) and what it can USE (cgroups)."
+/>
+
+---
+
+## What a Container Really Is
+
+*Stop 1 of 6.*
+
+Most people picture a container as a small virtual machine. That picture is wrong, and it's the root of most container confusion. Let's replace it.
+
+<Define term="container">
+A **container** is an ordinary Linux process (plus any children it starts) that the kernel runs with two kinds of restriction: **namespaces**, which limit what the process can *see*, and **cgroups**, which limit how much it can *use*. There's no separate operating system and no emulated hardware. The container's processes run on the host's kernel, and they show up in the host's process list like any other process.
+</Define>
+
+<Define term="kernel">
+The **kernel** is the core of the operating system. It's the one program that talks to the hardware directly, and it decides which process runs, which memory belongs to whom, and which files a process may open. Every other program, your Go service included, asks the kernel for these things through **system calls** (syscalls). Containers are built entirely from kernel features, and Go's `syscall` package gives you direct access to them.
+</Define>
+
+The difference from a virtual machine in one table:
+
+| | Virtual machine | Container |
+|---|---|---|
+| What runs | A whole guest OS with its own kernel, on emulated hardware | Your process, on the host's kernel |
+| Startup | Seconds to minutes (boots an OS) | Milliseconds (starts a process) |
+| Isolation comes from | The hypervisor | Namespaces + cgroups in the shared kernel |
+| Seen from the host | One opaque VM process | Your actual processes, with normal PIDs |
+
+The last row is the one to remember. When you ran gobox (we'll build it soon) and listed processes **from the host**, the container's processes were right there with ordinary PIDs:
+
+```text
+   86 gobox
+   93 exe
+   98 sleep
+```
+
+Inside the container, that same `sleep` process believes it's running on a machine called `gobox` where it's one of only two processes. Same process, two views. The rest of the chapter is about how the kernel keeps up both views at once.
+
+<QuickCheck
+  question={"A container is running a Go service. From the HOST, you run ps. What do you see?"}
+  options={["Nothing: container processes are hidden from the host", "One process: the container's virtual machine", "The Go service itself, with an ordinary host PID", "Only the container runtime (containerd), not the service"]}
+  answer={2}
+  explain="A container is a normal process on the host's kernel. The host sees it with a normal PID. Namespaces only change what the process inside can see, not what the host can see."
+/>
+
+---
+
+## Namespaces: What a Process Can See
+
+*Stop 2 of 6.* Now for restriction #1.
+
+<Define term="namespace">
+A **namespace** wraps one global resource of the machine, such as the hostname, the process ID numbering, or the list of mounted filesystems, so that processes inside the namespace get **their own private copy** of it. Changing the copy inside doesn't touch the host's. Linux has one namespace type per resource, and a process can be in a new namespace for some resources while sharing the host's for others.
+</Define>
+
+The namespace types, and what each one gives the process its own copy of:
+
+| Namespace | Flag | Private copy of | We use it? |
+|---|---|---|---|
+| UTS | `CLONE_NEWUTS` | hostname | ✅ |
+| PID | `CLONE_NEWPID` | process ID numbering | ✅ |
+| Mount | `CLONE_NEWNS` | the mount table (which filesystems are mounted where) | ✅ |
+| Network | `CLONE_NEWNET` | network interfaces, IPs, ports, routing | Exercise |
+| IPC | `CLONE_NEWIPC` | System V shared memory and message queues | — |
+| User | `CLONE_NEWUSER` | user and group IDs (root inside ≠ root outside) | Under the hood |
+| Cgroup | `CLONE_NEWCGROUP` | the process's view of the cgroup tree | — |
+
+(Mount was the first namespace ever added, in 2002. Nobody expected more types, so its flag is just `CLONE_NEWNS`, "new namespace".)
+
+Watch one process as we switch namespaces on one at a time. The left column is what the host sees, and the right column is what the process inside sees. When a namespace turns on, a wall comes down between the two values for that row:
+
+<IsolationAnim
+  title="Switching namespaces on, one at a time"
+  frames={[
+    { code: "exec.Command(\"sh\")", note: "A plain child process with no namespaces. It sees exactly what the host sees: same hostname, same PID numbers, same files, same mounts. Nothing is isolated yet.", beat: "neutral", rows: [
+      { label: "hostname", host: "meridian-prod-7", inside: "meridian-prod-7", ns: "UTS" },
+      { label: "shell's PID", host: "4312", inside: "4312", ns: "PID" },
+      { label: "sees processes", host: "all 212", inside: "all 212", ns: "/proc" },
+      { label: "root directory /", host: "host's /", inside: "host's /", ns: "chroot" },
+      { label: "mount table", host: "host's", inside: "host's", ns: "mount" }
+    ]},
+    { code: "Cloneflags: CLONE_NEWUTS", note: "UTS namespace: the child gets its own copy of the hostname. It sets it to gobox. The host's hostname doesn't change. This is the easiest namespace to see.", beat: "solution", rows: [
+      { label: "hostname", host: "meridian-prod-7", inside: "gobox", ns: "UTS" },
+      { label: "shell's PID", host: "4312", inside: "4312", ns: "PID" },
+      { label: "sees processes", host: "all 212", inside: "all 212", ns: "/proc" },
+      { label: "root directory /", host: "host's /", inside: "host's /", ns: "chroot" },
+      { label: "mount table", host: "host's", inside: "host's", ns: "mount" }
+    ]},
+    { code: "| CLONE_NEWPID", note: "PID namespace: the kernel keeps two numbers for the process. The host still calls it 4312, but inside the numbering restarts, and the first process is PID 1. But ps still lists every host process. Why? See the next frame.", beat: "problem", rows: [
+      { label: "hostname", host: "meridian-prod-7", inside: "gobox", ns: "UTS" },
+      { label: "shell's PID", host: "4312", inside: "1", ns: "PID" },
+      { label: "sees processes", host: "all 212", inside: "all 212 (!)", ns: "/proc" },
+      { label: "root directory /", host: "host's /", inside: "host's /", ns: "chroot" },
+      { label: "mount table", host: "host's", inside: "host's", ns: "mount" }
+    ]},
+    { code: "| CLONE_NEWNS  +  mount proc", note: "ps doesn't ask the kernel for a process list. It reads the /proc directory, and the child was still reading the HOST's /proc. With its own mount table, it can mount a fresh /proc that only knows its own PID namespace. Now it sees only its own processes.", beat: "solution", rows: [
+      { label: "hostname", host: "meridian-prod-7", inside: "gobox", ns: "UTS" },
+      { label: "shell's PID", host: "4312", inside: "1", ns: "PID" },
+      { label: "sees processes", host: "all 212", inside: "only its own", ns: "/proc" },
+      { label: "root directory /", host: "host's /", inside: "host's /", ns: "chroot" },
+      { label: "mount table", host: "host's", inside: "its own", ns: "mount" }
+    ]},
+    { code: "chroot(\"/rootfs\")", note: "Last, give it its own root directory: an Alpine Linux filesystem unpacked into /rootfs. Now / means /rootfs, and the host's files are out of reach. (chroot isn't a namespace. It's the next stop.)", beat: "solution", rows: [
+      { label: "hostname", host: "meridian-prod-7", inside: "gobox", ns: "UTS" },
+      { label: "shell's PID", host: "4312", inside: "1", ns: "PID" },
+      { label: "sees processes", host: "all 212", inside: "only its own", ns: "/proc" },
+      { label: "root directory /", host: "host's /", inside: "/rootfs (Alpine)", ns: "chroot" },
+      { label: "mount table", host: "host's", inside: "its own", ns: "mount" }
+    ]}
+  ]}
+  caption="Each namespace virtualizes ONE resource. A container is just a process with several switched on at once."
+/>
+
+### Step 1: Ask for namespaces when starting a process
+
+In Go, you request namespaces through `exec.Cmd`'s `SysProcAttr` field. It holds Linux-specific options that Go passes to the kernel when it creates the child process:
+
+```go noverify
+cmd := exec.Command("/bin/sh")
+cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+cmd.SysProcAttr = &syscall.SysProcAttr{
+	Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+}
+cmd.Run()
+```
+
+<Define term="clone / Cloneflags">
+On Linux, a new process is created with the **`clone`** system call. It's like `fork`, but it takes flags saying which resources the child should get a *new* copy of instead of sharing its parent's. `Cloneflags` is where Go passes those flags. `CLONE_NEWUTS | CLONE_NEWPID` is a bitwise OR, meaning "both of these".
+</Define>
+
+Run that as root and you get a shell in new namespaces. Type `hostname gobox` inside and the host's hostname is unaffected. The UTS namespace works.
+
+### Step 2: The problem: who sets things up inside?
+
+Look at step 1 again. The kernel creates the namespaces and immediately runs `/bin/sh`. But a container needs setup to happen *inside* the namespaces *before* the user's program starts: set the hostname, mount a fresh `/proc`, switch the root directory. `/bin/sh` won't do that for us. We need **our own Go code** to run inside the new namespaces first.
+
+The fix is a famous trick: **the program runs itself.**
+
+<Define term="/proc/self/exe">
+**`/proc/self/exe`** is a special path the kernel provides. For whatever process opens it, it points at that process's own executable file. So `exec.Command("/proc/self/exe", "child", ...)` means "start *another copy of this same program*", this time with the argument `child`.
+</Define>
+
+So gobox has two modes in one binary:
+
+<ExecTimeline
+  title="The re-exec trick: one binary, two roles"
+  lanes={[{ id: "host", label: "gobox run (on host)" }, { id: "kernel", label: "kernel" }, { id: "child", label: "gobox child (inside)" }]}
+  steps={[
+    { lane: "host", kind: "run", label: "gobox run /rootfs sh", note: "You start gobox with the 'run' command. This process lives on the host with no isolation." },
+    { lane: "host", kind: "spawn", label: "exec /proc/self/exe child", note: "run() starts a second copy of ITSELF with the argument 'child', asking for new UTS, PID, and mount namespaces." },
+    { lane: "kernel", kind: "run", label: "clone with NEW* flags", note: "The kernel creates the namespaces and starts the copy inside them. Inside, the copy is PID 1." },
+    { lane: "child", kind: "run", label: "sethostname, chroot, mount /proc", note: "Now OUR Go code is running inside the namespaces, so it can prepare the environment: hostname, root directory, /proc, /dev." },
+    { lane: "child", kind: "spawn", label: "exec sh", note: "Only once setup is finished does it start the user's command. The shell starts in an already-prepared container." },
+    { lane: "host", kind: "done", label: "wait, clean up", note: "The host copy waits for the child to exit, then removes the cgroup it created." }
+  ]}
+  caption="run creates the namespaces. child prepares them. Only then does the user's command start."
+/>
+
+Here's what that looks like from inside once it's working. It's real output from gobox running in an Alpine root filesystem:
+
+```text
+$ sudo ./gobox run /rootfs sh -c 'echo hostname=$(hostname); echo my pid=$$; ps'
+hostname=gobox
+my pid=6
+PID   USER     TIME  COMMAND
+    1 root      0:00 /proc/self/exe child /rootfs sh -c echo hostname=...
+    6 root      0:00 ps
+```
+
+Three things to notice:
+
+1. **PID 1 is gobox's child**, shown with the command line it was started with, `/proc/self/exe child ...`. That's the re-exec trick, visible.
+2. **The shell is PID 6, not 2.** The Go runtime starts several OS threads for PID 1 (for the scheduler and garbage collector), and on Linux threads take numbers from the same pool as processes. So PIDs 2–5 went to Go's own threads. Remember this. It comes back in the cgroups section.
+3. The shell's last command, `ps`, took over the shell's process (a shell optimization), so `ps` itself shows up as PID 6. Only two processes are visible out of the hundreds on the host.
+
+<UnderTheHood title="Why the PID namespace needs a new /proc, and what user namespaces add">
+
+**/proc is a filesystem, not an API.** Tools like `ps` and `top` read the `/proc` directory, where the kernel publishes one numbered folder per process. A `proc` filesystem is tied to the PID namespace **of the process that mounted it**. The host's `/proc` was mounted by the host, so it lists every host process. Mounting a new one from inside the new PID namespace gives a view of only that namespace. That's why gobox needs the mount namespace too: without its own mount table, mounting over `/proc` would replace the host's `/proc` for everyone.
+
+**Mount propagation.** On modern systemd hosts, `/` is mounted as *shared*, which means mount events propagate between namespaces. So gobox's first step inside is `mount("", "/", "", MS_PRIVATE|MS_REC, "")`, which makes every mount private so nothing gobox mounts leaks back to the host. (Go also does this for you if you set `SysProcAttr.Unshareflags: CLONE_NEWNS`. We do it explicitly so you can see it.)
+
+**User namespaces** (`CLONE_NEWUSER`) are the strongest isolation. The process can be `root` (UID 0) inside while mapped to an unprivileged UID like 100000 on the host. If it escapes, it's a nobody. This is how "rootless" Docker and Podman work, and Go supports it through `SysProcAttr.UidMappings` and `GidMappings`. gobox skips it to stay short, which is why it has to run with `sudo`.
+
+**The Go version note:** `SysProcAttr.Cloneflags` has been there since the early days, and `UseCgroupFD`/`CgroupFD` (which we use later) arrived in **Go 1.20**. This all works as written on Go 1.27.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={"gobox sets CLONE_NEWPID, but forgets to mount a new /proc. Inside, the shell runs `echo $$` and then `ps`. What happens?"}
+  options={["$$ is a small number, but ps still lists all the host's processes", "$$ is the host PID and ps lists only the container", "Both show only the container's view", "The shell fails to start without /proc"]}
+  answer={0}
+  explain="The PID namespace renumbers processes, so the shell gets a small PID. But ps reads the /proc directory, and the /proc it can see is still the host's, which lists every host process. Isolating the process LIST takes a new PID namespace AND a fresh /proc mounted inside it."
+/>
+
+---
+
+## The Filesystem: chroot and Image Layers
+
+*Stop 3 of 6.* The process can't see the host's processes any more, but it can still see the host's files. Let's fix that.
+
+### Step 1: chroot: a different /
+
+<Define term="root filesystem (rootfs)">
+A **root filesystem** is a directory tree that looks like a complete Linux system: `/bin`, `/etc`, `/lib`, `/usr`, and so on. A container image is essentially a packaged rootfs. For gobox we use Alpine Linux's "minirootfs", a 4 MB tarball you unpack into a folder such as `/rootfs`.
+</Define>
+
+`chroot` ("change root") tells the kernel: *for this process and its children, `/` now means this directory.*
+
+```go noverify
+syscall.Chroot("/rootfs") // "/" now means /rootfs
+os.Chdir("/")             // move into it: our old working dir is outside the new root
+```
+
+After this, `/bin/sh` means `/rootfs/bin/sh`, so the container runs Alpine's shell and Alpine's tools, even if the host runs Ubuntu. There's no way to name a path outside `/rootfs`. Remember the `os.Chdir("/")`: `chroot` doesn't move the current directory, and a current directory left outside the new root is a known way to escape it.
+
+When gobox first ran, `head -c 300m /dev/zero` failed with `/dev/zero: No such file or directory`. Alpine's minirootfs ships an **empty** `/dev`, and many programs expect a few device files to exist. So gobox mounts a small in-memory filesystem (`tmpfs`) on `/dev` and creates four device files with `mknod`: `null`, `zero`, `random`, and `urandom`. Real runtimes like runc do the same with a slightly longer list.
+
+<Callout kind="warn" title="chroot alone is not a security boundary">
+A root process can break out of a plain `chroot` with a well-known trick. That's why real runtimes (runc, crun) use **`pivot_root`** instead: it swaps the whole mount namespace's root and then *unmounts* the old one, so the host filesystem isn't just out of reach, it's gone from the namespace. gobox uses `chroot` because it's one line and the idea is the same. The Exercises have you upgrade it.
+</Callout>
+
+### Step 2: Image layers: where does /rootfs come from?
+
+With Docker, you never unpack a tarball by hand. You write a `Dockerfile`, and each instruction produces a **layer**. At runtime those layers become one root filesystem. The kernel feature that does this is **overlayfs**.
+
+<Define term="overlayfs">
+**overlayfs** is a Linux filesystem that stacks several directories and shows them as one. The lower directories are read-only (the image layers). The top one is writable (the container's own changes). Looking up a path checks the layers top-down, and the first match wins. Writing to a file from a lower layer first **copies it up** into the writable layer and changes the copy there. Deleting a file from a lower layer leaves a **whiteout** marker in the writable layer that hides it.
+</Define>
+
+Step through it. The files and results are the ones from a real overlay mount:
+
+<OverlayAnim
+  title="Stacking a ledger image"
+  frames={[
+    { note: "The base layer: what FROM alpine gives you. It's read-only, and every container built on Alpine shares this one copy on disk.", beat: "neutral",
+      layers: [{ name: "layer 1: alpine base", ro: true, files: [{ name: "os-release" }, { name: "config" }] }],
+      merged: [{ name: "os-release" }, { name: "config" }] },
+    { note: "COPY ledger /ledger adds a second read-only layer holding only the new file. The merged view is the union of both layers.", beat: "neutral",
+      layers: [{ name: "layer 1: alpine base", ro: true, files: [{ name: "os-release" }, { name: "config" }] }, { name: "layer 2: app", ro: true, files: [{ name: "ledger", state: "new" }] }],
+      merged: [{ name: "os-release" }, { name: "config" }, { name: "ledger", state: "new" }] },
+    { note: "docker run adds a writable layer on top. It starts empty. The process sees the merged view: one ordinary-looking filesystem.", beat: "neutral",
+      layers: [{ name: "layer 1: alpine base", ro: true, files: [{ name: "os-release" }, { name: "config" }] }, { name: "layer 2: app", ro: true, files: [{ name: "ledger" }] }, { name: "container layer", files: [] }],
+      merged: [{ name: "os-release" }, { name: "config" }, { name: "ledger" }] },
+    { note: "The process writes v2 into config. The base layer can't change, so overlayfs COPIES config UP into the writable layer and edits the copy. Base still says v1, and other containers are unaffected.", beat: "solution",
+      layers: [{ name: "layer 1: alpine base", ro: true, files: [{ name: "os-release" }, { name: "config", state: "hidden" }] }, { name: "layer 2: app", ro: true, files: [{ name: "ledger" }] }, { name: "container layer", files: [{ name: "config", state: "changed" }] }],
+      merged: [{ name: "os-release" }, { name: "config", state: "changed" }, { name: "ledger" }] },
+    { note: "The process deletes /ledger. Layer 2 is read-only, so the file isn't really removed. A WHITEOUT (a special 0,0 device file) goes in the writable layer, and it hides ledger from the merged view.", beat: "solution",
+      layers: [{ name: "layer 1: alpine base", ro: true, files: [{ name: "os-release" }, { name: "config", state: "hidden" }] }, { name: "layer 2: app", ro: true, files: [{ name: "ledger", state: "hidden" }] }, { name: "container layer", files: [{ name: "config", state: "changed" }, { name: "ledger", state: "whiteout" }] }],
+      merged: [{ name: "os-release" }, { name: "config", state: "changed" }] }
+  ]}
+  caption="Image layers are read-only and shared. Every change a container makes lands in its own thin writable layer."
+/>
+
+You can do this yourself with one `mount` command, which is exactly what Docker's overlay2 storage driver runs for every container:
+
+```text
+# mount -t overlay overlay \
+    -o lowerdir=/l/app:/l/base,upperdir=/l/upper,workdir=/l/work /l/merged
+# echo v2 > /l/merged/config; rm /l/merged/ledger
+# cat /l/base/config
+v1
+# ls -l /l/upper
+-rw-r--r--    1 root     root             3 config
+c---------    2 root     root        0,   0 ledger      ← the whiteout
+```
+
+This also explains two things you've probably wondered about:
+
+- **Why deleting a file in a later Dockerfile step doesn't shrink the image.** `RUN rm big.tar` only adds a whiteout on top. The bytes still sit in the earlier layer and still ship. That's why multi-stage builds exist.
+- **Why a container's changes vanish when it's removed.** They only ever lived in the writable layer, which is deleted with the container.
+
+<QuickCheck
+  question={"A Dockerfile does `COPY dump.sql /tmp/` (a 2 GB file) in one step, then `RUN rm /tmp/dump.sql` in the next. How big is the final image?"}
+  options={["About 2 GB bigger: the file is still in the earlier layer, and the rm only adds a whiteout", "Unchanged: the rm deletes the file", "Unchanged: Docker automatically squashes deleted files", "It fails to build: you can't delete a file from a lower layer"]}
+  answer={0}
+  explain="Layers are read-only and additive. The rm step adds a whiteout marker that hides the file in the merged view, but the 2 GB still lives in the COPY layer and ships with the image. Do the work in a builder stage and copy only the result, or do it inside a single RUN step."
+/>
+
+---
+
+## cgroups: What a Process Can Use
+
+*Stop 4 of 6.* Namespaces control what a process can *see*. None of them stop it from using all the memory or all the CPUs. That's restriction #2.
+
+<Define term="cgroup (control group)">
+A **cgroup** is a group of processes that the kernel accounts for and limits *together*. You create one by making a directory under `/sys/fs/cgroup`. You set limits by writing numbers into files in that directory, and you put a process in the group by writing its PID into the group's `cgroup.procs` file. The kernel then enforces the limits on every process in the group, and on their children, which join automatically. Modern Linux uses **cgroup v2**, a single tree, which is what this chapter uses.
+</Define>
+
+That's the key idea: **cgroups are driven entirely through files.** There's no special API. In Go, setting a limit is just `os.WriteFile`. These are the three limits gobox sets:
+
+| File | What we write | Meaning |
+|---|---|---|
+| `memory.max` | `104857600` | 100 MiB, **in bytes**. Past this, the kernel's OOM killer kills a process in the group. |
+| `pids.max` | `20` | At most 20 **tasks** (processes *and threads*). `fork` fails past this. |
+| `cpu.max` | `50000 100000` | "quota period" in microseconds: the group may run **50 ms of CPU in every 100 ms window**, which is half a core. |
+
+<Define term="OOM killer">
+When memory runs out, either on the whole machine or inside a cgroup that hit `memory.max`, the kernel's **out-of-memory (OOM) killer** picks a process and kills it with `SIGKILL`, a signal that can't be caught or ignored. A killed process's exit status is **137** (128 + 9, and 9 is SIGKILL's number). When you see exit code 137 in Kubernetes, think "OOMKilled".
+</Define>
+
+Now watch the limits bite. The numbers are from real gobox runs:
+
+<CgroupAnim
+  title="gobox's cgroup under attack"
+  frames={[
+    { note: "The container starts, running just `sleep`. It's already using 5 of its 20 pids: 4 are the Go runtime's threads in gobox's PID 1, and 1 is sleep. Threads count against pids.max.", beat: "neutral",
+      meters: [{ label: "memory.max", used: 3, limit: 100, unit: " MiB" }, { label: "pids.max", used: 5, limit: 20 }, { label: "cpu.max", used: 5, limit: 50, unit: " ms" }] },
+    { note: "Someone runs a loop that starts 30 background processes, a small fork bomb. Tasks climb toward the limit.", beat: "problem",
+      meters: [{ label: "memory.max", used: 6, limit: 100, unit: " MiB" }, { label: "pids.max", used: 17, limit: 20 }, { label: "cpu.max", used: 20, limit: 50, unit: " ms" }] },
+    { note: "At 20 the kernel refuses to create more. The shell prints `can't fork: Resource temporarily unavailable`. The host doesn't notice a thing.", beat: "solution",
+      meters: [{ label: "memory.max", used: 6, limit: 100, unit: " MiB" }, { label: "pids.max", used: 20, limit: 20 }, { label: "cpu.max", used: 20, limit: 50, unit: " ms" }], event: "fork refused (EAGAIN)" },
+    { note: "Next: `head -c 300m /dev/zero | tail`. tail keeps its input in memory looking for a final newline that never comes, so memory climbs fast.", beat: "problem",
+      meters: [{ label: "memory.max", used: 82, limit: 100, unit: " MiB" }, { label: "pids.max", used: 7, limit: 20 }, { label: "cpu.max", used: 50, limit: 50, unit: " ms" }] },
+    { note: "At 100 MiB the OOM killer picks the biggest process in the cgroup (tail, 99 MB resident) and SIGKILLs it. The exit status is 137. Only this cgroup is affected. The rest of the machine keeps running.", beat: "solution",
+      meters: [{ label: "memory.max", used: 100, limit: 100, unit: " MiB" }, { label: "pids.max", used: 7, limit: 20 }, { label: "cpu.max", used: 50, limit: 50, unit: " ms" }], event: "OOM kill: tail → exit 137" }
+  ]}
+  caption="Limits are numbers in files. The kernel checks them on every allocation, every fork, and every scheduling tick."
+/>
+
+The real terminal output, and the kernel's own log of the kill:
+
+```text
+$ sudo ./gobox run /rootfs sh -c 'head -c 300m /dev/zero | tail > /dev/null'
+Killed
+$ echo $?
+137
+$ dmesg | grep oom
+Memory cgroup out of memory: Killed process 3378 (tail)
+  total-vm:101016kB, anon-rss:99328kB ...
+```
+
+### Step 1: Creating the cgroup and writing limits
+
+```go noverify
+const cgroupDir = "/sys/fs/cgroup/gobox"
+
+func setupCgroup() (*os.File, error) {
+	// A cgroup IS a directory. The kernel fills it with control files.
+	if err := os.Mkdir(cgroupDir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	limits := []struct{ file, value string }{
+		{"memory.max", "104857600"}, // 100 MiB, in bytes
+		{"memory.swap.max", "0"},    // no escaping the limit via swap
+		{"pids.max", "20"},          // at most 20 tasks: no fork bombs
+		{"cpu.max", "50000 100000"}, // 50ms of CPU per 100ms: half a core
+	}
+	for _, l := range limits {
+		path := filepath.Join(cgroupDir, l.file)
+		if err := os.WriteFile(path, []byte(l.value), 0o644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", l.file, err)
+		}
+	}
+	// We return the directory itself, opened: see step 2 for why.
+	return os.Open(cgroupDir)
+}
+```
+
+### Step 2: Getting the process into the cgroup *from birth*
+
+The classic approach is to start the child, then write its PID into `cgroup.procs`. But that leaves a gap: for a few microseconds the child runs *without* limits, and anything it forks in that window escapes too.
+
+Since **Go 1.20**, you can close the gap. Pass an open file descriptor for the cgroup directory, and the kernel creates the child *directly inside* the cgroup (using the `clone3` syscall's `CLONE_INTO_CGROUP` flag):
+
+```go noverify
+cmd.SysProcAttr = &syscall.SysProcAttr{
+	Cloneflags:  syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+	UseCgroupFD: true,           // born inside the cgroup...
+	CgroupFD:    int(cg.Fd()),   // ...this one
+}
+```
+
+That's why `setupCgroup` returns an `*os.File` for the directory, not just its path.
+
+From the host, while the container runs, the limits are just files you can read:
+
+```text
+$ cat /sys/fs/cgroup/gobox/{cpu.max,pids.max,memory.max}
+50000 100000
+20
+104857600
+```
+
+<Gotcha>
+
+**`pids.max` counts threads, and Go programs have a lot of them.** gobox's PID 1 used 4 of the 20 slots before the user's command even started. A busy Go service can run dozens of OS threads, because each goroutine blocked in a system call holds one. Set a pids limit too low (Docker's `--pids-limit`, or a Kubernetes node's `podPidsLimit`) and the *Go runtime itself* crashes. We ran a Go program that blocked 50 goroutines in `read` calls under `--pids-limit=15`:
+
+```text
+runtime: failed to create new OS thread (have 17 already; errno=11)
+runtime: may need to increase max user processes (ulimit -u)
+fatal error: newosproc
+```
+
+It looks like a Go bug, and it points you at `ulimit`, but the cause is the cgroup's `pids.max`. errno 11 is `EAGAIN`.
+
+</Gotcha>
+
+<UnderTheHood title="How the kernel enforces each limit">
+
+- **Memory:** every page a process in the group allocates is charged to the cgroup. When a charge would push `memory.current` past `memory.max`, the kernel first tries to reclaim memory within the group (page cache, for example). If it can't, it runs the OOM killer, scoped to that cgroup only. There's also `memory.high`, a soft limit that slows the group down with reclaim pressure instead of killing it.
+- **CPU:** `cpu.max` sets up **CFS bandwidth control**. Each period (100 ms here), the group gets a quota of runtime (50 ms). Once the quota is used up, *every* thread in the group is **throttled**, meaning taken off the CPU until the next period starts. That's why a CPU-limited service can show fine average CPU yet terrible tail latency: it spends the end of every 100 ms window frozen. You can watch it happen in `cpu.stat` (`nr_throttled`, `throttled_usec`).
+- **PIDs:** a simple counter. `fork` and `clone` fail with `EAGAIN` once `pids.current` would pass `pids.max`.
+- **Controllers must be delegated.** A child cgroup only has a `memory.max` file if its parent lists `memory` in `cgroup.subtree_control`. On a systemd host, the root already delegates `cpu`, `memory`, and `pids`, which is why gobox's `os.WriteFile` calls just work.
+
+</UnderTheHood>
+
+<QuickCheck
+  question={"A pod's container keeps restarting. `kubectl describe` shows `Last State: Terminated, Exit Code: 137`. What's the most likely cause?"}
+  options={["It hit its memory limit and the OOM killer SIGKILLed it", "It hit its CPU limit and was killed", "It panicked with a nil pointer dereference", "It exited cleanly after SIGTERM"]}
+  answer={0}
+  explain="137 = 128 + 9, and signal 9 is SIGKILL, which is what the OOM killer sends when a cgroup exceeds memory.max. CPU limits never kill. They throttle. A Go panic exits with status 2, and a clean exit after SIGTERM would be 0."
+/>
+
+---
+
+## gobox: The Whole Runtime
+
+*Stop 5 of 6.* Here's the whole thing. Every piece should now be familiar: the `run` and `child` halves of the re-exec trick, namespaces through `Cloneflags`, the cgroup joined from birth, then `chroot`, `/proc`, and `/dev` set up inside.
+
+<Callout kind="note" title="Why there's no Run button on this one">
+gobox needs **Linux** and **root**, because it creates namespaces, mounts filesystems, and writes to `/sys/fs/cgroup`. The in-browser runner can't do that. Every output in this chapter came from running this exact code in a privileged Docker container, and on a Mac you can do the same. The steps are right after the code.
+</Callout>
+
+```go noverify
+//go:build linux
+
+// gobox is a tiny container runtime: namespaces + chroot + cgroups.
+//
+//	sudo ./gobox run <rootfs> <command> [args...]
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+)
+
+const cgroupDir = "/sys/fs/cgroup/gobox"
+
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: gobox run <rootfs> <command> [args...]")
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "run":
+		os.Exit(run(os.Args[2], os.Args[3:]))
+	case "child":
+		os.Exit(child(os.Args[2], os.Args[3:]))
+	default:
+		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
+		os.Exit(2)
+	}
+}
+
+// run executes on the host. It creates the cgroup, then starts a copy of
+// this same binary ("child") inside new namespaces and inside that cgroup.
+func run(rootfs string, argv []string) int {
+	cg, err := setupCgroup()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cgroup:", err)
+		return 1
+	}
+	defer os.Remove(cgroupDir) // only succeeds once the cgroup is empty
+	defer cg.Close()
+
+	args := append([]string{"child", rootfs}, argv...)
+	cmd := exec.Command("/proc/self/exe", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		// New hostname, new PID numbering, new mount table.
+		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		// Born inside the cgroup, so limits apply from its first instruction.
+		UseCgroupFD: true,
+		CgroupFD:    int(cg.Fd()),
+	}
+	return exitCode(cmd.Run())
+}
+
+// child executes inside the new namespaces, as PID 1.
+func child(rootfs string, argv []string) int {
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		// Stop our mounts from leaking back to the host's mount table.
+		{"make mounts private", func() error {
+			return syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, "")
+		}},
+		{"set hostname", func() error { return syscall.Sethostname([]byte("gobox")) }},
+		{"chroot", func() error { return syscall.Chroot(rootfs) }},
+		{"chdir /", func() error { return os.Chdir("/") }},
+		// A fresh /proc that only knows about processes in our PID namespace.
+		{"mount /proc", func() error { return syscall.Mount("proc", "/proc", "proc", 0, "") }},
+		// An empty /dev, plus the handful of devices every program expects.
+		{"mount /dev", func() error { return syscall.Mount("tmpfs", "/dev", "tmpfs", 0, "mode=755") }},
+		{"create devices", makeDevices},
+	}
+	for _, s := range steps {
+		if err := s.fn(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", s.name, err)
+			return 1
+		}
+	}
+	defer syscall.Unmount("/proc", 0)
+	defer syscall.Unmount("/dev", 0)
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = []string{"PATH=/bin:/sbin:/usr/bin:/usr/sbin", "PS1=gobox# "}
+	return exitCode(cmd.Run())
+}
+
+// makeDevices creates /dev/null, /dev/zero, /dev/random and /dev/urandom.
+func makeDevices() error {
+	devices := []struct {
+		name         string
+		major, minor int
+	}{{"null", 1, 3}, {"zero", 1, 5}, {"random", 1, 8}, {"urandom", 1, 9}}
+	for _, d := range devices {
+		path := "/dev/" + d.name
+		dev := d.major<<8 | d.minor // classic encoding; fine for numbers below 256
+		if err := syscall.Mknod(path, syscall.S_IFCHR|0o666, dev); err != nil {
+			return fmt.Errorf("mknod %s: %w", path, err)
+		}
+		if err := os.Chmod(path, 0o666); err != nil { // mknod's mode is masked by umask
+			return err
+		}
+	}
+	return nil
+}
+
+// setupCgroup creates the cgroup directory and writes its limits.
+// Each limit is just a file; the kernel enforces whatever we write.
+func setupCgroup() (*os.File, error) {
+	if err := os.Mkdir(cgroupDir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	limits := []struct{ file, value string }{
+		{"memory.max", "104857600"}, // 100 MiB, in bytes
+		{"memory.swap.max", "0"},    // no escaping the limit via swap
+		{"pids.max", "20"},          // at most 20 processes: no fork bombs
+		{"cpu.max", "50000 100000"}, // 50ms of CPU per 100ms: half a core
+	}
+	for _, l := range limits {
+		path := filepath.Join(cgroupDir, l.file)
+		if err := os.WriteFile(path, []byte(l.value), 0o644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", l.file, err)
+		}
+	}
+	return os.Open(cgroupDir)
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+		return ee.ExitCode()
+	}
+	fmt.Fprintln(os.Stderr, err)
+	return 1
+}
+```
+
+One design detail to notice: `child` lists its setup as a **table of named steps** and not a wall of `if err != nil` blocks. When a step fails inside a namespace, the error names *which* step (`mount /proc: operation not permitted`), and that's the first thing you need when debugging a runtime. And `exitCode` passes the user command's exit status all the way out, so `gobox run ... false` exits 1 and an OOM kill exits 137, just like `docker run`.
+
+### Run it yourself (macOS or Linux, using Docker)
+
+Docker Desktop runs a real Linux kernel in a VM, so a privileged container there is a fine lab. Put `main.go` in an empty folder, then:
+
+```bash
+# 1. Build gobox as a static Linux binary.
+docker run --rm -v "$PWD":/src -w /src golang:1.27 \
+  sh -c 'go mod init gobox; CGO_ENABLED=0 go build -o gobox .'
+
+# 2. Download an Alpine root filesystem (use x86_64 instead on Intel).
+curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.1-aarch64.tar.gz
+
+# 3. Start a privileged Linux box with its own cgroup tree.
+docker run --rm -it --privileged --cgroupns=private -v "$PWD":/src golang:1.27 bash
+```
+
+Then, inside that box:
+
+```bash
+# Let child cgroups use the memory, pids, and cpu controllers.
+# (A systemd host already does this. A fresh cgroup namespace doesn't.)
+mkdir -p /sys/fs/cgroup/init && echo $$ > /sys/fs/cgroup/init/cgroup.procs
+echo "+memory +pids +cpu" > /sys/fs/cgroup/cgroup.subtree_control
+
+mkdir /rootfs && tar -xzf /src/alpine-minirootfs-*.tar.gz -C /rootfs
+/src/gobox run /rootfs /bin/sh     # you're in. Try: hostname, ps, ls /
+```
+
+<CodeWalk
+  title="Tracing one gobox run"
+  steps={[
+    { lines: "19-33", note: "main is a switch between two roles. You type 'run'. The copy gobox starts of itself gets 'child'. One binary, two jobs.", pose: "idle", role: "captain", state: "idle", beat: "neutral" },
+    { lines: "37-44", note: "run starts on the host. It creates the cgroup first, so the limits exist before any container process does. The defers remove the cgroup directory after the child exits (the kernel refuses to delete a cgroup that still has processes).", pose: "run", role: "captain", state: "active", beat: "neutral" },
+    { lines: "46-56", note: "The re-exec: /proc/self/exe with 'child' first. Cloneflags asks for three new namespaces, and UseCgroupFD/CgroupFD make the kernel create the child directly inside the cgroup, with no window where it runs unlimited.", pose: "carry", role: "captain", state: "active", beat: "solution" },
+    { lines: "60-77", note: "Now we're INSIDE, as PID 1. Each setup step is a named entry: private mounts first (so nothing leaks to the host), then hostname, the new root, /proc for our PID namespace, and a minimal /dev.", pose: "run", role: "captain", state: "active", beat: "neutral" },
+    { lines: "78-83", note: "Run the steps in order and stop at the first failure, naming it. A failure here is almost always permissions (not root) or a wrong rootfs path.", pose: "idle", role: "detective", state: "active", beat: "neutral" },
+    { lines: "84-90", note: "Only now does the user's command start, already inside a finished container. PATH is set explicitly so the host's environment doesn't leak in.", pose: "happy", role: "captain", state: "ok", beat: "solution" },
+    { lines: "94-110", note: "Four device files, made with mknod. Major 1 is the kernel's 'memory devices' driver, and the minor number picks null, zero, random, or urandom.", pose: "carry", role: "mechanic", state: "active", beat: "neutral" },
+    { lines: "114-131", note: "The cgroup is a directory and four file writes. That's the whole resource-limit system: the kernel enforces whatever numbers land in these files.", pose: "wave", role: "guard", state: "done", beat: "solution" },
+    { lines: "133-142", note: "Pass the command's exit status through, like docker run does: an OOM kill comes out as 137 and a failing command as its own code.", pose: "happy", role: "detective", state: "ok", beat: "solution" }
+  ]}
+
+  caption="run makes the walls and the budget. child furnishes the room. Only then does the tenant move in."
+>
+
+```go noverify
+//go:build linux
+
+// gobox is a tiny container runtime: namespaces + chroot + cgroups.
+//
+//	sudo ./gobox run <rootfs> <command> [args...]
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+)
+
+const cgroupDir = "/sys/fs/cgroup/gobox"
+
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: gobox run <rootfs> <command> [args...]")
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "run":
+		os.Exit(run(os.Args[2], os.Args[3:]))
+	case "child":
+		os.Exit(child(os.Args[2], os.Args[3:]))
+	default:
+		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
+		os.Exit(2)
+	}
+}
+
+// run executes on the host. It creates the cgroup, then starts a copy of
+// this same binary ("child") inside new namespaces and inside that cgroup.
+func run(rootfs string, argv []string) int {
+	cg, err := setupCgroup()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cgroup:", err)
+		return 1
+	}
+	defer os.Remove(cgroupDir) // only succeeds once the cgroup is empty
+	defer cg.Close()
+
+	args := append([]string{"child", rootfs}, argv...)
+	cmd := exec.Command("/proc/self/exe", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		// New hostname, new PID numbering, new mount table.
+		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		// Born inside the cgroup, so limits apply from its first instruction.
+		UseCgroupFD: true,
+		CgroupFD:    int(cg.Fd()),
+	}
+	return exitCode(cmd.Run())
+}
+
+// child executes inside the new namespaces, as PID 1.
+func child(rootfs string, argv []string) int {
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		// Stop our mounts from leaking back to the host's mount table.
+		{"make mounts private", func() error {
+			return syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, "")
+		}},
+		{"set hostname", func() error { return syscall.Sethostname([]byte("gobox")) }},
+		{"chroot", func() error { return syscall.Chroot(rootfs) }},
+		{"chdir /", func() error { return os.Chdir("/") }},
+		// A fresh /proc that only knows about processes in our PID namespace.
+		{"mount /proc", func() error { return syscall.Mount("proc", "/proc", "proc", 0, "") }},
+		// An empty /dev, plus the handful of devices every program expects.
+		{"mount /dev", func() error { return syscall.Mount("tmpfs", "/dev", "tmpfs", 0, "mode=755") }},
+		{"create devices", makeDevices},
+	}
+	for _, s := range steps {
+		if err := s.fn(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", s.name, err)
+			return 1
+		}
+	}
+	defer syscall.Unmount("/proc", 0)
+	defer syscall.Unmount("/dev", 0)
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = []string{"PATH=/bin:/sbin:/usr/bin:/usr/sbin", "PS1=gobox# "}
+	return exitCode(cmd.Run())
+}
+
+// makeDevices creates /dev/null, /dev/zero, /dev/random and /dev/urandom.
+func makeDevices() error {
+	devices := []struct {
+		name         string
+		major, minor int
+	}{{"null", 1, 3}, {"zero", 1, 5}, {"random", 1, 8}, {"urandom", 1, 9}}
+	for _, d := range devices {
+		path := "/dev/" + d.name
+		dev := d.major<<8 | d.minor // classic encoding; fine for numbers below 256
+		if err := syscall.Mknod(path, syscall.S_IFCHR|0o666, dev); err != nil {
+			return fmt.Errorf("mknod %s: %w", path, err)
+		}
+		if err := os.Chmod(path, 0o666); err != nil { // mknod's mode is masked by umask
+			return err
+		}
+	}
+	return nil
+}
+
+// setupCgroup creates the cgroup directory and writes its limits.
+// Each limit is just a file; the kernel enforces whatever we write.
+func setupCgroup() (*os.File, error) {
+	if err := os.Mkdir(cgroupDir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	limits := []struct{ file, value string }{
+		{"memory.max", "104857600"}, // 100 MiB, in bytes
+		{"memory.swap.max", "0"},    // no escaping the limit via swap
+		{"pids.max", "20"},          // at most 20 processes: no fork bombs
+		{"cpu.max", "50000 100000"}, // 50ms of CPU per 100ms: half a core
+	}
+	for _, l := range limits {
+		path := filepath.Join(cgroupDir, l.file)
+		if err := os.WriteFile(path, []byte(l.value), 0o644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", l.file, err)
+		}
+	}
+	return os.Open(cgroupDir)
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+		return ee.ExitCode()
+	}
+	fmt.Fprintln(os.Stderr, err)
+	return 1
+}
+```
+
+</CodeWalk>
+
+<Callout kind="pro" title="What Docker adds on top of this">
+Docker → containerd → **runc**. runc is the piece that does what gobox does, driven by a JSON spec (the OCI runtime spec) in place of hard-coded values. On top of it: `pivot_root` instead of `chroot`, a network namespace with a virtual ethernet pair and a bridge, user namespaces, a seccomp filter that blocks dangerous syscalls, dropped Linux capabilities, read-only `/proc/sys`, and image management. It's more code, but no new *kind* of trick. You've now seen every core mechanism.
+</Callout>
+
+---
+
+## Go Inside Containers
+
+*Stop 6 of 6.* You know what a container is now. So what does it mean for a **Go service** running inside one? Four things, each verified by running a real Go binary under Docker.
+
+### 1. GOMAXPROCS follows the CPU limit (Go 1.25+)
+
+<Define term="GOMAXPROCS">
+**GOMAXPROCS** is the number of OS threads that may run Go code at the same moment, in other words how many goroutines truly run in parallel. It used to default to the number of CPUs on the *machine*.
+</Define>
+
+Before Go 1.25 that default was a trap. On a 64-core node with `cpu.max` set to 2 cores, Go set GOMAXPROCS=64, ran 64 threads in parallel, burned the 200 ms quota in the first ~3 ms of each 100 ms window, and then the whole service was **throttled** for the other ~97 ms. The result was awful tail latency. Everyone patched it with the `uber-go/automaxprocs` package.
+
+Since **Go 1.25** the runtime reads the cgroup's `cpu.max`, the same file gobox writes, and uses:
+
+> **GOMAXPROCS = min(number of CPUs, max(2, ⌈CPU limit⌉))**
+
+It also re-checks periodically, so it adjusts if the limit changes while the program runs. Measured on an 8-CPU Docker VM:
+
+| `docker run --cpus=` | `runtime.NumCPU()` | `GOMAXPROCS` |
+|---|---|---|
+| *(no limit)* | 8 | 8 |
+| `0.5` | 8 | **2** (never below 2) |
+| `1.5` | 8 | **2** (1.5 rounds up to 2) |
+| `2.5` | 8 | **3** (rounds up) |
+| `3` | 8 | **3** |
+| `3` with `GODEBUG=containermaxprocs=0` | 8 | 8 (old behavior) |
+
+Two takeaways: **delete `automaxprocs`** from services on Go 1.25+, and note that the floor of 2 means a `--cpus=0.5` service runs two threads against half a core's quota, so it *will* see some throttling. The runtime accepts that trade-off on purpose, because a single thread can't overlap GC work with your code.
+
+### 2. PID 1 is special, and Go handles SIGTERM differently than you'd expect
+
+In a container, your binary is usually **PID 1**. The kernel treats the init process of a PID namespace specially: **it won't deliver a signal to PID 1 unless PID 1 has installed a handler for it.** A signal's default action ("terminate") is simply skipped.
+
+When Kubernetes or `docker stop` wants your container gone, it sends `SIGTERM`, waits (10 s for Docker, 30 s for Kubernetes by default), then sends `SIGKILL`. Here's what happened when we tried two PID 1s:
+
+```text
+Go binary (time.Sleep) as PID 1:   stopped in 0s,  exit code 2
+busybox `sleep 3600` as PID 1:     stopped in 11s, exit code 137
+```
+
+`sleep` has no SIGTERM handler, so as PID 1 it never hears SIGTERM. Docker waits the full 10 s and SIGKILLs it (137). The Go program exits instantly because **the Go runtime installs its own signal handlers at startup**. With no `signal.Notify` in your code, the runtime's handler implements Go's documented default ("SIGTERM causes the program to exit") by exiting with **status 2**.
+
+So a Go PID 1 *does* die on SIGTERM, but abruptly: no draining in-flight requests, no closing DB connections, and an exit code of 2 that looks like a crash in your dashboards. Handle the signal yourself:
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	// ctx is cancelled on SIGTERM (what Kubernetes sends) or Ctrl-C.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	srv := &http.Server{Addr: ":8080", Handler: http.NotFoundHandler()}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("listen", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done() // block until the orchestrator asks us to stop
+	slog.Info("shutting down", "cause", context.Cause(ctx))
+
+	// Finish in-flight requests, but stay well inside the SIGKILL deadline.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("shutdown", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("clean exit") // exit code 0
+}
+```
+
+The in-browser runner can't open network sockets, so here's the same shutdown flow with a simulated in-flight transfer standing in for the HTTP server. The program sends *itself* a SIGTERM after half a second:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	// An in-flight transfer that needs 1.5s to finish.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fmt.Println("transfer tx-881: debiting...")
+		time.Sleep(1500 * time.Millisecond)
+		fmt.Println("transfer tx-881: credited, committed")
+	}()
+
+	// Nobody sends SIGTERM in the playground, so we play Kubernetes.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	}()
+
+	<-ctx.Done()
+	fmt.Println("shutting down, cause:", context.Cause(ctx))
+
+	// Drain: wait for in-flight work, but never past our own deadline.
+	select {
+	case <-done:
+		fmt.Println("drained, clean exit")
+	case <-time.After(20 * time.Second):
+		fmt.Println("drain timed out")
+		os.Exit(1)
+	}
+}
+```
+
+</GoPlayground>
+
+```text
+transfer tx-881: debiting...
+shutting down, cause: terminated signal received   ← "context canceled" before Go 1.26
+transfer tx-881: credited, committed
+drained, clean exit
+```
+
+Without `signal.NotifyContext`, the same program would die at the 0.5 s mark with exit status 2, halfway through the transfer.
+
+Since Go 1.26, `context.Cause(ctx)` on a `NotifyContext` context tells you *which* signal arrived. `ctx.Err()` still just says `context canceled`, but the cause reads `terminated signal received`, which is what you want in shutdown logs.
+
+### 3. PID 1 must reap zombies, and Go doesn't
+
+<Define term="zombie process">
+When a process exits, the kernel keeps a small record of it (its exit status) until its **parent** collects it by calling `wait`. A dead process whose status hasn't been collected yet is a **zombie**. If a process's parent dies first, the orphan is re-parented to **PID 1**, and it becomes PID 1's job to `wait` on it.
+</Define>
+
+A normal init system (systemd, or `tini` in containers) loops calling `wait` on any child. **The Go runtime doesn't.** `exec.Cmd.Wait` only reaps the child it started. We ran a Go PID 1 that started `sh -c "sleep 1 & exit 0"`. The shell exited, and its background `sleep` was orphaned to PID 1:
+
+```text
+pid=1  cmd=(goinc) state=R
+pid=13 cmd=(sleep) state=Z  ppid=1     ← a zombie, forever
+```
+
+Each zombie holds a PID, and PIDs count against `pids.max`. A Go service that shells out to scripts which background things will slowly leak PIDs until `fork` fails. The fix is to put a real init in front of your program: `docker run --init`, the tiny `tini` binary as the image's `ENTRYPOINT`, or in Kubernetes `shareProcessNamespace: true`, which makes the pod's `pause` container PID 1, and it reaps. With `--init`, `docker-init` became PID 1, our Go program became PID 7, and the zombie was gone.
+
+### 4. Memory: set GOMEMLIMIT a little below memory.max
+
+The Go garbage collector doesn't read `memory.max`. By default it runs whenever the heap has doubled since the last collection, whatever the container's limit. A service with a 400 MiB live heap will happily let the heap grow toward 800 MiB before collecting, even inside a 512 MiB container, and get OOM-killed (exit 137) with plenty of garbage it could have freed.
+
+`GOMEMLIMIT` (Go 1.19+) gives the GC a soft ceiling: as total Go memory approaches it, the GC runs more often. Set it to about 90% of the container limit, which leaves headroom for memory the Go heap doesn't track (thread stacks, cgo, the binary itself):
+
+```yaml
+resources:
+  limits:
+    memory: 512Mi
+env:
+  - name: GOMEMLIMIT
+    value: "460MiB"   # ~90% of the limit
+```
+
+<ExecTimeline
+  title="docker stop, done right"
+  lanes={[{ id: "orch", label: "Docker / Kubernetes" }, { id: "go", label: "Go service (PID 1)" }]}
+  steps={[
+    { lane: "orch", kind: "send", label: "SIGTERM", note: "The orchestrator asks politely and starts its grace-period timer (30s in Kubernetes)." },
+    { lane: "go", kind: "recv", label: "ctx.Done() fires", note: "Because we called signal.NotifyContext, the Go runtime routes SIGTERM to our context and doesn't exit(2)." },
+    { lane: "go", kind: "run", label: "srv.Shutdown(20s)", note: "Stop accepting new connections and let in-flight requests finish. A transfer that's halfway through gets to complete." },
+    { lane: "go", kind: "done", label: "exit 0", note: "Clean exit well inside the grace period. Dashboards show a normal stop, not a crash." },
+    { lane: "orch", kind: "block", label: "SIGKILL never needed", note: "The 30s timer never fires. Without the handler it would have been an abrupt exit 2, and for a non-Go PID 1 without a handler, a 30-second wait and then SIGKILL (137)." }
+  ]}
+  caption="Handle SIGTERM, drain within the grace period, exit 0."
+/>
+
+<QuickCheck
+  question={"A Go 1.26 service runs with a CPU limit of 1.5 cores on a 32-core node. It doesn't set GOMAXPROCS or import automaxprocs. What's its GOMAXPROCS?"}
+  options={["2", "1", "32", "1.5, rounded down to 1"]}
+  answer={0}
+  explain="Since Go 1.25 the runtime reads cpu.max: min(NumCPU, max(2, ceil(limit))) = min(32, max(2, 2)) = 2."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Watch the walls from both sides" level="easy">
+
+Run gobox with `/bin/sh`. Inside, run `hostname`, `echo $$`, and `ps`. In a **second terminal** on the host (for the Docker lab: `docker exec -it <box> bash`), run `ps -eo pid,comm | grep -E "gobox|exe|sh"` and `cat /sys/fs/cgroup/gobox/cgroup.procs`. Match every PID you see inside to its host PID.
+
+<Solution>
+
+Inside you'll see PID 1 (`/proc/self/exe child ...`) and your shell at a small number (around 6, after Go's runtime threads). On the host the same two processes have ordinary large PIDs: `gobox` (the `run` half), `exe` (the `child` half, whose name is `exe` because it was started as `/proc/self/exe`), and `sh`. `cgroup.procs` lists the host PIDs of `exe` and `sh`, but not the `run` half, which stayed outside the cgroup on purpose. The kernel keeps one process with two PID numbers, one per namespace level. You can see both in the host's `/proc/<pid>/status`, on the `NSpid:` line.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Measure CPU throttling" level="medium">
+
+Inside gobox, run a busy loop: `while :; do :; done &`. On the host, read `/sys/fs/cgroup/gobox/cpu.stat` twice, 10 seconds apart. Work out what fraction of periods were throttled and how much CPU time the loop actually got. Does it match `cpu.max`?
+
+<Solution>
+
+`cpu.stat` has `nr_periods`, `nr_throttled`, and `throttled_usec`. Over 10 s, `nr_periods` grows by about 100 (one per 100 ms), and `nr_throttled` grows by about the same, because the loop exhausts its 50 ms quota in *every* period. `usage_usec` grows by about 5,000,000 (5 s of CPU in 10 s of wall time), which is exactly half a core, matching `50000 100000`. This is how you diagnose throttling in production. If `nr_throttled / nr_periods` is high for a latency-sensitive service, raise the CPU limit or remove it and rely on requests.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Give gobox its own network" level="medium">
+
+Add `CLONE_NEWNET` to `Cloneflags`. Inside the container, run `ip addr` (Alpine has it through busybox). What interfaces exist? Can you `ping 127.0.0.1`? Why?
+
+<Solution>
+
+With a new network namespace, the container gets a private, empty network stack. The only useful interface is loopback `lo`, and it's **down**. (Some kernels also show inert tunnel devices such as `tunl0` and `gre0`, which are down too.) `ping 127.0.0.1` fails with `sendto: Network unreachable` until you run `ip link set lo up` (add it as a setup step: gobox's `child` would need to bring `lo` up with a netlink call, or you can exec `ip` from the rootfs). To reach the outside world, runtimes create a **veth pair** (a virtual cable), move one end into the container's namespace, attach the other to a bridge on the host (`docker0`), and set up NAT. That plumbing is most of what "container networking" means, and it's the subject of the Cloud Networking chapter.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Replace chroot with pivot_root" level="hard">
+
+Change `child` so it uses `pivot_root` in place of `chroot`. Hint: `pivot_root(new, putold)` requires `new` to be a mount point, so bind-mount the rootfs onto itself first. Then unmount the old root so the host filesystem disappears from the namespace entirely.
+
+<Solution>
+
+```go noverify
+func pivotRoot(rootfs string) error {
+	// pivot_root needs new_root to be a mount point: bind-mount it onto itself.
+	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("bind rootfs: %w", err)
+	}
+	putOld := filepath.Join(rootfs, ".oldroot")
+	if err := os.MkdirAll(putOld, 0o700); err != nil {
+		return err
+	}
+	// Swap: rootfs becomes "/", the old root moves to /.oldroot.
+	if err := syscall.PivotRoot(rootfs, putOld); err != nil {
+		return fmt.Errorf("pivot_root: %w", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return err
+	}
+	// Detach the old root: the host filesystem is now unreachable, not just hidden.
+	if err := syscall.Unmount("/.oldroot", syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("unmount old root: %w", err)
+	}
+	return os.Remove("/.oldroot")
+}
+```
+
+Replace the `chroot` and `chdir /` steps with `{"pivot_root", func() error { return pivotRoot(rootfs) }}`. This must come *after* "make mounts private" (pivot_root refuses to work with shared mounts). Unlike `chroot`, there's no longer any path, even for root, that leads back to the host's files. The old root isn't mounted in this namespace at all.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Fix the cgroup translator"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Two functions sit between an operator's request and the kernel. CgroupWrites turns human units (0.5 CPUs, 256 MiB, 64 pids) into cgroup v2 file writes, and it has three bugs. DefaultGOMAXPROCS should predict what a Go 1.25+ program picks for a given cpu.max, and it's unimplemented. Fix both so every check passes. main is the harness. Don't edit it."
+  starter={`package main
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// Limits is what an operator asks for, in human units.
+type Limits struct {
+	CPUs      float64 // 0.5 = half a core
+	MemoryMiB int     // mebibytes
+	MaxPids   int     // processes AND threads
+}
+
+// FileWrite is one write into the container's cgroup directory.
+type FileWrite struct {
+	File  string
+	Value string
+}
+
+const cpuPeriod = 100000 // microseconds: the standard 100ms window
+
+// CgroupWrites translates Limits into cgroup v2 file writes.
+// BUG: this was merged on a Friday. Three of these lines are wrong.
+func CgroupWrites(l Limits) []FileWrite {
+	quota := int(l.CPUs) * cpuPeriod
+	return []FileWrite{
+		{"memory.max", strconv.Itoa(l.MemoryMiB)},
+		{"pids.max", strconv.Itoa(l.MaxPids)},
+		{"cpu.max", fmt.Sprintf("%d %d", cpuPeriod, quota)},
+	}
+}
+
+// DefaultGOMAXPROCS predicts the GOMAXPROCS a Go 1.25+ program picks
+// when started with this cpu.max value on a machine with numCPU cores.
+// TODO: implement the runtime's rule.
+func DefaultGOMAXPROCS(cpuMax string, numCPU int) int {
+	return numCPU
+}
+
+// ── checks: do not edit. Run to verify your fix. ──
+func main() {
+	ok := true
+	check := func(name, got, want string) {
+		if got != want {
+			fmt.Printf("FAIL %s: got %q, want %q\\n", name, got, want)
+			ok = false
+			return
+		}
+		fmt.Printf("PASS %s\\n", name)
+	}
+	w := CgroupWrites(Limits{CPUs: 0.5, MemoryMiB: 256, MaxPids: 64})
+	got := map[string]string{}
+	for _, fw := range w {
+		got[fw.File] = fw.Value
+	}
+	check("memory.max is bytes", got["memory.max"], "268435456")
+	check("pids.max", got["pids.max"], "64")
+	check("cpu.max half a core", got["cpu.max"], "50000 100000")
+	w = CgroupWrites(Limits{CPUs: 2.5, MemoryMiB: 1, MaxPids: 1})
+	for _, fw := range w {
+		if fw.File == "cpu.max" {
+			check("cpu.max 2.5 cores", fw.Value, "250000 100000")
+		}
+	}
+	cases := []struct {
+		cpuMax string
+		cpus   int
+		want   int
+	}{
+		{"max 100000", 8, 8},
+		{"50000 100000", 8, 2},
+		{"150000 100000", 8, 2},
+		{"300000 100000", 8, 3},
+		{"250000 100000", 8, 3},
+		{"1600000 100000", 8, 8},
+		{"50000 100000", 1, 1},
+	}
+	for _, c := range cases {
+		name := fmt.Sprintf("GOMAXPROCS(%s, %d cpus)", c.cpuMax, c.cpus)
+		check(name, strconv.Itoa(DefaultGOMAXPROCS(c.cpuMax, c.cpus)), strconv.Itoa(c.want))
+	}
+	_ = strings.Fields
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  hints={[
+    "memory.max is in BYTES. 1 MiB = 1 << 20 bytes, so 256 MiB is 256 << 20 = 268435456.",
+    "cpu.max is 'QUOTA PERIOD', quota first. And int(l.CPUs) truncates 0.5 to 0 before you multiply. Multiply first, then round: int(math.Round(l.CPUs * cpuPeriod)). You'll need to import math.",
+    "GOMAXPROCS: 'max' in the first field means no limit, so return numCPU. Otherwise limit = ceil(quota/period), and the answer is min(numCPU, max(limit, 2)). Go 1.21+ has min and max built in."
+  ]}
+  flag="GO{cpu_max_is_quota_then_period}"
+>
+
+These two functions are what a Kubernetes-style operator tool runs before a container starts. Wrong units here don't cause an error. They quietly give a service 256 *bytes* of memory, or no CPU at all. Every check you fix is a production incident that doesn't happen. I've set the test personally, and it doesn't round in your favor.
+
+</Lab>
+
+<Recap>
+
+- A **container is a normal process** on the host's kernel with two kinds of restriction. The host sees it with a normal PID. There's no guest OS.
+- **Namespaces limit what it can see**: UTS (hostname), PID (numbering), mount (mount table), plus network, IPC, user, and cgroup. In Go you request them with `SysProcAttr.Cloneflags`.
+- **The re-exec trick**: gobox runs `/proc/self/exe child` so its own Go code runs *inside* the new namespaces and sets things up before the user's command starts.
+- A PID namespace needs a **fresh `/proc`** mounted inside it, because `ps` reads `/proc`. That needs a mount namespace, with mounts made **private** so nothing leaks to the host.
+- **`chroot`** gives the process its own `/`. Real runtimes use **`pivot_root`**, which also unmounts the old root.
+- **overlayfs** stacks read-only image layers under one writable layer. Writes **copy up**, deletes leave **whiteouts**, and `RUN rm` never shrinks an image.
+- **cgroups limit what it can use**, entirely through files: `memory.max` (bytes, OOM kill = exit 137), `cpu.max` (quota and period, throttling), `pids.max` (counts **threads** too). Since Go 1.20, `UseCgroupFD` starts a child inside the cgroup from birth.
+- **Go in containers**: since Go 1.25, GOMAXPROCS = min(CPUs, max(2, ⌈limit⌉)), so drop automaxprocs. A Go PID 1 exits with status **2** on unhandled SIGTERM, so handle it with `signal.NotifyContext` and drain. Go doesn't reap orphans, so use `--init`. Set **GOMEMLIMIT** to about 90% of the memory limit.
+
+</Recap>
+
+<Scoreboard
+  streak={0}
+  items={[
+    { label: "Quick check: what the host sees", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: PID namespace without /proc", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: rm in a later layer", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: exit code 137", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: GOMAXPROCS at 1.5 cores", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: Watch the walls from both sides", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: Measure CPU throttling", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: Give gobox its own network", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: Replace chroot with pivot_root", kind: "exercise", points: 25, done: false }
+  ]}
+  flag={{ label: "Lab: Fix the cgroup translator", captured: false, points: 80 }}
+/>
+
+You just built, in an afternoon, the thing half the industry treats as magic. Not bad, sport. It's no *me*, but the next time a pod says `OOMKilled`, you'll know exactly which file the kernel read before it pulled the trigger.

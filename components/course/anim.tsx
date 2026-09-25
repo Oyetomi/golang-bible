@@ -3439,3 +3439,235 @@ export function InterfaceAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   IsolationAnim — a container is one process seen
+   two ways. Left column: what the HOST sees. Right
+   column: what the process INSIDE sees. Each row is
+   one thing a namespace can virtualize (hostname,
+   PIDs, filesystem, mounts…). When a frame switches
+   a namespace on, that row's two values split apart
+   and a wall drops between them.
+   ════════════════════════════════════════════ */
+type IsoRow = { label: string; host: string; inside: string; ns?: string };
+type IsoFrame = {
+  code?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  rows: IsoRow[];
+};
+
+export function IsolationAnim({
+  title = "One process, two views",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: IsoFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2300);
+  const f = frames[st.cur] ?? frames[0];
+  const walled = f.rows.filter((r) => r.host !== r.inside).length;
+  return (
+    <AnimShell
+      title={title}
+      kicker="namespaces"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="iso">
+        {f.code && <code key={`c${st.cur}`} className="iso-code">{f.code}</code>}
+        <div className="iso-grid">
+          <span className="iso-head">
+            <Gopher pose="idle" state="idle" size={30} role="operator" title="host" /> host sees
+          </span>
+          <span />
+          <span className="iso-head">
+            <Gopher pose={walled ? "happy" : "idle"} state={walled ? "ok" : "idle"} size={30} role="captain" title="container" /> inside sees
+          </span>
+          {f.rows.map((r) => {
+            const split = r.host !== r.inside;
+            return (
+              <Fragment key={r.label}>
+                <span className="iso-cell">
+                  <span className="iso-lbl">{r.label}</span>
+                  <span className="iso-val">{r.host}</span>
+                </span>
+                <span className={`iso-wall ${split ? "up" : ""}`} title={r.ns}>
+                  {split && <span className="iso-ns">{r.ns}</span>}
+                </span>
+                <span className={`iso-cell ${split ? "split" : "shared"}`}>
+                  <span className="iso-lbl">{r.label}</span>
+                  <span key={r.inside} className="iso-val">{r.inside}</span>
+                </span>
+              </Fragment>
+            );
+          })}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   CgroupAnim — cgroup limits drawn as meters. Each
+   meter is one controller file (memory.max,
+   pids.max, cpu.max). Usage bars grow frame by
+   frame; hitting the limit turns the bar red and
+   the kernel gopher acts: OOM-kill or refuse fork.
+   ════════════════════════════════════════════ */
+type CgMeter = { label: string; used: number; limit: number; unit?: string };
+type CgFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  meters: CgMeter[];
+  event?: string; // e.g. "OOM kill: tail (exit 137)"
+};
+
+export function CgroupAnim({
+  title = "cgroup limits, enforced by the kernel",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: CgFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2000);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="cgroups"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="cgr">
+        <div className="cgr-meters">
+          {f.meters.map((m) => {
+            const pct = Math.min(100, (m.used / m.limit) * 100);
+            const lvl = pct >= 100 ? "full" : pct >= 75 ? "hot" : "ok";
+            return (
+              <div key={m.label} className="cgr-meter">
+                <span className="cgr-lbl">{m.label}</span>
+                <span className="cgr-track">
+                  <span className={`cgr-bar ${lvl}`} style={{ width: `${pct}%` } as CSSProperties} />
+                </span>
+                <span className="cgr-num">
+                  {m.used}
+                  {m.unit ?? ""} / {m.limit}
+                  {m.unit ?? ""}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="cgr-kernel">
+          <Gopher
+            pose={f.event ? "carry" : "idle"}
+            state={f.event ? "bad" : "idle"}
+            size={40}
+            role="guard"
+            title="the kernel"
+          />
+          <span className="cgr-klbl">kernel</span>
+          {f.event && <span key={f.event} className="cgr-event">{f.event}</span>}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   OverlayAnim — how a container image becomes one
+   filesystem. Read-only layers stack bottom-up, a
+   writable layer sits on top, and the merged view
+   is what the process sees. Writes copy-up into the
+   top layer; deletes leave a whiteout marker there.
+   ════════════════════════════════════════════ */
+type OvFile = { name: string; state?: "normal" | "new" | "changed" | "whiteout" | "hidden" };
+type OvLayer = { name: string; ro?: boolean; files: OvFile[] };
+type OvFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  layers: OvLayer[]; // bottom first
+  merged: OvFile[];
+};
+
+export function OverlayAnim({
+  title = "Image layers → one filesystem",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: OvFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const chip = (x: OvFile) => (
+    <span key={`${x.name}-${x.state ?? "normal"}`} className={`ovl-file ${x.state ?? "normal"}`}>
+      {x.state === "whiteout" ? `✕ ${x.name}` : x.name}
+    </span>
+  );
+  return (
+    <AnimShell
+      title={title}
+      kicker="overlayfs"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ovl">
+        <div className="ovl-merged">
+          <span className="ovl-name">
+            <Gopher pose="idle" state="ok" size={28} role="captain" title="container" /> merged view (what the process sees)
+          </span>
+          <div className="ovl-files">{f.merged.map(chip)}</div>
+        </div>
+        <div className="ovl-stack">
+          {[...f.layers].reverse().map((l) => (
+            <div key={l.name} className={`ovl-layer ${l.ro ? "ro" : "rw"}`}>
+              <span className="ovl-name">
+                {l.name} <em>{l.ro ? "read-only" : "writable"}</em>
+              </span>
+              <div className="ovl-files">
+                {l.files.length === 0 ? <span className="ovl-empty">empty</span> : l.files.map(chip)}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
