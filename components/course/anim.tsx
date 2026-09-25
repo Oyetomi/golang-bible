@@ -3671,3 +3671,274 @@ export function OverlayAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   GoroutineAnim — goroutines as gophers in lanes.
+   `go f()` makes a gopher walk in; it works, blocks,
+   or finishes on its own lane while main keeps
+   going. When main returns, every gopher still on
+   stage is killed mid-task: the most surprising rule
+   of goroutines, drawn literally. A stdout strip
+   shows what actually got printed.
+   ════════════════════════════════════════════ */
+type GoLaneState = "run" | "blocked" | "done" | "killed";
+type GoFrame = {
+  code?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  main: "run" | "blocked" | "exited";
+  goroutines: { name: string; state: GoLaneState; task?: string }[];
+  stdout?: string[];
+};
+
+export function GoroutineAnim({
+  title = "What `go` actually does",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: GoFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const pose = (s: GoLaneState | GoFrame["main"]): GopherPose =>
+    s === "run" ? "run" : s === "blocked" ? "blocked" : s === "done" ? "happy" : s === "killed" ? "panic" : "exit";
+  const state = (s: GoLaneState | GoFrame["main"]) =>
+    s === "run" ? "active" : s === "blocked" ? "warn" : s === "done" ? "done" : "bad";
+  return (
+    <AnimShell
+      title={title}
+      kicker="goroutines"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="gor">
+        {f.code && <code key={`c${st.cur}`} className="gor-code">{f.code}</code>}
+        <div className="gor-lanes">
+          <div className={`gor-lane main ${f.main}`}>
+            <span className="gor-name">main</span>
+            <span className="gor-actor">
+              <Gopher pose={pose(f.main)} state={state(f.main)} size={36} role="banker" title="main goroutine" />
+            </span>
+            <span className="gor-task">{f.main === "exited" ? "returned: program over" : f.main === "blocked" ? "waiting" : "running"}</span>
+          </div>
+          {f.goroutines.map((g) => (
+            <div key={g.name} className={`gor-lane ${g.state}`}>
+              <span className="gor-name">{g.name}</span>
+              <span key={`${g.name}-${g.state}`} className="gor-actor enter">
+                <Gopher pose={pose(g.state)} state={state(g.state)} size={36} role="courier" title={g.name} />
+              </span>
+              <span className="gor-task">{g.task ?? g.state}</span>
+            </div>
+          ))}
+        </div>
+        <div className="gor-out">
+          <span className="gor-out-lbl">stdout</span>
+          {(f.stdout ?? []).length === 0 ? (
+            <span className="gor-out-empty">(nothing printed)</span>
+          ) : (
+            (f.stdout ?? []).map((l, i) => (
+              <span key={`${i}-${l}`} className="gor-out-line">{l}</span>
+            ))
+          )}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   RendezvousAnim — an unbuffered channel is a
+   handshake, not a mailbox. The sender gopher holds
+   the value; whichever side arrives first PARKS; the
+   value physically travels across only when both
+   are present, and both wake together.
+   ════════════════════════════════════════════ */
+type RvSide = "away" | "running" | "parked" | "handoff" | "done";
+type RvFrame = {
+  code?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  sender: RvSide;
+  receiver: RvSide;
+  value?: string;
+  at?: "sender" | "channel" | "receiver"; // where the value is drawn
+};
+
+export function RendezvousAnim({
+  title = "Unbuffered channel: a handshake",
+  senderLabel = "sender goroutine",
+  receiverLabel = "receiver (main)",
+  frames,
+  caption,
+}: {
+  title?: string;
+  senderLabel?: string;
+  receiverLabel?: string;
+  frames: RvFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2100);
+  const f = frames[st.cur] ?? frames[0];
+  const pose = (s: RvSide): GopherPose =>
+    s === "parked" ? "blocked" : s === "handoff" ? "carry" : s === "done" ? "happy" : s === "away" ? "idle" : "run";
+  const gstate = (s: RvSide) =>
+    s === "parked" ? "warn" : s === "handoff" ? "active" : s === "done" ? "done" : "idle";
+  const label = (s: RvSide) =>
+    s === "parked" ? "parked (blocked)" : s === "handoff" ? "handing off" : s === "done" ? "unblocked" : s === "away" ? "not here yet" : "running";
+  return (
+    <AnimShell
+      title={title}
+      kicker="chan (cap 0)"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rdv">
+        {f.code && <code key={`c${st.cur}`} className="rdv-code">{f.code}</code>}
+        <div className="rdv-track">
+          <div className={`rdv-side ${f.sender}`}>
+            <Gopher pose={pose(f.sender)} state={gstate(f.sender)} size={44} role="courier" title={senderLabel} />
+            <span className="rdv-name">{senderLabel}</span>
+            <span className="rdv-state">{label(f.sender)}</span>
+          </div>
+          <div className="rdv-pipe">
+            <span className="rdv-pipe-lbl">meeting point (no storage)</span>
+            {f.value && (
+              <span className={`rdv-value at-${f.at ?? "sender"}`}>{f.value}</span>
+            )}
+          </div>
+          <div className={`rdv-side ${f.receiver}`}>
+            <Gopher pose={pose(f.receiver)} state={gstate(f.receiver)} size={44} role="banker" title={receiverLabel} />
+            <span className="rdv-name">{receiverLabel}</span>
+            <span className="rdv-state">{label(f.receiver)}</span>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   RaceAnim — the lost update, one CPU step at a
+   time. `balance += 100` is really READ → ADD →
+   WRITE. Two goroutines each copy the shared value
+   into their own register; when their steps
+   interleave, one WRITE overwrites the other and a
+   deposit vanishes. With a mutex, the second
+   goroutine waits at the door until the first is
+   completely done.
+   ════════════════════════════════════════════ */
+type RaceStep = "idle" | "read" | "add" | "write" | "wait" | "done";
+type RaceFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  shared: string;
+  expected?: string;
+  lock?: string | null; // name of the goroutine holding the mutex, if any
+  lanes: { name: string; step: RaceStep; local?: string }[];
+};
+
+export function RaceAnim({
+  title = "balance += 100, one CPU step at a time",
+  label = "balance",
+  frames,
+  caption,
+}: {
+  title?: string;
+  label?: string;
+  frames: RaceFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  // Only judge the result once every goroutine has finished: mid-way, a
+  // balance below the expected total is just work still in progress.
+  const finished = f.lanes.every((l) => l.step === "done");
+  const wrong = finished && f.expected !== undefined && f.expected !== f.shared;
+  const right = finished && f.expected !== undefined && f.expected === f.shared;
+  const steps: RaceStep[] = ["read", "add", "write"];
+  return (
+    <AnimShell
+      title={title}
+      kicker={f.lock !== undefined ? "mutex" : "data race"}
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rce">
+        {f.lanes.slice(0, 1).map((l) => lane(l))}
+        <div className={`rce-mem ${wrong ? "bad" : ""}`}>
+          <span className="rce-lbl">shared memory</span>
+          <span className="rce-var">{label}</span>
+          <span key={f.shared} className="rce-val">{f.shared}</span>
+          {f.expected !== undefined && (
+            <span className={`rce-exp ${wrong ? "bad" : right ? "ok" : ""}`}>
+              {wrong ? `expected ${f.expected}: deposit lost` : right ? `expected ${f.expected} ✓` : `expected ${f.expected}`}
+            </span>
+          )}
+          {f.lock !== undefined && (
+            <span className={`rce-lock ${f.lock ? "held" : ""}`}>🔒 {f.lock ? `held by ${f.lock}` : "unlocked"}</span>
+          )}
+        </div>
+        {f.lanes.slice(1).map((l) => lane(l))}
+      </div>
+    </AnimShell>
+  );
+
+  function lane(l: RaceFrame["lanes"][number]) {
+    const busy = l.step === "read" || l.step === "add" || l.step === "write";
+    return (
+      <div key={l.name} className={`rce-lane ${l.step}`}>
+        <Gopher
+          pose={l.step === "wait" ? "blocked" : l.step === "done" ? "happy" : busy ? "carry" : "idle"}
+          state={l.step === "wait" ? "warn" : l.step === "done" ? "done" : busy ? "active" : "idle"}
+          size={38}
+          role="banker"
+          title={l.name}
+        />
+        <span className="rce-name">{l.name}</span>
+        <div className="rce-steps">
+          {steps.map((s) => (
+            <span key={s} className={`rce-step ${l.step === s ? "on" : ""} ${steps.indexOf(s) < steps.indexOf(l.step as RaceStep) || l.step === "done" ? "past" : ""}`}>
+              {s}
+            </span>
+          ))}
+        </div>
+        <span className="rce-reg">
+          register: <b key={l.local ?? "-"}>{l.local ?? "—"}</b>
+        </span>
+        {l.step === "wait" && <span className="rce-wait">waiting for lock</span>}
+      </div>
+    );
+  }
+}
