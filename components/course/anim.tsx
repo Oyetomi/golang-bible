@@ -3342,3 +3342,100 @@ export function DPTableAnim({
 }
 
 
+
+/* ════════════════════════════════════════════
+   InterfaceAnim — an interface variable drawn as
+   what it IS: a box with two slots, TYPE and VALUE.
+   Each frame runs one line of code; the slots fill
+   (or stay empty) and a detective gopher reads the
+   `== nil` verdict, which is true ONLY when both
+   slots are empty. Built for the typed-nil trap:
+   watch the type slot fill while the value is nil.
+   ════════════════════════════════════════════ */
+type IfaceFrame = {
+  code: string; // the line being executed this frame
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  type: string | null; // dynamic type slot (null = empty)
+  value: string | null; // dynamic value slot (null = empty)
+  ptr?: { name: string; value: string }; // optional plain pointer var shown beside the box
+};
+
+export function InterfaceAnim({
+  title = "Inside an interface value",
+  name = "err",
+  iface = "error",
+  frames,
+  caption,
+}: {
+  title?: string;
+  name?: string;
+  iface?: string;
+  frames: IfaceFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const isNil = f.type === null && f.value === null;
+  const trap = f.type !== null && (f.value === null || f.value === "nil");
+  return (
+    <AnimShell
+      title={title}
+      kicker="interface value"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ifa">
+        <code key={`c${st.cur}`} className="ifa-code">{f.code}</code>
+        <div className="ifa-row">
+          {f.ptr && (
+            <div className="ifa-ptr">
+              <span className="ifa-name">{f.ptr.name}</span>
+              <span key={f.ptr.value} className={`ifa-cell ${f.ptr.value === "nil" ? "nil" : "full"}`}>{f.ptr.value}</span>
+              <span className={`ifa-verdict ${f.ptr.value === "nil" ? "yes" : "no"}`}>
+                {f.ptr.name} == nil → {f.ptr.value === "nil" ? "true" : "false"}
+              </span>
+            </div>
+          )}
+          <div className="ifa-var">
+            <span className="ifa-name">
+              {name} <em>({iface})</em>
+            </span>
+            <div className={`ifa-box ${trap ? "trap" : ""}`}>
+              <div className="ifa-slot">
+                <span className="ifa-lbl">type</span>
+                <span key={`t${f.type}`} className={`ifa-cell ${f.type === null ? "empty" : "full"}`}>{f.type ?? "—"}</span>
+              </div>
+              <div className="ifa-slot">
+                <span className="ifa-lbl">value</span>
+                <span key={`v${f.value}`} className={`ifa-cell ${f.value === null ? "empty" : f.value === "nil" ? "nil" : "full"}`}>{f.value ?? "—"}</span>
+              </div>
+            </div>
+            <span className={`ifa-verdict ${isNil ? "yes" : trap ? "trap" : "no"}`}>
+              {name} == nil → {isNil ? "true" : "false"}
+            </span>
+          </div>
+          <span className="ifa-gopher">
+            <Gopher
+              pose={trap ? "panic" : isNil ? "idle" : "happy"}
+              state={trap ? "bad" : isNil ? "idle" : "ok"}
+              size={40}
+              role="detective"
+              title="nil inspector"
+            />
+          </span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}

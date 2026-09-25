@@ -53,6 +53,7 @@ export const mdxComponents = {
   StackQueueAnim: A.StackQueueAnim,
   SlidingWindowAnim: A.SlidingWindowAnim,
   DPTableAnim: A.DPTableAnim,
+  InterfaceAnim: A.InterfaceAnim,
   CodeWalk,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
