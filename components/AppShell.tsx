@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { CodeEnhancer } from "@/components/CodeEnhancer";
+import { CodeFold } from "@/components/CodeFold";
 import { Search } from "@/components/Search";
 import { GamificationHeader } from "@/components/gamification/GamificationHeader";
 import { GopherCompanion } from "@/components/gamification/GopherCompanion";
@@ -66,6 +67,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <GopherCompanion />
       <QuickScratchpad />
       <CodeEnhancer />
+      <CodeFold />
       <Search />
     </div>
   );
