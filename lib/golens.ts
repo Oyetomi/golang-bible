@@ -19,6 +19,7 @@ export type LensHit = {
   end: number;
   text: string; // the matched source
   name?: string; // captured type/var name used in the diagram
+  basic?: boolean;
 };
 
 type Pattern = {
@@ -28,9 +29,13 @@ type Pattern = {
   body: (m: RegExpExecArray) => string;
   diagram?: LensDiagram;
   name?: (m: RegExpExecArray) => string;
+  basic?: boolean; // everyday syntax: shown as one compact line when others are present
 };
 
 const IDENT = "[A-Za-z_][A-Za-z0-9_]*";
+
+/* "an Account", "a Deposit": article by the name's first letter. */
+const an = (name: string) => `${/^[AEIOUaeiou]/.test(name.replace(/^\*/, "")) ? "an" : "a"} ${name}`;
 
 export const PATTERNS: Pattern[] = [
   {
@@ -38,28 +43,28 @@ export const PATTERNS: Pattern[] = [
     re: new RegExp(`^\\s*func\\s*\\(\\s*(${IDENT})\\s+\\*(${IDENT})(?:\\[[^\\]]*\\])?\\s*\\)\\s*(${IDENT})`, "g"),
     title: (m) => `func (${m[1]} *${m[2]}) ${m[3]}(…)`,
     body: (m) =>
-      `A method named ${m[3]} on the type ${m[2]}, with a POINTER receiver. Inside the method, ${m[1]} holds the address of the caller's ${m[2]}, not a copy, so changes made through ${m[1]} (like ${m[1]}.Field = …) change the caller's value. Use a pointer receiver when the method must modify the value, or when the value is large.`,
+      `A method on ${an(m[2])}, with a pointer receiver: ${m[1]} is the caller's own ${m[2]}, not a copy. Changes made through ${m[1]} stick.`,
   },
   {
     id: "val-receiver",
     re: new RegExp(`^\\s*func\\s*\\(\\s*(${IDENT})\\s+(${IDENT})(?:\\[[^\\]]*\\])?\\s*\\)\\s*(${IDENT})`, "g"),
     title: (m) => `func (${m[1]} ${m[2]}) ${m[3]}(…)`,
     body: (m) =>
-      `A method named ${m[3]} on the type ${m[2]}, with a VALUE receiver. Go copies the ${m[2]} when the method is called, so ${m[1]} is a private copy. Reading is fine, but changes to ${m[1]} vanish when the method returns.`,
+      `A method on ${an(m[2])}, with a value receiver: ${m[1]} is a copy of the caller's ${m[2]}. Changes to ${m[1]} vanish when the method returns.`,
   },
   {
     id: "generic-func",
     re: new RegExp(`^\\s*func\\s+(${IDENT})\\[([^\\]]+)\\]`, "g"),
     title: (m) => `func ${m[1]}[${m[2]}]`,
     body: (m) =>
-      `A generic function. The part in square brackets declares TYPE parameters: placeholders for types, filled in at each call. "${m[2].trim()}" lists each placeholder and its constraint (which types are allowed). any means every type is allowed; comparable means types you can compare with ==.`,
+      `A generic function. [${m[2].trim()}] declares type placeholders, filled in at each call. any allows every type; comparable allows types you can == .`,
   },
   {
     id: "ptr-literal",
     re: new RegExp(`&(${IDENT}(?:\\.${IDENT})?)\\s*\\{`, "g"),
     title: (m) => `&${m[1]}{…}`,
     body: (m) =>
-      `Two things in one expression. ${m[1]}{…} builds a new ${m[1]} value, filling in the fields listed. Then & takes its ADDRESS: where that value lives in memory. So the result isn't a ${m[1]}, it's a *${m[1]}: a pointer. Whoever holds the pointer can reach and modify the one shared value. And Go keeps the value alive (on the heap) as long as any pointer to it exists, so returning &${m[1]}{…} from a function is safe.`,
+      `Builds ${an(m[1])}, then & hands back its address. The result is a *${m[1]}: a pointer to one shared ${m[1]}, not a copy. Returning it from a function is safe.`,
     diagram: "pointer-literal",
     name: (m) => m[1],
   },
@@ -68,42 +73,42 @@ export const PATTERNS: Pattern[] = [
     re: new RegExp(`(${IDENT})\\s*,\\s*ok\\s*:?=\\s*(${IDENT}(?:\\.${IDENT})*)\\.\\(([^)]+)\\)`, "g"),
     title: (m) => `${m[1]}, ok := ${m[2]}.(${m[3]})`,
     body: (m) =>
-      `A safe type assertion. It asks whether the interface value ${m[2]} is really holding a ${m[3]}. If so, ${m[1]} gets that ${m[3]} and ok is true. If not, ${m[1]} is the zero value and ok is false. It never panics.`,
+      `Asks: is ${m[2]} holding ${an(m[3])}? If yes, ${m[1]} gets it and ok is true. If not, ok is false. It never panics.`,
   },
   {
     id: "type-switch",
     re: /\.\(type\)/g,
     title: () => `switch v := x.(type)`,
-    body: () =>
-      `A type switch. It checks which concrete type is stored inside an interface value and runs the matching case. Inside each case, v already has that concrete type.`,
+    body: (_m) =>
+      `A type switch: runs the case matching the concrete type stored in the interface. Inside each case, v has that type.`,
   },
   {
     id: "assert",
     re: new RegExp(`(${IDENT}(?:\\.${IDENT})*)\\.\\((\\*?${IDENT}(?:\\.${IDENT})?)\\)`, "g"),
     title: (m) => `${m[1]}.(${m[2]})`,
     body: (m) =>
-      `A type assertion: "I claim the interface value ${m[1]} is holding a ${m[2]}; give it to me as one." If the claim is wrong, the program PANICS. Use the two-value form (v, ok := ${m[1]}.(${m[2]})) when you're not sure.`,
+      `Claims ${m[1]} holds ${an(m[2])} and gives it to you as one. If the claim is wrong, the program panics. Use the v, ok := form when unsure.`,
   },
   {
     id: "comma-ok-map",
     re: new RegExp(`(${IDENT})\\s*,\\s*ok\\s*:?=\\s*(${IDENT}(?:\\.${IDENT})*)\\[`, "g"),
     title: (m) => `${m[1]}, ok := ${m[2]}[key]`,
     body: (m) =>
-      `The "comma ok" map lookup. ${m[1]} gets the value stored under the key, and ok says whether the key was actually present. Without ok you can't tell "missing" from "stored a zero value".`,
+      `Map lookup. ${m[1]} gets the stored value; ok says whether the key existed, so you can tell a missing key from a stored zero.`,
   },
   {
     id: "comma-ok-recv",
     re: new RegExp(`(${IDENT})\\s*,\\s*ok\\s*:?=\\s*<-\\s*(${IDENT})`, "g"),
     title: (m) => `${m[1]}, ok := <-${m[2]}`,
     body: (m) =>
-      `Receive from channel ${m[2]}, and also learn whether it's closed. ok is false only when ${m[2]} is closed AND empty, in which case ${m[1]} is the zero value.`,
+      `Receive from ${m[2]}. ok is false only when the channel is closed and empty.`,
   },
   {
     id: "send",
     re: new RegExp(`(${IDENT}(?:\\.${IDENT})*)\\s*<-\\s*[^\\s-]`, "g"),
     title: (m) => `${m[1]} <- value`,
     body: (m) =>
-      `SEND a value into the channel ${m[1]}. The arrow points INTO the channel. On an unbuffered channel this line waits (the goroutine parks) until another goroutine receives.`,
+      `Send into the channel ${m[1]}: the arrow points into it. On an unbuffered channel this line waits until someone receives.`,
     diagram: "send",
     name: (m) => m[1],
   },
@@ -112,7 +117,7 @@ export const PATTERNS: Pattern[] = [
     re: new RegExp(`<-\\s*(${IDENT}(?:\\.${IDENT})*(?:\\(\\))?)`, "g"),
     title: (m) => `<-${m[1]}`,
     body: (m) =>
-      `RECEIVE a value from the channel ${m[1]}. The arrow points OUT of the channel. This waits (the goroutine parks) until a value is available, or returns immediately with the zero value if the channel is closed.`,
+      `Receive from the channel ${m[1]}: the arrow points out of it. This waits until a value arrives, or returns the zero value if the channel is closed.`,
     diagram: "recv",
     name: (m) => m[1],
   },
@@ -120,35 +125,36 @@ export const PATTERNS: Pattern[] = [
     id: "go-stmt",
     re: /(?:^|[\s;{])go\s+(?:func\b|[A-Za-z_])/g,
     title: () => `go f(…)`,
-    body: () =>
-      `Start f running in a NEW goroutine, alongside the current code, and continue immediately without waiting. You don't get f's return value back. Use a channel or a WaitGroup if you need its result, or need to wait for it.`,
+    body: (_m) =>
+      `Starts the call in a new goroutine and moves on immediately, without waiting and without a return value.`,
   },
   {
     id: "defer",
     re: /(?:^|[\s;{])defer\s+/g,
     title: () => `defer f(…)`,
-    body: () =>
-      `Schedule f to run when the surrounding FUNCTION returns (not the block), however it returns, even on a panic. f's arguments are evaluated right now, on this line. Multiple defers run in reverse order: last in, first out.`,
+    body: (_m) =>
+      `Runs the call when this function returns (even on panic). Its arguments are evaluated now. Several defers run last-in, first-out.`,
   },
   {
     id: "variadic-param",
     re: new RegExp(`(${IDENT})\\s+\\.\\.\\.(\\*?[A-Za-z_][\\w.\\[\\]]*)`, "g"),
     title: (m) => `${m[1]} ...${m[2]}`,
     body: (m) =>
-      `A variadic parameter: the function accepts any number of ${m[2]} arguments (including zero). Inside the function, ${m[1]} is a []${m[2]} slice.`,
+      `Accepts any number of ${m[2]} arguments. Inside the function, ${m[1]} is a []${m[2]}.`,
   },
   {
     id: "spread",
     re: new RegExp(`(${IDENT})\\.\\.\\.\\s*\\)`, "g"),
     title: (m) => `f(${m[1]}...)`,
-    body: (m) => `Spread the slice ${m[1]} into separate arguments, for a variadic function.`,
+    body: (m) =>
+      `Passes each element of the slice ${m[1]} as a separate argument.`,
   },
   {
     id: "address-of",
     re: new RegExp(`(?:^|[\\s(,=:\\[{])&(${IDENT}(?:\\.${IDENT})*)(?![\\w{])`, "g"),
     title: (m) => `&${m[1]}`,
     body: (m) =>
-      `Take the ADDRESS of ${m[1]}: a pointer that says where ${m[1]} lives in memory. Anyone holding that pointer can read and change ${m[1]} itself, not a copy. This is how functions and methods modify the caller's variables.`,
+      `Takes the address of ${m[1]}: a pointer to it. Whoever holds the pointer can change ${m[1]} itself, not a copy.`,
     diagram: "address-of",
     name: (m) => m[1],
   },
@@ -157,7 +163,7 @@ export const PATTERNS: Pattern[] = [
     re: new RegExp(`(?:^\\s*|[=(,]\\s*|return\\s+)\\*(${IDENT})\\b(?!\\s*[\\[{])`, "g"),
     title: (m) => `*${m[1]}`,
     body: (m) =>
-      `Follow the pointer ${m[1]} to the value it points at ("dereference"). *${m[1]} = x writes to the pointed-at value, and y := *${m[1]} reads a copy of it. If ${m[1]} is nil, this panics.`,
+      `Follows the pointer ${m[1]} to the value it points at. *${m[1]} = x writes there; reading gives a copy. Panics if ${m[1]} is nil.`,
     diagram: "deref",
     name: (m) => m[1],
   },
@@ -166,63 +172,67 @@ export const PATTERNS: Pattern[] = [
     re: new RegExp(`(?:[\\s(,\\]]|^)\\*(${IDENT}(?:\\.${IDENT})?)(?=[\\s),{\\]]|$)`, "g"),
     title: (m) => `*${m[1]}`,
     body: (m) =>
-      `In a TYPE (a parameter, field, return value or var), *${m[1]} means "pointer to a ${m[1]}". A *${m[1]} doesn't hold a ${m[1]}. It holds the ADDRESS of one. Its zero value is nil, meaning it points nowhere.`,
+      `A type: pointer to ${an(m[1])}. It holds an address, not ${an(m[1])}. Zero value: nil.`,
   },
   {
     id: "err-check",
+    basic: true,
     re: /if\s+(?:[\w]+\s*:?=\s*[^;]+;\s*)?err\s*!=\s*nil/g,
     title: () => `if err != nil`,
-    body: () =>
-      `Go's error check. Functions that can fail return an error as their last result. nil means "no error". Anything else means it failed, and the code handles it right here instead of throwing an exception.`,
+    body: (_m) =>
+      `Error check: nil means success; anything else is the failure, handled right here.`,
   },
   {
     id: "make",
+    basic: true,
     re: /\bmake\(\s*(\[\]|map\[|chan\b)/g,
     title: () => `make(…)`,
-    body: () =>
-      `make creates and initializes a slice, map or channel: the three built-in types that need internal setup (a backing array, a hash table, a channel queue). make([]T, n) gives n zero-valued elements, make(map[K]V) gives an empty, ready-to-use map, and make(chan T, n) gives a channel with a buffer of n.`,
+    body: (_m) =>
+      `Creates a ready-to-use slice, map or channel (the types that need internal setup).`,
   },
   {
     id: "map-literal",
     re: /(?:[=(,:{]|return)\s*map\[[^\]]+\][\w.*[\]]+\s*\{/g,
     title: () => `map[K]V{…}`,
-    body: () =>
-      `A map literal: a hash table from keys of type K to values of type V, filled with the key: value pairs listed. Lookups by key are fast, and iteration order is deliberately random.`,
+    body: (_m) =>
+      `A map (hash table) with the listed key: value pairs. Iteration order is random.`,
   },
   {
     id: "slice-literal",
     re: /(?:[=(,:{]|return)\s*\[\](\*?[\w.]+)\s*\{/g,
     title: (m) => `[]${m[1]}{…}`,
     body: (m) =>
-      `A slice literal: a growable list of ${m[1]} values, created with the elements listed. Under the hood a slice is a small header (pointer to an array, length, capacity), so copying a slice shares the same elements.`,
+      `A slice of ${m[1]} with the listed elements. Copying a slice shares the elements.`,
   },
   {
     id: "empty-struct",
     re: /struct\{\}/g,
     title: () => `struct{}`,
-    body: () =>
-      `The empty struct: a type with no fields that takes ZERO bytes. It's used when only presence matters: chan struct{} is a pure signal ("done!"), and map[K]struct{} is a set.`,
+    body: (_m) =>
+      `A type with no fields and zero size: used as a pure signal (chan struct{}) or a set (map[K]struct{}).`,
   },
   {
     id: "range-int",
     re: /for\s+(?:\w+\s*:=\s*)?range\s+\d+|for\s+\w+\s*:=\s*range\s+\w+\s*\{/g,
     title: () => `for … := range …`,
-    body: () =>
-      `A range loop. Over a slice or array it gives index (and value). Over a map, key and value. Over a channel, each received value until it's closed. Over an integer n (Go 1.22+), 0 to n-1. Since Go 1.22, each iteration gets fresh loop variables.`,
+    body: (_m) =>
+      `A range loop: over a slice (index, value), a map (key, value), a channel (until closed), or an int n (0..n-1, Go 1.22+).`,
   },
   {
     id: "short-decl",
+    basic: true,
     re: new RegExp(`(${IDENT}(?:\\s*,\\s*${IDENT})*)\\s*:=`, "g"),
     title: (m) => `${m[1]} :=`,
     body: (m) =>
-      `Short variable declaration: CREATE new variable(s) ${m[1]} and assign them in one step. Go works out the type from the right-hand side. It's different from = (which only assigns to variables that already exist), and it only works inside functions.`,
+      `Creates ${m[1]} and assigns it; the type comes from the right-hand side.`,
   },
   {
     id: "blank",
+    basic: true,
     re: /(?:^|[\s(,])_\s*(?:,|=|:=)/g,
     title: () => `_`,
-    body: () =>
-      `The blank identifier: "I know this produces a value; I'm deliberately ignoring it." Go refuses to compile unused variables, so _ is how you discard one explicitly.`,
+    body: (_m) =>
+      `_ discards a value you don't need (Go rejects unused variables).`,
   },
 ];
 
@@ -278,6 +288,7 @@ export function scanLine(line: string): LensHit[] {
         body: p.body(orig),
         diagram: p.diagram,
         name: p.name?.(orig),
+        basic: p.basic,
         start,
         end,
         text: line.slice(start, end),

@@ -106,29 +106,45 @@ function showCard(line: HTMLElement) {
     document.body.appendChild(card);
   }
   card.dataset.for = lineKey(line);
+  // Important patterns get a full entry; everyday ones (:=, _, err checks)
+  // shrink to one compact line underneath, so the card stays short.
+  const main = hits.filter((h) => !h.basic);
+  const basics = hits.filter((h) => h.basic);
+  const full = (h: LensHit) =>
+    `<div class="lens-item"><code class="lens-syntax">${esc(h.title)}</code><p>${esc(h.body)}</p>${
+      h.diagram ? diagram(h.diagram, h.name ?? "") : ""
+    }</div>`;
+  const compact = (h: LensHit) => `<div class="lens-basic"><code>${esc(h.title)}</code> ${esc(h.body)}</div>`;
   card.innerHTML =
     `<div class="lens-kicker">Reading this line</div>` +
-    hits
-      .map(
-        (h) =>
-          `<div class="lens-item"><code class="lens-syntax">${esc(h.title)}</code><p>${esc(h.body)}</p>${
-            h.diagram ? diagram(h.diagram, h.name ?? "") : ""
-          }</div>`,
-      )
-      .join("");
+    (main.length ? main.map(full).join("") + basics.map(compact).join("") : basics.map(full).join(""));
   document.querySelectorAll(".lens-line-on").forEach((el) => el.classList.remove("lens-line-on"));
   line.classList.add("lens-line-on");
 
+  // Place it beside the line, never over it: below if it fits, else above,
+  // else on the roomier side with its own scroll.
   const r = line.getBoundingClientRect();
   const pr = pre.getBoundingClientRect();
-  const w = Math.min(460, window.innerWidth - 24);
+  const w = Math.min(440, window.innerWidth - 24);
+  const gap = 8;
+  const spaceBelow = window.innerHeight - r.bottom - gap - 8;
+  const spaceAbove = r.top - gap - 8;
   card.style.width = `${w}px`;
+  card.style.maxHeight = "";
   card.classList.add("on");
   const h = card.offsetHeight;
-  const left = Math.max(12, Math.min(pr.left + 48, window.innerWidth - w - 12));
-  const below = r.bottom + 8;
-  const top = below + h > window.innerHeight - 8 ? Math.max(8, r.top - h - 8) : below;
-  card.style.left = `${left}px`;
+  let top: number;
+  if (h <= spaceBelow) top = r.bottom + gap;
+  else if (h <= spaceAbove) top = r.top - gap - h;
+  else if (spaceBelow >= spaceAbove) {
+    card.style.maxHeight = `${Math.max(140, spaceBelow)}px`;
+    top = r.bottom + gap;
+  } else {
+    const mh = Math.max(140, spaceAbove);
+    card.style.maxHeight = `${mh}px`;
+    top = r.top - gap - Math.min(h, mh);
+  }
+  card.style.left = `${Math.max(12, Math.min(pr.left + 48, window.innerWidth - w - 12))}px`;
   card.style.top = `${top}px`;
 }
 
