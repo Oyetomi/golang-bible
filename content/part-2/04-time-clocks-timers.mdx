@@ -119,12 +119,54 @@ The **monotonic clock** (`CLOCK_MONOTONIC`) is a nanosecond counter that only ev
 
 `time.Now()` fills in **both**. The struct carries them together so that when you subtract two `time.Time` values obtained from `time.Now()`, Go automatically uses the monotonic readings — giving you an elapsed duration that is immune to NTP adjustments and DST.
 
-```go
-t1 := time.Now() // has both wall + monotonic
-// ... NTP steps the wall clock back 200ms during this interval ...
-t2 := time.Now() // has both wall + monotonic
-d := t2.Sub(t1)  // uses monotonic → always non-negative, correct
+You don't have to take that on trust. This program measures three seconds of work and, one second in, really steps the system clock back ten seconds with the `settimeofday` system call, which is what a time daemon does when it corrects a fast clock:
+
+```go noverify
+// Measures 3 seconds of work while the system clock is stepped back
+// 10 seconds, as a time daemon correcting a fast clock would do.
+// Linux only; needs CAP_SYS_TIME (run in a container with --cap-add SYS_TIME).
+package main
+
+import (
+	"fmt"
+	"syscall"
+	"time"
+)
+
+func stepClock(d time.Duration) error {
+	tv := syscall.NsecToTimeval(time.Now().Add(d).UnixNano())
+	return syscall.Settimeofday(&tv)
+}
+
+func main() {
+	t0 := time.Now()
+	wall0 := t0.Round(0) // same instant, wall clock only: what a database or JSON gives back
+
+	time.Sleep(1 * time.Second)
+	fmt.Println("step clock back 10s:", stepClock(-10*time.Second))
+	time.Sleep(2 * time.Second)
+
+	t1 := time.Now()
+	fmt.Println("time.Since(t0)         (monotonic):", time.Since(t0).Round(time.Millisecond))
+	fmt.Println("t1.Sub(wall0)          (wall only):", t1.Sub(wall0).Round(time.Millisecond))
+	fmt.Println("t1 wall clock went from", t0.Format("15:04:05"), "to", t1.Format("15:04:05"))
+
+	stepClock(10 * time.Second) // put it back
+}
 ```
+
+Changing the clock needs the `CAP_SYS_TIME` capability, so it runs in a Linux container that grants it:
+
+```text
+$ GOOS=linux CGO_ENABLED=0 go build -o ntpdemo .
+$ docker run --rm --cap-add SYS_TIME -v $PWD/ntpdemo:/ntpdemo alpine:3.22 /ntpdemo
+step clock back 10s: <nil>
+time.Since(t0)         (monotonic): 3.008s
+t1.Sub(wall0)          (wall only): -6.992s
+t1 wall clock went from 15:40:41 to 15:40:34
+```
+
+Three seconds really passed. The monotonic reading says so; the wall clock says the work took *minus seven* seconds, because the second reading is seven seconds earlier than the first. Without `--cap-add SYS_TIME` the step fails with `operation not permitted`, which is also why ordinary programs can't do this to your server.
 
 `time.Since(start)` is just `time.Now().Sub(start)` — it uses the monotonic clock too. You're safe.
 
@@ -132,7 +174,7 @@ d := t2.Sub(t1)  // uses monotonic → always non-negative, correct
 
 The monotonic reading is stripped in **four important situations**:
 
-1. **Marshaling / unmarshaling** — `time.Time.MarshalJSON`, `MarshalBinary`, `String()`, `Format()`, and `AppendFormat()` only encode the wall-clock reading. When you deserialize a `time.Time` from a database, JSON payload, or log line, you get **wall only**.
+1. **Marshaling / unmarshaling** — `MarshalJSON`, `MarshalText`, `MarshalBinary`, `Format()` and `AppendFormat()` only encode the wall-clock reading. (`String()` is the exception: it prints the monotonic reading as `m=+0.001500085`, which is how you can spot it in debug output.) When you deserialize a `time.Time` from a database, JSON payload, or log line, you get **wall only**.
 2. **`time.Unix(sec, nsec)` and `time.Date(...)`** — constructing a `time.Time` from parts gives you wall-only.
 3. **`t.Round()` and `t.Truncate()`** — these strip the monotonic reading as a side-effect (documented, but people forget). `t.Round(0)` is the idiomatic way to drop monotonic without changing the wall value.
 4. **Timezone and calendar operations** — `t.UTC()`, `t.Local()`, `t.In(loc)`, and `t.AddDate(y, m, d)` all strip the monotonic reading too. This catches people who store `parsed.UTC()` and assume the result still carries monotonic. (The package rule: any operation whose result has no meaning outside the current process drops the monotonic part.)
@@ -141,7 +183,67 @@ This is the source of the negative-duration bugs people see in production. A com
 
 <Callout kind="warn" title="Serialization boundary = monotonic stripped">
 
-Every time a `time.Time` crosses a serialization boundary — JSON, protobuf, SQL, Redis, gob — it loses its monotonic reading. A `time.Time` reconstructed from a database column is **wall-only**. Subtracting a wall-only time from `time.Now()` is safe as long as you're just computing an age ("how long ago was this payment initiated?"), but you should know which clock you're using.
+Every time a `time.Time` crosses a serialization boundary — JSON, protobuf, SQL, Redis, gob — it loses its monotonic reading. A `time.Time` reconstructed from a database column is **wall-only**. Subtracting a wall-only time from `time.Now()` is fine for an age ("how long ago was this payment initiated?"), but it's exposed to clock steps like the one above.
+
+A database can take something else away too: precision. Postgres stores timestamps to the **microsecond**; Go on Linux reads the clock to the **nanosecond**. Round-tripping a real `time.Now()` through Postgres:
+
+```go noverify
+// Stores a time.Time in Postgres and reads it back.
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+func main() {
+	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	created := time.Now()
+	var back time.Time
+	if err := db.QueryRow(`SELECT $1::timestamptz`, created).Scan(&back); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("sent:     ", created)
+	fmt.Println("read back:", back)
+	fmt.Println("equal (==):     ", created == back)
+	fmt.Println("Equal():        ", created.Equal(back))
+	fmt.Println("lost precision: ", created.Sub(back))
+	fmt.Println("Truncate(µs).Equal:", created.Truncate(time.Microsecond).Equal(back))
+
+	b, _ := json.Marshal(created)
+	var fromJSON time.Time
+	json.Unmarshal(b, &fromJSON)
+	fmt.Println("\nJSON:", string(b))
+	fmt.Println("JSON round trip Equal:", created.Equal(fromJSON), "| has monotonic:", fromJSON != fromJSON.Round(0))
+}
+```
+
+```text
+$ docker run --rm -e DATABASE_URL=postgres://postgres@host.docker.internal:55432/postgres -v $PWD/pgdemo:/pgdemo alpine:3.22 /pgdemo    # Linux
+sent:      2026-09-26 15:43:38.701413791 +0000 UTC m=+0.007555959
+read back: 2026-09-26 15:43:38.701413 +0000 UTC
+equal (==):      false
+Equal():         false
+lost precision:  791ns
+Truncate(µs).Equal: true
+
+JSON: "2026-09-26T15:43:38.701413791Z"
+JSON round trip Equal: true | has monotonic: false
+```
+
+Even `Equal` is false: 791 nanoseconds were dropped. A test that stores a record and compares its `CreatedAt` with the original fails on Linux CI and passes on a Mac (where `time.Now` only has microseconds, so nothing is lost; the same program printed `Equal(): true` and `lost precision: 0s` there). JSON keeps all nine digits, but not the monotonic reading. Truncate to microseconds before storing, or compare with `Truncate(time.Microsecond)`.
 
 </Callout>
 
@@ -153,6 +255,7 @@ Every time a `time.Time` crosses a serialization boundary — JSON, protobuf, SQ
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -161,9 +264,11 @@ func main() {
 	// time.Now() carries both readings.
 	t1 := time.Now()
 
-	// Simulate a wall-only time (as you'd get from a DB or JSON).
-	// time.Unix() strips the monotonic reading.
-	wallOnly := time.Unix(t1.Unix(), int64(t1.Nanosecond()))
+	// Send t1 through JSON, as an API or a queue would. The copy that
+	// comes back has only the wall-clock reading.
+	b, _ := json.Marshal(t1)
+	var wallOnly time.Time
+	json.Unmarshal(b, &wallOnly)
 
 	// Small sleep to give the monotonic clock something to measure.
 	time.Sleep(10 * time.Millisecond)
@@ -172,8 +277,8 @@ func main() {
 	// t2.Sub(t1) uses monotonic — correct.
 	monoElapsed := t2.Sub(t1)
 
-	// t2.Sub(wallOnly) uses wall only — correct here, but
-	// vulnerable to NTP steps in a real distributed system.
+	// t2.Sub(wallOnly) uses wall only: correct here, but exposed to a
+	// clock step like the one in the container demo above.
 	wallElapsed := t2.Sub(wallOnly)
 
 	fmt.Printf("monotonic-based elapsed: %v\n", monoElapsed.Round(time.Millisecond))
@@ -263,9 +368,10 @@ Here's where I watch engineers casually leak timer work like they're being paid 
 `time.NewTimer(d)` returns a `*Timer` with a channel `C`. After duration `d`, the runtime sends one value on `C`. Simple. But stopping it correctly is not simple.
 
 ```go
-t := time.NewTimer(5 * time.Second)
-// ... decide you don't need it ...
-t.Stop() // returns bool: was the timer active?
+retry := time.NewTimer(5 * time.Second) // retry the payment in 5s
+if paymentSucceeded {
+	retry.Stop() // returns false if it had already fired or been stopped
+}
 ```
 
 For Go 1.23 and later, channel-based timers use a synchronous channel: after `Stop` or `Reset` returns, a later receive from `C` cannot observe a stale value from the old timer setting. Before Go 1.23, `Timer.C` was buffered and a stopped timer could leave a stale value waiting in the channel.
@@ -273,9 +379,8 @@ For Go 1.23 and later, channel-based timers use a synchronous channel: after `St
 If you support older Go versions, use the compatibility stop-and-drain idiom and make the drain non-blocking:
 
 ```go
-t := time.NewTimer(5 * time.Second)
-// ... decide you don't need it ...
-if !t.Stop() {
+retry := time.NewTimer(5 * time.Second)
+if !retry.Stop() {
 	select {
 	case <-t.C:
 	default:
@@ -372,6 +477,8 @@ Always `defer t.Stop()` immediately after creating a ticker when you control its
   caption="Stop tickers you're done with. Go 1.23's garbage collection of timers only helps when nothing refers to them."
 />
 
+What did Go 1.23 actually change? A payment retry timer fires while the worker is busy, and the worker then resets it for an hour. Does a stale tick from the first firing come through? The behaviour depends on the `go` line in your `go.mod`, even with the same toolchain, because Go keeps old semantics for modules that declare an older version:
+
 <GoPlayground>
 
 ```go
@@ -379,40 +486,58 @@ package main
 
 import (
 	"fmt"
+	"testing"
 	"time"
 )
 
 func main() {
-	// Demonstrate correct timer stop-and-drain.
-	t := time.NewTimer(50 * time.Millisecond)
+	// A retry timer fires while we're busy, then we Reset it for the next attempt.
+	t := time.NewTimer(10 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond) // busy: the timer fires meanwhile
+	t.Reset(time.Hour)                // next retry in an hour
 
-	// We decide to cancel before the timer fires.
-	// (In practice this races — we simulate the "already fired" case too.)
-	if !t.Stop() {
+	select {
+	case <-t.C:
+		fmt.Println("received a value right after Reset(time.Hour): a stale tick")
+	case <-time.After(50 * time.Millisecond):
+		fmt.Println("nothing received after Reset(time.Hour): no stale tick")
+	}
+	fmt.Println("cap(t.C) =", cap(t.C))
+
+	loopAfter := testing.AllocsPerRun(1000, func() {
 		select {
-		case <-t.C:
+		case <-time.After(time.Minute):
 		default:
 		}
-	}
-	fmt.Println("timer stopped cleanly")
-
-	// Demonstrate a ticker used correctly.
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-
-	count := 0
-	for range ticker.C {
-		count++
-		fmt.Printf("tick %d\n", count)
-		if count == 3 {
-			break // stop reading; defer will Stop the ticker
+	})
+	reuse := time.NewTimer(time.Minute)
+	loopReset := testing.AllocsPerRun(1000, func() {
+		reuse.Reset(time.Minute)
+		select {
+		case <-reuse.C:
+		default:
 		}
-	}
-	fmt.Println("ticker stopped cleanly")
+	})
+	fmt.Printf("allocations per loop pass: time.After %.0f, reused timer %.0f\n", loopAfter, loopReset)
 }
 ```
 
 </GoPlayground>
+
+Run with the Go 1.27 toolchain, changing only `go.mod`:
+
+```text
+== go 1.22 in go.mod
+received a value right after Reset(time.Hour): a stale tick
+cap(t.C) = 1
+allocations per loop pass: time.After 3, reused timer 0
+== go 1.27 in go.mod
+nothing received after Reset(time.Hour): no stale tick
+cap(t.C) = 0
+allocations per loop pass: time.After 3, reused timer 0
+```
+
+Under the old semantics the channel held the stale value (capacity 1) and the retry would have fired immediately instead of in an hour. Under the new ones it's gone. The last line holds in both: `time.After` in a loop costs 3 allocations every pass, a reused timer none.
 
 <UnderTheHood title="How the runtime manages timers (and the Go 1.23 heap change)">
 
