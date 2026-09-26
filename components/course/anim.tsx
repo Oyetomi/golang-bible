@@ -1094,9 +1094,15 @@ export function GraphAnim({
                   </text>
                 ) : (
                   <>
-                    <text x={n.x} y={n.y + 4} textAnchor="middle" className="grf-node-id">
-                      {n.id}
-                    </text>
+                    {/* The full name is in the tag below; inside the 15px circle only a
+                        short id fits. Longer ids got clipped ("domain" → "omai"). */}
+                    {n.id.length <= 3 ? (
+                      <text x={n.x} y={n.y + 4} textAnchor="middle" className="grf-node-id">
+                        {n.id}
+                      </text>
+                    ) : (
+                      <circle cx={n.x} cy={n.y} r="4" className="grf-node-dot" />
+                    )}
                     <g className="grf-tag">
                       <rect
                         x={n.x - label.length * 3.8 - 6}
