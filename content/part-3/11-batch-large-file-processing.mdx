@@ -3,349 +3,163 @@ title: "Batch & Large-File Processing"
 part: 3
 order: 11
 type: "course"
-description: "Nightly reconciliation, statement generation and bank-file ingest: NACHA/ACH fixed-width and ISO 20022 XML, streaming multi-GB files without loading them into memory, checkpointing and resumability, and idempotent re-processing."
+description: "Meridian's nightly settlement file, 3 million card transactions in 276 MB, measured: csv ReadAll peaked at 890 MB of memory while reading one record at a time stayed at 16 MB; strings.Split misread a quarter of the rows; strict parsing quarantined all 24 damaged rows by line number, and the trailer's control total showed exactly the USD 5,595.41 they held; a cut-off file was rejected for its missing trailer; COPY loaded rows 21 to 43 times faster than one INSERT per row; goroutines without a limit held 893 MB where errgroup.SetLimit held 47 MB; restarting a killed load from the top duplicated 1,580,000 rows, a checkpoint saved after the commit duplicated 10,000, and a checkpoint committed with its rows survived three kill -9s with none duplicated and none missing."
 prerequisites: ["auditability-compliance"]
 ---
 
-<HeroCard label="Part 3 · Chapter 10" title="Batch & Large-File Processing">
+<HeroCard label="Part 3 · Chapter 11" title="Batch & Large-File Processing">
 
-Here's the thing, sport. Everyone in this industry falls in love with streams, events, Kafka, the thrill of real-time. Adorable. Then 2 a.m. rolls around, and the bank drops a 4-gigabyte NACHA file on your SFTP server and your nightly reconciliation job tries to load it into memory. I've watched systems crumple under their own ambition like tin foil in a fist.
+Most of the money Meridian moves is confirmed in bulk, not one event at a time. Every night each card network and bank sends a **settlement file**: every transaction of the day, one per line, with the amounts that will actually move between banks tomorrow. Meridian must read it, check it, load it, and prove its totals match, before the morning.
 
-Not yours. By the end of this chapter you'll know exactly how fintech's unglamorous backbone works — the file formats nobody talks about at conferences, how to stream a multi-GB file with flat memory usage, how to checkpoint so a failed job restarts mid-file instead of from zero, and how idempotency keeps you from double-posting a single return entry when you re-run. It's not glamorous. It's what separates the engineers from the cargo-culters. You're lucky to have me.
+The file in this chapter has **3,000,000 rows and weighs 276 MB**. The approaches that work for a 20-row test file fail on it: they run out of memory, trust rows they shouldn't, load at a few thousand rows a second, or, when the job dies halfway (and at 3 a.m., it will), load half the day twice. Every claim in this chapter is measured on that file.
+
+Six stops. If you get lost, come back here:
+
+1. **Stream.** Read one record at a time, so memory doesn't grow with the file.
+2. **Validate.** Parse every field strictly; put bad rows aside, with their line numbers.
+3. **Control totals.** Let the file's own trailer prove nothing was lost.
+4. **Bulk load.** Get 3 million rows into PostgreSQL fast: COPY.
+5. **Pipeline.** Read and write at the same time, without the reader running away.
+6. **Resume and rerun.** Survive `kill -9`, and load the same file twice without loading it twice.
 
 </HeroCard>
 
-<ChapterTabs tabs={["Why Batch Still Rules", "File Formats: NACHA and ISO 20022", "Streaming Without Loading", "Checkpointing & Resumability", "Idempotent Re-processing"]} />
+<ChapterTabs tabs={["Stream", "Validate", "Control Totals", "Bulk Load", "Pipeline", "Resume & Rerun"]} />
 
 <SpacedRecall
-  role={"worker"}
+  role={"banker"}
   items={[
     {
-      from: "Data semantics (part 1, ch3)",
-      q: "len(string) in Go counts…?",
-      options: ["runes", "bytes", "words", "lines"],
+      from: "Representing Money (part 3, ch01)",
+      q: "Why does Meridian store amounts as an integer number of cents with the currency attached?",
+      options: ["It's faster", "A float can't hold most decimal amounts exactly, so arithmetic drifts; integers of minor units are exact", "Postgres has no decimal type", "To save space"],
       answer: 1,
-      tie: "Fixed-width bank files (NACHA/ACH) are BYTE-positioned — every field is at a byte offset. Treat positions as runes and one multibyte character shifts every column. Bytes matter here."
+      tie: "Stop 2 meets the same problem at the door: an amount read from a file must be parsed exactly, not through a float."
     },
     {
-      from: "General",
-      q: "Reconciliation compares two sources to find…?",
-      options: ["the faster one", "mismatches / discrepancies", "duplicates only", "the total"],
+      from: "Idempotency & Exactly-Once (part 3, ch04)",
+      q: "A consumer receives the same message twice. What makes processing it twice harmless?",
+      options: ["A faster consumer", "Recording the message's id in the same transaction as its effect, and skipping ids already recorded", "Deleting the message first", "A longer timeout"],
       answer: 1,
-      tie: "Nightly reconciliation is the chapter's job — match your ledger against the bank file, surface every discrepancy. Statement generation and bank-file ingest round it out."
+      tie: "Stop 6 applies this to a whole file: its identity is the hash of its bytes, and its progress commits with its rows."
     },
   ]}
 />
-
 
 <PredictLab
-  prompt={"strings.Fields on \"a b  c\" (double space) yields how many fields?"}
-  role={"scribe"}
-  code={`fmt.Println(len(strings.Fields("a b  c")))`}
-  options={["3", "4", "2", "1"]}
-  answer={0}
-  output={`3`}
-  explain={"strings.Fields splits on RUNS of whitespace and drops empties \u2192 3 fields, even with the double space. (strings.Split(s, \" \") would give 4, including an empty string.) For parsing whitespace-delimited batch records, Fields is the safer tool."}
-/>
-
-<Scene
-  title="Streaming a huge file: flat memory + checkpoint"
-  actors={[
-    { id: "job", label: "Batch job" },
-    { id: "mem", label: "Heap memory" },
-    { id: "cp", label: "Checkpoint" },
-  ]}
-  rows={3}
-  cols={8}
-  frames={[
-    {
-      caption: "Naïve approach: os.ReadFile loads the entire 4 GB NACHA file into memory at once. The heap explodes.",
-      beat: "problem",
-      actors: [
-        { id: "job", state: "active" },
-        { id: "mem", state: "bad" },
-        { id: "cp", state: "idle" },
-      ],
-      cells: [
-        { id: "A1", state: "bad", label: "4 GB" },
-        { id: "A2", state: "bad", label: "mem" },
-        { id: "A3", state: "bad", label: "OOM" },
-        { id: "A4", state: "bad", label: "!!!" },
-        { id: "A5", state: "bad", label: "!!!" },
-        { id: "A6", state: "bad", label: "!!!" },
-        { id: "A7", state: "bad", label: "!!!" },
-        { id: "A8", state: "bad", label: "!!!" },
-      ],
-    },
-    {
-      caption: "Streaming approach: bufio.Scanner reads one record at a time through a fixed-size window. Memory stays flat.",
-      beat: "solution",
-      actors: [
-        { id: "job", state: "active" },
-        { id: "mem", state: "ok" },
-        { id: "cp", state: "idle" },
-      ],
-      cells: [
-        { id: "A1", state: "done", label: "rec 1" },
-        { id: "A2", state: "done", label: "rec 2" },
-        { id: "A3", state: "active", label: "rec 3" },
-        { id: "A4", state: "idle", label: "..." },
-        { id: "A5", state: "idle", label: "..." },
-        { id: "A6", state: "idle", label: "..." },
-        { id: "A7", state: "idle", label: "..." },
-        { id: "A8", state: "idle", label: "..." },
-        { id: "B1", state: "done", label: "~8 KB" },
-        { id: "B2", state: "done", label: "buf" },
-        { id: "B3", state: "done", label: "flat" },
-      ],
-    },
-    {
-      caption: "Crash mid-file without a checkpoint: the job restarts from record 1. Forty minutes of work lost.",
-      beat: "problem",
-      actors: [
-        { id: "job", state: "bad" },
-        { id: "mem", state: "idle" },
-        { id: "cp", state: "bad" },
-      ],
-      cells: [
-        { id: "A1", state: "done", label: "✓" },
-        { id: "A2", state: "done", label: "✓" },
-        { id: "A3", state: "done", label: "✓" },
-        { id: "A4", state: "done", label: "✓" },
-        { id: "A5", state: "bad", label: "CRASH" },
-        { id: "A6", state: "idle", label: "..." },
-        { id: "A7", state: "idle", label: "..." },
-        { id: "A8", state: "idle", label: "..." },
-        { id: "B5", state: "bad", label: "restart" },
-        { id: "B6", state: "bad", label: "→ 0" },
-      ],
-    },
-    {
-      caption: "With a checkpoint: crash at record 1,600 → restart seeks to the saved byte offset and resumes at record 1,001. No lost work.",
-      beat: "solution",
-      actors: [
-        { id: "job", state: "ok" },
-        { id: "mem", state: "ok" },
-        { id: "cp", state: "done" },
-      ],
-      cells: [
-        { id: "A1", state: "done", label: "✓" },
-        { id: "A2", state: "done", label: "✓" },
-        { id: "A3", state: "done", label: "CP" },
-        { id: "A4", state: "done", label: "✓" },
-        { id: "A5", state: "warn", label: "crash" },
-        { id: "A6", state: "active", label: "resume" },
-        { id: "A7", state: "idle", label: "..." },
-        { id: "A8", state: "idle", label: "..." },
-        { id: "B3", state: "done", label: "offset" },
-        { id: "B4", state: "done", label: "saved" },
-        { id: "B6", state: "done", label: "seek→" },
-        { id: "B7", state: "done", label: "1001" },
-      ],
-    },
-  ]}
-  caption="Streaming keeps heap flat regardless of file size. A checkpoint advancing after each committed batch means a crash restarts mid-file, not from zero — the two invariants that make nightly batch jobs production-grade."
-/>
-
-## Why Batch Still Rules
-
-Before you dismiss batch as legacy, let me paint you the actual production picture. The clock hits midnight. Every bank, clearinghouse, and payment processor on the planet starts its settlement run. The Federal Reserve's ACH network cuts a file. Your processor drops a return file on Meridian's SFTP server. Statement generation kicks off. Three separate nightly jobs, all launching within minutes of each other — and not a single one of them is a Kafka consumer.
-
-**On the job:** You hit batch the moment your bank, card network, or clearinghouse drops a file on your SFTP server. If your nightly reconciliation job misses its window because it OOM'd mid-file, you start the next business day with an unreconciled ledger — which means frozen settlements, compliance flags, and an ops team that will not be happy to see you.
-
-**Why batch persists:**
-
-<ConceptGrid cols={3}>
-  <ConceptCard label="Settlement windows">ACH, SEPA, and most card networks operate on batch settlement cycles — 2–3 per day. You will never get per-transaction settlement on these rails. Batch is the protocol.</ConceptCard>
-  <ConceptCard label="Auditability">A batch run produces a concrete artifact (file, log, report) with a clear start, end, record count, and total. Regulators love a printable ledger. The PCI auditor does not want your event stream's offset range.</ConceptCard>
-  <ConceptCard label="Throughput efficiency">A 10 GB file transferred once costs far less in network, parsing, and coordination overhead than 10 million individually sent events. For bulk, bulk wins.</ConceptCard>
-  <ConceptCard label="Reconciliation">Batch is *inherently* a reconciliation tool. You compare the file's totals against your ledger's totals. A streaming system requires a separate reconciliation layer anyway — batch already is that layer.</ConceptCard>
-  <ConceptCard label="Error isolation">One bad record in a batch can be flagged and quarantined. The rest continue. A streaming failure mid-topic is messier to triage across partitions.</ConceptCard>
-  <ConceptCard label="Cost predictability">A nightly job that runs for 90 minutes is cheaper and simpler to capacity-plan than a streaming service that must be right-sized for peak throughout the day.</ConceptCard>
-  <Gotcha>Batch vs stream is not a holy war. The real fintech architecture has both. Use streaming for latency-sensitive flows (authorizations, fraud scoring) and batch for settlement, reconciliation, and statement generation. Resilience & Correctness Under Load (Part 3) and Idempotency & Exactly-Once Semantics (Part 3) are your streaming safety net; this chapter is your batch foundation.</Gotcha>
-</ConceptGrid>
-
-<Define term="Batch processing" since="Batch & Large-File Processing (Part 3, Chapter 10)">
-**Batch processing** means collecting a set of work items — records, transactions, instructions — into a file or queue and processing them in bulk at a scheduled time, rather than one at a time as they arrive. On ACH rails the bank literally drops a file once or twice a day; there is no per-transaction API. Get it wrong and you miss the settlement window entirely.
-</Define>
-
-<Define term="Reconciliation" since="Double-Entry Ledgers (Part 3)">
-**Reconciliation** is the process of comparing two independent records of the same events and confirming they agree — typically your internal ledger against the bank's file. If Meridian's ledger says a transfer settled but the ACH return file says it was rejected, that discrepancy is a reconciliation break. Undetected breaks turn into compliance findings and, worse, real money losses.
-</Define>
-
-### The nightly ACH reconciliation spine
-
-The running scenario for this entire chapter is a real one: **ingesting a nightly ACH return file from your bank and reconciling it against Meridian's ledger.** The bank sends you a NACHA-formatted file containing return entries — transactions that failed (insufficient funds, closed account, etc.). Your job must:
-
-1. Parse the file record by record, streaming — no full load.
-2. Checkpoint progress so a crash mid-file restarts where it left off.
-3. Apply each return against the ledger exactly once — idempotently.
-
-By the end of this chapter that job will be production-grade. Let's build the foundation.
-
-## File Formats: NACHA and ISO 20022
-
-Fintech's file formats were designed by committee in the 1970s and 1990s. They are not beautiful. They are, however, what your bank sends you, so let's treat them with the respect they deserve: precise parsing, zero float money, careful byte offsets.
-
-### NACHA / ACH — fixed-width positional records
-
-<Define term="NACHA / ACH fixed-width format" since="Batch & Large-File Processing (Part 3, Chapter 10)">
-**NACHA** (National Automated Clearing House Association) is the rule-making body for the US **ACH** (Automated Clearing House) network — the rails that move most direct deposits, payroll, and bill payments in the United States. NACHA files use a **fixed-width, positional** format: every line is exactly 94 characters, terminated by a newline, with no delimiters. Fields are identified by byte offset, not by separators. If you parse by splitting on commas or spaces, you will corrupt data. The format has been largely unchanged since the 1970s. It is not charming; it is ubiquitous.
-</Define>
-
-**On the job:** You hit this when your bank or payment processor delivers a nightly return file. If you misparse even one byte offset, you will either miss a return (and not reverse the credit) or misidentify the amount (and reverse the wrong amount). Both outcomes are compliance defects.
-
-The ACH network uses NACHA-formatted files. Every line is exactly **94 characters** wide, terminated by a newline. There are no delimiters. Fields are at fixed byte positions. Read that sentence again: **fixed byte positions, no delimiters.** The record type is always the first character.
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Record types">The first byte identifies the record. `1` = File Header, `5` = Batch Header, `6` = Entry Detail, `7` = Addenda, `8` = Batch Control, `9` = File Control. A well-formed file is a stack of these, in order.</ConceptCard>
-  <ConceptCard label="The Entry Detail (type 6)">This is the money line. It carries: transaction code (2 chars), routing number (9 chars, position 4–12), account number (17 chars), amount in cents (10 chars, position 30–39), individual name (22 chars), trace number (15 chars), and more — all positional.</ConceptCard>
-</ConceptGrid>
-
-Here is a simplified but realistic Entry Detail record laid out by byte offset:
-
-```go
-// NACHA Entry Detail (record type "6"), 94 characters wide.
-// Positions are 1-based (NACHA spec convention); we subtract 1 for Go slices.
-// Amount is in whole cents — never a float. Never.
-type EntryDetail struct {
-	TransactionCode string // pos  2-3  (2 chars)
-	RoutingNumber   string // pos  4-12 (9 chars)
-	AccountNumber   string // pos 13-29 (17 chars)
-	AmountCents     int64  // pos 30-39 (10 chars, right-justified, zero-padded)
-	IndividualName  string // pos 55-76 (22 chars)
-	TraceNumber     string // pos 80-94 (15 chars)
-}
-```
-
-Parsing is just `record[start:end]` — slice the line by byte offset, trim spaces, parse the amount integer. No CSV library, no JSON — straight byte arithmetic.
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"strconv"
-	"strings"
-)
-
-// EntryDetail holds the fields we care about from a NACHA Entry Detail record.
-// AmountCents is int64 — money is always integer minor units.
-type EntryDetail struct {
-	TransactionCode string
-	RoutingNumber   string
-	AccountNumber   string
-	AmountCents     int64
-	IndividualName  string
-	TraceNumber     string
-}
-
-// parseEntryDetail parses a single 94-character NACHA Entry Detail line (type "6").
-// Positions are converted from 1-based NACHA spec to 0-based Go slice indices.
-func parseEntryDetail(line string) (EntryDetail, error) {
-	if len(line) < 94 {
-		return EntryDetail{}, fmt.Errorf("entry detail too short: %d chars", len(line))
-	}
-	if line[0] != '6' {
-		return EntryDetail{}, fmt.Errorf("not an entry detail record (type %q)", line[0])
-	}
-	amountStr := strings.TrimSpace(line[29:39])
-	cents, err := strconv.ParseInt(amountStr, 10, 64)
-	if err != nil {
-		return EntryDetail{}, fmt.Errorf("invalid amount %q: %w", amountStr, err)
-	}
-	return EntryDetail{
-		TransactionCode: strings.TrimSpace(line[1:3]),
-		RoutingNumber:   strings.TrimSpace(line[3:12]),
-		AccountNumber:   strings.TrimSpace(line[12:29]),
-		AmountCents:     cents,
-		IndividualName:  strings.TrimSpace(line[54:76]),
-		TraceNumber:     strings.TrimSpace(line[79:94]),
-	}, nil
-}
-
-func main() {
-	// A synthetic but structurally valid 94-char Entry Detail line.
-	// Fields: type=6, txnCode=27 (return), routing=021000021, acct=123456789012345,
-	//         amount=0000012500 (=$125.00), individual, trace.
-	line := "627021000021123456789012345 0000012500SMITH JOHN           1234567890123456789012345"
-	// Pad to exactly 94 chars so the parser is happy.
-	line = fmt.Sprintf("%-94s", line)
-
-	e, err := parseEntryDetail(line)
-	if err != nil {
-		fmt.Println("parse error:", err)
-		return
-	}
-	fmt.Printf("TxnCode:  %s\n", e.TransactionCode)
-	fmt.Printf("Routing:  %s\n", e.RoutingNumber)
-	fmt.Printf("Amount:   $%d.%02d\n", e.AmountCents/100, e.AmountCents%100)
-	fmt.Printf("Name:     %s\n", e.IndividualName)
-}
-```
-
-</GoPlayground>
-
-### ISO 20022 — XML on modern rails
-
-<Define term="ISO 20022" since="Batch & Large-File Processing (Part 3, Chapter 10)">
-**ISO 20022** is the international messaging standard used for modern payment rails — SEPA credit transfers, SWIFT gpi, FedNow, and many central-bank real-time gross settlement systems. Where NACHA is fixed-width plain text, ISO 20022 uses structured XML with a rich schema. The payment initiation message is **pain.001**; a direct debit is **pain.008**. Files for large batch runs can be hundreds of megabytes. You must stream them — `xml.Unmarshal` on a 500 MB file will OOM your process.
-</Define>
-
-**On the job:** You hit ISO 20022 when integrating with SEPA, SWIFT, or any modern cross-border rail. The verbose XML is a feature (machine-readable, extensible) and a gotcha (huge files that punish naive parsers equally).
-
-NACHA is the domestic US rail. International wires and SEPA credit transfers run on **ISO 20022**, a newer standard using XML. The payment initiation message is called **pain.001** (don't laugh — it's `Payment Initiation 001`). A wire instruction file might contain thousands of `CdtTrfTxInf` (Credit Transfer Transaction Information) elements, each carrying amounts in a `Ccy` (currency) + decimal amount structure.
-
-ISO 20022 XML is verbose. A real pain.001 file for a batch of 50,000 wire instructions might be hundreds of megabytes. You **cannot** `xml.Unmarshal` the whole thing. We'll stream it — that's the next section.
-
-<Callout kind="note" title="ISO 20022 at a conceptual level">
-
-A pain.001 document has a `GrpHdr` (Group Header) with the batch total, followed by a sequence of `PmtInf` (Payment Information) blocks, each containing one or more `CdtTrfTxInf` transaction elements. When we stream below, we'll step through `PmtInf` elements one at a time, never holding the full document tree in memory. The amount in ISO 20022 is a decimal string with a currency code — always parse it with a decimal library or into integer minor units. In this chapter we'll use integer cents after scaling.
-
-</Callout>
-
-<QuickCheck
-  question="A NACHA Entry Detail record is 94 characters wide with no delimiters. How do you extract the 10-digit amount field starting at position 30 (1-based)?"
-  options={[
-    "Split the line on commas and take index 4",
-    "Use line[29:39] — convert from 1-based position to 0-based slice indices by subtracting 1 from the start",
-    "Use a regex to find the numeric field",
-    "xml.Unmarshal the line into a struct"
-  ]}
+  prompt={"Meridian's settlement file is 276 MB on disk: 3,000,000 CSV rows. A loader reads it with encoding/csv's ReadAll, which returns every record at once as a [][]string, then totals the amounts. What is the process's peak memory?"}
+  role={"banker"}
+  code={`cr := csv.NewReader(f)
+records, err := cr.ReadAll() // every row, in memory`}
+  options={["About 276 MB: the same as the file", "About 890 MB: more than three times the file", "About 16 MB: Go streams it anyway", "About 60 MB: CSV compresses"]}
   answer={1}
-  explain="NACHA positions are 1-based. Position 30-39 maps to Go slice [29:39]. No delimiters exist — byte offsets are the entire parsing strategy."
+  output={`readall  3000000 rows, 0 rejected, total USD 707632327.27    2.83s  peak RSS   890 MB  allocated   1179 MB  GCs   12
+stream   3000000 rows, 0 rejected, total USD 707632327.27    1.40s  peak RSS    17 MB  allocated    804 MB  GCs  235`}
+  explain={"Each record becomes a string plus a slice of nine 16-byte string headers, and all 3 million are kept at once: 890 MB for a 276 MB file. Reading one record at a time and keeping only the running total peaked at 17 MB, and would at 30 million rows too."}
 />
 
-## Streaming Without Loading
+## The lab bench
 
-<Define term="Streaming parse (vs loading the whole file)" since="Batch & Large-File Processing (Part 3, Chapter 10)">
-**Streaming parse** means reading and processing a file one record (or one element) at a time, never holding the full file contents in memory. The alternative — loading the whole file first with `os.ReadFile` or `xml.Unmarshal` — requires memory proportional to the file size (O(n)). Streaming keeps memory O(1) in file size: you hold one record, process it, discard it, and move on. For a 4 GB NACHA file, streaming uses kilobytes; loading uses gigabytes.
-</Define>
+The settlement file is made by a generator in this chapter's Go 1.27 module, `batch` (`cmd/gen`), from a fixed seed, so the same command always writes the same bytes. It's CSV with a header, one detail record per card transaction, and a trailer:
 
-**On the job:** Every nightly batch job that tries to `os.ReadFile` a multi-GB bank file will OOM the process at 3 a.m. The streaming approach is not a micro-optimization — it is the only approach that survives production file sizes.
+```text
+H,SETTLE-20260926-VISA-11,2026-09-26,USD
+D,txn_0000000002,2026-09-26T03:16:05Z,m_03324,"The ""Night Owl"" Bar #3324",sale,amex,108.68,USD
+D,txn_0000000003,2026-09-26T02:26:44Z,m_03890,"Green & Co, Ltd #3890",sale,visa,27.64,USD
+T,3000000,707632327.27
+```
 
-Here's where most batch jobs die: someone wrote `data, err := os.ReadFile(path)` on a 4 GB file. The server OOMs at 3 a.m., the reconciliation job crashes, and now you have incomplete ledger entries and a very unhappy ops team. I've seen it. I've fixed it. You're not going to do it.
+A detail record (`D`) is one card transaction: its id, time, merchant, merchant name, `sale` or `refund`, card brand, amount and currency. The trailer (`T`) says how many detail records the sender wrote and what they add up to. Merchant names can contain commas and quotes, so the sender quotes them, as CSV (RFC 4180) requires. The real formats (NACHA files for US bank transfers, the card networks' clearing files, ISO 20022 XML) differ in layout, but they have the same three parts, and the same things go wrong with them.
 
-The rule is non-negotiable: **never load a batch file into memory.** Stream it. Hold one record at a time. Memory usage stays flat no matter how large the file gets — O(1) in file size.
+```text
+$ gen -rows 1000000 -o settle-1m.csv
+wrote settle-1m.csv: 1000000 detail rows, 0 damaged, 91.9 MB
+$ gen -rows 3000000 -o settle-3m.csv
+wrote settle-3m.csv: 3000000 detail rows, 0 damaged, 275.6 MB
+$ gen -rows 3000000 -faults 24 -o settle-3m-bad.csv
+wrote settle-3m-bad.csv: 3000000 detail rows, 24 damaged, 275.6 MB
+```
 
-Go's standard library gives you three streaming tools depending on the format:
+`settle-3m-bad.csv` is a different day with **24 damaged rows**: amounts with three decimal places, a dollar sign, exponent notation or nothing at all, a missing field, the wrong currency, a sale with a negative amount, a time without its `T`. The generator lists each one, with its line number and the amount the sender meant, in a side file, so the chapter can check that the loader finds exactly those rows. The database is PostgreSQL 14; the Go code uses `github.com/jackc/pgx/v5` v5.11.0, `golang.org/x/sync` v0.23.0 (for `errgroup`), and the `money` package from chapter 1. The machine is an 8-core laptop that other work was sharing, so **times varied by up to about 2x between runs**; each timed result below is the median of three runs, and the text gives the spread where it matters. Memory and row counts didn't vary.
 
-<ConceptGrid cols={3}>
-  <ConceptCard label="bufio.Scanner">Line-by-line streaming for newline-delimited text (NACHA, CSV, NDJSON). Reads in buffered chunks. Handles the file in a simple `for scanner.Scan()` loop.</ConceptCard>
-  <ConceptCard label="encoding/csv Reader">Streaming CSV parsing via `r.Read()` (one record) or `r.ReadAll()` (loads everything — avoid). Use `Read()` in a loop.</ConceptCard>
-  <ConceptCard label="encoding/xml Decoder">Token-by-token XML streaming via `d.Token()` and `d.DecodeElement()`. The counterpart to `xml.Unmarshal` — same structs, but you control the traversal cursor so you process one element at a time.</ConceptCard>
-  <Gotcha>
-    `bufio.Scanner` has a default max token size of 64 KiB (`bufio.MaxScanTokenSize`). A NACHA line is 94 bytes — fine. But some XML lines or base64-encoded content can exceed 64 KiB. Call `scanner.Buffer(make([]byte, 256*1024), 256*1024)` before your scan loop to raise the limit. Otherwise `scanner.Err()` returns `bufio.ErrTooLong` and you'll spend an hour confused.
-  </Gotcha>
-</ConceptGrid>
+## Stream
 
-<Define term="bufio.Scanner token limit" since="Batch & Large-File Processing (Part 3, Chapter 10)">
-`bufio.Scanner` returns one "token" per `Scan()` call — by default, one line. The **token limit** is the maximum size of a single token. The default is `bufio.MaxScanTokenSize` = 64 KiB. If any line exceeds this, `Scan()` returns `false` and `scanner.Err()` returns `bufio.ErrTooLong`. It does **not** truncate silently. For NACHA (94-byte lines) the default is fine. For XML or base64-heavy formats, call `scanner.Buffer(buf, maxSize)` before your loop to raise the limit. Always check `scanner.Err()` after the loop exits — EOF and error both cause `Scan()` to return `false`, and you cannot tell which without the explicit check.
-</Define>
+*Stop 1 of 6.*
 
-### Streaming a NACHA file with `bufio.Scanner`
+### Step 1: load it all
+
+The obvious program reads the whole file into memory and then works on it: `os.ReadFile`, or, for CSV, `csv.Reader.ReadAll`, which returns every record as a `[][]string` (a slice of records, each a slice of field strings). It's short, and on a test file it's fine.
+
+Its memory grows with the file. The number that matters is **peak RSS** (resident set size): the most memory the operating system actually had to give the process at once. If that exceeds what the machine or the container allows, the process is killed. A settlement file gets bigger on a busy day, which is exactly the day the job must not fail.
+
+### Step 2: or one record at a time
+
+The alternative is to **stream**: read one record, handle it, keep only what you need from it (here, a running total), and let it go. The garbage collector reclaims each record's memory, so the process holds a few records and a read buffer at any moment, whatever the size of the file.
+
+<PostRoomAnim
+  title="Loading the file vs streaming it"
+  kicker="memory · live"
+  ledgerLabel="settlement file · 276 MB on disk"
+  queueLabel="the process's memory"
+  retryLabel="garbage: freed by the GC"
+  deadLabel="running total"
+  binTone="neutral"
+  bookings={[{ id: "p1", label: "rows 1–750,000" }, { id: "p2", label: "rows 750,001–1.5M" }, { id: "p3", label: "rows 1.5M–2.25M" }, { id: "p4", label: "rows 2.25M–3M" }]}
+  workers={[{ id: "r", label: "reader", role: "worker" }]}
+  jobs={[{ id: "a", label: "750k rows" }, { id: "b", label: "750k rows" }, { id: "c", label: "750k rows" }, { id: "d", label: "750k rows" }, { id: "x", label: "1 row" }, { id: "y", label: "1 row" }, { id: "t", label: "USD 707,632,327.27" }]}
+  events={[
+    { at: 0, booking: "p1", bstate: "pending" }, { at: 0, booking: "p2", bstate: "pending" }, { at: 0, booking: "p3", bstate: "pending" }, { at: 0, booking: "p4", bstate: "pending", note: "The file on disk: 3,000,000 rows, 276 MB. First, ReadAll." },
+    { at: 0.8, job: "a", to: "queue", booking: "p1", bstate: "ok", worker: "r", wstate: "working", say: "ReadAll" },
+    { at: 1.4, job: "b", to: "queue", booking: "p2", bstate: "ok" },
+    { at: 2.0, job: "c", to: "queue", booking: "p3", bstate: "ok" },
+    { at: 2.6, job: "d", to: "queue", booking: "p4", bstate: "ok", beat: "problem", banner: "peak RSS 890 MB", note: "Every record is in memory at once, as strings and slices: 890 MB for a 276 MB file. A file twice as big needs twice the memory." },
+    { at: 4.0, job: "a", to: "" }, { at: 4.0, job: "b", to: "" }, { at: 4.0, job: "c", to: "" }, { at: 4.0, job: "d", to: "" }, { at: 4.0, banner: null, worker: "r", say: "Read, one at a time", booking: "p1", bstate: "pending" }, { at: 4.0, booking: "p2", bstate: "pending" }, { at: 4.0, booking: "p3", bstate: "pending" }, { at: 4.0, booking: "p4", bstate: "pending", note: "Now stream: read one record, add its amount to the total, let it go." },
+    { at: 4.8, job: "x", to: "w:r", note: "One record is in memory, being parsed." },
+    { at: 5.6, job: "x", to: "retry", tag: "freed" }, { at: 5.6, job: "y", to: "w:r" }, { at: 5.6, job: "t", to: "dead", tag: "running" },
+    { at: 6.4, job: "y", to: "retry", booking: "p1", bstate: "ok" }, { at: 6.8, booking: "p2", bstate: "ok" }, { at: 7.2, booking: "p3", bstate: "ok" },
+    { at: 7.6, booking: "p4", bstate: "ok", worker: "r", wstate: "idle", say: null, banner: "peak RSS 17 MB", beat: "solution", note: "Measured: 17 MB at 1 million rows and 17 MB at 3 million. The memory no longer depends on the file." }
+  ]}
+  caption="ReadAll keeps every record until the end. Streaming keeps one, and a running total."
+/>
+
+### Step 3: measured
+
+The `read` command totals the file four ways (all four run below; `split` is Step 5's). Each prints its wall time, peak RSS (from `getrusage`), total bytes allocated over the run, and garbage-collection cycles:
+
+```text
+$ read -mode readall settle-1m.csv   # median of 3 runs
+readall  1000000 rows, 0 rejected, total USD 235927217.33    0.81s  peak RSS   336 MB  allocated    390 MB  GCs    9
+$ read -mode split settle-1m.csv   # median of 3 runs
+split    748876 rows, 251124 rejected, total USD 176758170.65    0.90s  peak RSS    16 MB  allocated    309 MB  GCs   95
+$ read -mode stream settle-1m.csv   # median of 3 runs
+stream   1000000 rows, 0 rejected, total USD 235927217.33    0.57s  peak RSS    16 MB  allocated    268 MB  GCs   78
+$ read -mode reuse settle-1m.csv   # median of 3 runs
+reuse    1000000 rows, 0 rejected, total USD 235927217.33    0.65s  peak RSS    16 MB  allocated    131 MB  GCs   38
+$ read -mode readall settle-3m.csv   # median of 3 runs
+readall  3000000 rows, 0 rejected, total USD 707632327.27    2.83s  peak RSS   890 MB  allocated   1179 MB  GCs   12
+$ read -mode split settle-3m.csv   # median of 3 runs
+split    2247581 rows, 752419 rejected, total USD 530371921.07    2.62s  peak RSS    17 MB  allocated    927 MB  GCs  283
+$ read -mode stream settle-3m.csv   # median of 3 runs
+stream   3000000 rows, 0 rejected, total USD 707632327.27    1.40s  peak RSS    17 MB  allocated    804 MB  GCs  235
+$ read -mode reuse settle-3m.csv   # median of 3 runs
+reuse    3000000 rows, 0 rejected, total USD 707632327.27    1.55s  peak RSS    16 MB  allocated    393 MB  GCs  114
+```
+
+`readall` peaked at **336 MB** for the 92 MB file and **890 MB** for the 276 MB one: about 3.2 times the file, growing with it. `stream` and `reuse` peaked at **16–17 MB for both files**. Streaming also wasn't slower: over three runs `readall` took 2.1–3.2 s on the big file and `stream` 1.4–1.6 s, because the program never has to find room for 890 MB.
+
+<UnderTheHood title="Where 890 MB comes from">
+
+`encoding/csv` turns each record into **one string** holding all its fields' text, and a `[]string` whose elements point into it (you can see this in `readRecord`: `str := string(r.recordBuffer)`, then each field is a slice of `str`). A Go string is a 16-byte header (a pointer and a length) plus its bytes.
+
+For this file, per record: about 83 bytes of text (the line without its commas and newline), which the allocator rounds up to a 96-byte block; a backing array of 9 string headers, 9 × 16 = 144 bytes; and a 24-byte slice header in the outer `[][]string`. That's about 264 bytes per record, and 3,000,000 × 264 is about 790 MB. The outer slice also grew by doubling as `ReadAll` appended to it, copying itself each time, and the garbage collector lets the heap grow past what's live before it runs (by default up to twice the live heap, `GOGC=100`). Hence 890 MB of RSS for 276 MB on disk.
+
+Streaming allocates the same strings (804 MB allocated over the run), but only a few are alive at any moment, so the garbage collector reclaims them 235 times instead of 12, and the peak stays at 17 MB.
+
+</UnderTheHood>
+
+### Step 4: bufio.Scanner has a line limit
+
+The usual way to read a file line by line in Go is `bufio.Scanner`. It has a limit you need to know about: by default a line (a *token*) can be at most **64 KB** (`bufio.MaxScanTokenSize`). A longer line doesn't get truncated; `Scan` returns `false` and `Err` returns `bufio.ErrTooLong`, so a loop that only checks `Scan` silently stops early:
 
 <GoPlayground>
 
@@ -355,100 +169,42 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
-	"strconv"
 	"strings"
 )
 
-// sumACHReturns streams a NACHA file line by line through a bufio.Scanner,
-// summing the amounts of all return Entry Detail records (transaction codes
-// 21, 26, 27, 31, 36, 37). Memory stays flat — one line at a time, regardless
-// of file size. In production the io.Reader is an *os.File from os.Open; here
-// it's a strings.Reader so the example is self-contained.
-func sumACHReturns(r io.Reader) (int64, int, error) {
-	returnCodes := map[string]bool{
-		"21": true, "26": true, "27": true,
-		"31": true, "36": true, "37": true,
-	}
-	var totalCents int64
-	var count int
-
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) < 94 || line[0] != '6' {
-			continue // skip non-entry records
-		}
-		txnCode := strings.TrimSpace(line[1:3])
-		if !returnCodes[txnCode] {
-			continue // not a return
-		}
-		amountStr := strings.TrimSpace(line[29:39])
-		cents, err := strconv.ParseInt(amountStr, 10, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("bad amount in trace %s: %w",
-				strings.TrimSpace(line[79:94]), err)
-		}
-		totalCents += cents
-		count++
-	}
-	if err := scanner.Err(); err != nil {
-		return 0, 0, fmt.Errorf("scan: %w", err)
-	}
-	return totalCents, count, nil
-}
-
 func main() {
-	// Simulate a small NACHA file. In production this io.Reader is an *os.File
-	// from os.Open — never os.ReadFile into memory.
-	rows := []string{
-		"1" + strings.Repeat(" ", 93), // File Header
-		"5" + strings.Repeat(" ", 93), // Batch Header
-		// Three Entry Detail records, transaction code 27 (debit return):
-		"627021000021123456789012345 0000012500SMITH JOHN           1" + strings.Repeat("0", 14),
-		"627021000021987654321098765 0000025000JONES MARY           1" + strings.Repeat("1", 14),
-		"627021000021111111111111111 0000005075DAVIS BOB            1" + strings.Repeat("2", 14),
-		"8" + strings.Repeat(" ", 93), // Batch Control
-		"9" + strings.Repeat(" ", 93), // File Control
-	}
-	file := strings.Join(rows, "\n")
+	// Three lines; the middle one is 70,000 bytes long.
+	file := "H,SETTLE-20260926\n" + "D,txn_1," + strings.Repeat("x", 70_000) + "\n" + "T,1,0.00\n"
 
-	total, n, err := sumACHReturns(strings.NewReader(file))
-	if err != nil {
-		fmt.Println("error:", err)
-		return
+	sc := bufio.NewScanner(strings.NewReader(file))
+	lines := 0
+	for sc.Scan() {
+		lines++
 	}
-	fmt.Printf("Returns: %d entries, total $%d.%02d\n", n, total/100, total%100)
+	fmt.Println("default buffer:", lines, "line(s) read, then:", sc.Err())
+
+	sc = bufio.NewScanner(strings.NewReader(file))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // lines up to 1 MB
+	lines = 0
+	for sc.Scan() {
+		lines++
+	}
+	fmt.Println("1 MB maximum:  ", lines, "line(s) read, then:", sc.Err())
 }
 ```
 
 </GoPlayground>
 
-In production, replace the `[]string` slice with a `bufio.Scanner` over `os.Open`:
-
-```go
-f, err := os.Open(path)
-if err != nil {
-	return err
-}
-defer f.Close()
-
-scanner := bufio.NewScanner(f)
-// Raise the buffer if lines could exceed 64 KiB (rare for NACHA, possible for XML).
-scanner.Buffer(make([]byte, 256*1024), 256*1024)
-
-for scanner.Scan() {
-	line := scanner.Text()
-	// process line...
-}
-if err := scanner.Err(); err != nil {
-	return fmt.Errorf("scan error: %w", err)
-}
+```text
+default buffer: 1 line(s) read, then: bufio.Scanner: token too long
+1 MB maximum:   3 line(s) read, then: <nil>
 ```
 
-### Streaming ISO 20022 XML with `encoding/xml Decoder`
+With the default buffer the loop read **one line** of three and stopped. `sc.Buffer(buf, max)` raises the limit. Always check `sc.Err()` after the loop: without that check, the loop above would have reported a one-line file as a success.
 
-For XML, `bufio.Scanner` won't cut it — XML structure is hierarchical, not line-delimited. Use `encoding/xml`'s `Decoder` in token mode. The key pattern is: call `d.Token()` to advance through the document, and when you hit the start element you want, call `d.DecodeElement` into a local struct — it reads only *that element's subtree*, then the cursor advances past it. The rest of the file hasn't been read yet.
+### Step 5: CSV is not split on commas
+
+`strings.Split(line, ",")` looks like a CSV parser until a field contains a comma. In CSV (RFC 4180) such a field is quoted, and a quote inside it is doubled:
 
 <GoPlayground>
 
@@ -456,572 +212,745 @@ For XML, `bufio.Scanner` won't cut it — XML structure is hierarchical, not lin
 package main
 
 import (
-	"encoding/xml"
+	"encoding/csv"
 	"fmt"
-	"strconv"
 	"strings"
 )
 
-// CdtTrfTxInf is a single ISO 20022 credit transfer transaction.
-// In a real pain.001, the amount is a decimal string + currency attribute.
-// We parse it into integer cents (assuming EUR for this demo).
-type CdtTrfTxInf struct {
-	EndToEndId string `xml:"PmtId>EndToEndId"`
-	AmountStr  string `xml:"Amt>InstdAmt"`
-}
-
-// streamISO20022 processes a pain.001 XML document one CdtTrfTxInf at a time.
-// It never loads the full document tree — each element is decoded and discarded.
-func streamISO20022(data string) error {
-	dec := xml.NewDecoder(strings.NewReader(data))
-
-	var totalCents int64
-	var count int
-
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			break // io.EOF or parse error; real code checks err == io.EOF
-		}
-		se, ok := tok.(xml.StartElement)
-		if !ok || se.Name.Local != "CdtTrfTxInf" {
-			continue
-		}
-		// Decode only this element's subtree — the rest of the file is untouched.
-		var tx CdtTrfTxInf
-		if err := dec.DecodeElement(&tx, &se); err != nil {
-			return fmt.Errorf("decode CdtTrfTxInf: %w", err)
-		}
-		// Amount in ISO 20022 is a decimal like "125.00" — convert to integer cents.
-		// Real code uses a decimal library or big.Rat for precision.
-		cents, err := parseCents(tx.AmountStr)
-		if err != nil {
-			return fmt.Errorf("bad amount %q in %s: %w", tx.AmountStr, tx.EndToEndId, err)
-		}
-		totalCents += cents
-		count++
-	}
-
-	fmt.Printf("Processed %d transactions, total %d cents ($%d.%02d)\n",
-		count, totalCents, totalCents/100, totalCents%100)
-	return nil
-}
-
-// parseCents converts a decimal string "125.00" to integer cents 12500.
-// In production, use shopspring/decimal or math/big for arbitrary precision.
-func parseCents(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	dot := strings.IndexByte(s, '.')
-	if dot < 0 {
-		n, err := strconv.ParseInt(s, 10, 64)
-		return n * 100, err
-	}
-	whole := s[:dot]
-	frac := s[dot+1:]
-	// Ensure exactly 2 decimal places.
-	switch len(frac) {
-	case 0:
-		frac = "00"
-	case 1:
-		frac += "0"
-	default:
-		frac = frac[:2]
-	}
-	w, err := strconv.ParseInt(whole, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	f, err := strconv.ParseInt(frac, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return w*100 + f, nil
-}
-
 func main() {
-	// A minimal synthetic pain.001 fragment — streaming means we'd open os.File
-	// and pass it to xml.NewDecoder directly in production.
-	doc := `<?xml version="1.0"?>
-<Document>
-  <CstmrCdtTrfInitn>
-    <GrpHdr><MsgId>MSG001</MsgId></GrpHdr>
-    <PmtInf>
-      <CdtTrfTxInf>
-        <PmtId><EndToEndId>E2E-001</EndToEndId></PmtId>
-        <Amt><InstdAmt>125.00</InstdAmt></Amt>
-      </CdtTrfTxInf>
-      <CdtTrfTxInf>
-        <PmtId><EndToEndId>E2E-002</EndToEndId></PmtId>
-        <Amt><InstdAmt>2750.50</InstdAmt></Amt>
-      </CdtTrfTxInf>
-    </PmtInf>
-  </CstmrCdtTrfInitn>
-</Document>`
+	// One detail record. The merchant's name contains a comma, so the
+	// sender quoted it, as CSV requires.
+	line := `D,txn_0000000003,2026-09-26T02:26:44Z,m_03890,"Green & Co, Ltd #3890",sale,visa,27.64,USD`
 
-	if err := streamISO20022(doc); err != nil {
-		fmt.Println("error:", err)
-	}
+	fields := strings.Split(line, ",")
+	fmt.Printf("strings.Split: %d fields, amount field = %q\n", len(fields), fields[7])
+
+	rec, err := csv.NewReader(strings.NewReader(line)).Read()
+	fmt.Printf("encoding/csv:  %d fields, amount field = %q, err = %v\n", len(rec), rec[7], err)
 }
 ```
 
 </GoPlayground>
 
-<UnderTheHood title="Why streaming keeps memory O(1) in file size">
-
-When you call `xml.NewDecoder(f)` and drive it with `d.Token()`, the decoder maintains a small internal read buffer (a few kilobytes) and a tokenizer state machine. It reads from the underlying `io.Reader` in chunks, returning one token at a time. When you call `d.DecodeElement(&tx, &se)`, it allocates a struct for *that element only*, fills it, and returns. The struct goes out of scope at the end of the loop body and is collected on the next GC cycle.
-
-The key invariant: **at no point does the decoder hold more than its internal buffer plus one decoded element in memory, regardless of the total file size.** If your file is 4 GB and contains 2 million transactions, you still hold one `CdtTrfTxInf` at a time — roughly the size of one struct, not two million.
-
-This is in stark contrast to `xml.Unmarshal(data, &doc)`, which must first read the entire document into `data` (one 4 GB allocation), then build a full in-memory DOM tree (another several GB allocation). Both approaches parse the same XML — but streaming is O(1) space and the whole-document approach is O(n) in file size.
-
-As of **Go 1.26**, `io.ReadAll` is roughly 2× faster than it was in 1.25. This is a *trap*: a faster `ReadAll` just means you fill memory faster. For batch files, streaming with `Decoder.Token()` is always the right approach — the speed improvement in `ReadAll` doesn't change the memory equation.
-
-Go 1.26's **Green Tea GC** (the new default garbage collector) improves locality and scalability when marking and scanning many small objects. That can help allocation-heavy jobs, but the real win here is independent of the collector: a streaming batch job never retains the whole file, so live heap stays bounded.
-
-</UnderTheHood>
-
-<ExecTimeline
-  title="Streaming a 4 GB NACHA file — memory stays flat"
-  lanes={[{ id: "stream", label: "streaming parser" }, { id: "mem", label: "heap memory" }]}
-  steps={[
-    { lane: "stream", kind: "run", label: "open file", note: "os.Open returns an *os.File. No bytes read yet — the OS maps the file descriptor, not the content." },
-    { lane: "mem", kind: "run", label: "~8 KB buffer", note: "bufio.Scanner allocates its internal read buffer (default 4 KiB, or your custom size). This is the ceiling for NACHA streaming." },
-    { lane: "stream", kind: "run", label: "scanner.Scan() → line 1", note: "Scanner reads a chunk from the OS into its buffer. Returns one line. File Header — skip it." },
-    { lane: "stream", kind: "run", label: "scanner.Scan() → line N (Entry)", note: "An Entry Detail line is returned. Parse byte offsets 29:39 into AmountCents. Struct allocated." },
-    { lane: "mem", kind: "run", label: "one EntryDetail struct", note: "Roughly 128 bytes on the heap. Previous record is already unreachable — GC can collect it." },
-    { lane: "stream", kind: "run", label: "process + discard", note: "Apply the record to the running total. The struct goes out of scope. We never held more than one." },
-    { lane: "mem", kind: "done", label: "heap flat throughout", note: "After 2 million records, heap is identical to after record 1. Memory is O(1) in file size." }
-  ]}
-  caption="The file is 4 GB on disk. The heap never exceeds a few kilobytes plus one record struct. That's the streaming invariant."
-/>
-
-<QuickCheck
-  question={'`bufio.Scanner` silently truncates lines longer than its buffer and returns them as if they were fine. True or false?'}
-  options={[
-    "True — it truncates silently",
-    "False — it returns an error via scanner.Err() equal to bufio.ErrTooLong, and Scan() returns false",
-    "False — it automatically grows the buffer",
-    "True — but only lines over 1 MB"
-  ]}
-  answer={1}
-  explain="When a token exceeds the scanner's buffer size, Scan() returns false and scanner.Err() returns bufio.ErrTooLong. It does NOT truncate silently. Always call scanner.Buffer() to set an appropriate limit before your loop, and always check scanner.Err() after the loop."
-/>
-
-<ELI5
-  concept="Checkpointing"
-  analogy="Bookmarks in a long book, so a power cut does not send you back to page one."
-  role="reader"
->
-
-A settlement file with four million rows takes hours. Something will interrupt it — a deploy, a restart, a network blip on row 3.8 million.
-
-Without checkpoints there are only two options and both are bad. Start again from the beginning, losing hours and possibly missing the window. Or resume from a guess, and either skip rows or process some twice.
-
-**Checkpointing** records progress durably as you go: after every N rows, write down where you are — the byte offset, or the last id processed — in the same database you are writing results to.
-
-The detail that makes it correct is that the checkpoint and the work must commit **together**, in one transaction. Write the rows, then separately record the position, and a crash between those two writes leaves you having done work you have no record of — which on resume gets done again.
-
-Even with that right, a resumed batch will occasionally redo the last chunk, because the crash landed between checkpoints. So every row's effect still needs to be idempotent, keyed on something stable from the file.
-
-Same conclusion as everywhere else in this part: you cannot prevent the interruption, you can only make repeating a piece of work harmless.
-
-</ELI5>
-
-## Checkpointing & Resumability
-
-The 2 a.m. scenario this section exists for — a crash at record 1.8M of 3M:
-
-<JourneyAnim
-  title="NACHA ingest crashes mid-file — resume, don't restart"
-  hops={[
-    { id: "start", label: "records 0–1M", role: "worker" },
-    { id: "mid", label: "1M–1.8M", role: "worker" },
-    { id: "crash", label: "record 1,800,007", role: "detective" },
-    { id: "end", label: "1.8M–3M", role: "scribe" }
-  ]}
-  frames={[
-    {
-      note: "The nightly bank file: 3 million entries. The processor streams it record by record, and every 10,000 records it COMMITS a checkpoint — file offset + record count + running hash — in the same transaction as the batch's ledger writes.",
-      at: "start"
-    },
-    {
-      note: "1.8 million records in, 47 minutes elapsed. Checkpoint table says: 1,800,000 records done at byte offset 214,402,118 — committed atomically WITH the postings it covers. The checkpoint can never claim work that didn't commit, because it IS part of the work's transaction.",
-      at: "mid"
-    },
-    {
-      note: "Record 1,800,007: the pod is OOM-killed. No graceful shutdown, no deferred cleanup — the process simply stops existing. In-flight batch (7 records past the last checkpoint) rolls back with its uncommitted transaction.",
-      beat: "problem",
-      at: "crash",
-      failed: true
-    },
-    {
-      note: "Restart. The processor reads the last checkpoint: 1,800,000 records done, resume at offset X. It SEEKS straight there — no re-reading, no re-posting of 1.8M entries. The 7 rolled-back records are simply processed again.",
-      beat: "solution",
-      at: "crash"
-    },
-    {
-      note: "The remaining 1.2M records process normally. Total cost of the crash: re-doing 7 records and one restart — instead of a full 47-minute re-run that would DOUBLE-POST 1.8M entries (or force the whole file to be idempotent-checked row by row).",
-      beat: "solution",
-      at: "end"
-    }
-  ]}
-  caption="Checkpoint = (position, progress) committed in the SAME transaction as the work it describes. Crash anywhere, resume from the last checkpoint, re-do at most one batch — and pair it with idempotent handlers for the overlap."
-/>
-
-<Define term="Checkpoint / resumability" since="Batch & Large-File Processing (Part 3, Chapter 10)">
-A **checkpoint** is a durable record of how far a batch job has progressed — the byte offset or record number of the last successfully committed record. On a crash or restart, the job reads its checkpoint and resumes from that position instead of starting over. **Resumability** is the property that makes this work: given a valid checkpoint, the job can re-enter the file mid-stream with no loss of correctness. Without a checkpoint, a crash that happens 95% through a 4-hour run costs you the entire 4 hours; with one, it costs you at most one checkpoint interval (typically seconds).
-</Define>
-
-**On the job:** Every nightly batch job of meaningful size needs checkpointing. "It never crashes in production" is not a design. A deploy, an OOM kill, or a network partition will interrupt your job, and when it does, the checkpoint is the difference between re-running 30 seconds of work and re-running 4 hours.
-
-You've got a 4 GB NACHA file. You've been streaming for 40 minutes, you've processed 1.8 million records, and the process crashes — OOM killer, network blip, a deploy, someone tripped on a power cord. Without checkpointing, you restart from record 1. With checkpointing, you restart from record 1,800,001.
-
-A **checkpoint** is a durable record of your progress: how far into the file you've successfully processed. The checkpoint store is just a database row (or a file) you update after each committed batch of records. On restart, you read the checkpoint and seek (or skip) to that position.
-
-```go
-// Checkpoint records progress through a batch file so the job can resume
-// mid-file after a crash without reprocessing records from the start.
-type Checkpoint struct {
-	JobID          string    // which batch job
-	FilePath       string    // which file
-	LastRecordNum  int64     // last successfully processed record number (1-based)
-	ByteOffset     int64     // byte offset in file after last processed record
-	ProcessedCount int64     // total records processed so far
-	TotalCents     int64     // running sum (for reconciliation cross-check)
-	UpdatedAt      time.Time // when this checkpoint was written
-}
+```text
+strings.Split: 10 fields, amount field = "visa"
+encoding/csv:  9 fields, amount field = "27.64", err = <nil>
 ```
 
-Two flavors of checkpoint position:
+`strings.Split` cut the quoted name in two, so every field after it moved one place and the "amount" was `visa`. In the measured run, the `split` mode rejected **752,419 of 3,000,000 rows** (the quarter of merchants whose names contain a comma). The rows whose names contain only quotes passed, with the quote characters left in the name. `encoding/csv` read all 3,000,000 correctly.
 
-- **Record number**: the count of records processed. Simple; works when records are equal in length (NACHA's 94-byte lines). Skip the first N lines on resume.
-- **Byte offset**: the file position *after* the last processed record. More general; works for variable-length records. Use `file.Seek(offset, io.SeekStart)` to jump directly.
+### Step 6: reuse the record slice
 
-For NACHA (fixed-width lines), either works. We'll use byte offset because it's O(1) to seek and avoids re-scanning N lines just to skip them.
+`csv.Reader` has an option, `ReuseRecord`, that makes `Read` return the same `[]string` every time, overwriting it, instead of allocating a new one per record. The field *strings* are still new each time (they're safe to keep); only the slice holding them is reused, so you mustn't keep the slice itself past the next `Read`. This is the reading loop in `cmd/read`:
 
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"strings"
-	"time"
-)
-
-// Checkpoint records how far a batch job has progressed through a file.
-type Checkpoint struct {
-	JobID         string
-	FilePath      string
-	LastRecordNum int64
-	ByteOffset    int64
-	TotalCents    int64
-	UpdatedAt     time.Time
-}
-
-// InMemoryCheckpointStore is a toy store for this demo.
-// In production: a Postgres row with a unique job_id, updated in the same
-// transaction that commits the batch of ledger entries.
-type InMemoryCheckpointStore struct {
-	data map[string]*Checkpoint
-}
-
-func NewStore() *InMemoryCheckpointStore {
-	return &InMemoryCheckpointStore{data: make(map[string]*Checkpoint)}
-}
-
-func (s *InMemoryCheckpointStore) Save(cp Checkpoint) {
-	cp.UpdatedAt = time.Now()
-	s.data[cp.JobID] = &cp
-}
-
-func (s *InMemoryCheckpointStore) Load(jobID string) (Checkpoint, bool) {
-	cp, ok := s.data[jobID]
-	if !ok {
-		return Checkpoint{}, false
-	}
-	return *cp, true
-}
-
-// processLines simulates streaming from startLine, checkpointing every 2 records.
-func processLines(lines []string, store *InMemoryCheckpointStore, jobID string, startRecord int64) (int64, error) {
-	cp, _ := store.Load(jobID)
-	var byteOffset int64
-	for i, line := range lines[:startRecord] {
-		_ = i
-		byteOffset += int64(len(line)) + 1 // +1 for newline
-	}
-
-	var totalCents int64 = cp.TotalCents
-	var recordNum int64 = startRecord
-
-	for i := int(startRecord); i < len(lines); i++ {
-		line := lines[i]
-		byteOffset += int64(len(line)) + 1
-
-		if len(line) >= 94 && line[0] == '6' {
-			// Simulate parsing amount from position 29:39 (using a fixed value here).
-			totalCents += 5000 // $50.00 per record in this demo
-			recordNum++
-
-			// Checkpoint every 2 records (in production: every 1000-10000).
-			if recordNum%2 == 0 {
-				store.Save(Checkpoint{
-					JobID:         jobID,
-					LastRecordNum: recordNum,
-					ByteOffset:    byteOffset,
-					TotalCents:    totalCents,
-				})
-				fmt.Printf("[checkpoint] record %d, offset %d, total $%d.%02d\n",
-					recordNum, byteOffset, totalCents/100, totalCents%100)
+```go noverify
+// cmd/read/main.go, lines 67–85
+	case "stream", "reuse":
+		// One record at a time with encoding/csv.
+		cr := csv.NewReader(bufio.NewReaderSize(f, 1<<16))
+		cr.FieldsPerRecord = -1           // H, D and T records have different lengths
+		cr.ReuseRecord = *mode == "reuse" // reuse one []string for every record
+		for {
+			rec, err := cr.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Fatal(err)
+			}
+			if isDetail(rec) {
+				line, _ := cr.FieldPos(0)
+				add(rec, line)
 			}
 		}
 	}
-	return totalCents, nil
-}
+```
+
+Measured: `reuse` allocated **393 MB** over the run instead of 804 MB, and needed 114 garbage collections instead of 235. Its time (1.4–1.7 s) was within the machine's noise of `stream`'s. `cr.FieldPos(0)` gives the line the current record started on, which Stop 2 needs for its error messages.
+
+<QuickCheck
+  question="Why did streaming peak at the same 17 MB for a 92 MB file and a 276 MB file?"
+  options={[
+    "Go compresses strings",
+    "Only a few records and a read buffer are alive at any moment; each record becomes garbage once its amount is added, so memory depends on the record size, not the file size",
+    "The OS caches the file",
+    "ReuseRecord was on"
+  ]}
+  answer={1}
+  explain="ReadAll keeps every record alive until it returns: 336 MB for the small file, 890 MB for the large one. The stream mode allocated as much in total, but never held it at once."
+/>
+
+## Validate
+
+*Stop 2 of 6.*
+
+### Step 1: the file comes from someone else
+
+A settlement file is written by another company's software. It can have a bug, a format change nobody announced, or a row typed by hand into a correction. Every field must be checked, and a row that fails must go somewhere a person will see it, with enough information to find it in the original file: its **line number** and the reason.
+
+Putting a bad row aside, instead of either loading it or stopping, is called **quarantine**. The rest of the file can load; the quarantined rows wait for someone to fix and resubmit them.
+
+### Step 2: floats lie about money
+
+The fastest way to parse an amount wrong is `strconv.ParseFloat` and multiply by 100. A `float64` stores binary fractions, and most decimal amounts, like 0.29, have no exact binary form:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
 
 func main() {
-	lines := []string{
-		"1" + strings.Repeat(" ", 93), // File Header
-		"5" + strings.Repeat(" ", 93), // Batch Header
-		"6" + strings.Repeat("A", 93), // Entry 1
-		"6" + strings.Repeat("B", 93), // Entry 2  ← crash after this
-		"6" + strings.Repeat("C", 93), // Entry 3  ← resume starts here
-		"6" + strings.Repeat("D", 93), // Entry 4
-		"8" + strings.Repeat(" ", 93), // Batch Control
-		"9" + strings.Repeat(" ", 93), // File Control
+	for _, s := range []string{"0.29", "4.35", "19.99", "1e3", "12.345"} {
+		f, err := strconv.ParseFloat(s, 64)
+		fmt.Printf("%-7s -> float %-8v -> int64(f*100) = %d cents, err = %v\n", s, f, int64(f*100), err)
 	}
-
-	store := NewStore()
-	jobID := "ach-returns-2026-06-04"
-
-	fmt.Println("=== First run (crashes after record 2) ===")
-	// Process only through entry 2 (simulate crash mid-file).
-	processLines(lines[:4], store, jobID, 0) //nolint
-
-	// Simulate restart: load checkpoint and resume.
-	cp, ok := store.Load(jobID)
-	if !ok {
-		fmt.Println("no checkpoint — starting from scratch")
-		return
-	}
-	fmt.Printf("\n=== Resuming from checkpoint: record %d, $%d.%02d processed so far ===\n",
-		cp.LastRecordNum, cp.TotalCents/100, cp.TotalCents%100)
-
-	total, _ := processLines(lines, store, jobID, cp.LastRecordNum)
-	fmt.Printf("\nFinal total: $%d.%02d\n", total/100, total%100)
 }
 ```
 
 </GoPlayground>
 
-<ExecTimeline
-  title="Checkpoint advancing through a file — then crash and resume"
-  lanes={[{ id: "job", label: "batch job" }, { id: "store", label: "checkpoint store" }]}
-  steps={[
-    { lane: "job", kind: "run", label: "open file, read checkpoint", note: "On startup, load the checkpoint for this job ID. No checkpoint? Start at byte 0." },
-    { lane: "store", kind: "recv", label: "no checkpoint found", note: "First run — no prior state. Start from the beginning of the file." },
-    { lane: "job", kind: "run", label: "process records 1–1000", note: "Parse and apply each return entry to the ledger. Accumulate running total in memory." },
-    { lane: "store", kind: "send", label: "save checkpoint @ 1000", note: "Write record number, byte offset, and running total to the checkpoint store — atomically with the ledger commit." },
-    { lane: "job", kind: "block", label: "CRASH at record 1600", note: "OOM, deploy, or power failure. Records 1001–1600 were in-flight and not committed." },
-    { lane: "job", kind: "run", label: "restart → load checkpoint", note: "New process starts. Reads checkpoint: last committed record was 1000, byte offset N." },
-    { lane: "job", kind: "done", label: "seek to offset N, resume", note: "file.Seek(offset, io.SeekStart) jumps past records 1–1000. Processing resumes at record 1001 — no duplicates, no gaps." }
+```text
+0.29    -> float 0.29     -> int64(f*100) = 28 cents, err = <nil>
+4.35    -> float 4.35     -> int64(f*100) = 434 cents, err = <nil>
+19.99   -> float 19.99    -> int64(f*100) = 1998 cents, err = <nil>
+1e3     -> float 1000     -> int64(f*100) = 100000 cents, err = <nil>
+12.345  -> float 12.345   -> int64(f*100) = 1234 cents, err = <nil>
+```
+
+`0.29` became **28 cents**, `4.35` became 434, and `19.99` became 1,998, because `0.29 * 100` is 28.999999999999996 and converting to `int64` drops the fraction. Worse, `1e3` and `12.345` were accepted: the float parser reads any number, while a settlement amount has at most two decimal places and no exponent. Chapter 1's `money.Parse` reads the digits as text, so it's exact, and it refuses anything else.
+
+### Step 3: one strict function per row
+
+`ParseRow` checks every field of a detail record and returns a `Row` or an error naming the line and the problem. It never guesses: a row that isn't exactly right is an error.
+
+```go noverify
+// settle.go, lines 74–116
+// ParseRow checks one D record strictly: every field present and well formed,
+// the amount exact in the file's currency, and its sign matching its kind.
+// Nothing is guessed or repaired: a row that isn't exactly right is an error.
+func ParseRow(f []string, line int, c money.Currency) (Row, error) {
+	bad := func(format string, a ...any) (Row, error) {
+		return Row{}, fmt.Errorf("%w: line %d: %s", ErrRow, line, fmt.Sprintf(format, a...))
+	}
+	if len(f) != 9 || f[0] != "D" {
+		return bad("want 9 fields starting with D, got %d", len(f))
+	}
+	r := Row{Line: line, TxnID: f[1], Merchant: f[3], Name: f[4], Kind: f[5], Brand: f[6]}
+	if !strings.HasPrefix(r.TxnID, "txn_") {
+		return bad("transaction id %q", r.TxnID)
+	}
+	at, err := time.Parse(time.RFC3339, f[2])
+	if err != nil {
+		return bad("time %q", f[2])
+	}
+	r.At = at
+	if !strings.HasPrefix(r.Merchant, "m_") {
+		return bad("merchant id %q", r.Merchant)
+	}
+	switch r.Brand {
+	case "visa", "mastercard", "amex":
+	default:
+		return bad("card brand %q", r.Brand)
+	}
+	if f[8] != c.Code {
+		return bad("currency %q in a %s file", f[8], c.Code)
+	}
+	amt, err := money.Parse(f[7], c)
+	if err != nil {
+		return bad("%v", err)
+	}
+	r.Amount = amt
+	switch {
+	case r.Kind == "sale" && amt.Amount > 0:
+	case r.Kind == "refund" && amt.Amount < 0:
+	default:
+		return bad("%s of %s", r.Kind, f[7])
+	}
+	return r, nil
+}
+```
+
+(`bad` is a small function defined inside `ParseRow`, a *closure*, that formats the error with the line number, so each check is one line. `%w` wraps `ErrRow`, so a caller can test `errors.Is(err, batch.ErrRow)`.)
+
+<BankAnim
+  title="Every row stops at the counter"
+  kicker="strict parsing · live"
+  queueLabel="rows, in file order"
+  streetLabel="the file"
+  windows={[{ label: "ParseRow", sub: "every field checked" }, { label: "quarantine", sub: "line + reason, kept" }]}
+  accounts={[{ id: "ok", label: "accepted", balance: "0" }, { id: "q", label: "quarantined", balance: "0" }]}
+  customers={[{ id: "r1", label: "line 90,986", role: "banker" }, { id: "r2", label: "line 90,987", role: "banker", look: "pink" }, { id: "r3", label: "line 381,264", role: "banker" }]}
+  events={[
+    { at: 0, who: "r1", to: "queue", carry: "27.64 USD" }, { at: 0, who: "r2", to: "queue", carry: "311.955 USD" }, { at: 0, who: "r3", to: "queue", carry: "295.11 EUR", note: "Three rows of settle-3m-bad.csv, in order." },
+    { at: 1.0, who: "r1", to: "w0", say: "9 fields, time, brand, USD, 27.64 ✓", mood: "ok" },
+    { at: 2.0, who: "r1", to: "vault", say: null, account: "ok", balance: "1", flash: "ok", note: "Accepted: its amount is added to the running total." },
+    { at: 2.6, who: "r2", to: "w0", say: "311.955: three decimal places", mood: "bad", beat: "problem", note: "A USD amount can't have three decimal places. A float parser would have read it as 311.955 and rounded it somewhere." },
+    { at: 3.6, who: "r2", to: "w1", say: "line 90,987 set aside", mood: "wait", account: "q", balance: "1", flash: "bad", beat: "solution", note: "Quarantined, as received, with its line number and the reason. The file carries on." },
+    { at: 4.6, who: "r3", to: "w0", say: "EUR in a USD file", mood: "bad" },
+    { at: 5.6, who: "r3", to: "w1", say: "line 381,264 set aside", mood: "wait", account: "q", balance: "2", flash: "bad" },
+    { at: 6.6, account: "ok", balance: "2,999,976", flash: "ok" }, { at: 6.6, account: "q", balance: "24", flash: null, beat: "solution", note: "Measured over the whole file: 2,999,976 accepted, 24 quarantined: exactly the 24 rows the generator damaged, at the lines it logged." }
   ]}
-  caption="The checkpoint is the invariant: everything at or before LastRecordNum is committed and idempotent. Everything after is safe to re-run."
+  caption="Nothing is guessed or repaired. A row is exactly right, or it's set aside where a person will see it."
 />
 
-<Callout kind="pro" title="Atomic checkpoint + commit">
+### Step 4: measured
 
-The checkpoint must be written in the **same transaction** as the ledger entries it covers. If you write the checkpoint first and then the ledger commit fails, you'll skip those records on resume. If you write the ledger entries first and the checkpoint write fails, you'll re-process them — which is fine only if your handler is idempotent (which it must be; see the next section). The safe default: commit ledger entries and checkpoint in the same DB transaction. This makes the checkpoint a consistent snapshot of progress.
+`validate` streams the file through `ParseRow`, writes every rejected row to `<file>.rejects` (as CSV: line, reason, then the fields exactly as received) and checks the totals (Stop 3):
 
-</Callout>
+```text
+$ validate settle-3m.csv
+read 276 MB of settle-3m.csv: 3000000 accepted, 0 quarantined    1.21s  peak RSS    16 MB  allocated    393 MB  GCs  114
+count: 3000000 accepted + 0 quarantined = 3000000; trailer says 3000000
+total: accepted rows USD 707632327.27; trailer says USD 707632327.27
+BALANCED: ready to settle
+$ validate settle-3m-bad.csv
+read 276 MB of settle-3m-bad.csv: 2999976 accepted, 24 quarantined    1.23s  peak RSS    16 MB  allocated    393 MB  GCs  114
+count: 2999976 accepted + 24 quarantined = 3000000; trailer says 3000000
+total: accepted rows USD 708033820.07; trailer says USD 708039415.48
+HELD: USD 5595.41 is in the 24 quarantined rows; settle once they're resolved
+$ head -3 settle-3m-bad.csv.rejects
+90987,"bad row: line 90987: invalid USD amount ""311.955""",D,txn_0000090986,2026-09-26T09:46:00Z,m_00584,City Cinemas #584,sale,visa,311.955,USD
+381264,"bad row: line 381264: currency ""EUR"" in a USD file",D,txn_0000381263,2026-09-26T08:58:43Z,m_04744,Corner Cafe #4744,sale,visa,295.11,EUR
+431229,"bad row: line 431229: invalid USD amount ""5.065""",D,txn_0000431228,2026-09-26T09:49:11Z,m_04042,City Cinemas #4042,sale,visa,5.065,USD
+```
 
-## Idempotent Re-processing
+On the clean file, 3,000,000 accepted. On the damaged one, **24 quarantined**, and they are exactly the 24 the generator logged, at the same line numbers: 90,987 with `311.955`, 381,264 in EUR, and so on. Peak memory stayed at 16 MB, because rejected rows are written out, not kept.
 
-<Define term="Idempotent reprocessing" since="Idempotency & Exactly-Once Semantics (Part 3)">
-**Idempotent reprocessing** means running a batch job more than once on the same input — or re-processing a subset of records after a crash — produces the same outcome as running it exactly once. The key mechanism is a **natural dedup key**: a field in the record (like a NACHA Trace Number) that uniquely identifies it. Before posting a return to the ledger, the job checks whether a ledger entry for that key already exists. If it does, the record is silently skipped. If not, it is posted. A pre-insert `ON CONFLICT DO NOTHING` in Postgres does the same thing atomically at the database level. The deep treatment is in Idempotency & Exactly-Once Semantics (Part 3).
-</Define>
+### Step 5: quarantine, or reject the file?
 
-**On the job:** Idempotent reprocessing is what makes checkpoint + retry safe. Without it, every re-processed record in the window since your last checkpoint double-posts to the ledger — that is a compliance defect and potentially a real-money error. With it, re-processing is harmless.
+Quarantine is right for a few bad rows. It's wrong when the sender's system is broken: if the format changed, every row is bad, and quarantining 3 million rows one at a time fills a table with noise and delays the phone call that would fix it. So `Scan` takes a limit, `maxBad`, and rejects the **whole file** when it's passed. Here a file with 3,000 damaged rows (0.1%, spread through the file), with the limit at 100:
 
-The checkpoint gives you resumability. But resuming from a checkpoint means you might re-process some records — the ones that were in-flight when you crashed. If re-processing a return entry double-posts to the ledger, you've invented a compliance disaster. The last defense is **idempotency**.
+```text
+$ validate settle-3m-many.csv
+read 8 MB of settle-3m-many.csv: 86410 accepted, 101 quarantined    0.03s  peak RSS    14 MB  allocated     11 MB  GCs    3
+REJECTED: file rejected: more than 100 bad rows by line 86512: stop and ask the sender
+```
 
-The principle: **running a batch job N times on the same file produces the same result as running it once.** The ledger ends up in the same state whether you ran the job once cleanly or crashed and retried five times.
+It stopped at line 86,512 after reading **8 MB** of 276, in 0.03 s. The right limit is a business decision (per partner, per file size); the point is that there is one.
 
-How? Natural dedup keys. Every NACHA Entry Detail has a **Trace Number** (positions 80–94) — a 15-digit identifier that is unique within an ACH file. Use it as the dedup key. Before posting a return, check whether a ledger entry for that trace number already exists. If it does, skip it. If it doesn't, post and commit.
+<QuickCheck
+  question={'strconv.ParseFloat("0.29", 64) returns 0.29 with no error. Why does int64(f*100) give 28?'}
+  options={[
+    "ParseFloat rounds down",
+    "0.29 has no exact binary representation; the nearest float64 times 100 is 28.999999999999996, and converting to int64 drops the fraction",
+    "int64 can't hold 29",
+    "A bug in strconv"
+  ]}
+  answer={1}
+  explain={"Measured: 0.29 → 28, 4.35 → 434, 19.99 → 1998. Rounding instead of truncating would fix these three, but a float parser would still accept 1e3 and 12.345, which a strict decimal parser refuses."}
+/>
 
-```go
-// applyReturn applies a NACHA return entry to the ledger, idempotently.
-// If a ledger entry for this trace number already exists, it skips the insert.
-// This makes the function safe to call multiple times for the same record.
-func applyReturn(ctx context.Context, db *sql.DB, entry EntryDetail) error {
-	// Check for an existing debit entry with this trace number.
-	var exists bool
-	err := db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM ledger_entries WHERE trace_number = $1)`,
-		entry.TraceNumber,
-	).Scan(&exists)
-	if err != nil {
-		return fmt.Errorf("dedup check for trace %s: %w", entry.TraceNumber, err)
+## Control Totals
+
+*Stop 3 of 6.*
+
+### Step 1: the sender's own count
+
+Checking each row can't tell you that a row is **missing**, or that the file stops early. For that, the sender adds a **trailer** record: how many detail records it wrote, and what their amounts add up to. These are **control totals**. NACHA files, which carry US bank transfers, end with a File Control record holding the entry count, a hash of the routing numbers, and the total debits and credits; card network files have their equivalents. The receiver computes the same numbers from what it read and compares.
+
+A control total isn't a checksum of the bytes (for that, see the SHA-256 in Stop 6). It checks the **meaning**: the rows you'll act on add up to what the sender says it sent.
+
+### Step 2: balanced, or held
+
+This is the end of `validate` (its output is in Stop 2, Step 4):
+
+```go noverify
+// cmd/validate/main.go, lines 55–66
+	rows := s.Accepted + s.Rejected
+	fmt.Printf("count: %d accepted + %d quarantined = %d; trailer says %d\n", s.Accepted, s.Rejected, rows, s.Trailer.Count)
+	fmt.Printf("total: accepted rows %s; trailer says %s\n", s.Sum, s.Trailer.Total)
+	switch {
+	case rows != s.Trailer.Count:
+		fmt.Println("REJECTED: the record count doesn't match the trailer")
+	case s.Sum != s.Trailer.Total:
+		diff := money.New(s.Trailer.Total.Amount-s.Sum.Amount, s.Sum.Currency)
+		fmt.Printf("HELD: %s is in the %d quarantined rows; settle once they're resolved\n", diff, s.Rejected)
+	default:
+		fmt.Println("BALANCED: ready to settle")
 	}
-	if exists {
-		// Already posted — idempotent skip. Log at debug level for observability.
-		return nil
+```
+
+The clean file: 3,000,000 rows and USD 707,632,327.27, as the trailer says: **BALANCED**. The damaged file: 2,999,976 accepted plus 24 quarantined is 3,000,000, so the count balances, but the accepted rows are **USD 5,595.41** short of the trailer's total:
+
+```text
+the 24 damaged rows the generator logged add up to USD 5595.41
+```
+
+The trailer found the money in quarantine to the cent. The day is **held**: the good rows can be loaded, but it isn't settled until the 24 rows are fixed. Quarantine never makes money disappear quietly, because the trailer still counts it.
+
+### Step 3: the file that stops early
+
+Files are cut short: a transfer interrupted, a disk full on the sender's side, a job that picked the file up while it was still being written. Here are the first 150 MB of the good file:
+
+```text
+$ tail -c 100 settle-3m-cut.csv
+D,txn_0001632948,2026-09-26T04:24:34Z,m_01371,"The ""Night Owl"" Bar #1371",sale,mastercard,279.94,U
+$ validate settle-3m-cut.csv
+read 150 MB of settle-3m-cut.csv: 1632947 accepted, 1 quarantined    1.87s  peak RSS    16 MB  allocated    214 MB  GCs   62
+REJECTED: file rejected: no trailer after 1632948 rows: the file is incomplete
+```
+
+The last line was cut in the middle of its currency, `U`, and was quarantined for it. Had it been cut one field earlier, it would have had eight fields and been quarantined for that. But a file could as easily be cut exactly at the end of a line, and then every row would be valid. The **missing trailer** is what proves the file is incomplete: 1,632,948 rows read, and no trailer, so the file is **rejected**. A trailer must be the last record, and a file without one is never processed.
+
+<BankAnim
+  title="Counting against the trailer"
+  kicker="control totals · live"
+  queueLabel="rows read"
+  streetLabel="the file"
+  windows={[{ label: "trailer", sub: "the sender's count" }, { label: "decision", sub: "balanced · held · rejected" }]}
+  accounts={[{ id: "mine", label: "we read", balance: "0 rows" }, { id: "theirs", label: "trailer says", balance: "?" }]}
+  customers={[{ id: "g", label: "good day", role: "scribe" }, { id: "b", label: "24 bad rows", role: "scribe", look: "pink" }, { id: "c", label: "cut at 150 MB", role: "scribe" }]}
+  events={[
+    { at: 0, who: "g", to: "queue", account: "mine", balance: "3,000,000 · USD 707,632,327.27", note: "The clean file: every row read and totalled." },
+    { at: 1.0, who: "g", to: "w0", account: "theirs", balance: "3,000,000 · USD 707,632,327.27", flash: "ok" },
+    { at: 1.8, who: "g", to: "w1", say: "BALANCED", mood: "ok", beat: "solution", note: "Both numbers match: ready to settle." },
+    { at: 2.8, who: "g", to: "street", say: null, mood: null }, { at: 2.8, who: "b", to: "queue", account: "mine", balance: "3,000,000 · USD 708,033,820.07", flash: null, note: "The damaged day: 2,999,976 accepted plus 24 quarantined." },
+    { at: 3.8, who: "b", to: "w0", account: "theirs", balance: "3,000,000 · USD 708,039,415.48", flash: "bad" },
+    { at: 4.6, who: "b", to: "w1", say: "HELD: USD 5,595.41 in quarantine", mood: "wait", beat: "problem", note: "The count matches, the money doesn't: the difference is exactly what the 24 quarantined rows were meant to carry." },
+    { at: 5.6, who: "b", to: "street", say: null, mood: null }, { at: 5.6, who: "c", to: "queue", account: "mine", balance: "1,632,948 rows", flash: null, note: "A file cut off at 150 MB." },
+    { at: 6.6, who: "c", to: "w0", account: "theirs", balance: "no trailer", flash: "bad", beat: "problem" },
+    { at: 7.4, who: "c", to: "w1", say: "REJECTED: incomplete", mood: "bad", beat: "solution", note: "No trailer, no processing. Every row that was read could have been valid; only the trailer proves the file is whole." }
+  ]}
+  caption="Row checks catch bad rows. Only the sender's own totals catch missing ones."
+/>
+
+### Step 4: the rules, in the reader
+
+The trailer rules live in `batch.Scan`, the streaming reader `validate` uses: a trailer must parse, nothing may follow it, and reaching the end of the file without one is an error. Every file-level problem wraps `ErrFile`, so the caller can tell "reject this file" from "the disk failed":
+
+```go noverify
+// file.go, lines 43–85
+	for {
+		rec, err := cr.Read()
+		if err == io.EOF {
+			break
+		}
+		line, _ := cr.FieldPos(0)
+		if err != nil {
+			return s, fmt.Errorf("%w: line %d: %v", ErrFile, line, err)
+		}
+		if sawTrailer {
+			return s, fmt.Errorf("%w: line %d: a record after the trailer", ErrFile, line)
+		}
+		if rec[0] == "T" {
+			if s.Trailer, err = ParseTrailer(rec, s.Header.Currency); err != nil {
+				return s, fmt.Errorf("%w: line %d: %v", ErrFile, line, err)
+			}
+			sawTrailer = true
+			continue
+		}
+		r, err := ParseRow(rec, line, s.Header.Currency)
+		if err != nil {
+			s.Rejected++
+			if err := reject(line, rec, err); err != nil {
+				return s, err
+			}
+			if s.Rejected > maxBad {
+				return s, fmt.Errorf("%w: more than %d bad rows by line %d: stop and ask the sender", ErrFile, maxBad, line)
+			}
+			continue
+		}
+		s.Accepted++
+		if s.Sum, err = s.Sum.Add(r.Amount); err != nil {
+			return s, err
+		}
+		if err := row(r); err != nil {
+			return s, err
+		}
 	}
-	// Insert the return as a debit to the originator's account.
-	_, err = db.ExecContext(ctx, `
-		INSERT INTO ledger_entries (trace_number, account_id, amount_cents, entry_type, posted_at)
-		VALUES ($1, $2, $3, 'ach_return', NOW())`,
-		entry.TraceNumber, entry.AccountNumber, entry.AmountCents,
-	)
+	if !sawTrailer {
+		return s, fmt.Errorf("%w: no trailer after %d rows: the file is incomplete", ErrFile, s.Accepted+s.Rejected)
+	}
+	return s, nil
+}
+```
+
+<QuickCheck
+  question="A file is cut off exactly at the end of a line, so every row that arrived is valid. What detects it?"
+  options={[
+    "ParseRow",
+    "The missing trailer: the sender's last record never arrived, so the file is rejected",
+    "The file's size",
+    "Nothing can"
+  ]}
+  answer={1}
+  explain="Row validation only sees the rows that are there. The trailer is the sender saying 'this is the end, and this is what came before it', which is why a file without one is never processed."
+/>
+
+## Bulk Load
+
+*Stop 4 of 6.*
+
+### Step 1: what one row costs
+
+Once rows are validated, they go into PostgreSQL, table `settlement_rows`. Inserting a row costs more than the insert itself. With one `INSERT` per row, each row pays for a **round trip** (the statement travels to the server and the answer travels back, while the Go program waits) and, unless it's inside a larger transaction, a **commit**, which waits for the database's write-ahead log to reach the disk. At 3 million rows those fixed costs are the whole job.
+
+There are three ways to pay them less often:
+
+- **One transaction per chunk** of rows: one commit per 10,000 rows instead of per row. Still one round trip per row.
+- **A batch** (`pgx.Batch`): queue the chunk's 10,000 `INSERT`s, send them together, then read the 10,000 answers. One round trip per chunk.
+- **COPY**: PostgreSQL's bulk-load command. The client sends one `COPY settlement_rows FROM STDIN` and then streams the rows as data, not as statements; the server answers once at the end. `pgx` does this with `CopyFrom`.
+
+<BankAnim
+  title="Ten rows to the database, two ways"
+  kicker="round trips · live"
+  queueLabel="rows"
+  streetLabel="Go program"
+  windows={[{ label: "PostgreSQL", sub: "INSERT, one per row" }, { label: "PostgreSQL", sub: "COPY, one stream" }]}
+  accounts={[{ id: "i", label: "INSERT, rows a second", balance: "—" }, { id: "c", label: "COPY, rows a second", balance: "—" }]}
+  customers={[{ id: "a", label: "row", role: "librarian" }, { id: "b", label: "row", role: "librarian", look: "pink" }, { id: "k", label: "10,000 rows", role: "courier" }]}
+  events={[
+    { at: 0, who: "a", to: "queue" }, { at: 0, who: "b", to: "queue", note: "One INSERT per row: each row goes to the server and waits for its answer before the next can go." },
+    { at: 0.8, who: "a", to: "w0", say: "INSERT … wait … OK", mood: "wait" },
+    { at: 1.8, who: "a", to: "street", say: null, mood: null }, { at: 1.8, who: "b", to: "w0", say: "INSERT … wait … OK", mood: "wait" },
+    { at: 2.8, who: "b", to: "street", say: null, mood: null, account: "i", balance: "7,646", flash: "bad", beat: "problem", note: "Measured: 7,646 rows a second (7,470 to 10,878 over three runs). Almost all of it is waiting." },
+    { at: 3.8, who: "k", to: "queue", carry: "COPY", note: "COPY: one command, then the rows streamed as data, then one answer." },
+    { at: 4.6, who: "k", to: "w1", say: "rows… rows… rows… done", mood: "ok" },
+    { at: 5.8, who: "k", to: "street", say: null, account: "c", balance: "282,810", flash: "ok", beat: "solution", note: "Measured: 282,810 rows a second (230,296 to 322,197). Over three runs of each, 21 to 43 times faster." }
+  ]}
+  caption="The rows are the same. What changes is how many times the program stops to wait."
+/>
+
+### Step 2: the four ways, in code
+
+`cmd/bulk` reads the file with `batch.Scan`, gathers rows into chunks of 10,000, and hands each chunk to `flush`, which writes it one of four ways:
+
+```go noverify
+// cmd/bulk/main.go, lines 44–70
+		case "insert": // one INSERT per row, each its own transaction
+			for _, r := range rows {
+				if _, err := db.Exec(ctx, insert, r.Values(file)...); err != nil {
+					return err
+				}
+			}
+			return nil
+		case "tx": // one INSERT per row, one transaction per chunk
+			return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+				for _, r := range rows {
+					if _, err := tx.Exec(ctx, insert, r.Values(file)...); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		case "batch": // the chunk's INSERTs sent together, answers read together
+			return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+				b := &pgx.Batch{}
+				for _, r := range rows {
+					b.Queue(insert, r.Values(file)...)
+				}
+				return tx.SendBatch(ctx, b).Close()
+			})
+		default: // COPY: one command, the chunk streamed, one answer
+			return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error { return batch.CopyRows(ctx, tx, file, rows) })
+		}
+```
+
+`batch.CopyRows` is `CopyFrom` with a function that turns each `Row` into its column values, in the table's column order:
+
+```go noverify
+// db.go, lines 17–28
+// CopyRows writes rows with PostgreSQL's COPY protocol: one command, then
+// the rows streamed in binary, then one reply.
+func CopyRows(ctx context.Context, tx pgx.Tx, file int64, rows []Row) error {
+	return CopyInto(ctx, tx, "settlement_rows", file, rows)
+}
+
+// CopyInto is CopyRows into another table with the same columns.
+func CopyInto(ctx context.Context, tx pgx.Tx, table string, file int64, rows []Row) error {
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{table}, Columns,
+		pgx.CopyFromSlice(len(rows), func(i int) ([]any, error) { return rows[i].Values(file), nil }))
 	return err
 }
 ```
 
-Alternatively — and more efficiently — use a `UNIQUE` constraint on `trace_number` in the database and `INSERT ... ON CONFLICT DO NOTHING`. The database enforces uniqueness; your code just fires and forgets duplicates:
+(`pgx.BeginFunc` begins a transaction, runs the function, and commits if it returns `nil` or rolls back if it returns an error, so no path forgets to do either.)
 
-```go
-_, err = db.ExecContext(ctx, `
-    INSERT INTO ledger_entries (trace_number, account_id, amount_cents, entry_type, posted_at)
-    VALUES ($1, $2, $3, 'ach_return', NOW())
-    ON CONFLICT (trace_number) DO NOTHING`,
-	entry.TraceNumber, entry.AccountNumber, entry.AmountCents,
-)
+### Step 3: measured
+
+The first 100,000 rows each way, then COPY for the whole file:
+
+```text
+$ bulk -mode insert -limit 100000 settle-3m.csv   # median of 3 runs
+insert    100000 rows in   13.08s      7646 rows/s  (100000 in the table)
+$ bulk -mode tx -limit 100000 settle-3m.csv   # median of 3 runs
+tx        100000 rows in    7.87s     12713 rows/s  (100000 in the table)
+$ bulk -mode batch -limit 100000 settle-3m.csv   # median of 3 runs
+batch     100000 rows in    0.84s    119311 rows/s  (100000 in the table)
+$ bulk -mode copy -limit 100000 settle-3m.csv   # median of 3 runs
+copy      100000 rows in    0.35s    282810 rows/s  (100000 in the table)
+$ bulk -mode copy settle-3m.csv   # median of 3 runs
+copy     3000000 rows in   14.16s    211800 rows/s  (3000000 in the table)
 ```
 
-This ties directly to what you learned in Idempotency & Exactly-Once Semantics (Part 3): the trace number is your **natural idempotency key** — provided by the domain, not generated by you, and guaranteed unique per ACH file by the NACHA spec. You're not inventing dedup; you're leaning on the protocol's own key.
+One `INSERT` per row: **7,646 rows a second**, so the whole file would take 6½ minutes. One transaction per chunk: 12,713 (commits are cheap on this machine; see the note below). A batch: **119,311**, because the round trips are gone. COPY: **282,810** for 100,000 rows, and all **3,000,000 in 14.2 s** (11.5 to 15.9 s over three runs). Over the three runs of each, COPY beat one-insert-per-row by 21 to 43 times.
 
-<BeforeAfter
-  badLabel="Naïve — double-posts on retry"
-  goodLabel="Idempotent — safe to re-run"
-  bad={`// Posts without checking — crash + retry
-// will double-post the same return entry.
-db.Exec(
-  "INSERT INTO ledger_entries VALUES ($1,$2,$3)",
-  entry.TraceNumber,
-  entry.AmountCents,
-  entry.AccountNumber,
-)`}
-  good={`// ON CONFLICT DO NOTHING: the DB unique
-// constraint absorbs duplicate trace numbers.
-db.Exec(
-  "INSERT INTO ledger_entries VALUES ($1,$2,$3)"+
-  " ON CONFLICT (trace_number) DO NOTHING",
-  entry.TraceNumber,
-  entry.AmountCents,
-  entry.AccountNumber,
-)`}
-/>
+<Callout kind="note" title="Why a commit is cheap here">
 
-<Callout kind="warn" title="Append-only corrections, not updates">
-
-When a batch return is applied incorrectly and must be corrected, **do not update the existing ledger entry.** Append a correction entry with the original trace number, the correction amount (positive or negative), and a reference to the original. Mutating ledger entries breaks your audit trail and the double-entry invariant covered in Double-Entry Ledgers (Part 3). Corrections are entries, not mutations. Always.
+This PostgreSQL runs on macOS with its default `wal_sync_method`, and there `fsync` hands data to the drive without waiting for the drive's own cache to be written (PostgreSQL's `fsync_writethrough` setting forces that, and is slower). On a Linux server with a disk that honours flushes, each commit waits for the disk, so one-transaction-per-row is slower than here and the gap to COPY is larger. Measure on the hardware you run on.
 
 </Callout>
 
-<UnderTheHood title="Why streaming parse is O(1) memory and how checkpoint + idempotency make restarts safe">
+<UnderTheHood title="What COPY skips">
 
-Two separate guarantees combine to make a batch job correctly restartable.
+A normal statement in PostgreSQL's wire protocol (the *extended query protocol*, which `pgx` uses) is several messages: Parse (the SQL), Bind (the parameter values), Execute, and Sync, after which the client reads the server's replies. Without a batch, the client waits for those replies before sending the next row, so every row costs a full network round trip, even to `127.0.0.1`.
 
-**Memory O(1) in file size:** The `bufio.Scanner` or `encoding/xml` `Decoder` maintains a fixed-size read buffer (kilobytes) independent of file size. Each record is decoded into a stack-allocated or briefly heap-allocated struct, processed, and then becomes unreachable. A later GC cycle can reclaim those objects; Go 1.26's Green Tea GC can reduce the cost of scanning many small objects, but it does not change the O(1) live-memory argument. The heap footprint of a streaming batch job is dominated by your checkpoint store connection and a handful of live structs, not the file.
+`pgx.Batch` sends all the chunk's messages and then reads all the replies, which removes the waiting. The server still runs 10,000 statements.
 
-**Safe restartability:** Checkpoint + idempotency are separate guarantees that combine multiplicatively. The checkpoint ensures you don't re-process records from the beginning (performance + progress guarantee). Idempotency ensures that records you *do* re-process (the in-flight window since the last checkpoint) don't cause duplicate side effects (correctness guarantee). You need both. A checkpoint without idempotency still double-posts the in-flight window. Idempotency without a checkpoint still re-processes the whole file on every restart. Together: you skip what's already committed, and safely re-run what isn't.
-
-The checkpoint granularity is a tuning knob: commit every 1,000 records balances the cost of a checkpoint write against the worst-case re-processing window (up to 1,000 records on restart). The right number depends on how fast you process records and how expensive re-processing is.
-
-As of **Go 1.26**, `slog.NewMultiHandler` (new in 1.26) lets you fan structured log output to multiple destinations simultaneously — useful for a batch job that needs to log to both stdout (for the operator) and a structured audit sink. Pair with `slog.GroupAttrs` (1.25) to attach job ID and checkpoint position to every log line.
+`COPY ... FROM STDIN` is one statement. After it, the client sends `CopyData` messages full of rows (pgx uses PostgreSQL's binary format, so the server doesn't parse text either) and a final `CopyDone`. The server inserts each row straight into the table and its indexes, with no per-row statement, plan or reply. Every row is still written to the write-ahead log and the primary-key index, which is why COPY isn't infinitely fast: at around 280,000 rows a second, that work is the limit.
 
 </UnderTheHood>
 
----
+<QuickCheck
+  question="The batch mode sent each chunk's 10,000 INSERTs together and was about 10 times faster than one INSERT at a time in one transaction. What did it remove?"
+  options={[
+    "The commits",
+    "The waiting: without a batch, the program waits for each row's answer before sending the next, a round trip per row",
+    "The primary key checks",
+    "The write-ahead log"
+  ]}
+  answer={1}
+  explain="Both modes committed once per 10,000 rows. The difference is 10,000 round trips per chunk against one. COPY goes further by not being 10,000 statements at all."
+/>
 
-## Exercises
+## Pipeline
 
-Close the tab. Open your editor. The only way to learn this is to do it.
+*Stop 5 of 6.*
 
-<Exercise n={1} title="Fixed-width field extractor" level="easy">
+### Step 1: one reader, several writers
 
-Write a function `extractField(line string, start, end int) string` where `start` and `end` are 1-based NACHA positions. It should return `strings.TrimSpace(line[start-1:end])`. Write a `main` that calls it on a 94-char synthetic line to extract the routing number (positions 4–12).
+The COPY loader does one thing at a time: parse a chunk, then wait for the database to take it, then parse the next. The database can accept several COPYs at once on separate connections, so a **pipeline** splits the work: one goroutine (a function running concurrently with the rest of the program; `go f()` starts one) reads and parses, and several **writer** goroutines each take a finished chunk and COPY it on their own connection.
 
-<Solution>
+A pipeline has one rule that's easy to miss: the reader must **wait** when the writers are busy. The reader parses faster than the database writes. If it doesn't wait, it keeps going, and every chunk it has parsed but no writer has taken yet sits in memory. That's the whole file again, as in Stop 1. Making the reader wait is called **backpressure**, and a limit on how far ahead it can get is what makes a pipeline *bounded*.
+
+<PostRoomAnim
+  title="A reader and two writers"
+  kicker="backpressure · live"
+  ledgerLabel="settlement file"
+  queueLabel="parsed chunks, waiting for a writer"
+  retryLabel="PostgreSQL · COPY"
+  deadLabel="committed"
+  binTone="neutral"
+  bookings={[{ id: "f", label: "3,000,000 rows" }]}
+  workers={[{ id: "r", label: "reader", role: "worker" }, { id: "w1", label: "writer 1", role: "librarian" }, { id: "w2", label: "writer 2", role: "librarian", look: "pink" }]}
+  jobs={[{ id: "c1", label: "chunk 1" }, { id: "c2", label: "chunk 2" }, { id: "c3", label: "chunk 3" }, { id: "c4", label: "chunk 4" }, { id: "c5", label: "chunk 5" }, { id: "c6", label: "chunk 6" }]}
+  events={[
+    { at: 0, booking: "f", bstate: "pending", worker: "r", wstate: "working", say: "parse 10,000 rows", note: "No limit first: the reader parses chunks as fast as it can and hands each one off." },
+    { at: 0.6, job: "c1", to: "w:w1", worker: "w1", wstate: "working", say: "COPY" },
+    { at: 1.0, job: "c2", to: "w:w2", worker: "w2", wstate: "working", say: "COPY" },
+    { at: 1.4, job: "c3", to: "queue" }, { at: 1.8, job: "c4", to: "queue" }, { at: 2.2, job: "c5", to: "queue" },
+    { at: 2.6, job: "c6", to: "queue", banner: "peak RSS 893 MB", beat: "problem", note: "Both writers are busy, and the reader keeps going. Every waiting chunk holds its rows in memory. Measured: 893 MB, the same as loading the whole file." },
+    { at: 4.0, banner: null, job: "c3", to: "" }, { at: 4.0, job: "c4", to: "" }, { at: 4.0, job: "c5", to: "" }, { at: 4.0, job: "c6", to: "", note: "Now with errgroup.SetLimit: the reader can't start a new writer goroutine until one finishes." },
+    { at: 4.6, job: "c1", to: "dead", worker: "w1", say: null, wstate: "idle" }, { at: 4.8, job: "c3", to: "w:w1", worker: "w1", wstate: "working", say: "COPY" },
+    { at: 5.4, job: "c4", to: "queue", worker: "r", say: "wait for a free writer", wstate: "idle", beat: "solution", note: "The reader has one chunk ready and both writers are busy: it waits. Only this chunk is waiting in memory." },
+    { at: 6.4, job: "c2", to: "dead", worker: "w2", say: null, wstate: "idle" }, { at: 6.6, job: "c4", to: "w:w2", worker: "w2", wstate: "working", say: "COPY" }, { at: 6.6, worker: "r", wstate: "working", say: "parse 10,000 rows" },
+    { at: 7.6, booking: "f", bstate: "ok", banner: "peak RSS 47 MB", beat: "solution", note: "Measured with 4 writers: 47 MB for the whole run, against 893 MB, with no consistent difference in speed. The reader runs as fast as the writers can take its chunks." }
+  ]}
+  caption="A pipeline without a limit is ReadAll with extra steps. The limit is what keeps memory flat."
+/>
+
+### Step 2: the smallest example
+
+Here are 100 chunks, two writer slots (a buffered channel of size 2, used as a *semaphore*: sending takes a slot, and blocks when both are taken; receiving gives one back), and a counter of how many chunks are in memory. The only difference between the two runs is **where the reader waits for a slot**: before reading on, or inside the goroutine it has already started, holding the chunk.
+
+<GoPlayground>
 
 ```go
 package main
 
 import (
 	"fmt"
-	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-func extractField(line string, start, end int) string {
-	if len(line) < end {
-		return ""
+// load reads 100 chunks and hands each to one of two writers. It returns the
+// most chunks that were in memory at the same moment.
+func load(bounded bool) int64 {
+	var inMemory, peak atomic.Int64
+	writers := make(chan struct{}, 2) // two free writer slots
+	var wg sync.WaitGroup
+	for range 100 {
+		// The reader parses a chunk: it's in memory now.
+		if n := inMemory.Add(1); n > peak.Load() {
+			peak.Store(n)
+		}
+		if bounded {
+			writers <- struct{}{} // wait for a free writer before reading on
+		}
+		wg.Go(func() {
+			if !bounded {
+				writers <- struct{}{} // wait for a free writer, holding the chunk
+			}
+			time.Sleep(5 * time.Millisecond) // the database write
+			inMemory.Add(-1)
+			<-writers
+		})
 	}
-	return strings.TrimSpace(line[start-1 : end])
+	wg.Wait()
+	return peak.Load()
 }
 
 func main() {
-	line := fmt.Sprintf("%-94s", "627021000021123456789012345 0000012500SMITH JOHN")
-	routing := extractField(line, 4, 12)
-	fmt.Println("routing:", routing) // 021000021
+	fmt.Println("bounded:   at most", load(true), "chunks in memory at once")
+	fmt.Println("unbounded: at most", load(false), "chunks in memory at once")
 }
 ```
 
-The `start-1` converts from 1-based NACHA positions to 0-based Go slice indices. `strings.TrimSpace` handles trailing spaces — NACHA pads fields to their fixed width with spaces, not null bytes.
+</GoPlayground>
 
-</Solution>
-
-</Exercise>
-
-<Exercise n={2} title="Streaming line counter" level="easy">
-
-Write a program that uses `bufio.Scanner` to count the lines in a multi-line string (simulating a file). Set the scanner buffer to 256 KiB before the loop. Print the count. Verify `scanner.Err()` after the loop.
-
-<Solution>
-
-```go
-package main
-
-import (
-	"bufio"
-	"fmt"
-	"strings"
-)
-
-func countLines(data string) (int, error) {
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	// Raise limit in case any line exceeds the default 64 KiB.
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
-	var n int
-	for scanner.Scan() {
-		n++
-	}
-	return n, scanner.Err()
-}
-
-func main() {
-	data := "line one\nline two\nline three\n"
-	n, err := countLines(data)
-	if err != nil {
-		fmt.Println("scan error:", err)
-		return
-	}
-	fmt.Println("lines:", n) // 3
-}
+```text
+bounded:   at most 3 chunks in memory at once
+unbounded: at most 100 chunks in memory at once
 ```
 
-Always call `scanner.Err()` after the loop — `Scan()` returning `false` means either EOF or an error, and you can't tell which without checking `Err()`.
+Bounded: two chunks with the writers and one just read, waiting. Unbounded: the reader started a goroutine for every chunk at once, each holding its chunk while it waited for a slot, so **all 100** were in memory. (`wg.Go`, added in Go 1.25, starts a goroutine and counts it in the `WaitGroup`.)
 
-</Solution>
+### Step 3: errgroup
 
-</Exercise>
+The real pipeline uses `golang.org/x/sync/errgroup`, which is a `WaitGroup` with two more features that a batch job needs:
 
-<Exercise n={3} title="Streaming CSV sum" level="medium">
+- **The first error wins.** `g.Wait()` returns the first error any goroutine returned, and `errgroup.WithContext` cancels a context the moment that happens, so the others can stop.
+- **A limit.** After `g.SetLimit(n)`, `g.Go` blocks while `n` goroutines are running. That's the bounded version of Step 2, built in.
 
-Write `sumCSVAmounts(data string) (int64, error)` that uses `encoding/csv`'s `Read()` method in a loop (never `ReadAll`) to parse rows of the form `id,amount_cents` and return the sum. Handle `io.EOF` to stop the loop cleanly.
+```go noverify
+// cmd/pipeline/main.go, lines 50–82
+	start := time.Now()
+	g, gctx := errgroup.WithContext(ctx)
+	if *bounded {
+		// g.Go now blocks while this many goroutines are running: the reader
+		// can't get more than one chunk ahead of the writers.
+		g.SetLimit(*writers + 1) // +1: the reader itself
+	}
+	var read int64
+	g.Go(func() error {
+		buf := make([]batch.Row, 0, *chunk)
+		send := func() {
+			rows := buf
+			g.Go(func() error {
+				return pgx.BeginFunc(gctx, db, func(tx pgx.Tx) error { return batch.CopyRows(gctx, tx, 1, rows) })
+			})
+			buf = make([]batch.Row, 0, *chunk) // a new chunk: the old one now belongs to its writer
+		}
+		_, err := batch.Scan(f, 0, func(r batch.Row) error {
+			if err := gctx.Err(); err != nil {
+				return err // a writer failed: stop reading
+			}
+			read++
+			if buf = append(buf, r); len(buf) == *chunk {
+				send()
+			}
+			return nil
+		}, func(int, []string, error) error { return nil })
+		if err == nil && len(buf) > 0 {
+			send()
+		}
+		return err
+	})
+	err = g.Wait()
+```
 
-<Solution>
+`g.SetLimit(*writers + 1)` is the bound; the reader's own goroutine counts against the limit, hence the `+ 1`. In `send`, the chunk's slice is handed to the new goroutine and the reader starts a **new** slice for the next chunk: reusing the old one would overwrite rows a writer is still copying. The reader checks `gctx.Err()` before each row, so it stops reading once any writer has failed.
+
+### Step 4: measured
+
+```text
+$ pipeline -writers 1 settle-3m.csv   # median of 3 runs
+writers 1 bounded true   read 3000000 rows, 3000000 in the table  382055 rows/s    8.09s  peak RSS    29 MB  allocated   1840 MB  GCs  415
+$ pipeline -writers 2 settle-3m.csv   # median of 3 runs
+writers 2 bounded true   read 3000000 rows, 3000000 in the table  402706 rows/s    7.96s  peak RSS    35 MB  allocated   1841 MB  GCs  302
+$ pipeline -writers 4 settle-3m.csv   # median of 3 runs
+writers 4 bounded true   read 3000000 rows, 3000000 in the table  483493 rows/s    6.56s  peak RSS    47 MB  allocated   1839 MB  GCs  176
+$ pipeline -writers 8 settle-3m.csv   # median of 3 runs
+writers 8 bounded true   read 3000000 rows, 3000000 in the table  649250 rows/s    4.88s  peak RSS    67 MB  allocated   1838 MB  GCs  100
+$ pipeline -writers 4 -bounded=false settle-3m.csv   # median of 3 runs
+writers 4 bounded false  read 3000000 rows, 3000000 in the table  608948 rows/s    5.12s  peak RSS   893 MB  allocated   1830 MB  GCs   20
+```
+
+Memory is the clear result: bounded, **29 MB with one writer and 67 MB with eight** (each writer holds one 10,000-row chunk); unbounded, **893 MB**, the whole file in memory again. It wasn't consistently faster, either: over five runs each with four writers (three here, two more in `out/raw-extra.txt`), bounded took 6.4 to 8.5 s and unbounded 4.8 to 9.1 s, the same within this machine's noise. Speed in general is less clear on a shared machine. The medians went from 8.1 s with one writer to 4.9 s with eight, but single runs overlapped: two writers took anywhere from 6.1 to 16.7 s. More writers help while PostgreSQL has idle CPU to use them; beyond that, they compete with each other and with everything else on the machine. Measure before choosing a number.
+
+### Step 5: when a writer fails
+
+Here one row that the file contains is inserted in advance, so one chunk's COPY fails on the primary key:
+
+```text
+$ pipeline -writers 4 -clash 1500000 settle-3m.csv
+writers 4 bounded true   read 1531696 rows, 1490000 in the table  573902 rows/s    2.67s  peak RSS    44 MB  allocated    937 MB  GCs   98
+error: ERROR: duplicate key value violates unique constraint "settlement_rows_pkey" (SQLSTATE 23505)
+```
+
+The failure cancelled the context, the reader stopped at row 1,531,696, and `g.Wait` returned the error. That part worked. But **1,490,000 rows were already committed**, by the chunks that finished before the failure. Rerunning the job would load them again (or fail on the same key). A batch job that can stop halfway needs to know where it stopped. That's the last stop.
+
+<QuickCheck
+  question="The unbounded pipeline used 893 MB, the bounded one 47 MB, and neither was consistently faster. Why doesn't letting the reader run ahead speed things up?"
+  options={[
+    "The unbounded one had fewer writers",
+    "Both were limited by the same four writers; letting the reader run ahead only moved parsed chunks from the file into memory, it didn't make the database accept them faster",
+    "The garbage collector slowed the bounded one",
+    "COPY ignores concurrency"
+  ]}
+  answer={1}
+  explain="Throughput is set by the slowest stage, here the writers. A reader that gets ahead of them doesn't finish sooner; it just holds more of the file while it waits."
+/>
+
+## Resume & Rerun
+
+*Stop 6 of 6.*
+
+### Step 1: kill -9, then start again
+
+A nightly job gets killed: the machine reboots, a deploy restarts it, the container exceeds its memory limit. `kill -9` (the `SIGKILL` signal) is the hardest version: the process stops between two instructions, with no chance to clean up. Whatever the database committed stays; whatever was in flight is rolled back by PostgreSQL when the connection drops.
+
+The simplest recovery is to run the job again from the top. Here `ingest` loads the file in 10,000-row transactions into a table with no key, is killed after 4 seconds, and is run again:
+
+```text
+$ ingest -checkpoint none settle-3m.csv
+kill -9 after 4 s
+$ ingest -checkpoint none settle-3m.csv
+this run loaded 3000000 rows in 7.59s; the table holds 4580000 rows for the file: 1580000 duplicated, 0 missing, 0 quarantined
+control totals: 4580000 rows, USD 1080262846.67; trailer: 3000000 rows, USD 707632327.27: MISMATCH: the rows don't add up to the trailer's count
+```
+
+Before the kill, 1,580,000 rows had committed. The second run loaded all 3,000,000 again, so the table holds **4,580,000**, and the day's total reads **USD 1,080,262,846.67** instead of USD 707,632,327.27. The control totals catch it (MISMATCH), but only after the damage. The job needs to know **where it stopped**, and never do a chunk twice.
+
+<PostRoomAnim
+  title="Killed halfway, three ways to restart"
+  kicker="kill -9 · live"
+  ledgerLabel="settlement_rows"
+  queueLabel="the file, chunk by chunk"
+  retryLabel="checkpoint: where to start next"
+  deadLabel="loaded twice"
+  bookings={[{ id: "k1", label: "chunk 1 · lines 2–10,001" }, { id: "k2", label: "chunk 2 · lines 10,002–20,001" }, { id: "k3", label: "chunk 3 · lines 20,002–30,001" }, { id: "k2b", label: "chunk 2 again" }]}
+  workers={[{ id: "l", label: "ingest", role: "worker" }]}
+  jobs={[{ id: "c1", label: "chunk 1" }, { id: "c2", label: "chunk 2" }, { id: "c3", label: "chunk 3" }, { id: "cp", label: "next: line 10,002" }]}
+  events={[
+    { at: 0, job: "c1", to: "w:l", worker: "l", wstate: "working", say: "COPY + COMMIT", note: "Checkpoint saved to a file after each commit." },
+    { at: 0.8, booking: "k1", bstate: "ok", job: "c1", to: "" }, { at: 0.8, job: "cp", to: "retry", tag: "saved" },
+    { at: 1.6, job: "c2", to: "w:l", say: "COPY + COMMIT" },
+    { at: 2.4, booking: "k2", bstate: "ok", job: "c2", to: "", note: "Chunk 2 commits in PostgreSQL. The next step would save 'next: line 20,002' to the checkpoint file." },
+    { at: 3.0, worker: "l", wstate: "dead", say: "kill -9", beat: "problem", note: "Killed between the commit and the checkpoint write. The database has chunk 2; the checkpoint still says line 10,002." },
+    { at: 4.2, worker: "l", wstate: "working", say: "resume at line 10,002", job: "c2", to: "w:l", note: "The restart trusts the checkpoint and loads chunk 2 again." },
+    { at: 5.0, booking: "k2b", bstate: "ok", job: "c2", to: "dead", tag: "10,000 duplicated", beat: "problem", note: "Measured: resumed at line 990,002 after chunk 100 had committed. 10,000 rows duplicated." },
+    { at: 6.2, booking: "k2b", bstate: "gone", job: "c2", to: "", worker: "l", say: "COPY + UPDATE checkpoint, one COMMIT", note: "Instead: write the checkpoint in the same transaction as the chunk. They commit together, or neither does." },
+    { at: 7.0, job: "cp", to: "retry", tag: "next: line 20,002, committed with chunk 2" },
+    { at: 7.6, worker: "l", wstate: "dead", say: "kill -9" },
+    { at: 8.6, worker: "l", wstate: "working", say: "resume at line 20,002", job: "c3", to: "w:l" },
+    { at: 9.4, booking: "k3", bstate: "ok", job: "c3", to: "", worker: "l", wstate: "idle", say: null, beat: "solution", note: "Measured: killed three times, 0 duplicated, 0 missing, BALANCED against the trailer." }
+  ]}
+  caption="A checkpoint is only as good as its timing. Commit it with the rows it describes."
+/>
+
+### Step 2: a checkpoint is a byte offset
+
+To resume, the job needs two numbers: the **byte offset** in the file where the next unloaded record starts, and that record's **line number** (for error messages). Opening the file and moving to a byte offset (`f.Seek`) is instant, however far into the file it is. `csv.Reader.InputOffset()` (Go 1.19) says how many bytes the reader has consumed, which is exactly the start of the next record, quoted commas and all:
+
+<GoPlayground>
 
 ```go
 package main
@@ -1030,379 +959,664 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 )
 
-func sumCSVAmounts(data string) (int64, error) {
-	r := csv.NewReader(strings.NewReader(data))
-	r.Read() // skip header row
-	var total int64
+func main() {
+	file := "H,SETTLE-20260926,2026-09-26,USD\n" +
+		"D,txn_1,\"Corner Cafe, Soho\",12.00\n" +
+		"D,txn_2,Harbor Fuel,3.50\n" +
+		"D,txn_3,City Cinemas,7.25\n" +
+		"T,3,22.75\n"
+
+	// Run 1: read the header and one row, then note where the next record
+	// starts. (Then, say, the process is killed.)
+	cr := csv.NewReader(strings.NewReader(file))
+	cr.FieldsPerRecord = -1
+	cr.Read()
+	rec, _ := cr.Read()
+	checkpoint := cr.InputOffset()
+	fmt.Println("run 1 read", rec[1], "and saved checkpoint: byte", checkpoint)
+
+	// Run 2: start reading at that byte. With a real file this is
+	// f.Seek(checkpoint, io.SeekStart).
+	cr = csv.NewReader(strings.NewReader(file[checkpoint:]))
+	cr.FieldsPerRecord = -1
 	for {
-		record, err := r.Read()
+		rec, err := cr.Read()
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
-			return 0, fmt.Errorf("csv read: %w", err)
-		}
-		if len(record) < 2 {
-			continue
-		}
-		cents, err := strconv.ParseInt(strings.TrimSpace(record[1]), 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("bad amount %q: %w", record[1], err)
-		}
-		total += cents
+		fmt.Println("run 2 read", rec)
 	}
-	return total, nil
-}
-
-func main() {
-	data := "id,amount_cents\ntx001,12500\ntx002,7500\ntx003,30000\n"
-	total, err := sumCSVAmounts(data)
-	if err != nil {
-		fmt.Println("error:", err)
-		return
-	}
-	fmt.Printf("total: $%d.%02d\n", total/100, total%100) // $500.00
 }
 ```
 
-`r.Read()` returns one row at a time. `io.EOF` is the clean terminator. Checking for it explicitly (rather than wrapping in `errors.Is`) is the csv package's documented idiom.
+</GoPlayground>
 
-</Solution>
-
-</Exercise>
-
-<Exercise n={4} title="Checkpoint round-trip" level="medium">
-
-Implement a `Checkpoint` struct with fields `JobID string`, `RecordNum int64`, `TotalCents int64`. Implement `Save(path string, cp Checkpoint) error` and `Load(path string) (Checkpoint, error)` using `encoding/json` and `os.WriteFile`/`os.ReadFile`. Write a `main` that saves, loads, and prints the result.
-
-<Solution>
-
-```go
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-)
-
-type Checkpoint struct {
-	JobID      string `json:"job_id"`
-	RecordNum  int64  `json:"record_num"`
-	TotalCents int64  `json:"total_cents"`
-}
-
-func Save(path string, cp Checkpoint) error {
-	data, err := json.Marshal(cp)
-	if err != nil {
-		return fmt.Errorf("marshal checkpoint: %w", err)
-	}
-	return os.WriteFile(path, data, 0o600)
-}
-
-func Load(path string) (Checkpoint, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Checkpoint{}, err
-	}
-	var cp Checkpoint
-	if err := json.Unmarshal(data, &cp); err != nil {
-		return Checkpoint{}, fmt.Errorf("unmarshal checkpoint: %w", err)
-	}
-	return cp, nil
-}
-
-func main() {
-	cp := Checkpoint{JobID: "ach-2026-06-04", RecordNum: 14500, TotalCents: 982500}
-	path := "/tmp/ach_checkpoint.json"
-	if err := Save(path, cp); err != nil {
-		fmt.Println("save error:", err)
-		return
-	}
-	loaded, err := Load(path)
-	if err != nil {
-		fmt.Println("load error:", err)
-		return
-	}
-	fmt.Printf("Loaded: job=%s record=%d total=$%d.%02d\n",
-		loaded.JobID, loaded.RecordNum, loaded.TotalCents/100, loaded.TotalCents%100)
-}
+```text
+run 1 read txn_1 and saved checkpoint: byte 67
+run 2 read [D txn_2 Harbor Fuel 3.50]
+run 2 read [D txn_3 City Cinemas 7.25]
+run 2 read [T 3 22.75]
 ```
 
-The checkpoint file is written with `0o600` permissions — readable only by the process owner. In production, prefer the DB row approach for atomicity with the ledger commit.
+Run 1 read the header and `txn_1` and saved **byte 67**. Run 2 started at byte 67 and read `txn_2` next: nothing skipped, nothing read twice. (Counting lines instead wouldn't be safe: a quoted CSV field may contain a newline, so a record can span two lines. The offset is where the reader actually is.) When the second reader starts mid-file, its offsets and line numbers count from where it started, so `ingest` adds the checkpoint's offset and line to them.
 
-</Solution>
+### Step 3: saving the checkpoint after the commit
 
-</Exercise>
+The obvious place to save the checkpoint is a small file, written after each chunk commits. `-die-after-commit 100` makes `ingest` send itself `SIGKILL` right after chunk 100's commit, the moment between the two writes:
 
-<Exercise n={5} title="Idempotent in-memory ledger" level="hard">
+```text
+$ ingest -checkpoint file -die-after-commit 100 settle-3m.csv
+exit status 137 (killed by SIGKILL)
+$ ingest -checkpoint file settle-3m.csv
+resuming at line 990002 (byte 90941504)
+this run loaded 2010000 rows in 4.85s; the table holds 3010000 rows for the file: 10000 duplicated, 0 missing, 0 quarantined
+control totals: 3010000 rows, USD 709976266.28; trailer: 3000000 rows, USD 707632327.27: MISMATCH: the rows don't add up to the trailer's count
+```
 
-Build an `InMemoryLedger` with a `PostReturn(traceNum string, amountCents int64) (bool, error)` method. It should return `(true, nil)` on a new posting and `(false, nil)` if the trace number was already posted (idempotent skip). Store entries in a `map[string]int64`. Write a `main` that posts the same trace number twice and verifies only one entry exists.
+The checkpoint file still said line 990,002 (after chunk 99), but chunk 100 had committed: **10,000 rows duplicated**. Writing the checkpoint first and committing second would lose chunk 100 instead. Two separate systems (a database and a file) can't be updated at the same instant, and a kill can land between them. It's the **dual-write** problem again, from chapter 4's outbox.
 
-<Solution>
+### Step 4: saving it in the same transaction
 
-```go
-package main
+The fix is to keep the checkpoint **in the database**, in the file's own row (`settlement_files.next_line` and `next_offset`), and update it in the **same transaction** as the chunk's rows. Then the rows and the checkpoint commit together or not at all, and there's no moment in between. Here is the commit function:
 
-import (
-	"fmt"
-	"sync"
-)
-
-// InMemoryLedger is a toy ledger for demonstrating idempotent posting.
-// In production: a Postgres table with a UNIQUE constraint on trace_number.
-type InMemoryLedger struct {
-	mu      sync.Mutex
-	entries map[string]int64 // trace_number → amount_cents
-}
-
-func NewLedger() *InMemoryLedger {
-	return &InMemoryLedger{entries: make(map[string]int64)}
-}
-
-// PostReturn posts a return entry idempotently.
-// Returns (true, nil) if posted, (false, nil) if already exists.
-func (l *InMemoryLedger) PostReturn(traceNum string, amountCents int64) (bool, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if _, exists := l.entries[traceNum]; exists {
-		return false, nil // idempotent skip
-	}
-	l.entries[traceNum] = amountCents
-	return true, nil
-}
-
-func (l *InMemoryLedger) TotalCents() int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var total int64
-	for _, v := range l.entries {
-		total += v
-	}
-	return total
-}
-
-func main() {
-	ledger := NewLedger()
-
-	// Post the same trace number three times — only the first should stick.
-	traces := []struct {
-		trace  string
-		amount int64
-	}{
-		{"091000010000001", 12500},
-		{"091000010000001", 12500}, // duplicate
-		{"091000010000002", 7500},
-		{"091000010000001", 12500}, // duplicate again
-	}
-
-	for _, t := range traces {
-		posted, err := ledger.PostReturn(t.trace, t.amount)
+```go noverify
+// cmd/ingest/main.go, lines 114–153
+	// commit writes the chunk and, with -checkpoint tx, where to start next
+	// time, in one transaction: both happen or neither does.
+	commit := func(next int, off int64, done bool) error {
+		err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+			if err := batch.CopyInto(ctx, tx, table, id, rows); err != nil {
+				return err
+			}
+			if _, err := tx.CopyFrom(ctx, pgx.Identifier{"settlement_rejects"}, []string{"file", "line", "reason", "raw"}, pgx.CopyFromRows(rejects)); err != nil {
+				return err
+			}
+			if *mode == "tx" || done {
+				_, err := tx.Exec(ctx, `UPDATE settlement_files SET next_line = $2, next_offset = $3,
+					status = CASE WHEN $4 THEN 'loaded' ELSE 'loading' END,
+					loaded_at = CASE WHEN $4 THEN now() END WHERE id = $1`, id, next, off, done)
+				return err
+			}
+			return nil
+		})
 		if err != nil {
-			fmt.Println("error:", err)
-			return
+			return err
 		}
-		if posted {
-			fmt.Printf("posted  %s $%d.%02d\n", t.trace, t.amount/100, t.amount%100)
+		chunks++
+		loaded += int64(len(rows))
+		if chunks == *dieAfter {
+			syscall.Kill(os.Getpid(), syscall.SIGKILL) // the worst moment: committed, checkpoint not yet saved
+		}
+		if *mode == "file" {
+			// Save the checkpoint after the commit: write a new file, then
+			// rename it over the old one, so the file is never half-written.
+			tmp := path + ".ckpt.tmp"
+			if err := os.WriteFile(tmp, fmt.Appendf(nil, "%d %d", next, off), 0o644); err != nil {
+				return err
+			}
+			if err := os.Rename(tmp, path+".ckpt"); err != nil {
+				return err
+			}
+		}
+		rows, rejects = rows[:0], rejects[:0]
+		return nil
+	}
+```
+
+The main loop computes each chunk's checkpoint as the offset where this run started plus `cr.InputOffset()`:
+
+```go noverify
+// cmd/ingest/main.go, lines 155–186
+	var trailer batch.Trailer
+	for {
+		rec, err := cr.Read()
+		if err == io.EOF {
+			log.Fatalf("no trailer: the file is incomplete")
+		}
+		pos, _ := cr.FieldPos(0)
+		line := nextLine - 1 + pos
+		if err != nil {
+			log.Fatalf("line %d: %v", line, err)
+		}
+		if rec[0] == "T" {
+			if trailer, err = batch.ParseTrailer(rec, h.Currency); err != nil {
+				log.Fatal(err)
+			}
+			if err := commit(line+1, nextOff+cr.InputOffset(), true); err != nil {
+				log.Fatal(err)
+			}
+			break
+		}
+		r, err := batch.ParseRow(rec, line, h.Currency)
+		if err != nil {
+			rejects = append(rejects, []any{id, line, err.Error(), append([]string(nil), rec...)})
 		} else {
-			fmt.Printf("skipped %s (already posted)\n", t.trace)
+			rows = append(rows, r)
+		}
+		if len(rows)+len(rejects) == *chunk {
+			if err := commit(line+1, nextOff+cr.InputOffset(), false); err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
-
-	total := ledger.TotalCents()
-	fmt.Printf("\nledger total: $%d.%02d (2 unique entries)\n", total/100, total%100)
-}
 ```
 
-The `sync.Mutex` protects the map. In the real implementation, the `UNIQUE` constraint on `trace_number` plus `ON CONFLICT DO NOTHING` in Postgres does the same job — at database scope, which is where you want it for a distributed system.
+Measured: killed right after chunk 100 committed, then killed twice more at random moments (3 s into each run), then left to finish:
+
+```text
+$ ingest -checkpoint tx -die-after-commit 100 settle-3m.csv
+exit status 137 (killed by SIGKILL)
+$ ingest settle-3m.csv
+resuming at line 1000002 (byte 91860005)
+kill -9 after 3 s
+$ ingest settle-3m.csv
+resuming at line 2000002 (byte 183721144)
+kill -9 after 3 s
+$ ingest settle-3m.csv
+resuming at line 2670002 (byte 245265320)
+this run loaded 330000 rows in 4.45s; the table holds 3000000 rows for the file: 0 duplicated, 0 missing, 0 quarantined
+control totals: 3000000 rows, USD 707632327.27; trailer: 3000000 rows, USD 707632327.27: BALANCED
+```
+
+Each run resumed exactly where the last committed chunk ended: line 1,000,002 after chunk 100, then 2,000,002, then 2,670,002. A kill that lands while a chunk's transaction is open leaves nothing of it: PostgreSQL rolls back an open transaction when its connection drops, checkpoint included, so the next run does that chunk again, once. At the end: **3,000,000 rows, 0 duplicated, 0 missing, BALANCED**. The primary key on `(file, line)` is a second line of defence: had anything tried to load a line twice, the COPY would have failed rather than stored it.
+
+### Step 5: the same file, twice
+
+Partners resend files: after an outage, by mistake, or because someone "just to be sure" pressed the button again. A file's **identity** is its content, not its name, so `ingest` starts by computing the **SHA-256** of every byte and registers the file under that hash (`settlement_files.sha256` is `UNIQUE`):
+
+```go noverify
+// cmd/ingest/main.go, lines 40–85
+	// Which file is this? The hash of its bytes, not its name: a partner
+	// can resend a file under a new name, or a new file under an old one.
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	hash := sha256.New()
+	size, err := io.Copy(hash, f)
+	if err != nil {
+		log.Fatal(err)
+	}
+	sum := hash.Sum(nil)
+	hashed := time.Since(start)
+
+	// The header, for the currency and the partner's file id.
+	f.Seek(0, io.SeekStart)
+	cr := csv.NewReader(f)
+	cr.FieldsPerRecord = -1
+	rec, err := cr.Read()
+	if err != nil {
+		log.Fatal(err)
+	}
+	h, err := batch.ParseHeader(rec)
+	if err != nil {
+		log.Fatal(err)
+	}
+	firstRow := cr.InputOffset() // where line 2 starts
+
+	// Register the file, or find it: one row per distinct content.
+	var id int64
+	var status string
+	var nextLine int
+	var nextOff int64
+	err = db.QueryRow(ctx, `INSERT INTO settlement_files (sha256, name, file_id, next_offset) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (sha256) DO UPDATE SET sha256 = EXCLUDED.sha256
+		RETURNING id, status, next_line, next_offset`, sum, filepath.Base(path), h.FileID, firstRow).Scan(&id, &status, &nextLine, &nextOff)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if status == "loaded" {
+		var name string
+		db.QueryRow(ctx, `SELECT name FROM settlement_files WHERE id = $1`, id).Scan(&name)
+		fmt.Printf("%s: already loaded as %s (sha256 %x...); nothing to do. Hashed %.0f MB in %.2fs\n", filepath.Base(path), name, sum[:6], float64(size)/1e6, hashed.Seconds())
+		return
+	}
+```
+
+(`ON CONFLICT (sha256) DO UPDATE SET sha256 = EXCLUDED.sha256` is a no-op update whose only purpose is to make `RETURNING` return the existing row too, so one statement either registers the file or finds it.)
+
+```text
+$ ingest settle-3m.csv
+settle-3m.csv: already loaded as settle-3m.csv (sha256 c949916c97c3...); nothing to do. Hashed 276 MB in 0.17s
+$ cp settle-3m.csv resent-by-partner.csv
+$ ingest resent-by-partner.csv
+resent-by-partner.csv: already loaded as settle-3m.csv (sha256 c949916c97c3...); nothing to do. Hashed 276 MB in 0.20s
+$ ingest settle-3m-bad.csv
+this run loaded 2999976 rows in 11.75s; the table holds 2999976 rows for the file: 0 duplicated, 0 missing, 24 quarantined
+control totals: 3000000 rows, USD 708033820.07; trailer: 3000000 rows, USD 708039415.48: HELD: USD 5595.41 is in the 24 quarantined rows
+```
+
+The same file: **already loaded, nothing to do**, after hashing 276 MB in 0.17 s. The same bytes under a new name: recognised as the same file. And the damaged day loads its 2,999,976 good rows, quarantines 24 in the **same transactions** as their chunks (so a kill can't lose or double a quarantined row either), and is **HELD** for USD 5,595.41, exactly as `validate` said in Stop 3.
+
+<QuickCheck
+  question="The file-based checkpoint duplicated 10,000 rows after a kill. Why doesn't writing the checkpoint first, then committing the rows, fix it?"
+  options={[
+    "It does fix it",
+    "Then a kill between the two loses a chunk instead: the checkpoint says it's done, the rows never committed. With two separate writes, some order is always wrong; only one transaction for both removes the gap",
+    "Files can't be written before a commit",
+    "The checkpoint would be too large"
+  ]}
+  answer={1}
+  explain="Measured: commit then checkpoint duplicated chunk 100. Checkpoint in the same transaction: three kills, 0 duplicated, 0 missing."
+/>
+
+<QuickCheck
+  question="Why identify a settlement file by the SHA-256 of its bytes rather than its filename?"
+  options={[
+    "Hashes are shorter",
+    "A partner can resend the same file under a new name, or send a different file under an old one; only the content says whether it's the same file",
+    "Filenames can't be stored in Postgres",
+    "SHA-256 validates the rows"
+  ]}
+  answer={1}
+  explain="Measured: the resent copy under a new name was recognised as already loaded after 0.2 s of hashing, and nothing was loaded twice."
+/>
+
+---
+
+## Exercises
+
+These use the `batch` module, the generated files and the `p3c11` database from this chapter.
+
+<Exercise n={1} title="Quarantine by reason" level="easy">
+
+The operations team wants one line per kind of problem, not 24 lines. Make `validate` count quarantined rows by reason (three decimal places, wrong currency, missing field, and so on) and print the counts. What should the key be?
+
+<Solution>
+
+Not the full error text: it contains the line number and the value, so every row would be its own key. Give `ParseRow` a small set of reason codes instead, for example an error type with a `Code` field (`"amount"`, `"currency"`, `"fields"`, `"time"`, `"sign"`), and count `map[string]int` by code in the reject callback. Keep the full message in the rejects file, where a person fixing a row needs it. For the damaged file, the counts should add up to 24 and match the generator's `.faults` list: three of each of the eight kinds.
 
 </Solution>
 
 </Exercise>
+
+<Exercise n={2} title="Same name, different file" level="easy">
+
+A partner sends `settle-2026-09-26.csv`, then an hour later a corrected file with the **same name**. What does `ingest` do with the second one, and what should Meridian do about the first?
+
+<Solution>
+
+The corrected file has different bytes, so a different SHA-256: `ingest` registers and loads it as a new file. Now both are in `settlement_rows`, which is right for the audit trail (chapter 10: what was received is never deleted) but wrong for settlement. The header's file id (`SETTLE-20260926-VISA-11`) is the partner's name for the day; add a rule that a new file with the same file id **supersedes** the old one: mark the old file `superseded` in `settlement_files`, in the same transaction that marks the new one `loaded`, and have settlement read only files that are `loaded`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Two loaders, one file" level="medium">
+
+Cron starts `ingest` at 02:00, and at 02:01 an operator starts it by hand on the same file. What happens with the checkpoint in the database? Make it impossible.
+
+<Solution>
+
+Both read the same checkpoint and COPY the same chunk. The second COPY to commit fails on the `(file, line)` primary key, so there are no duplicates, but one job dies with an error and the operator doesn't know why. Take a lock on the file for the whole run: `SELECT pg_try_advisory_lock($1)` with the file's id (a session-level lock, released when the connection closes, including after `kill -9`), and exit with "already being loaded" if it returns false. `SELECT ... FROM settlement_files WHERE id = $1 FOR UPDATE NOWAIT` in a transaction held for the run also works, but a long transaction holds back vacuum; the advisory lock doesn't.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Settle into the ledger" level="medium">
+
+Once a file is `loaded` and BALANCED, post the day to chapter 2's ledger: per merchant, what they're owed from the card network. Make it impossible to post a day twice.
+
+<Solution>
+
+Sum by merchant in SQL, then post one balanced transaction per merchant with `ledger.PostTx`, all in the same database transaction that changes the file's status from `loaded` to `settled`:
+
+```go noverify
+err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+	tag, err := tx.Exec(ctx, `UPDATE settlement_files SET status = 'settled' WHERE id = $1 AND status = 'loaded'`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("not loaded, or already settled")
+	}
+	rows, err := tx.Query(ctx, `SELECT merchant, sum(amount_minor) FROM settlement_rows WHERE file = $1 GROUP BY merchant`, id)
+	if err != nil {
+		return err
+	}
+	owed := map[string]int64{}
+	for rows.Next() {
+		var m string
+		var cents int64
+		if err := rows.Scan(&m, &cents); err != nil {
+			return err
+		}
+		owed[m] = cents
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for m, cents := range owed {
+		if cents == 0 {
+			continue // a zero posting isn't allowed, and nothing is owed
+		}
+		t, err := ledger.NewTransaction("settlement",
+			ledger.Leg("network:visa:receivable", money.New(cents, money.USD)),
+			ledger.Leg("merchant:"+m+":payable", money.New(-cents, money.USD)))
+		if err != nil {
+			return err
+		}
+		if _, err := ledger.PostTx(ctx, tx, t); err != nil {
+			return err
+		}
+	}
+	return nil
+})
+```
+
+The ledger's accounts must exist first (chapter 2's `accounts` table), so open any merchant's payable account that's missing in the same transaction. The `WHERE status = 'loaded'` in the first statement is the guard: a second run finds no row to update and posts nothing, and because it's the same transaction, a crash halfway posts nothing either. (The rows are read fully before posting, because one connection can't run a new statement while it's still reading a query's results.)
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Resume with parallel writers" level="hard">
+
+The checkpoint in Stop 6 is one offset, which works because there's one writer and chunks commit in order. With Stop 5's parallel writers, chunk 7 can commit before chunk 6. Design a checkpoint that still resumes with no duplicates and no gaps.
+
+<Solution>
+
+Record each chunk, not a high-water mark: a table `settlement_chunks (file, chunk, first_line, next_offset, PRIMARY KEY (file, chunk))`, inserted in the same transaction as the chunk's COPY. Chunk boundaries must be deterministic (chunk *k* is always detail rows *k*·10,000 + 1 to (*k*+1)·10,000), so a restart cuts the file the same way. On resume, find the largest *k* such that chunks 0 to *k* are all committed, seek to chunk *k*'s `next_offset`, and read on, skipping (parsing but not writing) any later chunk already in the table. The primary key on `(file, chunk)` rejects a chunk committed twice, and the final control totals prove nothing was skipped. Test it the same way: `kill -9` at random moments, many times, and compare the table with the trailer.
+
+</Solution>
+
+</Exercise>
+
+---
 
 ## The Lab
 
-Warm-up's over, sport. I set this one personally — and I set it because this exact scenario is what kills batch jobs in production. Build it right, and you'll never lose sleep over a crashed nightly reconciliation run again.
-
 <Lab
-  title="Resumable, idempotent ACH return processor"
-  archetype="build-it"
-  difficulty="unscaffolded"
+  title="The Nightly File"
+  archetype="fix-it"
+  difficulty="guided"
   points={100}
-  hintCost={15}
+  hintCost={10}
   verify="self-check"
   expect="ALL CHECKS PASS"
-  objective="Build a streaming ACH return file processor that checkpoints after every 2 records, survives a simulated mid-file crash, resumes from the checkpoint, and never double-posts a return. main is the self-check harness — do not edit it. It runs two passes over an in-memory NACHA file and asserts ledger.Count()==10 and ledger.Total()==50000 cents with no double-counting. When both hold, it prints ALL CHECKS PASS."
+  objective="Fix the settlement loader. parseCents goes through a float, so 0.29 becomes 28 cents and 1e3 is accepted. load's checkpoint forgets that the reader may have started partway into the file. It treats a file that ends without a trailer as complete, and it never checks the trailer's control totals. Make every check pass: exact amounts, quarantined rows by line number, three kill -9s with every row loaded exactly once, and cut-off or mismatched files rejected."
   starter={`package main
 
 import (
-	"bufio"
+	"encoding/csv"
+	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
-type EntryDetail struct {
-	TraceNumber string
-	AmountCents int64
+// A settlement file, one record per line:
+//
+//	H,<file id>
+//	D,<txn id>,<amount>     (amount in dollars: "12.34", "-0.50", "7")
+//	T,<detail count>,<total>
+type Row struct {
+	Line  int
+	Txn   string
+	Cents int64
 }
 
+// Checkpoint is where the next run starts: the byte offset of the next
+// record in the file, and that record's line number.
 type Checkpoint struct {
-	JobID         string
-	LastRecordNum int64
-	TotalCents    int64
-	UpdatedAt     time.Time
+	Offset int64
+	Line   int
 }
 
-// TODO: parseEntry parses a 94-char NACHA Entry Detail line (first byte '6').
-// TraceNumber: line[79:94] (0-based). AmountCents: strconv.ParseInt(line[29:39]).
-// Return an error if len(line) < 94 or line[0] != '6'.
-func parseEntry(line string) (EntryDetail, error) {
-	return EntryDetail{}, fmt.Errorf("not implemented")
+var ErrControl = errors.New("control totals don't match")
+
+// parseCents reads a dollar amount exactly, as a whole number of cents:
+// digits, optionally a minus sign first, optionally a dot and one or two
+// digits after it. Anything else is an error; nothing is rounded.
+func parseCents(s string) (int64, error) {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("bad amount %q", s)
+	}
+	return int64(f * 100), nil
 }
 
-// TODO: InMemoryCheckpointStore stores checkpoints by job ID.
-// Add a map[string]Checkpoint field named data.
-type InMemoryCheckpointStore struct {
-	data map[string]Checkpoint
+// load reads the file from r, which holds the file's bytes from cp.Offset
+// on (line cp.Line). After every chunk records it calls commit with the
+// chunk's good rows, the line numbers it rejected, and the checkpoint just
+// after the chunk; the caller stores all three atomically. At the trailer
+// it commits the rest and checks the control totals: good plus rejected
+// rows must equal the trailer's count, and when nothing was rejected the
+// rows must add up to its total. A file that ends without a trailer is
+// incomplete: an error.
+func load(r io.Reader, cp Checkpoint, chunk int, commit func(rows []Row, rejected []int, next Checkpoint) error) error {
+	cr := csv.NewReader(r)
+	cr.FieldsPerRecord = -1
+	cr.ReuseRecord = true
+	var rows []Row
+	var rejected []int
+	for {
+		rec, err := cr.Read()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		pos, _ := cr.FieldPos(0)
+		line := cp.Line - 1 + pos
+		// Where the next record starts.
+		next := Checkpoint{Offset: cr.InputOffset(), Line: line + 1}
+		switch rec[0] {
+		case "H":
+			continue
+		case "T":
+			return commit(rows, rejected, next)
+		}
+		cents, err := parseCents(rec[len(rec)-1])
+		if len(rec) != 3 || rec[0] != "D" || err != nil {
+			rejected = append(rejected, line)
+		} else {
+			rows = append(rows, Row{Line: line, Txn: rec[1], Cents: cents})
+		}
+		if len(rows)+len(rejected) == chunk {
+			if err := commit(rows, rejected, next); err != nil {
+				return err
+			}
+			rows, rejected = nil, nil
+		}
+	}
 }
 
-func (s *InMemoryCheckpointStore) Save(cp Checkpoint) { /* TODO: s.data[cp.JobID] = cp */ }
-func (s *InMemoryCheckpointStore) Load(jobID string) (Checkpoint, bool) {
-	return Checkpoint{}, false // TODO: cp, ok := s.data[jobID]; return cp, ok
+// ── below this line: do not edit ──
+
+// The "database": rows by line, rejected lines, and the checkpoint, all
+// updated together by commit, the way one transaction would.
+type store struct {
+	rows     map[int]Row
+	dup      int
+	rejected []int
+	cp       Checkpoint
+	commits  int
+	crashAt  int // fail this commit (1-based) as if the process died; 0: never
 }
 
-// TODO: InMemoryLedger posts returns idempotently by trace number.
-// Use a map[string]int64 (trace->amount) protected by a sync.Mutex.
-type InMemoryLedger struct {
-	mu      sync.Mutex
-	entries map[string]int64
-}
+var errCrash = errors.New("kill -9")
 
-// PostReturn records the return if the trace is new. Returns true if posted, false if duplicate.
-func (l *InMemoryLedger) PostReturn(trace string, cents int64) bool {
-	return false // TODO
-}
-
-func (l *InMemoryLedger) Total() int64 { return 0 /* TODO */ }
-func (l *InMemoryLedger) Count() int   { return 0 /* TODO */ }
-
-// TODO: processFile streams lines from startRecord onward using bufio.Scanner,
-// checkpoints every 2 entry-detail records, posts each to ledger idempotently.
-func processFile(
-	lines []string,
-	startRecord int64,
-	store *InMemoryCheckpointStore,
-	ledger *InMemoryLedger,
-	jobID string,
-) error {
-	// Hint: scanner := bufio.NewScanner(strings.NewReader(strings.Join(lines, "\\n")))
-	// Skip non-'6' lines. Count entry lines; skip the first startRecord of them.
-	// After every 2 posted entries, call store.Save with the running total.
-	_ = bufio.NewScanner
-	_ = strconv.ParseInt
-	_ = strings.TrimSpace
+func (s *store) commit(rows []Row, rejected []int, next Checkpoint) error {
+	s.commits++
+	if s.commits == s.crashAt {
+		return errCrash
+	}
+	for _, r := range rows {
+		if _, ok := s.rows[r.Line]; ok {
+			s.dup++
+		}
+		s.rows[r.Line] = r
+	}
+	s.rejected = append(s.rejected, rejected...)
+	s.cp = next
 	return nil
 }
 
-// ── checks: do not edit. Run to verify your fix. ──
+// checkTrailer is called by load with the T record. It compares against the
+// store currently being loaded.
+var current *store
+
+func checkTrailer(rec []string) error {
+	if len(rec) != 3 {
+		return fmt.Errorf("%w: bad trailer", ErrControl)
+	}
+	count, err1 := strconv.Atoi(rec[1])
+	total, err2 := parseCents(rec[2])
+	if err1 != nil || err2 != nil {
+		return fmt.Errorf("%w: bad trailer", ErrControl)
+	}
+	var sum int64
+	for _, r := range current.rows {
+		sum += r.Cents
+	}
+	if len(current.rows)+len(current.rejected) != count {
+		return fmt.Errorf("%w: %d rows + %d rejected, trailer says %d", ErrControl, len(current.rows), len(current.rejected), count)
+	}
+	if len(current.rejected) == 0 && sum != total {
+		return fmt.Errorf("%w: rows add up to %d cents, trailer says %d", ErrControl, sum, total)
+	}
+	return nil
+}
+
+// run loads file into a fresh store, crashing at the given commits and
+// resuming from the stored checkpoint each time, like a job restarted by
+// its scheduler.
+func run(file string, chunk int, crashes ...int) (*store, error) {
+	s := &store{rows: map[int]Row{}, cp: Checkpoint{Offset: 0, Line: 1}}
+	current = s
+	for attempt := 0; ; attempt++ {
+		s.commits, s.crashAt = 0, 0
+		if attempt < len(crashes) {
+			s.crashAt = crashes[attempt]
+		}
+		err := load(strings.NewReader(file[s.cp.Offset:]), s.cp, chunk, s.commit)
+		if errors.Is(err, errCrash) {
+			continue
+		}
+		return s, err
+	}
+}
+
+func makeFile(n int, bad map[int]string) string {
+	var b strings.Builder
+	b.WriteString("H,SETTLE-20260926\\n")
+	var total int64
+	for i := 1; i <= n; i++ {
+		cents := int64(i*37%50000 + 1)
+		if i%10 == 0 {
+			cents = -cents
+		}
+		total += cents
+		amt := fmt.Sprintf("%d.%02d", cents/100, max(cents, -cents)%100)
+		if cents < 0 && cents > -100 {
+			amt = "-" + amt
+		}
+		if v, ok := bad[i]; ok {
+			amt = v
+		}
+		fmt.Fprintf(&b, "D,txn_%06d,%s\\n", i, amt)
+	}
+	fmt.Fprintf(&b, "T,%d,%d.%02d\\n", n, total/100, total%100)
+	return b.String()
+}
+
 func main() {
-	buildLine := func(i int) string {
-		trace := fmt.Sprintf("%015d", i)
-		amount := "0000005000"
-		line := "6" + "27" + "021000021" + fmt.Sprintf("%-17d", i) + amount +
-			strings.Repeat(" ", 15) + fmt.Sprintf("%-22s", "TEST") + " " + trace
-		return fmt.Sprintf("%-94s", line)
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+
+	// Check 1: amounts, exactly.
+	for s, want := range map[string]int64{"12.34": 1234, "0.29": 29, "4.35": 435, "-0.50": -50, "7": 700, "19.9": 1990, "1000000.01": 100000001} {
+		if got, err := parseCents(s); err != nil || got != want {
+			fail("parseCents(%q) = %d, %v; want %d", s, got, err, want)
+		}
+	}
+	for _, s := range []string{"12.345", "1e3", "$5.00", "", " 5.00", "1,299.00", "0.1.2", "5.", "-", "NaN", "+5"} {
+		if _, err := parseCents(s); err == nil {
+			fail("parseCents(%q) accepted a malformed amount", s)
+		}
 	}
 
-	var lines []string
-	lines = append(lines, fmt.Sprintf("%-94s", "1"))
-	lines = append(lines, fmt.Sprintf("%-94s", "5"))
-	for i := 1; i <= 10; i++ {
-		lines = append(lines, buildLine(i))
-	}
-	lines = append(lines, fmt.Sprintf("%-94s", "8"))
-	lines = append(lines, fmt.Sprintf("%-94s", "9"))
-
-	store := &InMemoryCheckpointStore{data: make(map[string]Checkpoint)}
-	ledger := &InMemoryLedger{entries: make(map[string]int64)}
-	jobID := "lab-ach-returns"
-
-	// Run 1: simulate crash after 4 entries (only first 6 lines fed).
-	if err := processFile(lines[:6], 0, store, ledger, jobID); err != nil {
-		fmt.Println("FAIL run1:", err)
-		return
-	}
-	cp, ok := store.Load(jobID)
-	if !ok {
-		fmt.Println("FAIL: no checkpoint after run 1")
-		return
+	// Check 2: a clean file, no crashes.
+	clean := makeFile(1000, nil)
+	s, err := run(clean, 64)
+	if err != nil || len(s.rows) != 1000 || s.dup != 0 {
+		fail("clean file: err %v, %d rows, %d duplicates; want nil, 1000, 0", err, len(s.rows), s.dup)
 	}
 
-	// Run 2: resume from checkpoint, full file.
-	if err := processFile(lines, cp.LastRecordNum, store, ledger, jobID); err != nil {
-		fmt.Println("FAIL run2:", err)
-		return
+	// Check 3: killed three times; every row exactly once.
+	s, err = run(clean, 64, 3, 2, 5)
+	if err != nil || len(s.rows) != 1000 || s.dup != 0 {
+		fail("killed three times: err %v, %d rows, %d duplicates; want nil, 1000, 0", err, len(s.rows), s.dup)
 	}
 
-	allOK := true
-	if ledger.Count() != 10 {
-		fmt.Printf("FAIL: count = %d, want 10\\n", ledger.Count())
-		allOK = false
-	}
-	if ledger.Total() != 50000 {
-		fmt.Printf("FAIL: total = %d cents, want 50000\\n", ledger.Total())
-		allOK = false
+	// Check 4: bad rows are quarantined by line number, and the count balances.
+	s, err = run(makeFile(500, map[int]string{7: "12.345", 250: "1e3", 499: "$1.00"}), 50, 2)
+	if err != nil || len(s.rows) != 497 || fmt.Sprint(s.rejected) != "[8 251 500]" {
+		fail("bad rows: err %v, %d rows, rejected lines %v; want nil, 497, [8 251 500]", err, len(s.rows), s.rejected)
 	}
 
-	if allOK {
+	// Check 5: a file cut off in transit.
+	if _, err := run(clean[:len(clean)/2], 64); err == nil {
+		fail("a file with no trailer was accepted")
+	}
+
+	// Check 6: a trailer that disagrees with the rows.
+	extra := strings.Replace(clean, "T,1000,", "T,1001,", 1)
+	if _, err := run(extra, 64); !errors.Is(err, ErrControl) {
+		fail("trailer count 1001 for 1000 rows: got %v, want ErrControl", err)
+	}
+
+	if ok {
 		fmt.Println("ALL CHECKS PASS")
 	}
 }`}
-  verifier="main runs two in-process passes over a 10-entry synthetic NACHA file using strings.NewReader — no real files. It asserts ledger.Count()==10 and ledger.Total()==50000 with no double-counting across the crash+resume. The flag unlocks when the program builds clean and prints ALL CHECKS PASS."
+  verifier="Checks parseCents on 7 valid amounts (including 0.29, 4.35 and 19.9) and rejects 11 malformed ones (12.345, 1e3, $5.00, empty, a leading space, 1,299.00, 0.1.2, 5., -, NaN, +5); loads a clean 1,000-row file; loads it again with the process killed at three different commits, resuming each time from the stored checkpoint, and requires 1,000 rows with no duplicates; loads a file with 3 bad rows and requires them quarantined at lines 8, 251 and 500; and requires a file cut in half and a file whose trailer claims 1,001 rows to be rejected. Prints ALL CHECKS PASS."
   hints={[
-    "parseEntry: return an error if len(line) < 94 or line[0] != '6'. TraceNumber = strings.TrimSpace(line[79:94]). AmountCents = strconv.ParseInt(strings.TrimSpace(line[29:39]), 10, 64). Money is always integer cents — no float.",
-    "InMemoryLedger.PostReturn: l.mu.Lock(); defer l.mu.Unlock(); if _, exists := l.entries[trace]; exists { return false }; l.entries[trace] = cents; return true. Total and Count just range over l.entries under the lock.",
-    "processFile: skipped := int64(0); entryCount := int64(0). For each line starting with '6': if skipped < startRecord { skipped++; continue }. Parse it, call PostReturn (which is idempotent), increment entryCount. Every 2 entries, store.Save a checkpoint with entryCount and running total."
+    "parseCents: don't use a float. Split on the dot with strings.Cut, check that the whole part is non-empty and all digits, that there are at most two digits after the dot (and at least one if there is a dot), then strconv.ParseInt the digits with the fraction padded to two places.",
+    "The checkpoint: when load resumes, r starts at byte cp.Offset of the file, so cr.InputOffset() counts from there. The next checkpoint's offset is cp.Offset + cr.InputOffset().",
+    "At io.EOF, return an error: a file without a trailer is incomplete. At the trailer, commit the last chunk, then return checkTrailer(rec) so the control totals are compared."
   ]}
-  flag="GO{streaming_checkpointed_idempotent_ach_returns}"
+  flag="GO{the_trailer_always_knows}"
 >
 
-The nightly job processed 4 entries and crashed. On restart it must skip those 4 without double-posting them and finish the remaining 6. Ten entries. $500.00 total. The checkpoint tells you where to resume; the idempotent ledger handles the re-fed entries cleanly. No real files — strings.NewReader gives you a streaming reader over the in-memory lines. Get it to print ALL CHECKS PASS.
+The same loader as `ingest`, with the database replaced by a map, so it runs anywhere. The harness kills it the way the chapter did: it fails a commit, as if the process died there, and restarts `load` from the stored checkpoint.
 
 </Lab>
 
 <Recap>
 
-You now own the batch stack:
-
-- **Batch still rules in fintech** — ACH settlement, nightly reconciliation, statement generation, and bank-file ingest are batch workloads by protocol, not by choice. Batch and streaming are complements, not competitors.
-- **NACHA / ACH** files are 94-character fixed-width records. Parse by byte offset (1-based positions → 0-based Go slices). Amount is integer cents — never a float. The Trace Number (positions 80–94) is your natural dedup key.
-- **ISO 20022 (pain.001)** XML carries modern wire and SEPA payments. Stream it with `encoding/xml`'s `Decoder.Token()` + `DecodeElement` — never `xml.Unmarshal` the whole document.
-- **Stream, never load.** `bufio.Scanner` for line-oriented files, `encoding/csv`'s `Read()` for CSV, `encoding/xml`'s `Decoder` for XML. Memory is O(1) in file size — you hold one record, not the file. Set the `bufio.Scanner` buffer if lines might exceed 64 KiB.
-- **Checkpointing** records your byte offset / record number after each committed batch. On restart, seek to that offset and resume mid-file. Write the checkpoint in the same transaction as the ledger commit.
-- **Idempotent re-processing** ensures crash + retry never double-posts. Use the trace number as a dedup key with `ON CONFLICT DO NOTHING`, or a pre-insert existence check. Append-only corrections — never mutate posted entries.
+- **Stream**: read one record at a time. csv `ReadAll` peaked at 890 MB for a 276 MB file; streaming stayed at 16–17 MB for 1 or 3 million rows. `bufio.Scanner` stops at 64 KB lines unless you call `Buffer`, and you must check `Err`. CSV needs `encoding/csv`: `strings.Split` misread 752,419 of 3,000,000 rows. `ReuseRecord` halved the bytes allocated.
+- **Validate**: parse every field strictly, money without floats (a float turned 0.29 into 28 cents). Quarantine bad rows with their line numbers: all 24 damaged rows found. Reject the whole file past a limit: 3,000 damaged rows stopped after 8 MB.
+- **Control totals**: the trailer is the sender's count and sum. It showed the USD 5,595.41 sitting in quarantine, and its absence rejected a file cut off at 150 MB.
+- **Bulk load**: COPY, not one INSERT per row: 282,810 rows a second against 7,646; 3,000,000 rows in about 14 s.
+- **Pipeline**: one reader, several writers, bounded with `errgroup.SetLimit`: 47 MB instead of 893 MB, and the first error stops everything. But chunks already committed stay committed.
+- **Resume and rerun**: commit the checkpoint (a byte offset from `csv.Reader.InputOffset`) in the same transaction as its rows. Restarting from the top duplicated 1,580,000 rows; a checkpoint saved after the commit duplicated 10,000; a checkpoint in the transaction survived three `kill -9`s with none duplicated or missing. Identify a file by its SHA-256, so a resent file loads nothing.
 
 </Recap>
 
 <Scoreboard
-  streak={10}
+  streak={7}
   items={[
-    { label: "Quick check — NACHA field extraction", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — bufio.Scanner ErrTooLong", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — Fixed-width extractor", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 2 — Streaming line counter", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 3 — Streaming CSV sum", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 4 — Checkpoint round-trip", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 5 — Idempotent in-memory ledger", kind: "exercise", points: 20, done: false }
+    { label: "Quick check: memory that doesn't grow", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: 0.29 is 28 cents", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the file that stops early", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: what a batch removes", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: why bounded isn't slower", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: checkpoint order", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: a file's identity", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: quarantine by reason", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: same name, different file", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: two loaders, one file", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: settle into the ledger", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: resume with parallel writers", kind: "exercise", points: 20, done: false }
   ]}
-  flag={{ label: "Lab — Resumable Idempotent ACH Processor", captured: false, points: 100 }}
+  flag={{ label: "Lab: The Nightly File", captured: false, points: 100 }}
 />
-
-Not bad. A streaming parser, a checkpoint store, an idempotent ledger — you put all three together and the bank can drop whatever it wants on that SFTP server. It's no *me*, but for a batch job? That'll do. Next up: Security for Financial Systems — because a correct system that leaks PAN data is still a catastrophe.
