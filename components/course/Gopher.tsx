@@ -469,6 +469,7 @@ export function Gopher({
   title,
   role,
   tag,
+  look,
 }: {
   pose?: GopherPose;
   state?: GopherState;
@@ -481,6 +482,8 @@ export function Gopher({
   role?: GopherRole;
   /** identity badge on the chest — "3" makes this THE worker-3 gopher */
   tag?: string;
+  /** "pink": pink fur and long hair (the book's women: alice, carol, erin…) */
+  look?: "pink";
 }) {
   const eyesClosed = pose === "sleep";
   const panicked = pose === "panic";
@@ -489,7 +492,7 @@ export function Gopher({
   const masked = role === "thief";
   return (
     <span
-      className={`gph gph-pose-${pose} gph-st-${state} ${flip ? "gph-flip" : ""}`}
+      className={`gph gph-pose-${pose} gph-st-${state} ${flip ? "gph-flip" : ""} ${look ? `gph-look-${look}` : ""}`}
       style={{ "--gph-size": `${size}px` } as CSSProperties}
       role="img"
       aria-label={title ?? `gopher (${role ?? pose})`}
@@ -513,6 +516,13 @@ export function Gopher({
         height={size}
         aria-hidden
       >
+        {/* long hair, behind everything: falls past the shoulders on both sides */}
+        {look === "pink" && (
+          <path
+            className="gph-hair"
+            d="M9 22 Q7 2 32 1.5 Q57 2 55 22 L60 51 Q53 57 47 47 L47 24 L17 24 L17 47 Q11 57 4 51 Z"
+          />
+        )}
         {/* ears */}
         <circle className="gph-ear" cx="19" cy="11" r="5.5" />
         <circle className="gph-ear" cx="45" cy="11" r="5.5" />
@@ -548,6 +558,10 @@ export function Gopher({
               {tag}
             </text>
           </>
+        )}
+        {/* fringe over the forehead, above the eyes */}
+        {look === "pink" && (
+          <path className="gph-hair" d="M14 18 Q16 4 32 4 Q48 4 50 18 Q43 12 37 16 Q32 10.5 27 16 Q21 12 14 18 Z" />
         )}
         {/* nose + teeth */}
         <ellipse className="gph-nose" cx="32" cy="32.5" rx="3.4" ry="2.6" />

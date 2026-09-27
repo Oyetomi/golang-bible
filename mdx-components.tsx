@@ -7,6 +7,7 @@ import { SpacedRecall } from "@/components/course/spacedrecall";
 import { Golings } from "@/components/course/golings";
 import { CodeWalk } from "@/components/course/CodeWalk";
 import { RuntimeStage } from "@/components/course/RuntimeStage";
+import { CinemaAnim } from "@/components/course/CinemaAnim";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
 import { ProjectCode } from "@/components/course/ProjectCode";
 
@@ -63,6 +64,7 @@ export const mdxComponents = {
   RaceAnim: A.RaceAnim,
   CodeWalk,
   RuntimeStage,
+  CinemaAnim,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
   Gotcha: S.Gotcha,
