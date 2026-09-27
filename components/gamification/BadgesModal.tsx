@@ -2,14 +2,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  BadgeId,
   BadgeProgress,
+  calculateLevelInfo,
   getAllBadgesWithProgress,
   PlayerProfile,
 } from "@/lib/gamification";
+import { GO_ERAS, RARITY, STICKERS, eraForLevel } from "@/lib/stickers";
 import { triggerConfetti } from "@/lib/confetti";
 import { playClick, playSuccess } from "@/lib/sound";
-import { Gopher, type GopherRole, type GopherPose } from "@/components/course/Gopher";
+import { StickerArt } from "./StickerArt";
 
 interface BadgesModalProps {
   isOpen: boolean;
@@ -19,264 +20,211 @@ interface BadgesModalProps {
 
 type FilterTab = "all" | "unlocked" | "locked";
 
-/** Every achievement wears one of the course's gopher roles, so the cast a
- *  reader met in the chapters is the same cast on the badge wall. Locked
- *  badges render the same gopher desaturated rather than a different mark, so
- *  you can see what you are working toward. */
-const BADGE_GOPHER: Record<BadgeId, { role: GopherRole; pose: GopherPose }> = {
-  first_code: { role: "hacker", pose: "happy" },
-  playground_hacker: { role: "mechanic", pose: "run" },
-  quick_thinker: { role: "scholar", pose: "happy" },
-  quiz_master: { role: "analyst", pose: "wave" },
-  lab_novice: { role: "detective", pose: "idle" },
-  lab_veteran: { role: "runner", pose: "run" },
-  channel_surfer: { role: "courier", pose: "carry" },
-  race_slayer: { role: "locksmith", pose: "happy" },
-  ddd_architect: { role: "architect", pose: "idle" },
-  consensus_king: { role: "leader", pose: "wave" },
-  zero_alloc_titan: { role: "alchemist", pose: "happy" },
-  ebpf_warlock: { role: "kernel", pose: "idle" },
-  wasm_alchemist: { role: "smith", pose: "idle" },
-  streak_3: { role: "timekeeper", pose: "happy" },
-  streak_7: { role: "worker", pose: "run" },
-  night_owl: { role: "hacker", pose: "sleep" },
-  explorer_10: { role: "pilot", pose: "run" },
-  scholar_50: { role: "scribe", pose: "idle" },
-  master_100: { role: "captain", pose: "wave" },
-  sound_enthusiast: { role: "operator", pose: "happy" },
-};
+const FILTERS: { id: FilterTab; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "unlocked", label: "Collected" },
+  { id: "locked", label: "Still to earn" },
+];
 
-function BadgeIcon({ id, title, unlocked }: { id: BadgeId; title: string; unlocked: boolean }) {
-  const cast = BADGE_GOPHER[id];
-  return (
-    <span className={`gb-badge-gopher ${unlocked ? "is-unlocked" : "is-locked"}`}>
-      <Gopher
-        role={cast.role}
-        pose={cast.pose}
-        state={unlocked ? "done" : "idle"}
-        size={40}
-        // Without this the label reads "gopher (hacker)", which tells a screen
-        // reader nothing about the achievement it is sitting on.
-        title={`${title} — ${unlocked ? "unlocked" : "locked"}`}
-      />
-    </span>
-  );
-}
-
+/* The sticker book. Achievements are die-cut stickers (StickerArt), collected
+   ones sorted first and rarest first; a locked slot shows the sticker's
+   outline and how to earn it. Above the grid, the reader's level sits on a
+   timeline of Go releases, because that is what the levels are named after. */
 export function BadgesModal({ isOpen, onClose, profile }: BadgesModalProps) {
   const [filter, setFilter] = useState<FilterTab>("all");
+  const [focus, setFocus] = useState<BadgeProgress | null>(null);
 
-  const allBadges = useMemo(() => {
-    return getAllBadgesWithProgress(profile);
-  }, [profile]);
+  const all = useMemo(() => getAllBadgesWithProgress(profile), [profile]);
+  const level = calculateLevelInfo(profile.xp).level;
+  const era = eraForLevel(level);
+  const count = all.filter((b) => b.unlocked).length;
 
-  const unlockedCount = useMemo(() => {
-    return allBadges.filter((b) => b.unlocked).length;
-  }, [allBadges]);
+  const list = useMemo(() => {
+    const sorted = [...all].sort(
+      (a, b) =>
+        Number(b.unlocked) - Number(a.unlocked) ||
+        RARITY[STICKERS[a.id].rarity].order - RARITY[STICKERS[b.id].rarity].order,
+    );
+    if (filter === "unlocked") return sorted.filter((b) => b.unlocked);
+    if (filter === "locked") return sorted.filter((b) => !b.unlocked);
+    return sorted;
+  }, [all, filter]);
 
-  const totalBadges = allBadges.length;
-  const completionPct = Math.round((unlockedCount / totalBadges) * 100);
-
-  const displayedBadges = useMemo(() => {
-    if (filter === "unlocked") return allBadges.filter((b) => b.unlocked);
-    if (filter === "locked") return allBadges.filter((b) => !b.unlocked);
-    return allBadges;
-  }, [allBadges, filter]);
-
-  // Handle escape key and body scroll lock
   useEffect(() => {
     if (!isOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (focus) setFocus(null);
+      else onClose();
     };
     window.addEventListener("keydown", onKey);
-    const origOverflow = document.body.style.overflow;
+    const orig = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       window.removeEventListener("keydown", onKey);
-      document.body.style.overflow = origOverflow;
+      document.body.style.overflow = orig;
     };
-  }, [isOpen, onClose]);
+  }, [isOpen, focus, onClose]);
 
   if (!isOpen) return null;
 
-  const handleCelebrate = (badge: BadgeProgress, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const close = () => {
+    playClick();
+    setFocus(null);
+    onClose();
+  };
+
+  // Eras are stored newest first; the timeline reads left to right.
+  const timeline = [...GO_ERAS].reverse();
+
+  return (
+    <div className="sb-scrim" onMouseDown={(e) => e.target === e.currentTarget && close()}>
+      <div className="sb-sheet" role="dialog" aria-modal="true" aria-labelledby="sb-title">
+        <div className="sb-head">
+          <div>
+            <p className="sb-kicker">Your sticker book</p>
+            <h2 id="sb-title" className="sb-title">
+              {count} of {all.length} collected
+            </h2>
+          </div>
+          <button className="sb-close" onClick={close} aria-label="Close sticker book" type="button">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="sb-body">
+          <section className="sb-eras" aria-label="Go release eras">
+            <div className="sb-eras-head">
+              <span className="sb-eras-now">
+                Level {level} · <strong>{era.name}</strong>
+              </span>
+              <span className="sb-eras-note">
+                {era.release} ({era.year}): {era.note}
+              </span>
+            </div>
+            <ol className="sb-rail">
+              {timeline.map((e) => {
+                const state = e === era ? "now" : level >= e.minLevel ? "past" : "ahead";
+                return (
+                  <li key={e.release} className={`sb-stop is-${state}`} title={`${e.release}: ${e.note}`}>
+                    <span className="sb-dot" />
+                    <span className="sb-rel">{e.release.replace("Go ", "")}</span>
+                    <span className="sb-lv">Lv {e.minLevel}</span>
+                  </li>
+                );
+              })}
+            </ol>
+          </section>
+
+          <div className="sb-meter" aria-hidden="true">
+            <span style={{ width: `${(count / all.length) * 100}%` }} />
+          </div>
+
+          <div className="sb-filters" role="tablist">
+            {FILTERS.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                role="tab"
+                aria-selected={filter === f.id}
+                className="sb-chip"
+                onClick={() => {
+                  playClick();
+                  setFilter(f.id);
+                }}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+
+          {list.length === 0 ? (
+            <p className="sb-empty">
+              {filter === "unlocked"
+                ? "Your first sticker is one snippet away: run any playground."
+                : "Every sticker collected. Iconic."}
+            </p>
+          ) : (
+            <div className="sb-grid">
+              {list.map((b) => {
+                const s = STICKERS[b.id];
+                return (
+                  <button key={b.id} type="button" className="sb-slot" onClick={() => setFocus(b)}>
+                    <StickerArt sticker={s} locked={!b.unlocked} title={`${b.title}${b.unlocked ? "" : " (locked)"}`} />
+                    <span className="sb-name">{b.title}</span>
+                    <span className="sb-meta">
+                      {b.unlocked ? RARITY[s.rarity].label : s.hint}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {focus && <StickerDetail badge={focus} onClose={() => setFocus(null)} />}
+    </div>
+  );
+}
+
+function StickerDetail({ badge, onClose }: { badge: BadgeProgress; onClose: () => void }) {
+  const s = STICKERS[badge.id];
+  const got = badge.unlocked;
+  const pct = Math.round(Math.min(1, badge.currentProgress / badge.maxProgress) * 100);
+
+  const celebrate = (e: React.MouseEvent) => {
+    if (!got) return;
     playSuccess();
-    const rect = e.currentTarget.getBoundingClientRect();
-    triggerConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2, 60);
+    const r = e.currentTarget.getBoundingClientRect();
+    triggerConfetti(r.left + r.width / 2, r.top + r.height / 2, 60);
   };
 
   return (
-    <div
-      className="gb-modal-overlay"
-      onClick={onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="badges-modal-title"
-    >
-      <div
-        className="gb-modal"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Modal Header */}
-        <div className="gb-modal-header">
-          <div className="gb-modal-title-wrap">
-            <span className="gb-modal-trophy">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="8" r="6" />
-                <path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11" />
-              </svg>
-            </span>
-            <div>
-              <h2 id="badges-modal-title" className="gb-modal-title">
-                Curriculum Achievements
-              </h2>
-              <p className="gb-modal-sub">
-                {unlockedCount} of {totalBadges} Unlocked ({completionPct}%)
+    <div className="sb-scrim sb-scrim-top" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="sb-sheet sb-detail" role="dialog" aria-modal="true" aria-label={badge.title}>
+        <button type="button" className="sb-detail-art" onClick={celebrate} aria-label={got ? "Celebrate" : badge.title}>
+          <StickerArt sticker={s} locked={!got} size={176} className={got ? "sticker-enter" : ""} />
+        </button>
+        <p className="sb-kicker">
+          {RARITY[s.rarity].label} · {badge.category}
+        </p>
+        <h3 className="sb-detail-title">{badge.title}</h3>
+        <p className="sb-detail-desc">{badge.description}.</p>
+
+        {got ? (
+          <>
+            <p className="sb-lore">{s.lore}</p>
+            {badge.unlockedAt && (
+              <p className="sb-when">
+                Collected{" "}
+                {new Date(badge.unlockedAt).toLocaleDateString(undefined, {
+                  day: "numeric",
+                  month: "long",
+                  year: "numeric",
+                })}
               </p>
+            )}
+          </>
+        ) : (
+          <div className="sb-progress">
+            <div className="sb-progress-row">
+              <span>To earn it: {s.hint.toLowerCase()}</span>
+              <span className="sb-progress-num">
+                {badge.currentProgress}/{badge.maxProgress}
+              </span>
+            </div>
+            <div className="sb-meter">
+              <span style={{ width: `${pct}%` }} />
             </div>
           </div>
-          <button
-            className="gb-modal-close"
-            onClick={() => {
-              playClick();
-              onClose();
-            }}
-            aria-label="Close modal"
-          >
-            ✕
-          </button>
-        </div>
+        )}
 
-        {/* Global Progress Bar */}
-        <div className="gb-modal-overall-track">
-          <div
-            className="gb-modal-overall-fill"
-            style={{ width: `${completionPct}%` }}
-          />
-        </div>
-
-        {/* Filter Tabs */}
-        <div className="gb-modal-tabs" role="tablist">
-          <button
-            className={`gb-modal-tab ${filter === "all" ? "active" : ""}`}
-            onClick={() => {
-              playClick();
-              setFilter("all");
-            }}
-            type="button"
-          >
-            All <span className="gb-tab-count">{totalBadges}</span>
-          </button>
-          <button
-            className={`gb-modal-tab ${filter === "unlocked" ? "active" : ""}`}
-            onClick={() => {
-              playClick();
-              setFilter("unlocked");
-            }}
-            type="button"
-          >
-            Unlocked <span className="gb-tab-count">{unlockedCount}</span>
-          </button>
-          <button
-            className={`gb-modal-tab ${filter === "locked" ? "active" : ""}`}
-            onClick={() => {
-              playClick();
-              setFilter("locked");
-            }}
-            type="button"
-          >
-            Locked <span className="gb-tab-count">{totalBadges - unlockedCount}</span>
-          </button>
-        </div>
-
-        {/* Badges Grid */}
-        <div className="gb-modal-grid">
-          {displayedBadges.map((b) => {
-            const progressRatio = Math.min(1, b.currentProgress / b.maxProgress);
-            const progressPercent = Math.round(progressRatio * 100);
-
-            return (
-              <div
-                key={b.id}
-                className={`gb-badge-card ${b.unlocked ? "unlocked" : "locked"}`}
-              >
-                <div className="gb-badge-card-top">
-                  <div className="gb-badge-icon-box">
-                    <BadgeIcon id={b.id} title={b.title} unlocked={b.unlocked} />
-                    {b.unlocked && <span className="gb-badge-check">✓</span>}
-                  </div>
-                  <div className="gb-badge-status-wrap">
-                    {b.unlocked ? (
-                      <button
-                        className="gb-badge-unlocked-pill"
-                        onClick={(e) => handleCelebrate(b, e)}
-                        title="Click to celebrate!"
-                        type="button"
-                      >
-                        ✓ Unlocked
-                      </button>
-                    ) : (
-                      <span className="gb-badge-locked-pill">
-                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ display: "inline-block", marginRight: "4px", verticalAlign: "middle" }}>
-                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                          <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                        </svg>
-                        Locked
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="gb-badge-cat-tag">
-                  {b.category.toUpperCase()}
-                </div>
-
-                <h3 className="gb-badge-name">{b.title}</h3>
-                <p className="gb-badge-desc">{b.description}</p>
-
-                {/* Progress bar for multi-step or locked items */}
-                <div className="gb-badge-progress-wrap">
-                  <div className="gb-badge-progress-text">
-                    <span>{b.unlocked ? "Completed" : "Progress"}</span>
-                    <span>
-                      {b.currentProgress} / {b.maxProgress}
-                    </span>
-                  </div>
-                  <div className="gb-badge-progress-track">
-                    <div
-                      className="gb-badge-progress-fill"
-                      style={{ width: `${b.unlocked ? 100 : progressPercent}%` }}
-                    />
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Modal Footer */}
-        <div className="gb-modal-footer">
-          <span className="gb-modal-footer-tip">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ display: "inline-block", marginRight: "6px", verticalAlign: "middle" }}>
-              <circle cx="12" cy="12" r="10" />
-              <line x1="12" y1="16" x2="12" y2="12" />
-              <line x1="12" y1="8" x2="12.01" y2="8" />
-            </svg>
-            Complete QuickChecks, Labs, and Sandboxes to earn XP and unlock badges!
-          </span>
-          <button
-            className="gb-modal-done-btn"
-            onClick={() => {
-              playClick();
-              onClose();
-            }}
-            type="button"
-          >
-            Done
-          </button>
-        </div>
+        <button type="button" className="sb-back" onClick={onClose}>
+          Back to the book
+        </button>
       </div>
     </div>
   );
