@@ -127,11 +127,19 @@ export function PostRoomAnim({
   caption,
   queueLabel = "queue · Redis",
   ledgerLabel = "bookings · Postgres",
+  mailLabel = "customers' inboxes · Mailpit",
+  retryLabel = "retry · waiting out backoff",
+  deadLabel = "archived · dead letters",
+  countNoun = "email",
 }: {
   title: string;
   kicker?: string;
   queueLabel?: string;
   ledgerLabel?: string;
+  mailLabel?: string;
+  retryLabel?: string;
+  deadLabel?: string;
+  countNoun?: string;
   workers: PostWorker[];
   customers?: PostCustomer[];
   jobs?: PostJob[];
@@ -311,10 +319,10 @@ export function PostRoomAnim({
           {usesBins && (
             <>
               <div className="post-bin retry" style={{ left: midL, top: bottomTop, width: half, height: bottomH }}>
-                <span className="post-zlabel">retry · waiting out backoff</span>
+                <span className="post-zlabel">{retryLabel}</span>
               </div>
               <div className="post-bin dead" style={{ left: midL + half + 12, top: bottomTop, width: half, height: bottomH }}>
-                <span className="post-zlabel">archived · dead letters</span>
+                <span className="post-zlabel">{deadLabel}</span>
               </div>
             </>
           )}
@@ -348,12 +356,12 @@ export function PostRoomAnim({
                   <div className="post-box">
                     <span className="post-flag" />
                     <span className="post-count">{n}</span>
-                    <span className="post-boxlabel">{n > 1 ? `${n} emails!` : n === 1 ? "1 email" : "inbox"}</span>
+                    <span className="post-boxlabel">{n > 1 ? `${n} ${countNoun}s!` : n === 1 ? `1 ${countNoun}` : "inbox"}</span>
                   </div>
                 </div>
               );
             })}
-          {hasMail && <span className="post-zlabel post-maillabel" style={{ left: W - 16 - mailW + 10, top: 14 }}>customers&apos; inboxes · Mailpit</span>}
+          {hasMail && <span className="post-zlabel post-maillabel" style={{ left: W - 16 - mailW + 10, top: 14 }}>{mailLabel}</span>}
 
           {w.banner && <span className="post-banner">{w.banner}</span>}
 
