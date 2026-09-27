@@ -57,6 +57,9 @@ export function GamificationHeader() {
       handleProfileUpdate as EventListener
     );
     window.addEventListener("gb:xp-gain", handleXpGain as EventListener);
+    // The home page's sticker-book card opens the same book.
+    const openStickers = () => setIsBadgesOpen(true);
+    window.addEventListener("gb:open-stickers", openStickers);
 
     return () => {
       window.removeEventListener(
@@ -64,6 +67,7 @@ export function GamificationHeader() {
         handleProfileUpdate as EventListener
       );
       window.removeEventListener("gb:xp-gain", handleXpGain as EventListener);
+      window.removeEventListener("gb:open-stickers", openStickers);
     };
   }, []);
 
