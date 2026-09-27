@@ -4144,3 +4144,109 @@ export function ErrorChainAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   ExpiryAnim — a store's map drawn as its table
+   of slots. Each key carries a timer; a reader
+   gopher deletes an expired key it touches (lazy
+   expiry), a sweeper gopher samples slots (active
+   expiry), and the table's size shows that a Go
+   map keeps its slots until it's rebuilt.
+   ════════════════════════════════════════════ */
+export type ExpirySlot = {
+  k: string;
+  /** clock second at which it expires; omit for no expiry */
+  exp?: number;
+};
+
+export type ExpiryFrame = {
+  /** the clock, in seconds */
+  t: number;
+  /** the table: one entry per slot, null for an empty slot */
+  slots: (ExpirySlot | null)[];
+  /** slot the reader gopher is touching */
+  read?: number;
+  /** slots the sweeper is sampling */
+  sweep?: number[];
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+export function ExpiryAnim({
+  title = "Keys that expire",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: ExpiryFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2000);
+  const f = frames[st.cur] ?? frames[0];
+  const live = f.slots.filter((s) => s && (s.exp === undefined || s.exp > f.t)).length;
+  const dead = f.slots.filter((s) => s && s.exp !== undefined && s.exp <= f.t).length;
+  const maxSlots = Math.max(...frames.map((x) => x.slots.length));
+  return (
+    <AnimShell
+      title={title}
+      kicker="expiry · the map"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="exq">
+        <div className="exq-top">
+          <span className="exq-clock">t = {f.t}s</span>
+          <span className="exq-count">
+            {live} live · <b className={dead ? "exq-dead-n" : ""}>{dead} expired, still stored</b>
+          </span>
+        </div>
+        <div className="exq-grid">
+          {f.slots.map((s, i) => {
+            const expired = !!s && s.exp !== undefined && s.exp <= f.t;
+            const sampled = f.sweep?.includes(i);
+            return (
+              <div
+                key={i}
+                className={`exq-slot ${!s ? "exq-empty" : expired ? "exq-expired" : "exq-live"} ${sampled ? "exq-sampled" : ""} ${f.read === i ? "exq-read" : ""}`}
+              >
+                {f.read === i && (
+                  <span className="exq-gph">
+                    <Gopher role="reader" pose={expired ? "blocked" : "happy"} state={expired ? "warn" : "ok"} size={30} title="a reader" />
+                  </span>
+                )}
+                {sampled && (
+                  <span className="exq-gph">
+                    <Gopher role="sweeper" pose="run" state="active" size={30} title="the sweeper" />
+                  </span>
+                )}
+                {s && (
+                  <>
+                    <span className="exq-k">{s.k}</span>
+                    <span className="exq-ttl">{s.exp === undefined ? "no expiry" : expired ? "expired" : `${s.exp - f.t}s left`}</span>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="exq-mem">
+          <span className="exq-mem-k">table size</span>
+          <div className="exq-bar">
+            <div className="exq-fill" style={{ width: `${(f.slots.length / maxSlots) * 100}%` }} />
+          </div>
+          <span className="exq-mem-n">{f.slots.length} slots</span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}

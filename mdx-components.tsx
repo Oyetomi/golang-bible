@@ -66,6 +66,7 @@ export const mdxComponents = {
   RaceAnim: A.RaceAnim,
   OdometerAnim: A.OdometerAnim,
   ErrorChainAnim: A.ErrorChainAnim,
+  ExpiryAnim: A.ExpiryAnim,
   CodeWalk,
   RuntimeStage,
   CinemaAnim,
