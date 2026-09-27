@@ -167,7 +167,7 @@ export function CinemaAnim({
   const gridW = seatStep * cols;
   const hallTop = 16;
   const screenH = 46;
-  const hallH = screenH + rows * seatStep + 34;
+  const hallH = screenH + rows * seatStep + 50; // room under the seats for a banner
   const lobbyTop = hallTop + hallH + 16;
   const lobbyH = 118;
   const H = lobbyTop + lobbyH + 14;
@@ -206,7 +206,7 @@ export function CinemaAnim({
     // Several customers at one seat crowd round it instead of stacking.
     const here = [...w.cust.entries()].filter(([, c]) => c.to === where).sort((a, b) => a[1].order - b[1].order).map(([cid]) => cid);
     const i = Math.max(0, here.indexOf(id));
-    return { x: p.x + (i - (here.length - 1) / 2) * (gSize * 0.62), y: p.y - 6 };
+    return { x: p.x + (i - (here.length - 1) / 2) * (gSize * 0.62), y: p.y + seatSize * 0.45 }; // sits on its own seat
   };
 
   const toggle = () => {
