@@ -3,1300 +3,949 @@ title: "Transactions, Consistency & Sagas"
 part: 3
 order: 3
 type: "course"
-description: "ACID and isolation, optimistic vs pessimistic locking, SELECT ... FOR UPDATE, concurrent transfers; then sagas — local transactions with compensating actions, orchestration vs choreography, and combining with the outbox."
+description: "Keeping Meridian's ledger correct under concurrency and failure, measured on PostgreSQL 14: one transaction ends chapter 2's lost money (10 of 10 killed runs intact); read-modify-write lost 6,856 of 8,000 updates at Read Committed; 50 payouts racing for $100.00 paid out up to $500 at Read Committed and Repeatable Read, and exactly $100 with Serializable (863 retries), SELECT FOR UPDATE (0 retries) or optimistic versions (1,173 retries); unordered row locks managed 28 transfers in 20 s against 121,312 in id order; and a payout saga against a real bank service that a naive version overpaid by $525, recovered to the cent after a kill -9."
 prerequisites: ["double-entry-ledgers"]
 ---
 
 <HeroCard label="Part 3 · Chapter 3" title="Transactions, Consistency & Sagas">
 
-Listen up, sport. Two goroutines walk into a database. Both read a balance of $100. Both subtract $30. Both write $70 back. You just lost $30 of real money and the database is smiling at you like it did nothing wrong.
+Chapter 2's ledger enforces its rules on every write: every transaction balances, and nothing is ever edited. But rules about single writes say nothing about **many writes at once**, or about **a process that dies halfway through a sequence of them**. Meridian pays out thousands of merchants a day, from dozens of workers, through a bank that is sometimes slow and sometimes down. This chapter measures what goes wrong in each of those situations, on the real ledger, and what each fix costs.
 
-That's not a hypothetical. That's Tuesday morning at any fintech company that didn't think hard about *this* chapter. I've seen engineers cry over that bug. Not me, obviously — I've never made a mistake in my life — but I've *witnessed* it, and it was educational.
+It covers two scales. Inside one database, **transactions** and their **isolation levels**, and the locking that decides who waits for whom. Across systems, where no database transaction can reach (Meridian's ledger and the bank's), a **saga**: a sequence of steps, each committed on its own, with a recorded state and a compensating step for when things fail.
 
-Today you learn how to make concurrent money movement correct. ACID. Isolation. Locking. And when the whole ACID model breaks down because the transfer spans two different systems — the saga pattern, compensating actions, and how it all ties to the transactional outbox. By the end, your balances will be inviolable. Or I will personally find your `float64` and make an example of it.
+Six stops. If you get lost, come back here:
+
+1. **Atomicity.** One transaction, and chapter 2's lost money stops.
+2. **Isolation.** What concurrent transactions can see of each other, and two anomalies measured.
+3. **Pessimistic locking.** `SELECT ... FOR UPDATE`: wait your turn.
+4. **Optimistic locking.** Check at the end, and retry.
+5. **Deadlocks.** Two transfers waiting for each other, and the ordering rule that prevents it.
+6. **Sagas.** A payout that crosses into the bank, survives timeouts and crashes, and reconciles.
 
 </HeroCard>
 
-<ChapterTabs tabs={["ACID & Isolation Levels", "The Lost-Update Problem", "Pessimistic Locking", "Optimistic Locking", "Safe Concurrent Transfers", "Sagas & Compensating Actions"]} />
+<ChapterTabs tabs={["Atomicity", "Isolation", "Pessimistic", "Optimistic", "Deadlocks", "Sagas"]} />
 
 <SpacedRecall
   role={"banker"}
   items={[
     {
-      from: "SQL & databases (part 1, ch18)",
-      q: "A DB transaction makes its statements…?",
-      options: ["faster", "all-commit-or-all-rollback (atomic)", "read-only", "async"],
+      from: "Double-Entry Ledgers (part 3, ch02)",
+      q: "Two UPDATEs committed separately, and the process was killed between them. What did the wallet table lose, and what did it record about it?",
+      options: ["Nothing: Postgres rolled back", "Money ($3.71, $4.14), and no record of which transfer", "Only the second wallet's row", "The whole table"],
       answer: 1,
-      tie: "Atomicity is the A in ACID — this chapter goes deep on the I (isolation levels) and the locking that enforces it: pessimistic SELECT ... FOR UPDATE vs optimistic version checks."
+      tie: "Stop 1 runs the same loop with both UPDATEs in one transaction and kills it ten times."
     },
     {
-      from: "Concurrency (part 1, ch4)",
-      q: "Two transactions updating the same row safely need…?",
-      options: ["a bigger DB", "locking or an optimistic version check", "a retry", "an index"],
+      from: "Double-Entry Ledgers (part 3, ch02)",
+      q: "Why did the cached balance row slow posting from 8,586 to 1,381 payments/s?",
+      options: ["The table had no index", "Every payment updated the same row, and its lock is held by one transaction at a time until commit", "UPDATE is slow", "Too many connections"],
       answer: 1,
-      tie: "Concurrent writes are the chapter's core problem — pessimistic locks hold the row, optimistic concurrency detects the conflict at commit. Picking between them is the design call."
+      tie: "That row lock is pessimistic locking you got without asking for it. Stop 3 asks for it on purpose."
     },
   ]}
 />
-
 
 <PredictLab
-  prompt={"Splitting 1000 cents three ways with integer math \u2014 base and remainder?"}
+  prompt={"A merchant is owed $100.00. Fifty payout requests of $10.00 arrive at the same moment, each running: BEGIN (Repeatable Read); SELECT the merchant's balance from its postings; if it's at least $10.00, INSERT the payout's postings; COMMIT. How much is paid out?"}
   role={"banker"}
-  code={`total, n := 1000, 3
-fmt.Println(total/n, total%n)`}
-  options={["333 1", "333 0", "334 1", "333.33 0"]}
-  answer={0}
-  output={`333 1`}
-  explain={"Integer division gives 333 cents each; the remainder (1000 % 3 = 1) is the leftover cent that must go SOMEWHERE \u2014 you can't drop it without breaking the books. Allocating that remainder deterministically is the whole art of splitting money."}
-/>
-
----
-
-<Scene
-  title="Two transfers race on one balance — lost update vs. locked"
-  actors={[{ id: "t1", label: "TX 1 — Gwendolyn ($30)" }, { id: "t2", label: "TX 2 — Marcus ($40)" }]}
-  rows={1}
-  cols={4}
-  cells={[
-    { id: "A1", label: "$100" },
-    { id: "A2", label: "$100" },
-    { id: "A3", label: "$100" },
-    { id: "A4", label: "$100" }
-  ]}
-  frames={[
-    {
-      caption: "Account 7 holds $100 (10000 cents). Both transfers start simultaneously — no lock.",
-      beat: "neutral",
-      actors: [{ id: "t1", state: "idle" }, { id: "t2", state: "idle" }],
-      cells: [{ id: "A1", state: "idle", label: "$100" }, { id: "A2", state: "idle", label: "$100" }, { id: "A3", state: "idle", label: "$100" }, { id: "A4", state: "idle", label: "$100" }]
-    },
-    {
-      caption: "Both read $100 at the same instant. Each now believes the balance is $100.",
-      beat: "problem",
-      actors: [{ id: "t1", state: "active" }, { id: "t2", state: "active" }],
-      cells: [{ id: "A1", state: "warn", label: "read" }, { id: "A2", state: "warn", label: "read" }, { id: "A3", state: "idle", label: "$100" }, { id: "A4", state: "idle", label: "$100" }]
-    },
-    {
-      caption: "TX 1 commits $100−$30=$70. TX 2 also commits $100−$40=$60 — from the stale read. TX 1's update is gone.",
-      beat: "problem",
-      actors: [{ id: "t1", state: "done" }, { id: "t2", state: "bad" }],
-      cells: [{ id: "A1", state: "bad", label: "$60" }, { id: "A2", state: "bad", label: "LOST" }, { id: "A3", state: "bad", label: "LOST" }, { id: "A4", state: "bad", label: "LOST" }]
-    },
-    {
-      caption: "With SELECT FOR UPDATE: TX 1 locks the row. TX 2 blocks until TX 1 commits.",
-      beat: "solution",
-      actors: [{ id: "t1", state: "active" }, { id: "t2", state: "idle" }],
-      cells: [{ id: "A1", state: "active", label: "locked" }, { id: "A2", state: "idle", label: "wait…" }, { id: "A3", state: "idle", label: "$100" }, { id: "A4", state: "idle", label: "$100" }]
-    },
-    {
-      caption: "TX 1 commits $70. TX 2 unblocks, reads the real $70, commits $30. Both applied. No money lost.",
-      beat: "solution",
-      actors: [{ id: "t1", state: "ok" }, { id: "t2", state: "ok" }],
-      cells: [{ id: "A1", state: "done", label: "$30" }, { id: "A2", state: "done", label: "OK" }, { id: "A3", state: "done", label: "OK" }, { id: "A4", state: "done", label: "OK" }]
-    }
-  ]}
-  caption="The lost-update race destroys $30 of real money silently. SELECT FOR UPDATE serializes the two transfers and produces the correct $30 balance."
-/>
-
-**On the job:** Every `POST /transfers` endpoint that reads a balance, checks funds, and writes a new balance is vulnerable to the lost-update problem under concurrent load. At Meridian, the first time a load test hits 50 concurrent transfers on a popular account, money either disappears or the balance goes negative — and no error is logged. This chapter is the fix.
-
----
-
-## ACID & Isolation Levels
-
-Before a single dollar moves, you need to understand the contract your database is making with you. That contract has four clauses. Every professional knows them cold.
-
-<Define term="ACID" since="SQL & Databases in Go (Part 1)">
-**ACID** is the set of four guarantees a database transaction makes: **A**tomicity (all operations in the transaction succeed together or none are visible), **C**onsistency (every transaction takes the database from one valid state to another — your invariants hold before and after every commit), **I**solation (concurrent transactions don't see each other's in-progress work), and **D**urability (once a transaction commits, it survives crashes). You care about ACID because without it, concurrent money movement corrupts balances silently — no exception thrown, no error logged.
-</Define>
-
-### The four properties
-
-A **transaction** is a group of operations that the database treats as a single unit. You've used them: `BEGIN` → do work → `COMMIT` (or `ROLLBACK`). The database promises four things about that unit:
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Atomicity">All operations in a transaction succeed together, or none of them are visible. A transfer that posts a debit and a credit either completes both or neither. No half-posted transfers. Ever.</ConceptCard>
-  <ConceptCard label="Consistency">Every transaction must take the database from one *valid state* to another. Your invariants — like "debits must equal credits" — hold before and after every commit. The DB enforces constraints; you enforce your domain rules in the transaction.</ConceptCard>
-  <ConceptCard label="Isolation">Concurrent transactions must not see each other's in-progress work. The *degree* to which they're shielded is the isolation level. This is the one that bites people in fintech.</ConceptCard>
-  <ConceptCard label="Durability">Once a transaction commits, it's permanent. A crash, a power cut, a cosmic ray — the committed data survives. The write-ahead log (WAL) is how Postgres makes this true.</ConceptCard>
-</ConceptGrid>
-
-Atomicity and durability are either on or off — you don't configure them. Isolation is a dial.
-
-### Isolation levels and the anomalies they prevent
-
-<Define term="Isolation level" since="SQL & Databases in Go (Part 1)">
-An **isolation level** controls how much a transaction can see of concurrent in-progress work from other transactions. The SQL standard defines four levels — Read Uncommitted, Read Committed, Repeatable Read, and Serializable — each buying protection against a specific class of anomaly. Higher isolation means fewer anomalies but more contention; lower isolation means more concurrency but more subtle bugs. Postgres defaults to **Read Committed**, which is safe for many workloads but not for concurrent balance updates.
-</Define>
-
-The SQL standard defines four isolation levels. Each one buys protection against specific anomalies. Here they are, strongest to weakest:
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Dirty Read">You read a row that a concurrent transaction has modified but not yet committed. If that transaction rolls back, you saw data that never existed. Postgres doesn't allow this at any isolation level.</ConceptCard>
-  <ConceptCard label="Non-Repeatable Read">You read a row, a concurrent transaction commits a change to it, you read it again and get a different value. Two reads of the same row in one transaction return different data.</ConceptCard>
-  <ConceptCard label="Phantom Read">You run a query with a `WHERE` clause, another transaction inserts rows that would match, you run the same query and get more rows. The "phantom" rows appeared between your reads.</ConceptCard>
-  <ConceptCard label="Lost Update">Two transactions both read a value, both compute a new value based on it, both write back. The second write silently overwrites the first. This is the one that destroys balances. We'll animate it next.</ConceptCard>
-</ConceptGrid>
-
-Here is how the four isolation levels stack up against these anomalies:
-
-| Isolation Level | Dirty Read | Non-Repeatable Read | Phantom Read | Lost Update |
-|---|---|---|---|---|
-| Read Uncommitted | possible | possible | possible | possible |
-| **Read Committed** (Postgres default) | prevented | possible | possible | possible |
-| Repeatable Read | prevented | prevented | prevented* | prevented |
-| Serializable | prevented | prevented | prevented | prevented |
-
-*Postgres's Repeatable Read also prevents phantoms, exceeding the SQL standard.
-
-**Postgres defaults to Read Committed.** That means within a single transaction, each statement sees only committed data — but two statements in the same transaction can see different snapshots if another transaction commits between them. For a balance update, that's dangerous enough to deserve a section of its own.
-
-<Callout kind="warn" title="Read Committed is not safe for concurrent balance updates">
-
-At Read Committed, two concurrent transactions can each read the same balance, compute the same new balance, and both write it back — losing one update entirely. This isn't a Postgres bug. It's exactly what Read Committed promises to allow. The fix is locking, not hoping.
-
-</Callout>
-
-<ExecTimeline
-  title="ACID: what a committed transfer looks like"
-  lanes={[{ id: "tx", label: "Transfer TX" }]}
-  steps={[
-    { lane: "tx", kind: "run", label: "BEGIN", note: "The database opens a transaction. All subsequent operations are wrapped in this unit." },
-    { lane: "tx", kind: "run", label: "SELECT balance FROM accounts", note: "Read the sender's balance — 10000 cents ($100). This read is part of the transaction." },
-    { lane: "tx", kind: "run", label: "INSERT ledger entries (debit + credit)", note: "Post the balanced double-entry pair. Both entries are invisible to other transactions until we commit." },
-    { lane: "tx", kind: "run", label: "UPDATE accounts SET balance = 7000", note: "Subtract $30. Still not visible outside this transaction." },
-    { lane: "tx", kind: "done", label: "COMMIT", note: "All changes become durable and visible atomically. Postgres flushes to the WAL. The transfer is permanent." }
-  ]}
-  caption="Atomicity: every operation commits together or none do. Durability: the WAL ensures the commit survives a crash."
-/>
-
-<UnderTheHood title="How Postgres makes ACID real (Go 1.26 baseline)">
-
-**Atomicity** is enforced by the write-ahead log (WAL). Every change is written to the WAL before it's applied to the heap. If the database crashes mid-transaction, on restart it replays the WAL and rolls back any uncommitted work — the incomplete transaction vanishes as if it never happened.
-
-**Durability** is also the WAL. When you `COMMIT`, Postgres `fsync`s the WAL record to disk before acknowledging success. Even a crash right after the acknowledgement leaves the data recoverable.
-
-**Isolation** (at Read Committed) is implemented via MVCC — Multi-Version Concurrency Control. Every row has a system column `xmin` (the transaction ID that created it) and `xmax` (the transaction ID that deleted it). When you read, Postgres checks whether each row version was committed before your statement started, using a snapshot of the transaction ID space. Writers and readers don't block each other — readers see old versions, writers create new ones. This is why Postgres reads don't block writes and vice versa at Read Committed.
-
-**`SELECT ... FOR UPDATE`** (coming in the next section) steps *outside* MVCC for one purpose: it acquires a real row-level lock so only one transaction can hold it at a time. This is the bridge between MVCC's snapshot reads and the serial behavior we need for balance updates.
-
-*This is a model, not the full implementation — the real MVCC machinery is more nuanced.* The Go 1.26 `database/sql` package provides `db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})` if you want to bump the isolation level for specific transactions.
-
-</UnderTheHood>
-
-<QuickCheck
-  question="What is Postgres's default isolation level, and what anomaly does it NOT prevent?"
-  options={[
-    "Serializable — it prevents all anomalies",
-    "Read Committed — it does not prevent the lost-update anomaly on concurrent balance writes",
-    "Repeatable Read — it does not prevent dirty reads",
-    "Read Uncommitted — it does not prevent phantom reads"
-  ]}
+  code={`avail, _ := available(ctx, tx, merchant) // sum of postings
+if avail < amt {
+	return ErrInsufficient
+}
+ledger.PostTx(ctx, tx, payoutTx(merchant, amt))`}
+  options={["Exactly $100.00", "More than $100.00: many transactions saw the same $100.00", "Less than $100.00", "Postgres raises a serialization error for all but ten"]}
   answer={1}
-  explain="Postgres defaults to Read Committed. At this level dirty reads are prevented, but two concurrent transactions can both read the same balance and both write back, silently losing one update — the lost-update problem."
+  output={`repeatable read, no lock       $500 $500 $500 $500 $500`}
+  explain={"Each transaction reads from a snapshot taken when it began. All fifty see $100.00 available, and all fifty insert new postings; no two touch the same row, so nothing conflicts. Five rounds, five times the limit paid out. Stop 2 explains why Repeatable Read doesn't catch this and Serializable does."}
 />
 
-<ELI5
-  concept="The lost update"
-  analogy="Two people editing the same printed page from their own photocopy."
-  role="reader"
->
+## The lab bench
 
-Two transfers hit the same account at the same instant. Each does the obvious thing: read the balance, subtract, write it back.
+The same PostgreSQL 14.19 and the same ledger as chapter 2 (its schema, plus a version table and a `payouts` table), in a fresh database. The Go module `txlab` uses chapter 2's `ledger` package, which gained one function for this chapter, `PostTx`: it posts inside a database transaction the caller already has open, so postings can commit together with other writes. Experiments live in `cmd/`: `atomic`, `lostupdate`, `payouts`, `deadlock`, and for stop 6, a partner bank (`bank`, a separate HTTP service) and the payout worker (`saga`).
 
-```
-A reads 1000        B reads 1000
-A computes 900      B computes 800
-A writes 900        B writes 800
-```
+## Atomicity
 
-The account started at 1000, paid out 100 and 200, and ends at 800. It should be 700. The bank just gave away 100 — and nothing errored, no constraint fired, both transfers reported success.
+*Stop 1 of 6.*
 
-This is the **lost update**, and it happens because the read and the write are separate steps with a gap in between. B read a value that was already stale by the time it wrote.
+### Step 1: all or nothing
 
-Two ways to close it. **Pessimistic**: take a lock on the row when you read it (`SELECT … FOR UPDATE`), so B waits until A is finished and reads 900. **Optimistic**: don't lock, but include the version you read in the write (`WHERE version = 7`), so B's update matches zero rows, and B retries against fresh data.
+A database **transaction** groups statements so they take effect together or not at all: `BEGIN`, the statements, `COMMIT`. If the process dies, the connection drops, or any statement fails before `COMMIT`, Postgres discards everything the transaction did. That's the **A** in ACID (atomicity). The other three: **C**onsistency (the constraints hold after every commit: chapter 2's balance trigger is one), **I**solation (stop 2), and **D**urability (once `COMMIT` returns, the change survives a crash, because it's in the write-ahead log on disk).
 
-Locking is simpler and costs throughput under contention. Optimistic is faster when conflicts are rare and requires you to actually handle the retry. What is not an option is doing neither, which is where most systems start.
+### Step 2: chapter 2's loop, in one transaction
 
-</ELI5>
+The same random transfers between two wallets, but both `UPDATE`s inside `pgx.BeginFunc`, which commits if the function returns `nil` and rolls back otherwise:
 
-## The Lost-Update Problem
-
-Enough theory. Let's watch the disaster happen in real time.
-
-<Define term="The lost-update problem">
-The **lost-update problem** occurs when two transactions both read the same value, each independently computes a new value based on that read, and both write back — so the second write silently overwrites the first. No error is raised. No constraint is violated. The database happily commits both transactions. In a balance update, this means real money either disappears or gets created from nothing.
-</Define>
-
-**On the job:** At Meridian, `POST /transfers` is hit by payment processors, mobile clients, and batch jobs simultaneously. Any read-compute-write pattern on `accounts.balance_cents` without a lock is a lost-update waiting to happen — and it only manifests under load, not in unit tests.
-
-Two customers are pulling money from the same account simultaneously. Gwendolyn wants to send $30. Marcus wants to send $40. The account has $100. After both transfers succeed, the balance should be $30. Watch what happens without any locking:
-
-<ExecTimeline
-  title="Two concurrent transfers — the lost update"
-  lanes={[
-    { id: "t1", label: "TX 1 — Gwendolyn ($30)" },
-    { id: "t2", label: "TX 2 — Marcus ($40)" }
-  ]}
-  steps={[
-    { lane: "t1", kind: "run", label: "BEGIN + open", note: "TX 1 opens. TX 2 also opens concurrently — both transactions are now in flight at the same time." },
-    { lane: "t2", kind: "run", label: "BEGIN + open", note: "TX 2 begins alongside TX 1. At Read Committed neither holds a lock on the account row yet." },
-    { lane: "t1", kind: "run", label: "SELECT balance → 10000", note: "TX 1 reads the balance: 10000 cents ($100). No lock acquired at Read Committed — TX 2 can read simultaneously." },
-    { lane: "t2", kind: "run", label: "SELECT balance → 10000", note: "TX 2 also reads 10000. Both transactions now believe the balance is $100. This is the root of the bug." },
-    { lane: "t1", kind: "run", label: "UPDATE balance = 7000, COMMIT", note: "TX 1 writes 10000 − 3000 = 7000 and commits. Balance is now $70. TX 2 hasn't committed yet." },
-    { lane: "t2", kind: "run", label: "UPDATE balance = 6000", note: "TX 2 writes 10000 − 4000 = 6000. It computed from the OLD balance read in step 4 — it never saw TX 1's write." },
-    { lane: "t2", kind: "done", label: "COMMIT — balance WRONG", note: "TX 2 commits. Final balance is 6000 cents ($60). Gwendolyn's $30 debit was silently overwritten. $30 vanished." }
-  ]}
-  caption="Lost update: both transactions read 10000, TX 2 computed from the stale value and overwrote TX 1. Correct: $30 (3000 cents). Actual: $60 (6000 cents). $30 destroyed."
-/>
-
-That's the lost-update problem. In a real system it means real money either disappears or gets created from nothing. No exception is thrown. No error is logged. The database happily committed both transactions. It was doing exactly what Read Committed isolation allows.
-
-Let's make this concrete at the Go level too, using goroutines and a shared in-memory balance — because we *can* run that:
-
-<CodeWalk
-  title="The lost-update race, line by line"
-  steps={[
-    { lines: "9", note: "balance is a plain int shared across goroutines with no mutex. In-memory, no database — but the bug is identical to the SQL version. Both read from shared state without a lock.", pose: "idle", role: "banker", state: "active", beat: "problem" },
-    { lines: "14-16", note: "Three separate steps: read, compute, write. Between steps 1 and 3 the goroutine scheduler can context-switch. Another goroutine reads the old value in that gap. This is the lost-update window.", pose: "blocked", role: "banker", state: "warn", beat: "problem" },
-    { lines: "21-23", note: "Both goroutines are launched concurrently. No ordering guaranteed. Gwendolyn and Marcus both read balance=10000 before either writes. Both will compute from the stale value.", pose: "run", role: "banker", state: "bad", beat: "problem" },
-    { lines: "25", note: "Whichever goroutine writes last wins. The other write is silently overwritten. Final balance is 7000 or 6000 depending on scheduling — never 3000 as required.", pose: "panic", role: "banker", state: "bad", beat: "problem" }
-  ]}
-  caption="Read-modify-write with no lock is the lost-update bug. Run this a few times and watch the final balance vary. The race detector catches it instantly."
->
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
-// balance is shared state — in cents, never a float.
-var balance int = 10000 // $100.00
-
-func unsafeTransfer(amount int, name string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	// Read-modify-write with no synchronization: the lost-update bug.
-	current := balance        // Step 1: read
-	newBal := current - amount // Step 2: compute
-	balance = newBal          // Step 3: write (can overwrite a concurrent write)
-	fmt.Printf("%s: read %d, wrote %d\n", name, current, newBal)
-}
-
-func main() {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go unsafeTransfer(3000, "Gwendolyn", &wg) // $30
-	go unsafeTransfer(4000, "Marcus", &wg)    // $40
-	wg.Wait()
-	fmt.Printf("final balance: %d (want 3000)\n", balance)
-}
-```
-
-</GoPlayground>
-
-</CodeWalk>
-
-Run it a few times. You'll see the final balance bounce between 6000, 7000, and occasionally 3000 — a data race. The race detector will catch it instantly.
-
-Here is what the race test looks like — this is the kind of test you write before you write the fix:
-
-```go
-// race_test.go — run with: go test -race ./...
-package ledger_test
-
-import (
-	"sync"
-	"testing"
-)
-
-func TestConcurrentTransfersRace(t *testing.T) {
-	const workers = 50
-	const transferCents = 100 // $1 per transfer
-	balance := 100_000        // $1000.00 starting balance — all in cents
-
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			mu.Lock()
-			defer mu.Unlock()
-			// Correct: the mutex serialises the read-modify-write.
-			if balance < transferCents {
-				return // insufficient funds — skip rather than go negative
+```go noverify
+// main.go, lines 36–45
+			err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+				if _, err := tx.Exec(ctx, `UPDATE wallets SET balance = balance - $2 WHERE id = $1`, from, amt); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx, `UPDATE wallets SET balance = balance + $2 WHERE id = $1`, to, amt)
+				return err
+			})
+			if err != nil {
+				log.Fatal(err)
 			}
-			balance -= transferCents
-		}()
-	}
-
-	wg.Wait()
-
-	// After all transfers the balance must be non-negative and
-	// exactly workers*transferCents less than the start.
-	want := 100_000 - workers*transferCents
-	if balance != want {
-		t.Errorf("balance = %d, want %d", balance, want)
-	}
-	if balance < 0 {
-		t.Errorf("balance went negative: %d", balance)
-	}
-}
 ```
 
-<Callout kind="note" title="This test is the spec for the Lab">
+Killed with `SIGKILL` after two seconds, ten times:
 
-The `go test -race` flag instruments every memory access and reports concurrent reads/writes without a happens-before edge. A clean `-race` run on this test is the bar. Keep it in mind — it comes back in the Lab. Note: `for range workers` uses Go 1.22's range-over-integer syntax, which works unchanged in Go 1.26.
-
-</Callout>
-
-## Pessimistic Locking
-
-The fix for the lost-update problem at the database level is pessimistic locking: acquire a lock on the row *before* you read it, hold that lock until you commit. No other transaction can read or write that row while you hold the lock. You're pessimistic — you assume someone *will* race you, so you prevent it up front.
-
-<Define term="Pessimistic locking / SELECT ... FOR UPDATE">
-**Pessimistic locking** means acquiring an exclusive lock on a resource *before* reading it, holding that lock for the duration of the transaction. In Postgres, the SQL clause is `SELECT ... FOR UPDATE`. It says: "read this row AND lock it — no other transaction may lock or write it until I commit or roll back." You're paying the overhead of lock management on every read, whether or not there's a race. The payoff: zero possibility of a lost update on that row.
-</Define>
-
-**On the job:** Use pessimistic locking on Meridian's account rows any time you do a read-compute-write on `balance_cents`. High-volume accounts (a prize pool, a merchant settlement account) can see hundreds of concurrent transfers — `SELECT ... FOR UPDATE` is the only correct tool there.
-
-In Postgres (and most SQL databases), the spell is `SELECT ... FOR UPDATE`.
-
-```sql
--- Instead of this (racy):
-SELECT balance_cents FROM accounts WHERE id = $1;
-
--- Write this (safe):
-SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE;
+```text
+run 1: killed after 12000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 2: killed after 11000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 3: killed after 13000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 4: killed after 10000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 5: killed after 13000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 6: killed after 13000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 7: killed after 10000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 8: killed after 11000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 9: killed after 12000 transfers; money in the system: 2000.00 (started with 2000.00)
+run 10: killed after 13000 transfers; money in the system: 2000.00 (started with 2000.00)
 ```
 
-The `FOR UPDATE` clause does two things:
-
-1. It reads the row *and* acquires an exclusive row-level lock on it.
-2. Any other transaction that tries to `SELECT ... FOR UPDATE` the same row will **block** until your transaction commits or rolls back.
-
-Watch the same two transfers, now with locking:
-
-<LockAnim
-  title="Two concurrent transfers — SELECT FOR UPDATE makes it correct"
-  resource="balance_cents"
-  frames={[
-    {
-      note: "The account row holds 10000 cents. TX 1 (Gwendolyn, −$30) and TX 2 (Marcus, −$40) arrive at the same instant. The row lock is the door; Postgres holds the only key.",
-      waiting: [],
-      value: "10000"
-    },
-    {
-      note: "TX 1's SELECT … FOR UPDATE reads the balance AND takes the exclusive row lock. It's inside; the row is its alone until COMMIT or ROLLBACK.",
-      beat: "solution",
-      holder: "TX 1 (−3000)",
-      waiting: [],
-      value: "10000"
-    },
-    {
-      note: "TX 2 issues the same SELECT … FOR UPDATE — and BLOCKS at the door. No error, no stale read: Postgres simply parks it until the lock frees. This waiting IS the correctness.",
-      beat: "solution",
-      holder: "TX 1 (−3000)",
-      waiting: ["TX 2 (−4000)"],
-      value: "10000 → 7000"
-    },
-    {
-      note: "TX 1 writes 7000 and COMMITs — the lock releases. Only now does TX 2 unblock, re-read the row, and see the TRUE post-commit balance: 7000, not the stale 10000.",
-      beat: "solution",
-      holder: "TX 2 (−4000)",
-      waiting: [],
-      value: "7000 → 3000"
-    },
-    {
-      note: "TX 2 computes 7000 − 4000 = 3000, writes, commits. Final balance: $30 — both debits applied, zero money lost. The transfers ran concurrently but the ROW saw them serially.",
-      beat: "solution",
-      waiting: [],
-      value: "3000 ✓"
-    }
-  ]}
-  caption="SELECT FOR UPDATE serializes the two transfers at the row: TX 2 waits at the locked door, then reads the real post-commit balance. Final: $30. Correct."
-/>
-
-The transfers are now effectively serialized — one at a time on that account row, even though they ran concurrently. No money lost. No money created.
-
-In Go, using `pgx` (the idiomatic Postgres driver), the lock query looks like this:
-
-```go
-// selectBalanceForUpdate reads the account balance and acquires a row lock.
-// Must be called inside an active transaction (tx).
-func selectBalanceForUpdate(ctx context.Context, tx pgx.Tx, accountID int64) (int64, error) {
-	var balanceCents int64
-	err := tx.QueryRow(ctx,
-		`SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE`,
-		accountID,
-	).Scan(&balanceCents)
-	return balanceCents, err
-}
-```
-
-<Callout kind="warn" title="FOR UPDATE is a database-level lock — not a Go-level mutex">
-
-`SELECT ... FOR UPDATE` acquires a lock *inside the database*. Other Go processes hitting the same Postgres instance are also blocked — it's not limited to your one service instance. This is exactly what you want for a balance update: the lock must be cluster-wide, not just in-process.
-
-</Callout>
-
-<UnderTheHood title="How SELECT FOR UPDATE acquires a row lock (Go 1.26 / Postgres 16+)">
-
-When Postgres executes `SELECT ... FOR UPDATE`, it does something distinct from a normal MVCC read:
-
-1. It finds the target row via normal index/heap scans.
-2. For each row, it calls `LockTuple()` in the lock manager, requesting an `ExclusiveLock` on that specific heap tuple.
-3. If another transaction already holds an incompatible lock (another `FOR UPDATE`, a `FOR SHARE`, or a `FOR NO KEY UPDATE`), the requesting transaction is added to a **wait queue** on that lock. The OS puts the waiter to sleep via a condition variable inside `ProcSleep()`. The lock manager is protected by a lightweight `LWLock`, not a heavyweight lock — fast for the common case where there's no contention.
-4. When the holding transaction commits or rolls back, Postgres calls `UnlockTuple()`, wakes the first waiter in the queue, and the waiter re-checks the lock before proceeding.
-
-The row lock is held for the rest of the transaction — it's released only at `COMMIT` or `ROLLBACK`. This is why you must keep transactions short when using `FOR UPDATE`: long-held row locks create a queue of waiting transactions, and your throughput tanks.
-
-*This description models the lock manager at a conceptual level; the actual implementation spans multiple source files and is more nuanced.*
-
-**Deadlock detection:** Postgres detects deadlocks by periodically traversing the wait-for graph. If TX A waits for a lock held by TX B, and TX B waits for a lock held by TX A, Postgres picks one of the transactions as the victim and rolls it back with `ERROR: deadlock detected` — which one is chosen is difficult to predict and should not be relied upon. Go code receives this as an error from `tx.Exec` and must retry the transaction from scratch. We'll show the deadlock-safe lock ordering in the next section.
-
-</UnderTheHood>
+Ten out of ten intact. A kill between the two statements now kills an uncommitted transaction, and Postgres rolls it back. Chapter 2's ledger was built this way from the start: `Post` writes a transaction's postings in one database transaction, so a crash can never leave half a transaction in the ledger.
 
 <QuickCheck
-  question={'What does `SELECT ... FOR UPDATE` do that a plain `SELECT` does not?'}
+  question="The process is killed after the first UPDATE of a transfer, inside BEGIN ... COMMIT. What does the database hold?"
   options={[
-    "It reads a more recent snapshot of the data",
-    "It acquires an exclusive row-level lock that blocks other transactions from locking the same row until this transaction commits or rolls back",
-    "It prevents the row from being deleted",
-    "It bumps the isolation level to Serializable for the whole transaction"
+    "The first UPDATE",
+    "Neither UPDATE: the transaction never committed, so Postgres rolls it back",
+    "Both UPDATEs",
+    "It depends on the isolation level"
   ]}
   answer={1}
-  explain="SELECT FOR UPDATE reads the row AND acquires an exclusive row lock. Other transactions attempting SELECT FOR UPDATE (or any lock-acquiring operation) on the same row will block until this transaction ends. A plain SELECT at Read Committed does not acquire any lock."
+  explain="An uncommitted transaction's changes are never visible to anyone and are discarded when its connection dies. Measured: 10 of 10 killed runs kept exactly $2,000.00."
 />
 
-## Optimistic Locking
+## Isolation
 
-Pessimistic locking is correct, but it serializes all writes to a row. If contention is low — most of the time nobody races you — you're paying the overhead of lock management and blocking for a scenario that rarely happens. **Optimistic locking** assumes you won't be raced, and detects the collision after the fact instead of preventing it up front.
+*Stop 2 of 6.*
 
-<Define term="Optimistic locking">
-**Optimistic locking** lets a transaction proceed without acquiring any lock, then checks at commit time whether the data changed under it. The standard implementation adds a **version column** — an integer that increments on every update. At write time, the `UPDATE` includes `WHERE version = $old_version`: if zero rows are affected, another transaction won the race and changed the version first. The current transaction retries from scratch. Optimistic locking wins when contention is low (most writes don't race); it degrades into a thundering-herd problem when contention is high.
-</Define>
+### Step 1: what a transaction sees
 
-**On the job:** Optimistic locking is the right choice for Meridian's user profile updates or currency preferences — fields that are rarely written concurrently. It's the wrong choice for `balance_cents` on a high-volume account.
+When transactions run at the same time, **isolation** decides what each sees of the others. The SQL standard defines levels by the anomalies they allow; Postgres implements three:
 
-The pattern uses a **version column**: an integer that increments on every update. The transaction reads the current version, does its work, and then updates only if the version *hasn't changed*. If another transaction beat you, the version has changed and your update affects zero rows — that's your signal to retry.
+- **Read Committed** (the default): each statement sees everything committed before *it* started. Two `SELECT`s in one transaction can see different data.
+- **Repeatable Read**: the whole transaction sees one **snapshot**, taken at its first statement. Rows updated by others after that are invisible, and updating a row someone else changed and committed meanwhile aborts with a serialization failure (SQLSTATE `40001`).
+- **Serializable**: the result is guaranteed to be the same as running the transactions one after another in some order. Postgres does it by watching what each transaction read and wrote (Serializable Snapshot Isolation) and aborting one with `40001` when a dangerous pattern appears. The application must retry.
 
-```sql
--- Schema: add a version column to accounts
-ALTER TABLE accounts ADD COLUMN version INT NOT NULL DEFAULT 1;
+### Step 2: the lost update
 
--- Optimistic update: only succeeds if nobody changed the row since we read it
-UPDATE accounts
-SET balance_cents = $1, version = version + 1
-WHERE id = $2 AND version = $3;
--- If rowsAffected == 0, someone else changed it first → retry the transaction
+Sixteen workers each add $1.00 to one cached balance 500 times: $8,000.00 in total. Three ways:
+
+```go noverify
+// main.go, lines 27–44
+	// Read the balance into Go, add, write the result back.
+	readModifyWrite := func(iso pgx.TxIsoLevel) func() error {
+		return func() error {
+			return pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: iso}, func(tx pgx.Tx) error {
+				var b int64
+				if err := tx.QueryRow(ctx, `SELECT balance FROM counter WHERE id = 1`).Scan(&b); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx, `UPDATE counter SET balance = $1 WHERE id = 1`, b+100)
+				return err
+			})
+		}
+	}
+	// Let the database do the addition.
+	increment := func() error {
+		_, err := db.Exec(ctx, `UPDATE counter SET balance = balance + 100 WHERE id = 1`)
+		return err
+	}
 ```
 
-Here's the full Go implementation of an optimistic transfer:
+```text
+read-modify-write, read committed    balance $1144.00 of $8000.00; 6856 updates lost; 0 aborted with 40001
+read-modify-write, repeatable read   balance $1676.00 of $8000.00; 0 updates lost; 6324 aborted with 40001
+balance = balance + 100              balance $8000.00 of $8000.00; 0 updates lost; 0 aborted with 40001
+```
 
-```go
-// ErrConflict signals that another transaction committed before us.
-// The caller should retry the whole operation.
-var ErrConflict = errors.New("optimistic conflict: row was modified by another transaction")
+At Read Committed, read-modify-write lost **6,856 of 8,000** additions: two workers read the same balance, each wrote back its own "balance + 1", and one overwrote the other. At Repeatable Read, nothing was lost silently, but 6,324 transactions were aborted with `40001` because another had changed the row after their snapshot; without a retry loop that's 6,324 failed requests. `balance = balance + 100` in SQL lost nothing at the default level: the database reads and writes the row under its lock, in one step. (That's why chapter 2's `Post` updates cached balances this way.)
 
-// transferOptimistic attempts a balance debit using optimistic locking.
-// It retries up to maxRetries times on conflict.
-func transferOptimistic(
-	ctx context.Context,
-	db *pgxpool.Pool,
-	accountID int64,
-	amountCents int64,
-	maxRetries int,
-) error {
-	for attempt := range maxRetries {
-		err := tryTransferOptimistic(ctx, db, accountID, amountCents)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, ErrConflict) {
-			return err // real error — don't retry
-		}
-		// Exponential backoff with jitter would go here in production.
-		// For clarity, we just loop.
-		_ = attempt
-	}
-	return fmt.Errorf("transfer failed after %d retries: %w", maxRetries, ErrConflict)
+### Step 3: write skew, the anomaly with no shared row
+
+The payout rule reads many rows (a merchant's postings) and writes new ones (a payout's postings). No two payouts update the same row, so nothing in stop 2's list conflicts. Fifty $10.00 payouts race for a merchant's $100.00, five rounds per strategy:
+
+```go noverify
+// payouts.go, lines 18–72
+var ErrInsufficient = errors.New("insufficient balance")
+
+// available is what Meridian owes the merchant: the negated balance of
+// its liability account, derived from the postings.
+func available(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, merchant string) (int64, error) {
+	var b int64
+	err := q.QueryRow(ctx, `SELECT coalesce(sum(amount), 0) FROM postings WHERE account_id = $1`, merchant).Scan(&b)
+	return -b, err
 }
 
-func tryTransferOptimistic(
-	ctx context.Context,
-	db *pgxpool.Pool,
-	accountID int64,
-	amountCents int64,
-) error {
-	tx, err := db.Begin(ctx)
+func payoutTx(merchant string, amt int64) ledger.Transaction {
+	tx, err := ledger.NewTransaction("payout",
+		ledger.Leg(merchant, money.New(amt, money.USD)),
+		ledger.Leg("assets:bank:usd", money.New(-amt, money.USD)))
 	if err != nil {
-		return err
+		panic(err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck — intentional best-effort rollback
+	return tx
+}
 
-	// 1. Read current balance and version — no lock acquired.
-	var balanceCents int64
-	var version int
-	err = tx.QueryRow(ctx,
-		`SELECT balance_cents, version FROM accounts WHERE id = $1`,
-		accountID,
-	).Scan(&balanceCents, &version)
-	if err != nil {
-		return err
-	}
+// Strategy is one way of making "check the balance, then pay out" safe
+// (or not) when many payouts run at once.
+type Strategy func(ctx context.Context, db *pgxpool.Pool, merchant string, amt int64) (retries int, err error)
 
-	// 2. Check funds — business logic, not a DB constraint.
-	if balanceCents < amountCents {
-		return errors.New("insufficient funds")
+// Naive checks and posts in one transaction at the given isolation level,
+// with no locks. Read Committed and Repeatable Read both let two payouts
+// see the same balance.
+func Naive(iso pgx.TxIsoLevel) Strategy {
+	return func(ctx context.Context, db *pgxpool.Pool, merchant string, amt int64) (int, error) {
+		return 0, pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: iso}, func(tx pgx.Tx) error {
+			avail, err := available(ctx, tx, merchant)
+			if err != nil {
+				return err
+			}
+			if avail < amt {
+				return ErrInsufficient
+			}
+			_, err = ledger.PostTx(ctx, tx, payoutTx(merchant, amt))
+			return err
+		})
 	}
+}
 
-	// 3. Compare-and-swap: only update if version hasn't changed.
-	tag, err := tx.Exec(ctx,
-		`UPDATE accounts
-		    SET balance_cents = $1, version = version + 1
-		  WHERE id = $2 AND version = $3`,
-		balanceCents-amountCents, accountID, version,
-	)
-	if err != nil {
-		return err
+// Serializable runs the same code at SERIALIZABLE and retries when
+// Postgres aborts it with a serialization failure (SQLSTATE 40001).
+func Serializable(ctx context.Context, db *pgxpool.Pool, merchant string, amt int64) (int, error) {
+	for retries := 0; ; retries++ {
+		_, err := Naive(pgx.Serializable)(ctx, db, merchant, amt)
+		if !isCode(err, "40001") {
+			return retries, err
+		}
 	}
-	if tag.RowsAffected() == 0 {
-		// Zero rows updated → someone else changed the version first.
-		return ErrConflict
-	}
-
-	return tx.Commit(ctx)
 }
 ```
 
-`for attempt := range maxRetries` uses Go 1.22's range-over-integer syntax, unchanged in Go 1.26.
+```text
+strategy                       paid out per round (5 rounds; limit $100.00) retries  time/round
+read committed, no lock        $150 $500 $500 $500 $500                           0  45ms
+repeatable read, no lock       $500 $500 $500 $500 $500                           0  9ms
+serializable + retry           $100 $100 $100 $100 $100                         863  27ms
+SELECT ... FOR UPDATE          $100 $100 $100 $100 $100                           0  16ms
+optimistic (version) + retry   $100 $100 $100 $100 $100                        1173  51ms
+```
 
-### When to choose optimistic vs. pessimistic
+Read the first two rows. At **Read Committed**, $150 and then $500 paid out from $100. At **Repeatable Read**, $500 every round: all fifty snapshots said $100.00 was available, and all fifty inserted. This is **write skew**: each transaction's decision was correct for the data it read, and together they broke the rule. Repeatable Read can't see it, because it only aborts writes to the *same row*.
 
-<ConceptGrid cols={2}>
-  <ConceptCard label="Use pessimistic (FOR UPDATE) when...">Contention is high — the same account is hit by many concurrent transfers. A payment processing queue where many workers drain one account. You cannot afford retries (strict latency SLAs). The operation has expensive side effects you don't want to repeat.</ConceptCard>
-  <ConceptCard label="Use optimistic (version column) when...">Contention is low — most transfers hit different accounts. You're writing a distributed system where lock-holding across network calls would be disastrous. Retries are cheap and safe. The happy path (no conflict) must be as fast as possible.</ConceptCard>
-  <Gotcha>Never use optimistic locking for the account balance if your service handles burst traffic on popular accounts (e.g., a prize account hit by 10,000 concurrent claimants). At high contention, every transaction retries repeatedly, and you've turned a locking problem into a thundering-herd problem. Use FOR UPDATE there.</Gotcha>
-</ConceptGrid>
+**Serializable** paid exactly $100 every round. Postgres tracked that each payout read the merchant's postings and another inserted into them, found the cycle, and aborted the losers with `40001`; `Serializable` retried them (863 retries over five rounds), and the retries saw the new balance and were refused.
 
-## Safe Concurrent Transfers
+<BankAnim
+  title="Two payouts, one $10.00 balance"
+  kicker="write skew · live"
+  queueLabel="payout requests"
+  streetLabel="paid"
+  windows={[{ label: "payout A", sub: "repeatable read" }, { label: "payout B", sub: "repeatable read" }]}
+  accounts={[{ id: "m", label: "owed to merchant", balance: "$10.00" }]}
+  customers={[{ id: "a", label: "$10.00", role: "banker" }, { id: "b", label: "$10.00", role: "banker", look: "pink" }]}
+  events={[
+    { at: 0, who: "a", to: "queue" }, { at: 0, who: "b", to: "queue", note: "Meridian owes a merchant $10.00. Two payout requests of $10.00 arrive together." },
+    { at: 1.0, who: "a", to: "w0", say: "sees $10.00: ok" }, { at: 1.0, who: "b", to: "w1", say: "sees $10.00: ok", note: "Each transaction reads the merchant's postings from its own snapshot. Both see $10.00 available." },
+    { at: 2.2, who: "a", say: "INSERT postings" }, { at: 2.2, who: "b", say: "INSERT postings", note: "Each inserts new postings. They write different rows, so nothing conflicts." },
+    { at: 3.2, account: "m", balance: "−$10.00", flash: "bad", beat: "problem", note: "Both commit. $20.00 paid out of $10.00: each decision was right for its snapshot, and together they broke the rule. Measured: $500 paid from $100 in every Repeatable Read round." },
+    { at: 3.4, who: "a", to: "street", say: null }, { at: 3.4, who: "b", to: "street", say: null, mood: "bad" },
+    { at: 4.8, account: "m", balance: "$10.00", flash: null }, { at: 4.8, who: "a", to: "w0", say: "FOR UPDATE: got the lock", beat: "solution", note: "Replay with SELECT ... FOR UPDATE on the merchant's account first (stop 3). A takes the row lock." },
+    { at: 4.8, who: "b", to: "queue", say: "waiting for the lock", mood: "wait" },
+    { at: 5.8, who: "a", to: "street", say: "paid" }, { at: 5.8, account: "m", balance: "$0.00", flash: "ok" },
+    { at: 6.4, who: "b", to: "w1", say: "sees $0.00: refused", mood: "bad", beat: "solution", note: "B gets the lock only after A commits, reads $0.00, and is refused. Measured: exactly $100 paid in every round." }
+  ]}
+  caption="No shared row, no conflict, and the rule is broken anyway. Something has to make the second payout see the first."
+/>
 
-Now we put it all together. A production transfer between two accounts — with both sides locked, a funds check, and the double-entry ledger posted inside the same transaction.
+<QuickCheck
+  question="Why doesn't Repeatable Read stop fifty payouts from each spending the same $100.00?"
+  options={[
+    "It isn't implemented in Postgres",
+    "Each transaction reads a consistent snapshot and inserts new rows; Repeatable Read only aborts writes to rows another transaction changed, and these writes never touch the same row",
+    "The payouts use different connections",
+    "Repeatable Read is weaker than Read Committed"
+  ]}
+  answer={1}
+  explain="This is write skew: the conflict is between what one transaction read and what another wrote. Only Serializable tracks reads, or you lock something every payout must touch (stop 3)."
+/>
 
-But first: **deadlocks**.
+## Pessimistic
 
-<Define term="Deadlock">
-A **deadlock** occurs when two or more transactions are each waiting for a lock held by the other, forming a cycle in the wait-for graph. Neither can proceed. Example: TX 1 locks account A then waits for account B; TX 2 has locked account B and is waiting for account A. Postgres detects this within `deadlock_timeout` (default 1 second) and aborts one transaction with `ERROR: deadlock detected`. The aborted transaction must be retried from scratch. Prevention is better than detection — lock multiple rows in a deterministic order.
-</Define>
+*Stop 3 of 6.*
 
-**On the job:** Deadlocks between transfers are the most common liveness bug in fintech database code. They're invisible in single-threaded tests and emerge under concurrent load. The fix costs one comparison.
+### Step 1: lock first, then check
 
-If TX 1 locks account A then tries to lock account B, while TX 2 locks account B then tries to lock account A — they deadlock. The fix is a deterministic lock order: always lock accounts in ascending order of their ID, regardless of which is the sender and which is the receiver.
+If every payout for a merchant must take the same lock before reading the balance, they run one at a time, and each sees the previous one's postings. `SELECT ... FOR UPDATE` on the merchant's row in `accounts` is that lock: the row isn't changed, it's used as a turnstile:
 
-```go
-// TransferCents moves amountCents from senderID to receiverID.
-// It posts balanced double-entry ledger entries and updates both
-// account balances inside a single ACID transaction.
-// Accounts are locked in ascending ID order to prevent deadlocks.
-func TransferCents(
-	ctx context.Context,
-	db *pgxpool.Pool,
-	senderID, receiverID int64,
-	amountCents int64,
-	description string,
-) error {
-	if amountCents <= 0 {
-		return errors.New("transfer amount must be positive")
-	}
-	if senderID == receiverID {
-		return errors.New("sender and receiver must be different")
-	}
-
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck — rollback on any early return
-
-	// --- Step 1: lock both accounts in a consistent order (lower ID first) ---
-	// This is the deadlock prevention. Without it, two concurrent transfers
-	// between accounts A and B can deadlock if they lock in opposite orders.
-	first, second := senderID, receiverID
-	if receiverID < senderID {
-		first, second = receiverID, senderID
-	}
-
-	type accountRow struct {
-		id           int64
-		balanceCents int64
-	}
-
-	var accs [2]accountRow
-	rows, err := tx.Query(ctx,
-		`SELECT id, balance_cents
-		   FROM accounts
-		  WHERE id = ANY($1)
-		  ORDER BY id
-		  FOR UPDATE`,
-		[]int64{first, second},
-	)
-	if err != nil {
-		return fmt.Errorf("lock accounts: %w", err)
-	}
-	i := 0
-	for rows.Next() {
-		if err := rows.Scan(&accs[i].id, &accs[i].balanceCents); err != nil {
-			rows.Close()
+```go noverify
+// payouts.go, lines 74–91
+// ForUpdate takes a row lock on the merchant's account first, so payouts
+// for one merchant run one at a time.
+func ForUpdate(ctx context.Context, db *pgxpool.Pool, merchant string, amt int64) (int, error) {
+	return 0, pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE`, merchant); err != nil {
 			return err
 		}
-		i++
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read locked accounts: %w", err)
-	}
-	if i != 2 {
-		return errors.New("one or both accounts not found")
-	}
-
-	// Map back: which locked row is sender, which is receiver?
-	var senderBal, receiverBal int64
-	for _, a := range accs {
-		if a.id == senderID {
-			senderBal = a.balanceCents
-		} else {
-			receiverBal = a.balanceCents
+		avail, err := available(ctx, tx, merchant)
+		if err != nil {
+			return err
 		}
-	}
-
-	// --- Step 2: business rule — sufficient funds ---
-	if senderBal < amountCents {
-		return fmt.Errorf("insufficient funds: have %d cents, need %d", senderBal, amountCents)
-	}
-
-	// --- Step 3: post the balanced double-entry ledger entries ---
-	_, err = tx.Exec(ctx,
-		`INSERT INTO ledger_entries (account_id, amount_cents, description, created_at)
-		 VALUES ($1, $2, $3, NOW()),
-		        ($4, $5, $3, NOW())`,
-		senderID, -amountCents, description,
-		receiverID, amountCents, description,
-	)
-	if err != nil {
-		return fmt.Errorf("post ledger entries: %w", err)
-	}
-
-	// --- Step 4: update both balances atomically ---
-	_, err = tx.Exec(ctx,
-		`UPDATE accounts
-		    SET balance_cents = CASE id
-		        WHEN $1 THEN balance_cents - $3
-		        WHEN $2 THEN balance_cents + $3
-		    END
-		  WHERE id = ANY($4)`,
-		senderID, receiverID, amountCents, []int64{senderID, receiverID},
-	)
-	if err != nil {
-		return fmt.Errorf("update balances: %w", err)
-	}
-
-	// Sanity check: no negative balances (belt-and-suspenders; a DB constraint also enforces this)
-	if senderBal-amountCents < 0 || receiverBal+amountCents < 0 {
-		return errors.New("balance invariant violated — rolling back")
-	}
-
-	return tx.Commit(ctx)
+		if avail < amt {
+			return ErrInsufficient
+		}
+		_, err = ledger.PostTx(ctx, tx, payoutTx(merchant, amt))
+		return err
+	})
 }
 ```
 
-<ExecTimeline
-  title="Safe transfer: BEGIN → lock in order → check funds → post entries → COMMIT"
-  lanes={[{ id: "tx", label: "TransferCents()" }]}
-  steps={[
-    { lane: "tx", kind: "run", label: "BEGIN", note: "Open the transaction. All subsequent operations are wrapped in this ACID unit." },
-    { lane: "tx", kind: "run", label: "SELECT ... ORDER BY id FOR UPDATE", note: "Lock BOTH accounts in ascending ID order. Any concurrent transfer on the same pair will block here, not deadlock." },
-    { lane: "tx", kind: "run", label: "Check: senderBal >= amountCents", note: "Apply the business rule inside the lock. The balance we read is guaranteed stable — no other transaction can change it." },
-    { lane: "tx", kind: "run", label: "INSERT ledger_entries (debit + credit)", note: "Post the balanced double-entry pair. Both entries are written in the same transaction — either both commit or neither does." },
-    { lane: "tx", kind: "run", label: "UPDATE accounts SET balance_cents", note: "Decrement sender, increment receiver. Both updates in one statement." },
-    { lane: "tx", kind: "done", label: "COMMIT", note: "All changes are durable and visible atomically. Row locks are released. Concurrent transfers on these accounts can now proceed." }
+In the table above: **$100 every round, no retries, 16 ms a round**. The fifty payouts queue on the lock; each, once in, reads a balance that includes everything committed before it.
+
+### Step 2: what it costs
+
+The lock is held until the transaction commits, so everything the transaction does while holding it (queries, and anything slow a careless handler might do, like calling another service) adds to everyone else's wait. Keep the locked section short, and lock only what the rule is about: one merchant's payouts wait for each other, but not for other merchants'.
+
+<QuickCheck
+  question="Why lock the merchant's row in accounts, which the payout never changes?"
+  options={[
+    "Postgres requires it",
+    "Every payout for that merchant must take the same lock before reading its balance, so they run one at a time and each sees the one before; the row is just the thing they all agree to lock",
+    "To make the INSERT faster",
+    "To stop other merchants' payouts"
   ]}
-  caption="The lock-in-order pattern prevents deadlocks. Funds check happens inside the lock — no TOCTOU race possible."
+  answer={1}
+  explain="The rule is about one merchant's balance, spread over many posting rows. Locking a single row that stands for the merchant serialises exactly the transactions that could conflict, and nothing else."
 />
 
-<Callout kind="pro" title="Always lock in a deterministic order">
+## Optimistic
 
-The single most common cause of database deadlocks in fintech systems is two transfers between the same pair of accounts locking in opposite orders. Account A → B deadlocks with B → A. Sorting by ID (or any stable key) before acquiring locks eliminates this entire class of bug. It costs one comparison. Do it.
+*Stop 4 of 6.*
 
-</Callout>
+### Step 1: check at the end
 
-<MentalModel
-  title="A saga cannot roll back, so it apologises in the correct order"
-  concept="Sagas and compensation"
-  metaphor="Cancelling a holiday one booking at a time"
-  analogy="A database transaction can undo work because nothing was ever visible outside it. Across services that is gone: once the payment provider has taken the money, no ROLLBACK reaches into their system. A saga accepts this. It runs the steps in order, and if step four fails it walks BACKWARDS running a compensating action for each completed step — refund the charge, release the reserved funds, unbook the seat. Compensation is not undo, because the original effect really happened and remains in the record. It is a second, opposite action that leaves the world in an acceptable state."
-  realWorld="Cancelling a holiday. The airline refunds, the hotel releases the room, the car hire cancels — three separate apologies in reverse order, not one magic rewind."
-  goCode="Every compensating step must itself be idempotent and retryable, because the compensation can fail too. A refund that runs twice is a second bug, not a recovery."
-  takeaway="Some steps have no compensation — an email that has been sent cannot be unsent. Order the saga so irreversible steps come last, after everything reversible has already succeeded."
-  role="medic"
-/>
+**Optimistic** concurrency control takes no lock while working. It reads a **version** number along with the data, does its work, and commits only if the version is still the same, bumping it in the same statement. If someone else committed first, the version has moved, the update matches no row, and the transaction starts over:
 
-## Sagas & Compensating Actions
-
-ACID transactions are powerful, but they have a hard limit: they work when *all the operations you need to make atomically live inside one database*. Reality is messier.
-
-Consider this Meridian transfer: debit the user's wallet in the ledger service, then credit their external bank account via the ACH network. These are two different systems. You cannot put them in one `BEGIN`/`COMMIT` block. If the ACH call succeeds but the ledger service crashes before recording it, or vice versa — you have a split-brain transfer.
-
-This is the problem **sagas** solve.
-
-Forward until something breaks, then compensate BACKWARD — the whole shape of a saga in one run:
-
-<JourneyAnim
-  title="Cross-bank transfer saga: step 3 fails, steps 2 and 1 unwind"
-  hops={[
-    { id: "wallet", label: "1 · debit wallet", role: "banker" },
-    { id: "escrow", label: "2 · reserve escrow", role: "guard" },
-    { id: "ach", label: "3 · submit ACH", role: "operator" },
-    { id: "done", label: "settled", role: "scribe" }
-  ]}
-  frames={[
-    {
-      note: "Step 1: debit $200 from the user's wallet — a local Postgres transaction that COMMITS for real. There is no global lock being held; this money is genuinely gone from the wallet.",
-      at: "wallet"
-    },
-    {
-      note: "Step 2: reserve $200 in escrow — another local commit, in its own database. Two steps done, each independently durable. The saga's state machine records how far we got.",
-      at: "escrow"
-    },
-    {
-      note: "Step 3: submit to the ACH network… REJECTED (bad routing number, say). Here is the crisis: steps 1 and 2 are already committed. ROLLBACK does not exist across systems. The money is in limbo.",
-      beat: "problem",
-      at: "ach",
-      failed: true
-    },
-    {
-      note: "The saga unwinds — newest first. Compensate step 2: RELEASE the escrow reservation. Not a rollback; a brand-new committed transaction that reverses the business effect, visible forever in the audit log.",
-      beat: "solution",
-      at: "escrow"
-    },
-    {
-      note: "Compensate step 1: CREDIT $200 back to the wallet. Again a new ledger entry — the original debit and this credit BOTH remain in history, netting to zero. Auditors see what happened and that it was corrected.",
-      beat: "solution",
-      at: "wallet"
-    },
-    {
-      note: "Final state: books net to zero, every system consistent, full audit trail of the failure. That is a saga — atomicity rebuilt out of ordinary local transactions plus the discipline of writing a compensation for every step BEFORE you ship it.",
-      beat: "solution",
-      at: "wallet"
-    }
-  ]}
-  caption="A saga commits forward step by step; on failure it walks BACKWARD issuing compensations — new transactions that reverse effects. No distributed lock, no two-phase commit, full auditability."
-/>
-
-
-<Define term="Saga">
-A **saga** is a sequence of local ACID transactions, one per service or system, each of which commits independently. Instead of one global atomic commit across multiple systems (which is impossible without a distributed coordinator), a saga achieves **eventual consistency** — with the guarantee that if any step fails, every preceding step is reversed by a **compensating action**. A saga is not a hack; it's the correct model for multi-system money movement, used in production at every major payments company.
-</Define>
-
-**On the job:** Meridian's cross-bank transfer is a saga: debit the wallet (local Postgres), reserve escrow (local Postgres), submit to ACH (external). Any of these can fail independently. A saga with compensating actions is what keeps the books correct when step 3 fails after steps 1 and 2 already committed.
-
-### What a saga is
-
-A saga is a **sequence of local transactions**, where each step commits to its own database. Instead of a global atomic commit, you get eventual consistency — with the guarantee that if any step fails, every *preceding step* is undone by a **compensating action**.
-
-<Define term="Compensating action / transaction">
-A **compensating action** (also called a compensating transaction) is a new, committed database transaction that reverses the *business effect* of a previously committed step. It is NOT a `ROLLBACK` — that would make the change invisible. A compensation is a new ledger entry that is permanently visible in the audit log. Example: a debit of $200 is compensated by a credit of $200 — both appear in the ledger, and together they net to zero. This is mandatory for regulated financial systems: auditors need to see what happened and that it was corrected, not a sanitized view where the failure never occurred.
-</Define>
-
-Every step has a companion:
-
-| Forward Action | Compensating Action |
-|---|---|
-| Debit sender wallet | Credit sender wallet (reverse debit) |
-| Reserve funds in escrow | Release escrow hold |
-| Submit ACH transfer | Initiate ACH return / reversal |
-| Notify recipient | Send "transfer failed" notification |
-
-A compensating action is not a rollback — it's a new, committed transaction that reverses the business effect of a previous one. The failed step and the compensation are *both* in the ledger's audit trail. That's a feature, not a bug.
-
-### Orchestration vs. choreography
-
-<Define term="Orchestration vs. choreography">
-**Orchestration** uses a central **saga orchestrator** — a dedicated service or state machine — that knows the full step sequence, calls each step, and triggers compensating actions on failure. The orchestrator is the single source of truth for saga state. **Choreography** uses no central coordinator: each service publishes events ("DebitSucceeded") and subscribes to events from others ("ACHFailed"), and the saga emerges from the event flow. Orchestration is easier to reason about and observe; choreography is more decoupled but harder to trace. For money movement at Meridian, prefer orchestration — a money transfer needs a clear, auditable state machine.
-</Define>
-
-**On the job:** Choreography sounds elegant until you have to debug a half-executed saga in production at 2am. An orchestrated saga has a `saga_state` table — you can query it. A choreographed saga's state is implicit in a dozen event handlers across five services.
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Orchestration">A central **saga orchestrator** (a dedicated service or state machine) knows the full sequence. It calls step 1, waits for success, calls step 2, and so on. If any step fails, it calls the compensating actions in reverse order. The orchestrator is the single source of truth for saga state. Easier to reason about, easier to observe, but the orchestrator is a bottleneck and a single point of failure.</ConceptCard>
-  <ConceptCard label="Choreography">Each service **publishes events** and subscribes to the events of others. "DebitSucceeded" triggers the ACH submission. "ACHFailed" triggers the compensation. No central coordinator — the saga emerges from the event flow. Decoupled and scalable, but harder to trace and debug. The saga's state is implicit in the event stream.</ConceptCard>
-</ConceptGrid>
-
-For fintech, **orchestration is usually the right choice for the saga itself** — you want a clear, observable state machine for a money movement, not implicit behavior spread across a dozen event handlers. Use choreography for the notifications and downstream side effects.
-
-### A saga unwinding via compensating actions
-
-Here is what happens when step 3 of a cross-service Meridian transfer fails — and the saga correctly compensates:
-
-<ExecTimeline
-  title="Cross-service transfer saga — step 3 fails, saga unwinds"
-  lanes={[
-    { id: "orch", label: "Saga Orchestrator" },
-    { id: "ledger", label: "Ledger Service" },
-    { id: "ach", label: "ACH Gateway" }
-  ]}
-  steps={[
-    { lane: "orch", kind: "run", label: "Start saga: debit $200", note: "Orchestrator begins the saga. It persists saga state ('STARTED') to its own database before calling step 1." },
-    { lane: "ledger", kind: "run", label: "Step 1: Debit sender ($200)", note: "Ledger service posts the debit in a local ACID transaction. Commits. Returns success to orchestrator." },
-    { lane: "orch", kind: "run", label: "Step 2: Reserve escrow", note: "Orchestrator records step 1 succeeded, then calls step 2. Saga state: 'DEBITED'." },
-    { lane: "ledger", kind: "run", label: "Step 2: Hold $200 in escrow", note: "Ledger creates an escrow hold. Commits locally. Returns success." },
-    { lane: "ach", kind: "block", label: "Step 3: Submit ACH — FAILS", note: "ACH gateway returns an error: bank account closed. Step 3 failed. Orchestrator receives the error and begins compensating." },
-    { lane: "ledger", kind: "run", label: "Compensate step 2: Release escrow", note: "Orchestrator calls compensation for step 2 first (LIFO order). Ledger reverses the escrow hold. Commits." },
-    { lane: "ledger", kind: "done", label: "Compensate step 1: Credit sender", note: "Orchestrator calls compensation for step 1. Ledger credits the $200 back to the sender. Commits. Saga state: 'COMPENSATED'." }
-  ]}
-  caption="The saga unwinds in reverse order. Each compensation is a new committed transaction — both the forward actions and compensations appear in the audit log. Eventually consistent, never lost."
-/>
-
-### Combining the saga with the transactional outbox
-
-There's a subtle bug lurking in a naive saga implementation: what if the orchestrator successfully calls `DebitSender` but *crashes before it can record that step 1 succeeded* and trigger step 2? On restart, does it retry step 1 (double-debit!) or skip it (inconsistent)?
-
-The answer is the **transactional outbox** — covered in depth in the Idempotency & Exactly-Once Semantics chapter. The short version: every state transition in the saga is written to an `outbox` table inside the *same* local ACID transaction as the saga state update. A separate outbox relay process reads unprocessed outbox records and fires the next saga step (or the compensating action) reliably — with at-least-once delivery and idempotent handlers. If the orchestrator crashes, the relay picks up where it left off, using the outbox as a durable work queue.
-
-```
-saga_state table (orchestrator DB)          outbox table (same DB, same TX)
-┌─────────────────────────────────┐         ┌──────────────────────────────────┐
-│ id │ step    │ status           │         │ id │ saga_id │ event_type        │
-│ 42 │ DEBITED │ COMPENSATING ... │  ──TX── │ 7  │ 42      │ debit_compensate  │
-└─────────────────────────────────┘         └──────────────────────────────────┘
-         ↑ both written in one BEGIN/COMMIT
-         Relay reads outbox and calls compensating action exactly once
-```
-
-<UnderTheHood title="Why sagas are not rollbacks — and why that matters for auditability">
-
-A database `ROLLBACK` is invisible: it undoes changes as if they never happened, and nothing appears in the audit log. A saga compensation is the opposite: it is a *committed* transaction that explicitly reverses a business effect, and both the original action and the compensation are permanently visible in your ledger.
-
-For a regulated financial system, this is mandatory. Your auditor wants to see that $200 was debited at 14:23:01, an ACH submission failed at 14:23:07, and a compensating credit was posted at 14:23:08. They want the full event history, not a cleaned-up state as if the failure never happened.
-
-This is why Meridian's ledger is **append-only** (see the Double-Entry Ledgers chapter) and why a saga compensation posts a new ledger entry rather than deleting the original one. Immutability of the audit trail is a compliance requirement, not an implementation detail.
-
-</UnderTheHood>
-
-<CodeWalk
-  title="RunSaga: forward and compensate, line by line"
-  steps={[
-    { lines: "9-13", note: "SagaStep pairs each forward action with its compensation. Both are functions so they can call real services, post ledger entries, or do nothing. The struct enforces the discipline: you cannot define a step without also defining its undo.", pose: "scribe", role: "banker", state: "active", beat: "neutral" },
-    { lines: "18-19", note: "completed tracks only the steps that actually succeeded. If step 3 fails, only steps 1 and 2 are in this slice. We only compensate what was committed.", pose: "run", role: "banker", state: "active", beat: "neutral" },
-    { lines: "21-22", note: "Execute the forward action. If it returns nil, the step committed. Append it to completed so we know to compensate it if something later fails.", pose: "run", role: "banker", state: "active", beat: "neutral" },
-    { lines: "23-35", note: "A step failed. Walk completed in LIFO order — newest first — and call each Compensate. This is not a ROLLBACK. Each compensation is a new committed transaction that reverses the business effect. Both actions stay in the audit log.", pose: "carry", role: "banker", state: "warn", beat: "problem" },
-    { lines: "55-60", note: "Step 3 (ACH) returns an error. Steps 1 and 2 already committed. RunSaga walks backward: compensates step 2 (release escrow), then step 1 (credit wallet). Books return to zero.", pose: "happy", role: "banker", state: "done", beat: "solution" }
-  ]}
-  caption="A saga commits forward step by step. On failure it walks backward, issuing new compensating transactions. No money disappears from the ledger — both the error and the correction are visible forever."
->
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"errors"
-	"fmt"
-)
-
-// SagaStep describes one step and its compensation.
-type SagaStep struct {
-	Name       string
-	Forward    func() error
-	Compensate func() error
-}
-
-// RunSaga executes steps in order.
-// If any step fails, it runs compensating actions in reverse order
-// for all previously completed steps.
-func RunSaga(steps []SagaStep) error {
-	completed := make([]SagaStep, 0, len(steps))
-
-	for _, step := range steps {
-		fmt.Printf("→ executing: %s\n", step.Name)
-		if err := step.Forward(); err != nil {
-			fmt.Printf("✗ %s failed: %v — compensating\n", step.Name, err)
-			// Unwind in reverse order (LIFO).
-			for i := len(completed) - 1; i >= 0; i-- {
-				s := completed[i]
-				fmt.Printf("  ↩ compensating: %s\n", s.Name)
-				if cerr := s.Compensate(); cerr != nil {
-					// Compensation failure is a serious problem in production —
-					// log it, alert, and queue for manual review. Never silently drop.
-					fmt.Printf("  ✗ compensation failed for %s: %v\n", s.Name, cerr)
-				}
+```go noverify
+// payouts.go, lines 93–130
+// Optimistic takes no lock while reading. It reads a version number with
+// the balance, and commits only if nobody bumped the version meanwhile;
+// otherwise it starts again.
+func Optimistic(ctx context.Context, db *pgxpool.Pool, merchant string, amt int64) (int, error) {
+	for retries := 0; ; retries++ {
+		err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+			var version int64
+			if err := tx.QueryRow(ctx, `SELECT version FROM account_versions WHERE account_id = $1`, merchant).Scan(&version); err != nil {
+				return err
 			}
-			return fmt.Errorf("saga failed at step %q: %w", step.Name, err)
+			avail, err := available(ctx, tx, merchant)
+			if err != nil {
+				return err
+			}
+			if avail < amt {
+				return ErrInsufficient
+			}
+			if _, err := ledger.PostTx(ctx, tx, payoutTx(merchant, amt)); err != nil {
+				return err
+			}
+			tag, err := tx.Exec(ctx,
+				`UPDATE account_versions SET version = version + 1 WHERE account_id = $1 AND version = $2`,
+				merchant, version)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return errConflict
+			}
+			return nil
+		})
+		if !errors.Is(err, errConflict) {
+			return retries, err
 		}
-		fmt.Printf("✓ %s succeeded\n", step.Name)
-		completed = append(completed, step)
 	}
-	return nil
 }
 
-func main() {
-	// Simulate a cross-service transfer: debit → escrow → ACH submission.
-	// Step 3 (ACH) fails.
-	steps := []SagaStep{
-		{
-			Name:       "Debit sender wallet ($200)",
-			Forward:    func() error { return nil }, // succeeds
-			Compensate: func() error { fmt.Println("  [ledger] credit $200 back to sender"); return nil },
-		},
-		{
-			Name:       "Reserve escrow hold",
-			Forward:    func() error { return nil }, // succeeds
-			Compensate: func() error { fmt.Println("  [ledger] release escrow hold"); return nil },
-		},
-		{
-			Name:       "Submit ACH transfer",
-			Forward:    func() error { return errors.New("bank account closed") }, // fails
-			Compensate: func() error { return nil },                               // nothing to undo — never ran
-		},
-	}
+var errConflict = errors.New("version changed")
+```
 
-	if err := RunSaga(steps); err != nil {
-		fmt.Println("\nsaga result:", err)
+In the table: **$100 every round**, and **1,173 retries**. Fifty payouts all started together, all read version 0, and only one could win each time; the rest went round again.
+
+### Step 2: choosing
+
+| strategy | correct? | retries (5 rounds) | time per round |
+| :--- | :---: | ---: | ---: |
+| Read Committed, no lock | no ($150 to $500 from $100) | 0 | 45 ms |
+| Repeatable Read, no lock | no ($500 from $100) | 0 | 9 ms |
+| Serializable + retry | yes | 863 | 27 ms |
+| `SELECT ... FOR UPDATE` | yes | 0 | 16 ms |
+| optimistic version + retry | yes | 1,173 | 51 ms |
+
+With fifty writers aimed at one merchant, the pessimistic lock won: waiting in line is cheaper than doing the work and throwing it away. Optimistic control wins in the opposite case, when conflicts are rare (payouts spread over many merchants) or when the "transaction" spans a user's think time and can't hold a lock that long (an edit form that saves with `WHERE version = $n`). Serializable is the most general (it catches conflicts you didn't think of) and needs every caller to retry on `40001`, and so do the other two retry-based strategies.
+
+<QuickCheck
+  question="Optimistic locking needed 1,173 retries for fifty payouts to one merchant. When would it be the better choice?"
+  options={[
+    "Never",
+    "When conflicts are rare, for example payouts spread across many merchants, or when a lock can't be held for the duration (a user editing a form)",
+    "Only at Serializable isolation",
+    "When the database has no row locks"
+  ]}
+  answer={1}
+  explain="Optimistic control costs nothing when nobody collides, and a full redo when someone does. Fifty writers on one merchant is the worst case for it."
+/>
+
+## Deadlocks
+
+*Stop 5 of 6.*
+
+### Step 1: two transfers, waiting for each other
+
+Transfers between wallets lock both rows. If a transfer from Alice to Bob locks Alice, and at the same moment a transfer from Bob to Alice locks Bob, each then waits for the row the other holds. Neither can proceed: a **deadlock**. Postgres checks for one when a lock wait passes `deadlock_timeout` (1 second by default), and breaks it by aborting one transaction with SQLSTATE `40P01`.
+
+```go noverify
+// main.go, lines 29–44
+	// transfer locks the payer's row, then the payee's.
+	transfer := func(tx pgx.Tx, from, to string, amt int64) error {
+		for _, id := range []string{from, to} {
+			if _, err := tx.Exec(ctx, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`, id); err != nil {
+				return err
+			}
+		}
+		return move(ctx, tx, from, to, amt)
 	}
+	// ordered locks both rows in one statement, always in id order.
+	ordered := func(tx pgx.Tx, from, to string, amt int64) error {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE`, from, to); err != nil {
+			return err
+		}
+		return move(ctx, tx, from, to, amt)
+	}
+```
+
+Eight workers, random directions, 20 seconds each way, every deadlock retried:
+
+```text
+lock payer, then payee       28 transfers in 20 s,   51 deadlocks (each retried), slowest transfer 34.112s
+lock both in id order    121312 transfers in 20 s,    0 deadlocks (each retried), slowest transfer 159ms
+```
+
+**28 transfers in 20 seconds**, 51 deadlocks, and one transfer that waited 34 seconds, because a retry mostly walked into the next deadlock and the next 1-second detection. Locking both rows in a fixed order (by id) makes a cycle impossible: whoever holds the lower id can always get the higher one eventually. **121,312 transfers, no deadlocks.**
+
+<BankAnim
+  title="Alice → Bob and Bob → Alice, at the same moment"
+  kicker="deadlock · live"
+  queueLabel="waiting for a row lock"
+  streetLabel="done"
+  windows={[{ label: "alice's row", sub: "lock" }, { label: "bob's row", sub: "lock" }]}
+  customers={[{ id: "x", label: "alice → bob", role: "banker", look: "pink" }, { id: "y", label: "bob → alice", role: "banker" }]}
+  events={[
+    { at: 0, who: "x", to: "w0", say: "locked alice" }, { at: 0, who: "y", to: "w1", say: "locked bob", note: "Each transfer locks its payer's row first." },
+    { at: 1.2, who: "x", say: "waiting for bob…", mood: "wait" }, { at: 1.2, who: "y", say: "waiting for alice…", mood: "wait", beat: "problem", note: "Then each asks for the other's row, which is held by a transaction that is itself waiting. Neither can ever proceed." },
+    { at: 2.6, banner: "1 s later: Postgres aborts one (40P01)", note: "After deadlock_timeout (1 s), Postgres finds the cycle and kills one transaction. The other finishes; the victim retries, often straight into the next deadlock." },
+    { at: 3.4, who: "y", to: "queue", say: "aborted: retry", mood: "bad" }, { at: 3.4, who: "x", to: "w1", say: "locked bob" },
+    { at: 4.2, who: "x", to: "street", say: "done", banner: null, note: "Measured: 28 transfers in 20 s, 51 deadlocks, a slowest transfer of 34 s." },
+    { at: 5.4, who: "x", to: "w0", say: "alice, then bob", mood: "ok", beat: "solution", note: "The fix: every transfer locks the two rows in the same order, lowest id first, in one statement." },
+    { at: 5.4, who: "y", to: "queue", say: "alice first too: wait", mood: "wait" },
+    { at: 6.4, who: "x", to: "street", say: null }, { at: 6.4, who: "y", to: "w0", say: "alice, then bob", mood: "ok", note: "Bob → Alice also starts with Alice, so it waits instead of grabbing Bob. No cycle can form. Measured: 121,312 transfers in 20 s, no deadlocks." },
+    { at: 7.4, who: "y", to: "street", say: null }
+  ]}
+  caption="A deadlock needs two transactions to take the same locks in opposite orders. Take them in one order and it can't happen."
+/>
+
+<QuickCheck
+  question="Why does locking the two rows in id order prevent deadlocks?"
+  options={[
+    "Postgres gives priority to lower ids",
+    "Every transaction asks for the lower id first, so no transaction can hold the higher one while waiting for the lower: a cycle of waits can't form",
+    "It makes transactions shorter",
+    "It changes the isolation level"
+  ]}
+  answer={1}
+  explain="A deadlock is a cycle: A waits for B's lock while B waits for A's. With a global order, the transaction holding the higher lock already holds everything below it, so it can always finish."
+/>
+
+## Sagas
+
+*Stop 6 of 6.*
+
+### Step 1: past the edge of the database
+
+A payout ends with a bank transfer, and the bank isn't in Meridian's database: no `BEGIN ... COMMIT` can include both. The bank here is a separate HTTP service (`cmd/bank`) that behaves like a real partner: it deduplicates by transfer id, refuses closed accounts with `422`, answers `503` to about one request in ten, and for about one in twenty **executes the transfer but answers after 2 seconds**, long after Meridian's 500 ms timeout.
+
+A **saga** splits the work into local transactions, each committed on its own, and gives every step that can't be undone by rollback a **compensating** step:
+
+1. **Reserve**: move the amount from the merchant's account to `liabilities:payouts-pending`, and record the payout as `reserved`, in one database transaction.
+2. **Send** to the bank with the payout's id.
+3. **Settle** (pending → Meridian's bank account; state `settled`) if the bank paid, or **compensate** (pending → back to the merchant; state `compensated`) if it definitely won't.
+
+### Step 2: the naive version
+
+```go noverify
+// saga.go, lines 165–192
+// NaivePay is the same three steps with no saga state, and a timeout
+// treated as a failure.
+func NaivePay(ctx context.Context, db *pgxpool.Pool, bank Bank, id, merchant, account string, amt int64) (string, error) {
+	post := func(tx ledger.Transaction) error {
+		return pgx.BeginFunc(ctx, db, func(dbtx pgx.Tx) error { _, err := ledger.PostTx(ctx, dbtx, tx); return err })
+	}
+	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE`, merchant); err != nil {
+			return err
+		}
+		avail, err := available(ctx, tx, merchant)
+		if err != nil {
+			return err
+		}
+		if avail < amt {
+			return ErrInsufficient
+		}
+		_, err = ledger.PostTx(ctx, tx, legs("payout reserve", merchant, pending, amt))
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := bank.Send(ctx, id, account, amt); err != nil {
+		return "compensated", post(legs("payout compensate", pending, merchant, amt))
+	}
+	return "settled", post(legs("payout settle", pending, "assets:bank:usd", amt))
 }
 ```
 
-</GoPlayground>
+It compensates on *any* error, and it keeps no record of where each payout is. Four hundred payouts to twenty merchants, eight workers:
 
-</CodeWalk>
+```text
+== naive, runs to completion
+ledger: paid out $8125.00, stuck in payouts-pending $0.00, payout states {}
+bank:   paid out $8650.00 in 346 transfers
+        the bank paid $525.00 more than the ledger says
+== naive, killed mid-run
+(killed after 0.5 s, 58 payouts finished)
+ledger: paid out $1150.00, stuck in payouts-pending $200.00, payout states {}
+bank:   paid out $1350.00 in 54 transfers
+        the bank paid $200.00 more than the ledger says
+== saga, killed mid-run
+(killed after 2 s, 386 payouts finished)
+ledger: paid out $9150.00, stuck in payouts-pending $200.00, payout states { "settled" : 366, "reserved" : 8, "compensated" : 20 }
+bank:   paid out $9300.00 in 372 transfers
+        the bank paid $150.00 more than the ledger says
+-- restart and recover:
+recovered: map[settled:8]
+ledger: paid out $9350.00, stuck in payouts-pending $0.00, payout states { "settled" : 374, "compensated" : 20 }
+bank:   paid out $9350.00 in 374 transfers
+        ledger and bank agree
+== saga, runs to completion
+ledger: paid out $9500.00, stuck in payouts-pending $0.00, payout states { "settled" : 380, "compensated" : 20 }
+bank:   paid out $9500.00 in 380 transfers
+        ledger and bank agree
+```
+
+The first scenario: the naive worker ran to completion, and **the bank paid $525.00 more than Meridian's ledger says**: 21 payouts timed out, were compensated (the merchant's money put back), and had in fact been paid. Those merchants will be paid again. The second: killed after half a second, $200.00 stuck in payouts-pending, and nothing records which payouts it belongs to or whether the bank paid them.
+
+### Step 3: the saga, done properly
+
+Three changes, each answering one of those failures:
+
+```go noverify
+// saga.go, lines 63–163
+const pending = "liabilities:payouts-pending"
+
+// Payouts pays merchants out as a saga: reserve in the ledger, send to the
+// bank, then settle or compensate. Each step's postings and the payout's
+// state commit together, so a crash between steps leaves a row that says
+// exactly where the payout stopped.
+type Payouts struct {
+	DB   *pgxpool.Pool
+	Bank Bank
+}
+
+// Pay runs one payout. It returns the state the payout reached.
+func (p *Payouts) Pay(ctx context.Context, id, merchant, account string, amt int64) (string, error) {
+	// Step 1: reserve. Lock the merchant (stop 3), check, move the money
+	// from the merchant's account to payouts-pending, record the payout.
+	err := pgx.BeginFunc(ctx, p.DB, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE`, merchant); err != nil {
+			return err
+		}
+		avail, err := available(ctx, tx, merchant)
+		if err != nil {
+			return err
+		}
+		if avail < amt {
+			return ErrInsufficient
+		}
+		if _, err := ledger.PostTx(ctx, tx, legs("payout reserve", merchant, pending, amt)); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO payouts (id, merchant, amount, state) VALUES ($1, $2, $3, 'reserved')`, id, merchant, amt)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return p.send(ctx, id, merchant, account, amt)
+}
+
+// send is steps 2 and 3. An unknown outcome is retried with the same id,
+// which the bank deduplicates; it is never compensated, because the bank
+// may have paid.
+func (p *Payouts) send(ctx context.Context, id, merchant, account string, amt int64) (string, error) {
+	var err error
+	for attempt := range 5 {
+		if attempt > 0 {
+			time.Sleep(time.Duration(50<<attempt) * time.Millisecond)
+		}
+		err = p.Bank.Send(ctx, id, account, amt)
+		if err == nil {
+			return "settled", p.finish(ctx, id, "settled", legs("payout settle", pending, "assets:bank:usd", amt))
+		}
+		if errors.Is(err, ErrRejected) {
+			return "compensated", p.finish(ctx, id, "compensated", legs("payout compensate", pending, merchant, amt))
+		}
+	}
+	return "reserved", nil // still unknown: Recover will try again later
+}
+
+// finish posts the step's transaction and moves the payout out of
+// 'reserved', together. If another worker already finished it, nothing
+// is posted.
+func (p *Payouts) finish(ctx context.Context, id, state string, tx ledger.Transaction) error {
+	return pgx.BeginFunc(ctx, p.DB, func(dbtx pgx.Tx) error {
+		tag, err := dbtx.Exec(ctx, `UPDATE payouts SET state = $2, updated_at = now() WHERE id = $1 AND state = 'reserved'`, id, state)
+		if err != nil || tag.RowsAffected() == 0 {
+			return err
+		}
+		_, err = ledger.PostTx(ctx, dbtx, tx)
+		return err
+	})
+}
+
+// Recover finishes every payout a crash left in 'reserved': it sends
+// again with the same id (the bank pays each id at most once) and settles
+// or compensates.
+func (p *Payouts) Recover(ctx context.Context, account func(merchant string) string) (map[string]int, error) {
+	rows, err := p.DB.Query(ctx, `SELECT id, merchant, amount FROM payouts WHERE state = 'reserved'`)
+	if err != nil {
+		return nil, err
+	}
+	type po struct {
+		id, merchant string
+		amt          int64
+	}
+	todo, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (po, error) {
+		var x po
+		return x, r.Scan(&x.id, &x.merchant, &x.amt)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]int{}
+	for _, x := range todo {
+		state, err := p.send(ctx, x.id, x.merchant, account(x.merchant), x.amt)
+		if err != nil {
+			return out, err
+		}
+		out[state]++
+	}
+	return out, nil
+}
+```
+
+- **State with every step.** The payout row is written in the same database transaction as the step's postings, so after any crash, `state = 'reserved'` lists exactly the payouts that stopped between steps.
+- **Unknown is not failure.** A timeout or `503` means the bank *may* have paid. The saga retries with the **same id**, which the bank deduplicates, so a retry never pays twice. It compensates only on a definite refusal (`422`, merchant 7's closed account: 20 payouts).
+- **Recovery.** On restart, `Recover` resends every `reserved` payout (same id) and finishes it.
+
+The third scenario above killed the saga after 2 seconds: 8 payouts were `reserved` and $200.00 was pending; the bank had paid 6 of them and the ledger didn't know yet ($150.00 of difference). After `Recover`: 8 settled, nothing pending, **ledger and bank agree to the cent**. Run to completion, the saga settled 380 and compensated 20, again in agreement.
+
+<BankAnim
+  title="A payout the bank paid, then answered too late"
+  kicker="saga · live"
+  queueLabel="payouts"
+  streetLabel="the bank (another company)"
+  windows={[{ label: "reserve", sub: "ledger" }, { label: "send", sub: "bank API" }, { label: "finish", sub: "settle or undo" }]}
+  accounts={[{ id: "m", label: "owed to merchant", balance: "$25.00" }, { id: "p", label: "payouts pending", balance: "$0.00" }, { id: "k", label: "paid (ledger)", balance: "$0.00" }, { id: "b", label: "paid (bank's records)", balance: "$0.00" }]}
+  customers={[{ id: "po", label: "po-03-11", role: "courier", look: "pink" }]}
+  events={[
+    { at: 0, who: "po", to: "w0", carry: "$25.00", note: "Reserve: in one database transaction, $25.00 moves from the merchant's account to payouts-pending, and the payout is recorded as 'reserved'." },
+    { at: 1.0, account: "m", balance: "$0.00", flash: "ok" }, { at: 1.0, account: "p", balance: "$25.00", flash: "ok" },
+    { at: 2.0, who: "po", to: "w1", say: "POST /transfers (id po-03-11)", note: "Send it to the bank, with the payout's id." },
+    { at: 3.0, account: "b", balance: "$25.00", flash: "ok", note: "The bank pays, then takes 2 seconds to answer." },
+    { at: 3.6, who: "po", say: "timeout after 500 ms", mood: "wait", beat: "problem", note: "Meridian gives up waiting. The outcome is unknown: the bank may or may not have paid." },
+    { at: 4.8, who: "po", to: "w2", say: "naive: compensate", mood: "bad", beat: "problem" }, { at: 5.6, account: "p", balance: "$0.00" }, { at: 5.6, account: "m", balance: "$25.00", flash: "bad", note: "The naive version treats the timeout as a failure and gives the merchant their money back. They were paid, and will be paid again. Measured: $525.00 overpaid in one run." },
+    { at: 7.0, account: "m", balance: "$0.00", flash: null }, { at: 7.0, account: "p", balance: "$25.00", flash: null }, { at: 7.0, who: "po", to: "w1", say: "retry, same id", mood: "wait", beat: "solution", note: "The saga instead retries with the same id. The bank deduplicates: this transfer already happened." },
+    { at: 8.0, who: "po", say: "200: already paid", mood: "ok" },
+    { at: 9.0, who: "po", to: "w2", say: "settle" }, { at: 9.6, account: "p", balance: "$0.00", flash: "ok" }, { at: 9.6, account: "k", balance: "$25.00", flash: "ok", beat: "solution", note: "Settle: pending → paid, state 'settled', in one transaction. The ledger and the bank's records agree." },
+    { at: 10.6, who: "po", to: "street", say: "settled", mood: "ok" }
+  ]}
+  caption="When another system might have acted, don't undo: ask again, with an id that makes asking again safe."
+/>
+
+### Step 4: what makes a saga work
+
+Sagas give up isolation: between reserve and settle, the money is visibly in flight, and other transactions can see the intermediate state (which is why it sits in its own pending account, not in the merchant's). In return, each step is short and local. The pattern holds as long as three things do: **every step records its state atomically with its effect, every external call is idempotent** (a retry is harmless), **and every step that can be undone has a compensation**. The first two reappear in the next two chapters: idempotency keys and exactly-once processing (chapter 4), and the transactional outbox, which records "a message must be sent" in the same transaction as the change that caused it (chapters 4 and 5).
+
+<QuickCheck
+  question="The bank call timed out. Why does the saga retry instead of compensating?"
+  options={[
+    "Compensation is slower",
+    "A timeout doesn't say the bank didn't pay; retrying with the same id (which the bank deduplicates) finds out safely, while compensating could put back money that was already paid",
+    "The bank requires three attempts",
+    "Retries are free"
+  ]}
+  answer={1}
+  explain="Measured: treating timeouts as failures overpaid $525.00 in one run. Compensate only on a definite 'no'."
+/>
 
 ---
 
 ## Exercises
 
-The concepts live in your head. Now put them in your fingers.
+These use the `txlab` module, the database and the bank service from this chapter.
 
-<Exercise n={1} title="Identify the anomaly" level="easy">
+<Exercise n={1} title="Retry with backoff" level="easy">
 
-A user's session reads their account balance at 09:00 AM, displaying $500 in the UI. While their session is still open, a scheduled fee deduction commits and reduces the balance to $480. The user's session runs the same balance query again at 09:05 AM and sees $480.
-
-Name the anomaly. Which isolation level prevents it? Which isolation level is this session running at (or lower)?
+`Serializable` and `Optimistic` retry immediately, forever. Add a cap (say 10 attempts) and exponential backoff with jitter, and rerun the fifty-payout race. What happens to the retry count and the time per round?
 
 <Solution>
 
-This is a **non-repeatable read** — the same query in the same transaction returned a different value because another transaction committed between the two reads.
-
-It is prevented by **Repeatable Read** isolation (and Serializable). At Repeatable Read, Postgres takes a snapshot at the start of the transaction, not at the start of each statement, so the balance query at 09:05 would still return $500 even after the fee committed.
-
-The session is running at **Read Committed** (or lower) — because that's the isolation level at which each statement gets a fresh snapshot.
+Backoff spreads the retries out, so fewer of them collide again: the retry count drops sharply, and time per round may rise slightly (the waiting is now sleep instead of wasted work). The cap matters in production: under a pathological load, unbounded retries turn into unbounded latency. After the cap, return an error the caller can show ("try again") rather than spinning.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={2} title="Write the locking query" level="easy">
+<Exercise n={2} title="Serializable, for real" level="easy">
 
-You have a table `accounts(id BIGINT, balance_cents BIGINT)`. Write the SQL query (as a Go string passed to `tx.QueryRow`) that reads the balance for a given account ID *and* acquires a row-level exclusive lock. Explain in a comment why the lock must be acquired before reading the balance.
+Run the lost-update experiment's read-modify-write at `pgx.Serializable`, with and without a retry loop. How does it compare with Repeatable Read?
 
 <Solution>
 
-```go
-// selectForUpdate reads the balance and acquires an exclusive row lock.
-// The lock MUST be acquired before we read the balance so that no other
-// transaction can modify this row between our read and our UPDATE.
-// Without FOR UPDATE, two concurrent transactions can both read the same
-// balance, both compute a new balance, and both write — losing one update.
-const query = `SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE`
-
-var balanceCents int64
-err := tx.QueryRow(ctx, query, accountID).Scan(&balanceCents)
-```
-
-The `FOR UPDATE` clause acquires the exclusive lock atomically with the read — there is no gap between "read" and "lock" where another transaction could sneak in.
+Without retries it behaves like Repeatable Read here: the conflicting updates abort with 40001, and nothing is lost silently. With a retry loop, the balance reaches exactly $8,000.00. For single-row read-modify-write, Repeatable Read already detects the conflict; Serializable's extra value is in cases like stop 2's write skew, where the conflict is between a read and someone else's write.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={3} title="Fix the deadlock" level="medium">
+<Exercise n={3} title="Advisory locks" level="medium">
 
-This code runs concurrently for transfers between account pairs. Identify why it can deadlock and rewrite the locking to be deadlock-safe.
-
-```go
-// BUGGY — can deadlock if two transfers between the same accounts run concurrently.
-func transferBuggy(ctx context.Context, tx pgx.Tx, senderID, receiverID int64) error {
-	var senderBal int64
-	if err := tx.QueryRow(ctx,
-		`SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE`, senderID,
-	).Scan(&senderBal); err != nil {
-		return err
-	}
-	var receiverBal int64
-	return tx.QueryRow(ctx,
-		`SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE`, receiverID,
-	).Scan(&receiverBal)
-}
-```
+Replace `SELECT ... FOR UPDATE` on the accounts row with `pg_advisory_xact_lock(hashtext($1))`. What changes, and what could go wrong?
 
 <Solution>
 
-The bug: if TX 1 does `lock(A) then lock(B)` while TX 2 does `lock(B) then lock(A)`, they deadlock — each holds what the other needs.
-
-The fix: always lock in ascending ID order, regardless of which is sender and which is receiver.
-
-```go
-// transferFixed locks both accounts in ascending ID order to prevent deadlocks.
-func transferFixed(ctx context.Context, tx pgx.Tx, senderID, receiverID int64) error {
-	// Sort IDs so we always lock the lower ID first.
-	ids := []int64{senderID, receiverID}
-	if ids[1] < ids[0] {
-		ids[0], ids[1] = ids[1], ids[0]
-	}
-
-	var bal1, bal2 int64
-	if err := tx.QueryRow(ctx,
-		`SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE`, ids[0],
-	).Scan(&bal1); err != nil {
-		return err
-	}
-	return tx.QueryRow(ctx,
-		`SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE`, ids[1],
-	).Scan(&bal2)
-	// In a real transfer you'd use the scanned balances to check funds and post entries.
-}
-```
-
-Two concurrent transfers between accounts 1 and 2 will both try to lock account 1 first. One blocks; the other proceeds and commits; the blocked one then gets the lock. No deadlock.
+Advisory locks lock a number, not a row, so they need no row to exist and don't block anything else that reads or updates the accounts table. The transaction-scoped form releases at commit or rollback, like a row lock. What can go wrong: two different merchants' names can hash to the same number and share a lock (harmless but slower), and every code path must remember to take the lock, because Postgres attaches it to nothing.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={4} title="Optimistic locking with retry" level="medium">
+<Exercise n={4} title="Crash between send and settle" level="medium">
 
-Implement `debitOptimistic(ctx context.Context, db *pgxpool.Pool, accountID int64, amountCents int64) error` using a version column. The function should read `balance_cents` and `version`, check funds, then attempt a compare-and-swap update. If `RowsAffected() == 0` (conflict), return a sentinel `ErrConflict`. Wrap it in a loop that retries up to 3 times.
+Make the saga worker exit right after the bank returns 200 and before `finish` commits, for one payout. Show that `Recover` settles it without paying twice.
 
 <Solution>
 
-```go
-var ErrConflict = errors.New("optimistic conflict")
-
-func debitOptimistic(ctx context.Context, db *pgxpool.Pool, accountID, amountCents int64) error {
-	for attempt := range 3 {
-		err := attemptDebit(ctx, db, accountID, amountCents)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, ErrConflict) {
-			return err
-		}
-		// Conflict on attempt+1; loop and retry.
-		_ = attempt
-	}
-	return fmt.Errorf("debit failed after 3 retries: %w", ErrConflict)
-}
-
-func attemptDebit(ctx context.Context, db *pgxpool.Pool, accountID, amountCents int64) error {
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	var bal, ver int64
-	err = tx.QueryRow(ctx,
-		`SELECT balance_cents, version FROM accounts WHERE id = $1`,
-		accountID,
-	).Scan(&bal, &ver)
-	if err != nil {
-		return err
-	}
-	if bal < amountCents {
-		return errors.New("insufficient funds")
-	}
-
-	tag, err := tx.Exec(ctx,
-		`UPDATE accounts
-		    SET balance_cents = $1, version = version + 1
-		  WHERE id = $2 AND version = $3`,
-		bal-amountCents, accountID, ver,
-	)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrConflict
-	}
-	return tx.Commit(ctx)
-}
-```
-
-`for attempt := range 3` uses Go 1.22+'s range-over-integer syntax, unchanged in Go 1.26. The `_ = attempt` suppresses the unused variable; in production you'd use it to compute backoff duration.
+The payout stays `reserved` with its money in payouts-pending. `Recover` resends with the same id; the bank has it already and answers 200 without paying again; `finish` settles it. Bank total and ledger agree. If the bank didn't deduplicate by id, this recovery would pay the merchant twice, which is why idempotency is part of the saga's design and not an optimisation.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={5} title="Add a compensating action" level="hard">
+<Exercise n={5} title="A payout stuck for a day" level="hard">
 
-You have a saga where step 1 debits $50 from account 42 by calling `postLedgerEntry(ctx, db, accountID, -5000)`. Define the compensating action as a function `compensateDebit(ctx context.Context, db *pgxpool.Pool, accountID, amountCents int64) error` and explain: (a) why the compensation must be a new INSERT, not a DELETE; (b) how you ensure the compensation is not applied twice if the saga orchestrator crashes after the compensation commits but before it records the outcome.
+A payout has been `reserved` for 24 hours: every send has returned 503. Design what should happen, and implement the query that finds such payouts.
 
 <Solution>
 
-```go
-// compensateDebit reverses a previously posted debit by inserting a new credit
-// entry. It does NOT delete the original debit — the audit trail is immutable.
-func compensateDebit(ctx context.Context, db *pgxpool.Pool, accountID, amountCents int64) error {
-	// amountCents is the absolute value of the original debit (positive).
-	// The compensating entry credits the account (positive amount).
-	return postLedgerEntry(ctx, db, accountID, amountCents)
-}
-
-// postLedgerEntry inserts one ledger entry and updates the running balance.
-// idempotencyKey (omitted here for brevity) prevents double-posting on retry.
-func postLedgerEntry(ctx context.Context, db *pgxpool.Pool, accountID, amountCents int64) error {
-	// Real implementation uses a transaction and updates balance_cents too.
-	_, err := db.Exec(ctx,
-		`INSERT INTO ledger_entries (account_id, amount_cents, created_at)
-		 VALUES ($1, $2, NOW())`,
-		accountID, amountCents,
-	)
-	return err
-}
-```
-
-**(a)** The original debit must never be deleted because Meridian's ledger is an immutable audit trail. Regulators and auditors need to see that a debit was posted and then reversed — both events. A DELETE would leave a gap in the audit log that looks like the money never moved. Compensation is a new, committed credit entry; the two entries together net to zero, and both are visible forever.
-
-**(b)** Use an **idempotency key** on the compensation: store the saga step ID (e.g., `saga_id + "_compensate_step1"`) as a unique key on the `ledger_entries` table. If the orchestrator crashes after the compensation commits but before recording the outcome, the relay re-runs the compensation, hits the unique constraint, and knows the compensation already succeeded. The Idempotency & Exactly-Once Semantics chapter covers this pattern in depth.
+`SELECT id, merchant, amount, updated_at FROM payouts WHERE state = 'reserved' AND updated_at < now() - interval '24 hours'`. Don't compensate on age alone: the bank may execute a queued request later. Ask the bank for the transfer's status with the id (`GET /transfers/{id}`, which this bank provides); if it says it has no such transfer, and its API guarantees it won't execute one later (for example, by cancelling it by id first), compensate. Otherwise alert a human: a payout in doubt for a day is an operations problem, and the ledger's pending account shows exactly how much money is in that state.
 
 </Solution>
 
 </Exercise>
 
-<Recap>
+---
 
-- **ACID** is the contract: **A**tomicity (all or nothing), **C**onsistency (invariants hold), **I**solation (concurrent transactions don't see each other's in-progress work), **D**urability (committed data survives crashes).
-- **Postgres defaults to Read Committed.** At this level, each SQL statement sees a fresh snapshot of committed data — but two statements in the same transaction can see different snapshots, enabling the lost-update anomaly.
-- The **lost-update problem**: two transactions both read the same balance, compute independently, both write back — one update is silently overwritten. No error is raised. Real money vanishes.
-- **`SELECT ... FOR UPDATE`** (pessimistic locking) acquires an exclusive row lock before reading, blocking all concurrent lockers until commit. It serializes writes to a row and prevents lost updates.
-- **Optimistic locking** uses a version column and a compare-and-swap update. If `RowsAffected() == 0`, another transaction won the race — retry. Best when contention is low.
-- **Deadlock prevention**: always lock multiple rows in a deterministic order (ascending ID). Inconsistent lock ordering is the #1 cause of database deadlocks in fintech systems. Postgres detects deadlocks and rolls back one victim; your code must retry.
-- A **saga** is a sequence of local ACID transactions, each with a **compensating action** (a new committed transaction that reverses the business effect). Used when a transfer spans services or external systems that can't share one ACID transaction.
-- **Compensation is not rollback** — it's a new committed event. Both the forward action and the compensation appear in the audit log. This is a compliance requirement, not a workaround.
-- **Orchestration vs. choreography**: orchestration uses a central coordinator (clear state, easier to observe); choreography uses events (decoupled, harder to trace). Use orchestration for saga state machines in fintech.
-- Wire the saga to the **transactional outbox** (covered in Idempotency & Exactly-Once Semantics) so saga state transitions and outbox events are committed atomically — no crash can leave the saga in an ambiguous state.
-
-</Recap>
+## The Lab
 
 <Lab
-  title="Fix the race in the concurrent debit engine"
+  title="One Transfer at a Time"
   archetype="fix-it"
   difficulty="guided"
-  points={80}
-  hintCost={15}
+  points={100}
+  hintCost={10}
   verify="self-check"
   expect="ALL CHECKS PASS"
-  objective="The Account.Debit and Account.Balance methods have a data race: the read-modify-write is unprotected. Fix both so 100 concurrent 100-cent debits on a 20000-cent account always produce 10000 cents with no balance going negative. main is the self-check harness — do not edit it. It runs the concurrent debit, checks the final balance, and prints ALL CHECKS PASS only when every assertion holds."
+  objective="Fix transfer: it checks the balance before taking the lock (so racing payouts overdraw) and locks payer then payee (so opposite transfers deadlock). Make it atomic, never overdrawn, and deadlock-free, with the risk check still called for every transfer."
   starter={`package main
 
 import (
+	"errors"
 	"fmt"
+	"math/rand/v2"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
-// Account holds a balance in cents. Money is NEVER a float.
-// BUG: Debit and Balance are not safe for concurrent use.
+// An Account's Balance is in minor units, guarded by mu.
 type Account struct {
-	balanceCents int
-	// TODO: add a sync.Mutex field here
+	ID      int
+	mu      sync.Mutex
+	Balance int64
 }
 
-// Debit subtracts amountCents from the account balance.
-// BUG: read-modify-write with no lock — data race under concurrent calls.
-func (a *Account) Debit(amountCents int) {
-	if a.balanceCents < amountCents {
-		return // insufficient funds — skip
+var ErrInsufficient = errors.New("insufficient balance")
+
+// transfer moves amt from one account to another: all of it or none, never
+// leaving from below zero, and safe to call from many goroutines at once.
+// It returns ErrInsufficient if from doesn't have amt, and an error for a
+// zero or negative amount or a transfer to the same account.
+func transfer(from, to *Account, amt int64) error {
+	if amt <= 0 || from == to {
+		return errors.New("invalid transfer")
 	}
-	a.balanceCents -= amountCents // BUG: unprotected write
+	from.mu.Lock()
+	enough := from.Balance >= amt
+	from.mu.Unlock()
+	if !enough {
+		return ErrInsufficient
+	}
+	from.mu.Lock()
+	defer from.mu.Unlock()
+	fraudCheck(from, to, amt)
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	from.Balance -= amt
+	to.Balance += amt
+	return nil
 }
 
-// Balance returns the current balance in cents.
-func (a *Account) Balance() int {
-	return a.balanceCents // BUG: unprotected read
+// ── below this line: do not edit ──
+
+// fraudCheck stands in for the call Meridian makes to its risk service
+// before moving money. Like any I/O, it lets other goroutines run.
+func fraudCheck(from, to *Account, amt int64) {
+	for range 3 {
+		runtime.Gosched()
+	}
 }
 
-// ── checks: do not edit. Run to verify your fix. ──
 func main() {
-	allOK := true
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
 
-	const (
-		startingBalance = 20_000 // 200 USD in cents
-		workers         = 100
-		debitAmount     = 100 // 1 USD in cents each
-		wantBalance     = startingBalance - workers*debitAmount // 10000
-	)
-
-	// Run the concurrent debit 5 times to catch non-deterministic failures.
-	for round := range 5 {
-		acc := &Account{balanceCents: startingBalance}
+	// Check 1: 50 payouts of $10.00 race for a merchant's $100.00.
+	for round := range 20 {
+		m := &Account{ID: 1, Balance: 10_000}
+		bank := &Account{ID: 2, Balance: 1 << 40}
+		var paid atomic.Int64
 		var wg sync.WaitGroup
-		for range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				acc.Debit(debitAmount)
-			}()
+		for range 50 {
+			wg.Go(func() {
+				if transfer(m, bank, 1_000) == nil {
+					paid.Add(1)
+				}
+			})
 		}
 		wg.Wait()
-
-		got := acc.Balance()
-		if got != wantBalance {
-			fmt.Printf("FAIL round %d: balance = %d cents, want %d\\n", round, got, wantBalance)
-			allOK = false
-		}
-		if got < 0 {
-			fmt.Printf("FAIL round %d: balance went negative: %d\\n", round, got)
-			allOK = false
+		if paid.Load() != 10 || m.Balance != 0 {
+			fail("round %d: %d payouts of $10.00 succeeded from $100.00 (balance now %d)", round, paid.Load(), m.Balance)
+			break
 		}
 	}
 
-	if allOK {
+	// Check 2: 8 workers move money between three accounts in every
+	// direction. It must finish, and not a cent may appear or vanish.
+	accts := []*Account{{ID: 10, Balance: 1_000_000}, {ID: 20, Balance: 1_000_000}, {ID: 30, Balance: 1_000_000}}
+	finished := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for w := range 8 {
+			wg.Go(func() {
+				r := rand.New(rand.NewPCG(uint64(w), 9))
+				for range 20_000 {
+					i, j := r.IntN(3), r.IntN(3)
+					if i != j {
+						transfer(accts[i], accts[j], int64(1+r.IntN(100)))
+					}
+				}
+			})
+		}
+		wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		var total int64
+		for _, a := range accts {
+			total += a.Balance
+			if a.Balance < 0 {
+				fail("account %d is overdrawn: %d", a.ID, a.Balance)
+			}
+		}
+		if total != 3_000_000 {
+			fail("money in the system is %d, want 3000000", total)
+		}
+	case <-time.After(10 * time.Second):
+		fail("transfers still running after 10 s: deadlock")
+	}
+
+	// Check 3: refusals.
+	a, b := &Account{ID: 1, Balance: 500}, &Account{ID: 2}
+	if !errors.Is(transfer(a, b, 501), ErrInsufficient) || a.Balance != 500 || b.Balance != 0 {
+		fail("an overdraft must return ErrInsufficient and move nothing")
+	}
+	if transfer(a, b, 0) == nil || transfer(a, b, -5) == nil || transfer(a, a, 5) == nil {
+		fail("zero, negative and self transfers must be refused")
+	}
+
+	if ok {
 		fmt.Println("ALL CHECKS PASS")
 	}
 }`}
-  verifier="main runs 5 rounds of 100 concurrent 100-cent debits on a 20000-cent account in-process. Each round asserts the final balance equals 10000 and is non-negative. The flag unlocks when the program builds clean and prints ALL CHECKS PASS on the last line."
+  verifier="Races 50 payouts of $10.00 for $100.00 twenty times (exactly 10 must succeed each round); runs 8 workers doing 20,000 random transfers each between three accounts in every direction, which must finish within 10 seconds and conserve every cent; and checks that overdrafts return ErrInsufficient and move nothing, and that zero, negative and self transfers are refused. Prints ALL CHECKS PASS."
   hints={[
-    "Add a sync.Mutex field to Account (e.g. mu sync.Mutex). Do not use a pointer — embed it directly in the struct.",
-    "In Debit: call a.mu.Lock() at the top and defer a.mu.Unlock(). The entire check-and-subtract must happen while holding the lock — otherwise two goroutines can both pass the balance check and both subtract.",
-    "In Balance: lock and unlock around the read. a.mu.Lock(); b := a.balanceCents; a.mu.Unlock(); return b. A bare read of a.balanceCents while another goroutine writes it is a data race even if you think it's harmless."
+    "The balance check and the debit must happen while the payer's lock is held, with no unlock in between. Otherwise another goroutine can spend the money after you checked it.",
+    "Lock the two accounts in a fixed order, lower ID first, whichever is the payer. That's stop 5's rule, with mutexes instead of rows.",
+    "Call fraudCheck before taking any lock: it's slow I/O, and holding a lock across it makes everyone else wait for it (stop 3)."
   ]}
-  flag="GO{concurrent_balance_mutex_correct_under_race}"
+  flag="GO{one_transfer_at_a_time}"
 >
 
-The mutex makes the whole check-and-subtract one uninterruptible step. Without it, two goroutines can both read $200, both subtract $1, and both write $199 — losing a debit. Five rounds of 100 goroutines will expose any window you leave open. Close them all, get the flag.
+The same three rules as the database version: check under the lock, take locks in one order, and keep the locked section short. With `-race`, your fix should also run clean.
 
 </Lab>
 
-<Scoreboard
-  streak={3}
-  items={[
-    { label: "Quick check — Postgres isolation default", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — SELECT FOR UPDATE behavior", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — Identify the anomaly", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 2 — Write the locking query", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 3 — Fix the deadlock", kind: "exercise", points: 20, done: false },
-    { label: "Exercise 4 — Optimistic locking with retry", kind: "exercise", points: 20, done: false },
-    { label: "Exercise 5 — Add a compensating action", kind: "exercise", points: 25, done: false }
-  ]}
-  flag={{ label: "Lab — Concurrent Balance Verifier", captured: false, points: 80 }}
-/>
+<Recap>
 
-Not bad. You now know how money moves without disappearing, without doubling, and without leaving the books in ruins. That's not nothing — most engineers never learn this until they've already destroyed a balance in production and had to explain it to a very unhappy compliance officer. You got it from me instead. You're lucky. Next we handle the other half of distributed money movement: what happens when the *same transfer is retried three times* — and how you ensure exactly one of them actually posts.
+- **Atomicity**: one database transaction per transfer; ten SIGKILLed runs kept every cent. A: all or nothing; C: constraints hold; I: stop 2; D: committed means on disk.
+- **Isolation**: Read Committed (per statement), Repeatable Read (one snapshot; aborts conflicting row updates with 40001), Serializable (as if one at a time; aborts dangerous patterns, retry needed). Read-modify-write lost 6,856 of 8,000 updates at Read Committed; `balance = balance + x` lost none. Write skew (no shared row) paid $500 from $100 at Read Committed and Repeatable Read.
+- **Pessimistic**: `SELECT ... FOR UPDATE` on the merchant's row: $100 exactly, 0 retries, 16 ms per round. Keep the locked section short.
+- **Optimistic**: a version checked at commit: $100 exactly with 1,173 retries under heavy contention; best when conflicts are rare or locks can't be held. Serializable + retry: 863 retries.
+- **Deadlocks**: opposite lock orders managed 28 transfers in 20 s (51 deadlocks, 1 s detection each, 34 s worst case); locking in id order did 121,312 with none.
+- **Sagas**: steps committed separately, each with its state; unknown outcomes retried with an idempotent id, never compensated; recovery finishes what a crash interrupted. The naive version overpaid $525.00; the saga, killed and recovered, agreed with the bank to the cent.
+
+</Recap>
+
+<Scoreboard
+  streak={6}
+  items={[
+    { label: "Quick check: killed inside BEGIN", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: write skew", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the turnstile row", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: when optimistic wins", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: lock ordering", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: timeout is not failure", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: retry with backoff", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: serializable, for real", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: advisory locks", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: crash between send and settle", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: a payout stuck for a day", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab: One Transfer at a Time", captured: false, points: 100 }}
+/>
