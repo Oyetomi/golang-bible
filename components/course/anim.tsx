@@ -3948,3 +3948,199 @@ export function RaceAnim({
     );
   }
 }
+
+/* ════════════════════════════════════════════
+   OdometerAnim — a fixed-size integer drawn as a
+   car odometer: one wheel per bit, rolling over
+   with the carry from right to left. Two readouts
+   show the same bits as signed and unsigned, so
+   127 + 1 visibly lands on -128. A guard frame
+   shows the check that refuses before adding.
+   ════════════════════════════════════════════ */
+export type OdometerFrame = {
+  /** the register's bits, 0..2^width-1 */
+  bits: number;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** label on the gopher's crank, e.g. "+1" */
+  op?: string;
+  /** the overflow check refused this step: the wheels don't move */
+  refused?: string;
+};
+
+export function OdometerAnim({
+  title = "A fixed-size integer",
+  width = 8,
+  frames,
+  caption,
+}: {
+  title?: string;
+  width?: number;
+  frames: OdometerFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1900);
+  const f = frames[st.cur] ?? frames[0];
+  const mod = 2 ** width;
+  const unsigned = (b: number) => ((b % mod) + mod) % mod;
+  const toSigned = (b: number) => (unsigned(b) >= mod / 2 ? unsigned(b) - mod : unsigned(b));
+  const u = unsigned(f.bits);
+  const signed = toSigned(f.bits);
+  // wrapped: this step added to a non-negative number and landed on a negative one
+  const wrapped =
+    !f.refused && st.cur > 0 && signed < 0 && toSigned(frames[st.cur - 1].bits) >= 0;
+  return (
+    <AnimShell
+      title={title}
+      kicker={`int${width} · odometer`}
+      note={f.note}
+      beat={f.beat ?? (wrapped ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="odo">
+        <div className="odo-crank">
+          <Gopher
+            pose={f.refused ? "blocked" : wrapped ? "panic" : st.playing ? "run" : "idle"}
+            state={f.refused ? "warn" : wrapped ? "bad" : "active"}
+            role="mechanic"
+            size={46}
+            title="the counter"
+          />
+          <span className={`odo-op ${f.refused ? "odo-op-no" : ""}`}>{f.refused ?? f.op ?? "+1"}</span>
+        </div>
+        <div className={`odo-body ${wrapped ? "odo-body-bad" : ""} ${f.refused ? "odo-body-guard" : ""}`}>
+          <div className="odo-wheels">
+            {Array.from({ length: width }, (_, i) => {
+              const place = width - 1 - i;
+              const bit = (u >> place) & 1;
+              return (
+                <div key={i} className={`odo-wheel ${i === 0 ? "odo-sign" : ""}`}>
+                  <div
+                    className="odo-strip"
+                    style={{
+                      transform: `translateY(${-bit * 50}%)`,
+                      transitionDelay: `${place * 70}ms`,
+                    }}
+                  >
+                    <span>0</span>
+                    <span>1</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="odo-places">
+            {Array.from({ length: width }, (_, i) => {
+              const place = width - 1 - i;
+              return (
+                <span key={i} className={i === 0 ? "odo-sign-l" : ""}>
+                  {i === 0 ? `−${2 ** place}` : 2 ** place}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        <div className="odo-read">
+          <div className={`odo-val ${signed < 0 && wrapped ? "odo-val-bad" : ""}`}>
+            <span className="odo-k">as int{width}</span>
+            <span className="odo-n">{signed}</span>
+          </div>
+          <div className="odo-val odo-val-dim">
+            <span className="odo-k">as uint{width}</span>
+            <span className="odo-n">{u}</span>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   ErrorChainAnim — a wrapped error drawn as what
+   it is: boxes nested inside boxes (%w), or one
+   flat box (%v). A detective gopher compares the
+   target against one layer at a time, the way
+   errors.Is walks Unwrap.
+   ════════════════════════════════════════════ */
+export type ErrorChainFrame = {
+  /** layers, outermost first; each is the text that layer adds */
+  chain: string[];
+  /** the sentinel errors.Is is looking for */
+  target?: string;
+  /** which layer is being compared now (index into chain) */
+  probe?: number;
+  /** "match" / "miss" for the probed layer, "none" when the chain ran out */
+  result?: "match" | "miss" | "none";
+  /** a label for how the check is done, e.g. "==" or "errors.Is" */
+  check?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+};
+
+export function ErrorChainAnim({
+  title = "errors.Is walks the chain",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: ErrorChainFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1900);
+  const f = frames[st.cur] ?? frames[0];
+  const nest = (i: number): ReactNode => {
+    if (i >= f.chain.length) return null;
+    const probed = f.probe === i;
+    const cls = probed ? (f.result === "match" ? "ech-match" : f.result === "miss" ? "ech-miss" : "ech-probe") : "";
+    return (
+      <div className={`ech-box ${cls} ${i === f.chain.length - 1 ? "ech-core" : ""}`}>
+        <span className="ech-text">{f.chain[i]}</span>
+        {nest(i + 1)}
+      </div>
+    );
+  };
+  const beat = f.beat ?? (f.result === "match" ? "solution" : f.result === "none" || f.result === "miss" ? "problem" : "neutral");
+  return (
+    <AnimShell
+      title={title}
+      kicker="error chain"
+      note={f.note}
+      beat={beat}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ech">
+        <div className="ech-who">
+          <Gopher
+            role="detective"
+            pose={f.result === "match" ? "happy" : f.result === "none" ? "blocked" : "idle"}
+            state={f.result === "match" ? "ok" : f.result === "none" || f.result === "miss" ? "warn" : "active"}
+            size={46}
+            title="the caller"
+          />
+          {f.check && <span className="ech-check">{f.check}</span>}
+          {f.target && <span className="ech-target">looking for {f.target}</span>}
+        </div>
+        <div className="ech-chain">{nest(0)}</div>
+        {f.result === "none" && <span className="ech-none">no match: nothing left to unwrap</span>}
+      </div>
+    </AnimShell>
+  );
+}
