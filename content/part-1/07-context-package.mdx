@@ -11,7 +11,18 @@ prerequisites: ["generics"]
 
 Let me tell you something, sport. There's a special kind of pain reserved for the engineer who ships a handler that fans out to two slow downstream APIs, ignores the user's disconnect, and keeps both goroutines running long after the client closed the tab. That handler is a disgrace. That engineer is someone's problem — not mine.
 
-After this chapter, it won't be yours either. `context.Context` is the mechanism Go chose to propagate cancellation, deadlines, and request-scoped values across the goroutine tree of a live request. It is small, it is explicit, and it is *everywhere* in production Go. Learn it cold, or spend the rest of your career wondering why your service is slowly choking on leaked goroutines at 3 a.m. Let's go.
+After this chapter, it won't be yours either. `context.Context` is the mechanism Go chose to propagate cancellation, deadlines, and request-scoped values across the goroutine tree of a live request. It is small, it is explicit, and it is *everywhere* in production Go. Learn it cold, or spend the rest of your career wondering why your service is slowly choking on leaked goroutines at 3 a.m.
+
+Context is invisible: nothing in the code *looks* like a signal travelling. So every stop here has a moving picture. The route:
+
+1. **What a context is.** A value passed down a call tree, carrying one broadcast signal: "stop".
+2. **Cancellation, deadlines and timeouts.** The `With*` constructors, and why `defer cancel()` is non-negotiable.
+3. **How the signal travels.** A closed channel, a tree of contexts, and why cancellation only ever flows down.
+4. **Propagation in practice.** Goroutine trees, HTTP handlers and database calls.
+5. **Values, and their misuse.** The one right way to attach request data.
+6. **The first-argument convention, and the two classic leaks.**
+
+Let's go.
 
 </HeroCard>
 
@@ -54,6 +65,8 @@ fmt.Println(ctx.Value("u")) // read with a plain string key`}
 <MentalModel preset="context" />
 
 ## What context.Context Is
+
+*Stop 1 of 6.*
 
 Here's the setup, and I want you to feel it before I give you any code.
 
@@ -138,7 +151,7 @@ type Context interface {
 	Done() <-chan struct{}
 
 	// Err returns nil if Done is not yet closed. After Done is closed,
-	// Err returns Cancelled or DeadlineExceeded — never anything else.
+	// Err returns context.Canceled or context.DeadlineExceeded.
 	Err() error
 
 	// Deadline returns the time when this context will be cancelled
@@ -153,33 +166,42 @@ type Context interface {
 
 Four methods. That's the whole API surface. Notice what's missing: there is no `Cancel()` method on the interface. Cancellation is controlled by the *creator* of the context, not by whatever function *receives* it. A function that gets a `ctx context.Context` can only *observe* — it can never cancel upstream.
 
-The `ctx` **value flows down** the call tree — creator to handler to DB driver:
+Here's the whole idea in motion. The `/checkout` handler starts three goroutines and passes each the request's `ctx`. Each one parks in a `select`, waiting on its downstream call *or* `ctx.Done()`. Then the user taps Back:
 
-<ExecTimeline
-  title="① Context flows DOWN: creation → handler → DB"
-  lanes={[{ id: "main", label: "creator" }, { id: "handler", label: "handler" }, { id: "db", label: "DB call" }]}
-  steps={[
-    { lane: "main", kind: "spawn", label: "ctx, cancel := context.WithTimeout(…)", note: "The creator makes the root context with a deadline. It holds the cancel function — the only way to cancel." },
-    { lane: "main", kind: "send", label: "ctx passed to handler(ctx, …)", note: "The ctx value is passed down — handlers, goroutines, and library calls all receive the same (or child) ctx." },
-    { lane: "handler", kind: "recv", label: "handler receives ctx", note: "The handler receives ctx. It can read Done(), Err(), Deadline(), Value() — but cannot call cancel()." },
-    { lane: "handler", kind: "send", label: "ctx passed to db.QueryContext(ctx, …)", note: "The handler passes ctx onward to the DB driver, which will abort the query if the context is cancelled." },
-    { lane: "db", kind: "recv", label: "DB driver receives ctx", note: "The driver watches ctx.Done(). If it fires before the query finishes, the driver cancels the network call and returns an error." }
+<RuntimeStage
+  title="One request, three goroutines, one cancel"
+  kicker="context · live"
+  height={440}
+  zones={[
+    { id: "srv", label: "http.Server", sub: "owns the request's cancel()", x: 16, y: 16, w: 170, h: 124, kind: "cpu" },
+    { id: "hand", label: "checkout handler", sub: "passes ctx to each call", x: 202, y: 16, w: 170, h: 124, kind: "cpu" },
+    { id: "wait", label: "calling downstream", sub: "fraud, payment, ledger", x: 388, y: 16, w: 356, h: 124, kind: "wait" },
+    { id: "doneq", label: "ctx.Done() waiters", sub: "a ticket per select", x: 16, y: 156, w: 728, h: 110, kind: "chan" },
+    { id: "errs", label: "errors returned", x: 16, y: 282, w: 470, h: 142, kind: "plain" },
+    { id: "exit", label: "returned", x: 502, y: 282, w: 242, h: 142, kind: "exit" }
   ]}
-  caption="One ctx value threads down the whole call tree as an explicit first argument. Nobody downstream can cancel — they can only observe."
-/>
-
-Then the **cancellation signal flows up** — the deadline fires and the error unwinds the stack:
-
-<ExecTimeline
-  title="② Cancellation flows UP: deadline → error → unwind → cleanup"
-  lanes={[{ id: "main", label: "creator" }, { id: "handler", label: "handler" }, { id: "db", label: "DB call" }]}
-  steps={[
-    { lane: "main", kind: "block", label: "deadline fires / cancel() called", note: "200ms deadline hits. The runtime closes the Done() channel. Every goroutine that is select-ing on ctx.Done() wakes up." },
-    { lane: "db", kind: "done", label: "DB call returns context.DeadlineExceeded", note: "The driver sees Done() closed, aborts, and returns the error up the call stack." },
-    { lane: "handler", kind: "done", label: "handler unwinds, returns error", note: "The handler receives the error from the DB call, short-circuits remaining work, and returns." },
-    { lane: "main", kind: "done", label: "defer cancel() cleans up", note: "defer cancel() fires. The context tree is garbage-collected. No goroutines leaked." }
+  actors={[
+    { id: "h", label: "handler", role: "operator", tag: "1" },
+    { id: "f", label: "fraud", role: "detective", tag: "2" },
+    { id: "p", label: "payment", role: "banker", tag: "3" },
+    { id: "l", label: "ledger", role: "scribe", tag: "4" },
+    { id: "c0", label: "ctx", kind: "value" },
+    { id: "tf", label: "fraud ticket", kind: "value" }, { id: "tp", label: "payment ticket", kind: "value" }, { id: "tl", label: "ledger ticket", kind: "value" },
+    { id: "ef", label: "fraud: context canceled", kind: "value" }, { id: "ep", label: "payment: context canceled", kind: "value" }, { id: "el", label: "ledger: context canceled", kind: "value" }
   ]}
-  caption="Closing the Done() channel broadcasts to every goroutine at once; the error then unwinds up through the same call tree the ctx came down."
+  events={[
+    { at: 0, id: "c0", to: "srv", note: "A request arrives. http.Server creates its context and keeps the cancel function. Nobody downstream will ever get cancel(), only ctx." },
+    { at: 0.8, id: "h", to: "hand", state: "running" }, { at: 0.8, id: "c0", to: "hand", note: "The handler receives ctx (as r.Context())." },
+    { at: 1.8, id: "f", to: "wait", state: "sleeping" }, { at: 2.0, id: "p", to: "wait", state: "sleeping" }, { at: 2.2, id: "l", to: "wait", state: "sleeping", note: "It starts three goroutines, passing ctx to each. Each makes its downstream call inside a select that also waits on ctx.Done()." },
+    { at: 2.6, id: "tf", to: "doneq" }, { at: 2.7, id: "tp", to: "doneq" }, { at: 2.8, id: "tl", to: "doneq" },
+    { at: 3.0, id: "h", state: "parked", note: "Three goroutines waiting, each with a ticket on ctx's Done channel. The handler waits for their results." },
+    { at: 4.4, id: "c0", to: "srv", beat: "problem", note: "400 ms in, the user taps Back. The connection closes, and http.Server calls cancel() on the request context." },
+    { at: 5.0, id: "tf", to: "" }, { at: 5.0, id: "tp", to: "" }, { at: 5.0, id: "tl", to: "", note: "cancel() CLOSES the Done channel. One close wakes every waiter at once." },
+    { at: 5.0, id: "f", to: "exit", state: "done" }, { at: 5.0, id: "p", to: "exit", state: "done" }, { at: 5.0, id: "l", to: "exit", state: "done" },
+    { at: 5.6, id: "ef", to: "errs" }, { at: 5.7, id: "ep", to: "errs" }, { at: 5.8, id: "el", to: "errs", note: "Each goroutine's select takes the ctx.Done() case and returns ctx.Err(), which is context.Canceled. The downstream calls are abandoned instead of running for nobody." },
+    { at: 6.6, id: "h", to: "exit", state: "done", beat: "solution", note: "The handler gets the errors and returns. No goroutine is left running for a client that's gone. Note the direction: the signal went DOWN, and only errors came back up." }
+  ]}
+  caption="ctx flows down as a normal argument; cancel() stays with whoever created the context. Closing Done reaches every goroutine watching it at once."
 />
 
 <ConceptGrid cols={3}>
@@ -193,25 +215,10 @@ Then the **cancellation signal flows up** — the deadline fires and the error u
 A Go interface with four methods — `Done()`, `Err()`, `Deadline()`, `Value()` — that every function doing I/O or spawning goroutines accepts as its first argument. It is the shared, cooperative cancellation signal for a call tree: the creator controls cancellation; every function downstream can only observe it. Without it, a disconnected client leaves orphaned goroutines running until your service falls over.
 </Define>
 
-<Define term="cancellation" since="Concurrency: Goroutines, Channels & Select (Part 1)">
-Telling every goroutine in a call tree to stop work and return — cooperatively, not forcibly. A goroutine is cancelled when it sees `ctx.Done()` close and returns `ctx.Err()` to its caller. Go has no mechanism to kill a goroutine from outside; cancellation only works if every goroutine in the tree selects on `ctx.Done()`.
-</Define>
 
-<Define term="deadline / timeout">
-A **deadline** is a wall-clock moment after which the context cancels itself (`context.WithDeadline`). A **timeout** is a duration from now — shorthand for a deadline (`context.WithTimeout(parent, 200*time.Millisecond)`). Both return a `CancelFunc` you must call. If you do not, the deadline timer and the child's slot in the parent cancel list stay alive until the deadline fires or the parent itself cancels.
-</Define>
 
-<Define term="the Done() channel">
-A `<-chan struct{}` returned by `ctx.Done()`. It is `nil` for `context.Background()` (never fires) and lazily allocated the first time it is called on a cancellable context. When the context is cancelled or its deadline fires, the runtime **closes** the channel — not sends to it. A channel close broadcasts to every goroutine blocking on it simultaneously, at O(1) cost, which is why one `cancel()` call tears down an entire goroutine tree.
-</Define>
 
-<Define term="context value (request-scoped)">
-Data attached with `context.WithValue(parent, key, val)` and retrieved with `ctx.Value(key)`. It is a linked list of key–value pairs layered on the parent. Use it for request metadata that must cross API boundaries where a function parameter is not feasible — a request ID, a trace span, an authenticated user. Never use it for required function arguments, configuration, or dependencies; those belong in function parameters where the type system can enforce their presence.
-</Define>
 
-<Define term="context leak (forgetting cancel())">
-When a `With*`-derived context's `CancelFunc` is never called, the context's resources — its slot in the parent's cancel list, and any deadline timer created by `WithTimeout`/`WithDeadline` — stay alive until the deadline fires or the parent context cancels. Under load, each leaked context is a small allocation and retained timer work. Multiply by requests per second and it is a slow memory bleed that kills services by 3 a.m. The fix is always: `defer cancel()` as the very next line after every `With*` call.
-</Define>
 
 <QuickCheck
   question={"What does ctx.Done() return when the context is created with context.Background()?"}
@@ -222,49 +229,16 @@ When a `With*`-derived context's `CancelFunc` is never called, the context's res
 
 ## Cancellation, Deadlines & Timeouts
 
+*Stop 2 of 6.*
+
 You build a context tree by wrapping parent contexts with the four `With*` constructors. Each one returns a new child context and — critically — a `CancelFunc` you must store and eventually call.
 
-### WithCancel — manual cancellation
+### Step 1: WithCancel, manual cancellation
 
-```go
-package main
+<Define term="cancellation" since="Concurrency: Goroutines, Channels & Select (Part 1)">
+Telling every goroutine in a call tree to stop work and return — cooperatively, not forcibly. A goroutine is cancelled when it sees `ctx.Done()` close and returns `ctx.Err()` to its caller. Go has no mechanism to kill a goroutine from outside; cancellation only works if every goroutine in the tree selects on `ctx.Done()`.
+</Define>
 
-import (
-	"context"
-	"fmt"
-	"time"
-)
-
-func fetchFraudScore(ctx context.Context, accountID string) error {
-	// Simulate a slow fraud-scoring service.
-	select {
-	case <-time.After(300 * time.Millisecond):
-		fmt.Println("fraud score fetched for", accountID)
-		return nil
-	case <-ctx.Done():
-		// The context was cancelled before we finished.
-		return ctx.Err()
-	}
-}
-
-func main() {
-	// WithCancel: we control exactly when to cancel.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // always — even if we cancel manually below
-
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		fmt.Println("client disconnected — cancelling")
-		cancel() // manual cancellation: client hung up
-	}()
-
-	err := fetchFraudScore(ctx, "acc-8821")
-	if err != nil {
-		fmt.Println("fraud check aborted:", err) // context.Canceled
-		return
-	}
-}
-```
 
 <CodeWalk
   title="A cancellation, line by line"
@@ -321,9 +295,16 @@ func main() {
 
 </CodeWalk>
 
-### WithTimeout and WithDeadline — time-based cancellation
+### Step 2: WithTimeout and WithDeadline, cancelling on a clock
+
+<Define term="deadline / timeout">
+A **deadline** is a wall-clock moment after which the context cancels itself (`context.WithDeadline`). A **timeout** is a duration from now — shorthand for a deadline (`context.WithTimeout(parent, 200*time.Millisecond)`). Both return a `CancelFunc` you must call. If you do not, the deadline timer and the child's slot in the parent cancel list stay alive until the deadline fires or the parent itself cancels.
+</Define>
+
 
 `WithTimeout` is shorthand for `WithDeadline(ctx, time.Now().Add(d))`. They do the same thing: cancel the child context automatically when the clock runs out.
+
+<GoPlayground>
 
 ```go
 package main
@@ -357,38 +338,6 @@ func main() {
 }
 ```
 
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-)
-
-func callPaymentProcessor(ctx context.Context, amount int64) error {
-	select {
-	case <-time.After(250 * time.Millisecond):
-		fmt.Printf("processor accepted $%d.%02d\n", amount/100, amount%100)
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("payment processor: %w", ctx.Err())
-	}
-}
-
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	err := callPaymentProcessor(ctx, 4999)
-	if err != nil {
-		fmt.Println("payment failed:", err)
-	}
-}
-```
-
 </GoPlayground>
 
 <BeforeAfter
@@ -403,7 +352,7 @@ defer cancel() // ← first line after every With* call, no exceptions
 doSlowWork(ctx)`}
 />
 
-### All four constructors at a glance
+### Step 3: All four constructors at a glance
 
 <ConceptGrid cols={2}>
   <ConceptCard label="WithCancel(parent)">Returns a child that is cancelled when `cancel()` is called, or when `parent` is cancelled — whichever comes first. Use when you control the cancellation trigger (e.g., a client disconnect signal).</ConceptCard>
@@ -428,11 +377,20 @@ Everything in this section runs against the real clock, which is fine in a playg
 
 ## How Cancellation Signals
 
+*Stop 3 of 6.*
+
 This is the section most tutorials rush past, and that's a crime. Let me show you exactly what happens inside a cancelled context — because once you see it, the select pattern writes itself.
 
-### The Done() channel is closed, not sent to
+### Step 1: The Done() channel is closed, not sent to
+
+<Define term="the Done() channel">
+A `<-chan struct{}` returned by `ctx.Done()`. It is `nil` for `context.Background()` (never fires) and lazily allocated the first time it is called on a cancellable context. When the context is cancelled or its deadline fires, the runtime **closes** the channel — not sends to it. Closing a channel wakes every goroutine blocked receiving from it, in one operation, which is why one `cancel()` call reaches an entire goroutine tree.
+</Define>
+
 
 `ctx.Done()` returns a receive-only channel of type `<-chan struct{}`. When the context is cancelled, the runtime **closes** that channel — it does not send a value. A closed channel can be received on immediately by any number of goroutines; that's the broadcast mechanism. Every goroutine blocking on `<-ctx.Done()` wakes up at the same instant when the context is cancelled.
+
+<GoPlayground>
 
 ```go
 package main
@@ -502,113 +460,47 @@ func main() {
 }
 ```
 
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
-)
-
-func fanOutCheckout(ctx context.Context, accountID string, amountCents int64) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-
-	wg.Go(func() { // Go 1.25: replaces wg.Add(1) + go func() { defer wg.Done(); ... }()
-		select {
-		case <-time.After(180 * time.Millisecond):
-			fmt.Println("fraud: OK")
-		case <-ctx.Done():
-			errs <- fmt.Errorf("fraud check: %w", ctx.Err())
-		}
-	})
-
-	wg.Go(func() {
-		select {
-		case <-time.After(350 * time.Millisecond):
-			fmt.Println("payment: OK")
-		case <-ctx.Done():
-			errs <- fmt.Errorf("payment: %w", ctx.Err())
-		}
-	})
-
-	go func() {
-		wg.Wait()
-		close(errs)
-	}()
-
-	for err := range errs {
-		if err != nil {
-			cancel()
-			return err
-		}
-	}
-	return nil
-}
-
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	err := fanOutCheckout(ctx, "acc-8821", 4999)
-	if err != nil {
-		fmt.Println("checkout failed:", err)
-	}
-}
-```
-
 </GoPlayground>
 
-### The cancellation ripple — animated
+### Step 2: Contexts form a tree, and cancellation only flows down
 
-This is the animation I promised. Watch a cancellation fire at the parent and propagate through every child goroutine in the tree.
+Every `With*` call makes a **child** of the context you pass in. Cancel a context and all its descendants are cancelled too, but never its parent or its siblings. Here the handler gives the fraud check its own 50 ms budget (`WithTimeout`) and the other two plain children:
 
-<ExecTimeline
-  title="① Signal fans out: deadline closes one channel"
-  lanes={[
-    { id: "parent", label: "parent ctx" },
-    { id: "handler", label: "handler goroutine" },
-    { id: "fraud", label: "fraud goroutine" },
-    { id: "payment", label: "payment goroutine" }
+<RuntimeStage
+  title="A tree of contexts: who gets cancelled?"
+  kicker="context tree · live"
+  height={440}
+  zones={[
+    { id: "root", label: "request ctx", sub: "cancelled if the client leaves", x: 16, y: 16, w: 728, h: 110, kind: "cpu" },
+    { id: "cf", label: "fraudCtx", sub: "WithTimeout(ctx, 50ms)", x: 16, y: 142, w: 232, h: 124, kind: "chan" },
+    { id: "cp", label: "payCtx", sub: "WithCancel(ctx)", x: 264, y: 142, w: 232, h: 124, kind: "chan" },
+    { id: "cl", label: "ledgerCtx", sub: "WithCancel(ctx)", x: 512, y: 142, w: 232, h: 124, kind: "chan" },
+    { id: "exit", label: "cancelled: returned ctx.Err()", x: 16, y: 282, w: 728, h: 142, kind: "exit" }
   ]}
-  steps={[
-    { lane: "parent", kind: "run", label: "WithTimeout fires: 200ms deadline set", note: "The parent context has a 200ms deadline. Its internal timer is registered." },
-    { lane: "handler", kind: "spawn", label: "handler spawns fraud goroutine", note: "The handler calls go fetchFraudScore(ctx, ...). The goroutine inherits the parent's deadline via the ctx value." },
-    { lane: "handler", kind: "spawn", label: "handler spawns payment goroutine", note: "The handler calls go callPaymentProcessor(ctx, ...). Same ctx, same deadline." },
-    { lane: "fraud", kind: "run", label: "fraud: select { <-ctx.Done() / <-work }", note: "Fraud goroutine blocks in select, racing the work timer against ctx.Done()." },
-    { lane: "payment", kind: "run", label: "payment: select { <-ctx.Done() / <-work }", note: "Payment goroutine also blocks in select. Two goroutines waiting." },
-    { lane: "handler", kind: "block", label: "handler: select { <-ctx.Done() / <-errs }", note: "Handler also watches ctx.Done() and waits for results from both children." },
-    { lane: "parent", kind: "done", label: "200ms deadline fires — Done() channel closed", note: "The runtime closes the Done() channel on the parent context. This simultaneously unblocks ALL goroutines blocked on <-ctx.Done()." }
+  actors={[
+    { id: "h", label: "handler", role: "operator", tag: "1" },
+    { id: "f", label: "fraud", role: "detective", tag: "2" },
+    { id: "p", label: "payment", role: "banker", tag: "3" },
+    { id: "l", label: "ledger", role: "scribe", tag: "4" },
+    { id: "e1", label: "fraud: DeadlineExceeded", kind: "value" },
+    { id: "e2", label: "payment: Canceled", kind: "value" },
+    { id: "e3", label: "ledger: Canceled", kind: "value" }
   ]}
-  caption="One closed channel wakes every goroutine in the tree simultaneously. No polling, no locks, no manual signaling — just a channel close that broadcasts to all."
+  events={[
+    { at: 0, id: "h", to: "root", state: "parked", note: "The handler watches the request context. Each goroutine watches its OWN child context, derived from the request's." },
+    { at: 0.3, id: "f", to: "cf", state: "parked" }, { at: 0.5, id: "p", to: "cp", state: "parked" }, { at: 0.7, id: "l", to: "cl", state: "parked" },
+    { at: 2.0, id: "f", to: "exit", state: "done", beat: "problem", clock: "t = 50 ms", note: "50 ms: fraudCtx's own timer fires. ONLY fraudCtx is cancelled. Its Done closes, and the fraud goroutine returns context.DeadlineExceeded." },
+    { at: 2.0, id: "e1", to: "exit" },
+    { at: 3.2, note: "Look at who is still waiting: the request context and its other two children are untouched. A child's cancellation never travels up or sideways. The handler decides what to do about the fraud timeout (maybe fall back to a cached score)." },
+    { at: 4.6, clock: "t = 400 ms", note: "400 ms: the client disconnects, and the server cancels the request context itself." },
+    { at: 5.2, id: "p", to: "exit", state: "done", beat: "solution", note: "Cancelling a parent cancels every descendant: payCtx and ledgerCtx close in the same call, and both goroutines return context.Canceled." },
+    { at: 5.2, id: "l", to: "exit", state: "done" }, { at: 5.2, id: "e2", to: "exit" }, { at: 5.2, id: "e3", to: "exit" },
+    { at: 5.8, id: "h", to: "exit", state: "done", note: "The handler's own select fires too. The whole tree is down, from the top." }
+  ]}
+  caption="Down, never up: cancelling a context cancels its children and their children, but never its parent or siblings. That's what lets one part of a request have a tighter deadline without affecting the rest."
 />
 
-With the channel closed, every goroutine that was parked on `<-ctx.Done()` wakes at once and unwinds:
-
-<ExecTimeline
-  title="② Goroutines unwind: each returns and is gone"
-  lanes={[
-    { id: "parent", label: "parent ctx" },
-    { id: "handler", label: "handler goroutine" },
-    { id: "fraud", label: "fraud goroutine" },
-    { id: "payment", label: "payment goroutine" }
-  ]}
-  steps={[
-    { lane: "fraud", kind: "done", label: "fraud goroutine: ctx.Done() fires → returns error", note: "Fraud select case <-ctx.Done() wins. Goroutine calls ctx.Err() → DeadlineExceeded, sends to errs, returns. Goroutine is gone." },
-    { lane: "payment", kind: "done", label: "payment goroutine: ctx.Done() fires → returns error", note: "Same. Payment goroutine wakes up, sees ctx cancelled, returns immediately. Goroutine is gone." },
-    { lane: "handler", kind: "done", label: "handler: receives error, defer cancel() fires, returns", note: "Handler receives the first error from errs, calls the inner cancel(), returns up. defer cancel() on the outer ctx fires. Full cleanup. Zero leaks." }
-  ]}
-  caption="The same closed channel that fanned the signal out now drains the tree: each goroutine returns its error and frees its stack. Zero leaks."
-/>
-
-### ctx.Err() — two possible answers
+### Step 3: ctx.Err(), two possible answers
 
 After `Done()` is closed, `ctx.Err()` tells you *why*:
 
@@ -617,7 +509,7 @@ After `Done()` is closed, `ctx.Err()` tells you *why*:
 
 That distinction matters at the call site: a `DeadlineExceeded` often warrants a user-facing "took too long, try again" message; a `Canceled` is usually silent cleanup. Always check `errors.Is(err, context.DeadlineExceeded)` rather than string-comparing the error message.
 
-### WithCancelCause and Cause — knowing *why* it was cancelled (Go 1.20+)
+### Step 4: WithCancelCause and Cause, knowing *why* (Go 1.20+)
 
 `ctx.Err()` tells you *that* the context was cancelled, but only in two coarse categories: `Canceled` or `DeadlineExceeded`. Sometimes you need the *reason* — the specific error that caused the cancellation. Go 1.20 added `context.WithCancelCause` and `context.Cause` for exactly this.
 
@@ -720,13 +612,13 @@ Before Go 1.26, `context.Cause(ctx)` did not identify which signal cancelled a `
 
 </Callout>
 
-<UnderTheHood title="How Done() is lazily created and how the cancel tree is wired (Go 1.26)">
+<UnderTheHood title="How Done() is lazily created and how the cancel tree is wired (Go 1.27 source)">
 
 The `Done()` channel is **not** allocated when you call `context.WithCancel`. The internal `cancelCtx` struct stores a `chan struct{}` field that starts `nil`. The first call to `Done()` on a given context creates the channel and stores it — that lazy creation avoids allocating a channel for contexts that never actually need cancellation signalling (common in code that propagates a context but never selects on Done).
 
 **The propagation tree is a linked list of parents.** Each `cancelCtx` holds a pointer to its parent. When `cancel()` is called, it:
 1. Closes `c.done` (the channel).
-2. Walks its slice of registered children and cancels each one recursively.
+2. Walks its registered children (kept in a map used as a set) and cancels each one, which cancels their children in turn.
 3. Removes itself from the parent's child list.
 
 Child-registration walks the parent chain at construction time via `propagateCancel`. Each `cancelCtx` has always carried its **own** `sync.Mutex` (since Go 1.7 — there has never been a global lock over the context tree), so registering and cancelling children touches only the locks of the contexts directly involved, keeping contention low even with many concurrent child contexts.
@@ -736,17 +628,19 @@ Child-registration walks the parent chain at construction time via `propagateCan
 - `context.WithoutCancel(parent)` — returns a child that is *never* cancelled, even when `parent` is. Use it to spawn a goroutine that should outlive the request (e.g., an audit-log write you commit even if the HTTP handler times out). Dangerous if misused — that goroutine needs its own lifetime management.
 - `context.AfterFunc(ctx, f)` — registers a function `f` to run in its own goroutine when `ctx` is done. Returns a stop function; call it to prevent `f` from running if `ctx` hasn't fired yet. This is a cleaner alternative to `go func() { <-ctx.Done(); cleanup() }()`.
 
-**context.Background() and context.TODO()** are both `*emptyCtx` values, a private type that implements `Context` with all no-op methods. Their `Done()` returns `nil` always, which is why selecting on `context.Background().Done()` never fires.
+**context.Background() and context.TODO()** return `backgroundCtx{}` and `todoCtx{}` (since Go 1.21), tiny value types that embed a private `emptyCtx` whose methods do nothing. Their `Done()` returns `nil` always, which is why selecting on `context.Background().Done()` never fires.
 
-The `hchan` underlying `Done()` uses a zero-size element type (`struct{}`), so the channel carries no data payload — it exists purely as a coordination primitive. Closing it is O(1) in the runtime scheduler: the runtime walks the blocked receivers list and makes each one runnable. This is why a single close broadcasts to arbitrarily many goroutines with constant overhead.
+The `hchan` underlying `Done()` uses a zero-size element type (`struct{}`), so the channel carries no data payload — it exists purely as a coordination primitive. Closing it walks the channel's list of blocked receivers and makes each one runnable, so the cost grows with the number of waiters, but it's one operation from the caller's point of view, and no goroutine has to poll.
 
 </UnderTheHood>
 
 ## Propagation in Practice
 
+*Stop 4 of 6.*
+
 Let's cement the three propagation paths you'll encounter daily: goroutine trees, HTTP handlers, and database calls.
 
-### Goroutine trees — the real scenario
+### Step 1: Goroutine trees, the real scenario
 
 One `cancel()` at the root, and the whole tree comes down — watch the close broadcast sweep the branches:
 
@@ -767,7 +661,7 @@ One `cancel()` at the root, and the whole tree comes down — watch the close br
       edges: ["h-v1", "h-v2", "h-tax", "v2-retry"]
     },
     {
-      note: "The client hangs up — the HTTP server calls cancel() on the request context. The runtime CLOSES the Done channel. A close (unlike a send) reaches every listener simultaneously, in O(1).",
+      note: "The client hangs up — the HTTP server calls cancel() on the request context. The runtime CLOSES the Done channel. A close (unlike a send) reaches every listener in one operation.",
       beat: "problem",
       at: "h",
       nodes: { h: "reject", v1: "frontier", v2: "frontier", tax: "frontier", retry: "frontier" }
@@ -792,6 +686,8 @@ The checkout fan-out above is the canonical pattern. A few sharper rules to inte
 **Rule 1: Always pass the *derived* context to child goroutines, not a fresh one.** Passing `context.Background()` to a child severs it from the parent's deadline — the parent's cancellation can no longer reach it.
 
 **Rule 2: When you fan out and want to cancel siblings on the first error, make a child context before spawning.**
+
+<GoPlayground>
 
 ```go
 package main
@@ -867,126 +763,15 @@ func main() {
 }
 ```
 
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-)
-
-func processTransfer(ctx context.Context, fromAcc, toAcc string, cents int64) error {
-	ctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
-	defer cancel()
-
-	type result struct {
-		name string
-		err  error
-	}
-	ch := make(chan result, 3)
-
-	checks := []struct {
-		name string
-		work func() error
-	}{
-		{"balance", func() error { time.Sleep(80 * time.Millisecond); return nil }},
-		{"fraud", func() error { time.Sleep(200 * time.Millisecond); return nil }},
-		{"compliance", func() error { time.Sleep(60 * time.Millisecond); return nil }},
-	}
-
-	for _, c := range checks {
-		go func() {
-			done := make(chan error, 1)
-			go func() { done <- c.work() }()
-			select {
-			case err := <-done:
-				ch <- result{c.name, err}
-			case <-ctx.Done():
-				ch <- result{c.name, fmt.Errorf("%s: %w", c.name, ctx.Err())}
-			}
-		}()
-	}
-
-	var errs []error
-	for range 3 { // Go 1.22: range over an int — one receive per check
-		r := <-ch
-		if r.err != nil {
-			errs = append(errs, r.err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func main() {
-	ctx := context.Background()
-	err := processTransfer(ctx, "acc-001", "acc-002", 50000)
-	if err != nil {
-		fmt.Println("transfer failed:", err)
-		return
-	}
-	fmt.Println("transfer OK")
-}
-```
-
 </GoPlayground>
 
-### HTTP handlers — r.Context() and server-side cancellation
+```text
+transfer failed: fraud: context deadline exceeded
+```
+
+### Step 2: HTTP handlers, r.Context() and server-side cancellation
 
 Every `*http.Request` carries a context that the `http.Server` cancels when the client disconnects. You get it with `r.Context()` and you pass it everywhere downstream.
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"net/http"
-	"time"
-)
-
-func checkoutHandler(w http.ResponseWriter, r *http.Request) {
-	// r.Context() is already wired to the server's cancellation.
-	// When the client disconnects, this context is cancelled automatically.
-	ctx := r.Context()
-
-	// Add a 200ms hard deadline for the entire handler.
-	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-
-	if err := processCheckout(ctx, r.URL.Query().Get("account")); err != nil {
-		if ctx.Err() != nil {
-			// Context expired — this is an expected timeout, not a bug.
-			http.Error(w, "request timed out", http.StatusGatewayTimeout)
-			return
-		}
-		http.Error(w, "checkout failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	fmt.Fprintln(w, "OK")
-}
-
-func processCheckout(ctx context.Context, accountID string) error {
-	select {
-	case <-time.After(150 * time.Millisecond): // simulate work
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func main() {
-	http.HandleFunc("/checkout", checkoutHandler)
-	fmt.Println("listening on :8080")
-	// http.ListenAndServe(":8080", nil)
-	// (Commented out so the playground terminates cleanly.)
-	fmt.Println("(server not started in playground mode)")
-}
-```
 
 <GoPlayground>
 
@@ -1037,7 +822,7 @@ As of Go 1.7, `http.Server` creates a fresh `context.Background()`-derived conte
 
 </Callout>
 
-### Database calls — QueryContext and ExecContext
+### Step 3: Database calls, QueryContext and ExecContext
 
 Every method in `database/sql` has a context-aware variant: `QueryContext`, `QueryRowContext`, `ExecContext`, `BeginTx`. Pass your `ctx` and the driver cancels the in-flight network call when the context fires.
 
@@ -1147,45 +932,38 @@ func main() {
 
 </GoPlayground>
 
-<ExecTimeline
-  title="① Request flows DOWN: client → server → handler → DB"
-  lanes={[
-    { id: "client", label: "HTTP client" },
-    { id: "server", label: "http.Server" },
-    { id: "handler", label: "checkout handler" },
-    { id: "db", label: "sql driver" }
+<RuntimeStage
+  title="A slow query, and a client who leaves"
+  kicker="request → database · live"
+  height={300}
+  zones={[
+    { id: "client", label: "browser", x: 16, y: 16, w: 128, h: 124, kind: "plain" },
+    { id: "srv", label: "http.Server", x: 156, y: 16, w: 140, h: 124, kind: "cpu" },
+    { id: "hand", label: "handler", sub: "QueryContext(ctx, …)", x: 308, y: 16, w: 140, h: 124, kind: "cpu" },
+    { id: "drv", label: "SQL driver", sub: "watches ctx.Done()", x: 460, y: 16, w: 140, h: 124, kind: "cpu" },
+    { id: "db", label: "database", x: 612, y: 16, w: 132, h: 124, kind: "wait" },
+    { id: "pool", label: "connection pool", sub: "connection returned, ready for the next request", x: 16, y: 156, w: 728, h: 124, kind: "exit" }
   ]}
-  steps={[
-    { lane: "client", kind: "send", label: "GET /checkout — TCP connect", note: "Client opens a connection and sends the HTTP request." },
-    { lane: "server", kind: "recv", label: "Server receives request, creates r.Context()", note: "http.Server wraps the connection in a context. When this connection closes, r.Context() is cancelled." },
-    { lane: "server", kind: "send", label: "Dispatches to checkoutHandler(w, r)", note: "The handler goroutine is started. It receives the request with its live context." },
-    { lane: "handler", kind: "run", label: "ctx, cancel := WithTimeout(r.Context(), 200ms)", note: "Handler adds its own 200ms hard deadline. defer cancel() is queued." },
-    { lane: "handler", kind: "send", label: "db.QueryRowContext(ctx, …)", note: "Handler passes ctx into the SQL driver. The driver starts the network call and watches ctx.Done()." },
-    { lane: "db", kind: "run", label: "sends query bytes over TCP to Postgres", note: "The driver writes the query to the connection." }
+  actors={[
+    { id: "rq", label: "GET /balance", kind: "value" },
+    { id: "q", label: "SELECT … (slow)", kind: "value" },
+    { id: "cx", label: "cancel query", kind: "value" },
+    { id: "conn", label: "DB connection", kind: "value" }
   ]}
-  caption="The ctx value threads down every layer as an explicit argument: r.Context() → handler ctx → DB driver. The whole chain is now watching one Done() channel."
-/>
-
-Then the user closes the tab. The TCP disconnect travels back UP the very same chain — cancelling the query mid-flight:
-
-<ExecTimeline
-  title="② Disconnect tears it down: TCP FIN → DB → handler"
-  lanes={[
-    { id: "client", label: "HTTP client" },
-    { id: "server", label: "http.Server" },
-    { id: "handler", label: "checkout handler" },
-    { id: "db", label: "sql driver" }
+  events={[
+    { at: 0, id: "rq", to: "client" }, { at: 0.8, id: "rq", to: "srv" }, { at: 1.6, id: "rq", to: "hand", note: "The handler calls db.QueryRowContext(r.Context(), …), passing the request's context all the way down." },
+    { at: 2.4, id: "conn", to: "drv" }, { at: 2.4, id: "q", to: "db", note: "The driver takes a connection from the pool and sends the query. It's a slow one." },
+    { at: 3.8, id: "rq", to: "", beat: "problem", note: "The user closes the tab. The server sees the connection close and cancels the request context." },
+    { at: 4.6, id: "cx", to: "db", note: "The driver was watching ctx.Done(). It stops waiting, and drivers that support it (pgx for Postgres, for example) ask the database to cancel the query, so the database stops working too." },
+    { at: 5.4, id: "q", to: "" }, { at: 5.4, id: "cx", to: "" },
+    { at: 5.4, id: "conn", to: "pool", beat: "solution", note: "QueryRowContext returns context.Canceled, the handler returns, and the connection goes back to the pool instead of being tied up for a client that's gone." }
   ]}
-  steps={[
-    { lane: "client", kind: "block", label: "client disconnects after 80ms", note: "The user closed the tab. TCP FIN. http.Server sees it and cancels r.Context()." },
-    { lane: "server", kind: "done", label: "r.Context() Done() channel closed", note: "Since handler's ctx is a child of r.Context(), its Done() channel is also closed." },
-    { lane: "db", kind: "done", label: "driver sees ctx.Done(), cancels network read", note: "The pgx/sql driver sends a cancel to Postgres and returns context.Canceled." },
-    { lane: "handler", kind: "done", label: "handler returns; defer cancel() fires", note: "Handler unwinds, defer cancel() cleans up the 200ms timer. No goroutines leaked." }
-  ]}
-  caption="The context thread connects every layer: TCP disconnect → r.Context() → handler ctx → DB driver. One cooperative chain."
+  caption="Pass ctx to every ...Context method. Without it, the query runs to completion, holding a pooled connection for nobody; under load that's how a pool runs dry."
 />
 
 ## Values & Their Misuse
+
+*Stop 5 of 6.*
 
 `context.WithValue` is the one constructor that gets weaponized. Let me be very clear about what it's for, and very clear about what it is not.
 
@@ -1193,9 +971,16 @@ Then the user closes the tab. The TCP disconnect travels back UP the very same c
 
 **What it is not:** a backdoor for optional parameters, configuration, or anything that could be a normal function argument.
 
-### The typed-key pattern — the only right way
+### Step 1: The typed-key pattern, the only right way
+
+<Define term="context value (request-scoped)">
+Data attached with `context.WithValue(parent, key, val)` and retrieved with `ctx.Value(key)`. It is a linked list of key–value pairs layered on the parent. Use it for request metadata that must cross API boundaries where a function parameter is not feasible — a request ID, a trace span, an authenticated user. Never use it for required function arguments, configuration, or dependencies; those belong in function parameters where the type system can enforce their presence.
+</Define>
+
 
 If you use a plain string or built-in type as a context key, any other package using the same string will collide with you. The fix is a private, unexported type:
+
+<GoPlayground>
 
 ```go
 package main
@@ -1247,54 +1032,9 @@ func main() {
 }
 ```
 
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-)
-
-type requestKey struct{}
-type userKey struct{}
-
-func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, requestKey{}, id)
-}
-
-func RequestIDFromContext(ctx context.Context) (string, bool) {
-	id, ok := ctx.Value(requestKey{}).(string)
-	return id, ok
-}
-
-func WithUserID(ctx context.Context, userID int64) context.Context {
-	return context.WithValue(ctx, userKey{}, userID)
-}
-
-func UserIDFromContext(ctx context.Context) (int64, bool) {
-	id, ok := ctx.Value(userKey{}).(int64)
-	return id, ok
-}
-
-func handlePayment(ctx context.Context) {
-	reqID, _ := RequestIDFromContext(ctx)
-	userID, _ := UserIDFromContext(ctx)
-	fmt.Printf("[req=%s user=%d] processing payment\n", reqID, userID)
-}
-
-func main() {
-	ctx := context.Background()
-	ctx = WithRequestID(ctx, "req-f4a9b2")
-	ctx = WithUserID(ctx, 1042)
-	handlePayment(ctx)
-}
-```
-
 </GoPlayground>
 
-### The anti-pattern — don't do this
+### Step 2: The anti-pattern, don't do this
 
 <BeforeAfter
   badLabel="Anti-pattern: config via context"
@@ -1325,7 +1065,7 @@ doWork(ctx, WorkConfig{Timeout: 500 * time.Millisecond, Retries: 3})`}
 ```go
 // simplified from src/context/context.go
 type valueCtx struct {
-	Context        // the parent
+	Context  // the parent
 	key, val any
 }
 
@@ -1344,6 +1084,8 @@ Every `WithValue` call adds one node to the linked list. A `Value(key)` call wal
 </UnderTheHood>
 
 ## The First-Argument Convention
+
+*Stop 6 of 6.*
 
 There's one law, and it is not optional.
 
@@ -1367,7 +1109,12 @@ The convention is *first argument*, not *struct field*. A `context.Context` stor
 
 </Callout>
 
-### The two classic leaks — and how to never ship them
+### The two classic leaks, and how to never ship them
+
+<Define term="context leak (forgetting cancel())">
+When a `With*`-derived context's `CancelFunc` is never called, the context's resources — its slot in the parent's cancel list, and any deadline timer created by `WithTimeout`/`WithDeadline` — stay alive until the deadline fires or the parent context cancels. Under load, each leaked context is a small allocation and retained timer work. Multiply by requests per second and it is a slow memory bleed that kills services by 3 a.m. The fix is always: `defer cancel()` as the very next line after every `With*` call.
+</Define>
+
 
 **Leak 1: forgetting `defer cancel()`**
 
@@ -1376,7 +1123,7 @@ Every `With*` constructor allocates a slot in the parent's child list. `WithTime
 ```go
 // LEAKED — the child context and timer live longer than necessary
 func badHandler(ctx context.Context) {
-	ctx, _ = context.WithTimeout(ctx, 5*time.Second) // cancel discarded!
+	ctx, _ = context.WithTimeout(ctx, 5*time.Second) // cancel discarded! (go vet's lostcancel check flags this)
 	doWork(ctx)
 	// timer + parent child entry: still retained until deadline/parent cancel
 }
@@ -1403,38 +1150,64 @@ func leakyWorker(ctx context.Context) {
 	// goroutine leaks if ctx is cancelled while expensiveAPICall blocks
 }
 
-// CORRECT — the goroutine respects the context
+// CORRECT — pass ctx INTO the call, so the work itself can stop
 func cleanWorker(ctx context.Context) {
 	go func() {
-		done := make(chan string, 1)
-		go func() { done <- expensiveAPICall() }()
+		result, err := expensiveAPICall(ctx) // e.g. an HTTP request built with ctx
+		if err != nil {
+			return // cancelled (or failed): the call itself aborted
+		}
+		process(result)
+	}()
+}
+
+// NOT ENOUGH — select stops the WAITING, not the work
+func halfFixedWorker(ctx context.Context) {
+	go func() {
+		done := make(chan string, 1)                    // buffered, so the inner goroutine can always finish
+		go func() { done <- expensiveAPICallNoCtx() }() // still runs until the API returns!
 		select {
 		case result := <-done:
 			process(result)
 		case <-ctx.Done():
-			return // context cancelled — clean exit
+			return // this goroutine exits, but the one above keeps running
 		}
 	}()
 }
 ```
 
-<ExecTimeline
-  title="Goroutine leak vs. clean teardown"
-  lanes={[
-    { id: "handler", label: "handler" },
-    { id: "leaked", label: "leaky goroutine" },
-    { id: "clean", label: "clean goroutine" }
+<RuntimeStage
+  title="Three goroutines when the context is cancelled"
+  kicker="leaks · live"
+  height={440}
+  zones={[
+    { id: "hand", label: "handler", x: 16, y: 16, w: 170, h: 124, kind: "cpu" },
+    { id: "api", label: "stuck in a slow API call", sub: "the API never answers", x: 202, y: 16, w: 542, h: 124, kind: "wait" },
+    { id: "doneq", label: "ctx.Done() waiters", x: 16, y: 156, w: 728, h: 110, kind: "chan" },
+    { id: "exit", label: "returned", x: 16, y: 282, w: 356, h: 142, kind: "exit" },
+    { id: "leak", label: "still running: leaked", sub: "stack + memory + connection held", x: 388, y: 282, w: 356, h: 142, kind: "chan" }
   ]}
-  steps={[
-    { lane: "handler", kind: "spawn", label: "spawns leaky goroutine (no ctx.Done check)", note: "The leaky goroutine ignores context. It will run until its own blocking call completes — potentially forever." },
-    { lane: "handler", kind: "spawn", label: "spawns clean goroutine (select on ctx.Done)", note: "The clean goroutine selects between its work channel and ctx.Done()." },
-    { lane: "leaked", kind: "block", label: "blocked on expensiveAPICall()", note: "No ctx.Done check. This goroutine is now invisible to the context tree." },
-    { lane: "clean", kind: "block", label: "select { case <-done / case <-ctx.Done() }", note: "The clean goroutine is ready to wake up on either the result or the cancel signal." },
-    { lane: "handler", kind: "done", label: "handler returns — ctx cancelled", note: "The handler's context is cancelled (client disconnect or timeout)." },
-    { lane: "leaked", kind: "run", label: "still running — context unaware", note: "Nothing woke the leaky goroutine. It holds memory, a goroutine stack, and possibly a network connection. Multiply by 10 000 and your service OOMs." },
-    { lane: "clean", kind: "done", label: "ctx.Done() fires — goroutine exits cleanly", note: "select picks case <-ctx.Done(). Goroutine returns. Stack freed. Network connection returned to pool. Zero leaks." }
+  actors={[
+    { id: "h", label: "handler", role: "operator", tag: "1" },
+    { id: "a", label: "leakyWorker", role: "courier", tag: "2" },
+    { id: "b", label: "halfFixed", role: "courier", tag: "3" },
+    { id: "b2", label: "halfFixed's inner call", role: "courier", tag: "4" },
+    { id: "c", label: "cleanWorker", role: "courier", tag: "5" },
+    { id: "tb", label: "halfFixed ticket", kind: "value" }
   ]}
-  caption="The difference between a goroutine that leaks and one that doesn't is a single select case. Write it every time."
+  events={[
+    { at: 0, id: "h", to: "hand", state: "running", note: "The handler starts three versions of the same worker. Each calls an API that, today, never answers." },
+    { at: 0.8, id: "a", to: "api", state: "parked", note: "leakyWorker: the call ignores ctx completely." },
+    { at: 1.4, id: "b", to: "doneq", state: "parked" }, { at: 1.4, id: "tb", to: "doneq" },
+    { at: 1.4, id: "b2", to: "api", state: "parked", note: "halfFixedWorker: the call runs in an inner goroutine, while the outer one selects on the result OR ctx.Done()." },
+    { at: 2.0, id: "c", to: "api", state: "parked", note: "cleanWorker: ctx is passed INTO the call (for example, an HTTP request built with ctx), so the call itself watches ctx." },
+    { at: 3.4, id: "h", to: "exit", state: "done", beat: "problem", note: "The client leaves and the context is cancelled." },
+    { at: 4.0, id: "c", to: "exit", state: "done", beat: "solution", note: "cleanWorker: the API call itself aborts and returns an error, so the goroutine returns. Clean." },
+    { at: 4.6, id: "tb", to: "" }, { at: 4.6, id: "b", to: "exit", state: "done", note: "halfFixed: its select sees ctx.Done() and the OUTER goroutine returns..." },
+    { at: 5.4, id: "b2", to: "leak", state: "parked", beat: "problem", note: "...but its inner goroutine is still stuck inside the API call. Selecting on ctx.Done() stopped the waiting, not the work." },
+    { at: 6.2, id: "a", to: "leak", state: "parked", beat: "problem", note: "leakyWorker never looked at ctx, so nothing can reach it. Two goroutines leaked on every request; at 10,000 requests a minute, the service runs out of memory." }
+  ]}
+  caption="Only work that is handed ctx can be stopped by ctx. A select on ctx.Done() lets YOU stop waiting; passing ctx into the call lets the call stop working."
 />
 
 <QuickCheck
@@ -1878,7 +1651,7 @@ You now own `context.Context` — not just the API surface, but the mechanism un
 - **`context.Context` is the cancellation backbone** of every request tree. It flows *down* through function arguments; cancellation signals flow *up* through the closed `Done()` channel.
 - **`context.Background()`** is the root — never cancelled, carries nothing, starts every real tree. **`context.TODO()`** is a marker for future plumbing.
 - **Four constructors:** `WithCancel` (manual trigger), `WithTimeout` (duration from now), `WithDeadline` (wall-clock time), `WithValue` (request-scoped data). Every `With*` call returns a `CancelFunc` — `defer cancel()` is mandatory, immediately, no exceptions.
-- **`Done()` is a lazily-created channel that is *closed* on cancellation** — not sent to. A single close broadcasts to every goroutine blocking on `<-ctx.Done()`, instantly and at O(1) cost.
+- **`Done()` is a lazily-created channel that is *closed* on cancellation** — not sent to. A single close wakes every goroutine blocking on `<-ctx.Done()`, in one operation.
 - **`ctx.Err()`** returns `context.Canceled` (manual cancel) or `context.DeadlineExceeded` (timer fired). Use `errors.Is` to distinguish them.
 - **Propagation paths:** `r.Context()` in HTTP handlers (auto-cancelled on client disconnect), `QueryContext`/`ExecContext`/`BeginTx` in `database/sql`, and explicit `<-ctx.Done()` in every goroutine you spawn.
 - **Values:** request-scoped only. Typed unexported key structs, no collision. Never pass configuration or dependencies through context — function parameters exist for a reason.

@@ -3,10 +3,13 @@
 import { useEffect, useState } from "react";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { CodeEnhancer } from "@/components/CodeEnhancer";
+import { CodeFold } from "@/components/CodeFold";
+import { GoLens } from "@/components/GoLens";
 import { Search } from "@/components/Search";
 import { GamificationHeader } from "@/components/gamification/GamificationHeader";
 import { GopherCompanion } from "@/components/gamification/GopherCompanion";
 import { QuickScratchpad } from "@/components/course/QuickScratchpad";
+import { StickerToast } from "@/components/gamification/StickerToast";
 
 /* Collapsible app shell. Collapsing the sidebar hands the whole viewport to the
    content column so code, animations, and playgrounds get maximum width.
@@ -64,8 +67,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </footer>
       </main>
       <GopherCompanion />
+      <StickerToast />
       <QuickScratchpad />
       <CodeEnhancer />
+      <CodeFold />
+      <GoLens />
       <Search />
     </div>
   );

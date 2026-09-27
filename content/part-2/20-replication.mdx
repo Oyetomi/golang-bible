@@ -3,824 +3,945 @@ title: "Replication: Copies, Lag & Quorums"
 part: 2
 order: 20
 type: "course"
-description: "Keeping copies of your data in sync, explained from zero: why you replicate, single-leader vs multi-leader vs leaderless, replication lag and the stale-read problem, read-your-writes consistency, quorum reads and writes (W + R > N), and resolving conflicting writes with last-writer-wins and version vectors — all grounded in replicating Meridian's account balances."
+description: "Keep copies of the cinema's bookings on more than one machine, and measure what that costs: a Postgres 17 streaming replica that missed 3% of just-made bookings with no delay and all of them 300 ms behind; read-your-writes by waiting for an LSN (and the bug of reading the LSN too early); synchronous_commit levels from 0.6 ms to 306 ms; a synchronous standby that stopped commits for 135 s; ten confirmed bookings lost in an async failover, then split brain; and leaderless quorums on three Redis nodes, where R=1 missed a hold 116 times in 300 and concurrent writes surfaced as a conflict."
 prerequisites: ["model-context-protocol"]
 ---
 
-<HeroCard label="Part 2 · Chapter 19" title="Replication: Copies, Lag & Quorums">
+<HeroCard label="Part 2 · Chapter 20" title="Replication: Copies, Lag & Quorums">
 
-One database holding every Meridian account balance is a beautiful thing right up until the moment that one machine dies — and then the entire company is down, customers can't see their money, and you're the one explaining it. So you keep **copies**. More than one machine holds the data. That's replication, and it sounds trivial until you realize the copies *disagree with each other* constantly, and now you have to decide which copy is telling the truth.
+Every booking the cinema confirms is a row in Postgres. One database server is one machine that can fail, and one machine that every seat-map request must reach. So you keep **copies**: a replica that can take over if the primary dies, and that can answer reads so the primary isn't answering all of them.
 
-I'm going to teach you this from absolute zero — no assumed knowledge of databases, distributed systems, or any of the intimidating vocabulary people hide behind. By the end you'll understand exactly why a customer can deposit money and then *not see it* a second later, why two data centers can both think they're right, and the elegant little inequality (`W + R > N`) that lets a pile of unreliable machines give a reliable answer. We'll replicate Meridian's account balances the whole way through. Let's go.
+Copies are never quite the same, though, and the gap is where the bugs live. A customer books a seat and the page, reading from a replica, says it's still free. A failover promotes a replica that never received the last ten bookings. Two machines both believe they're the primary. This chapter builds a real primary and replica, makes each of those things happen, measures them, and fixes the ones that can be fixed. Then it goes leaderless: three nodes, no primary, and quorums.
+
+Six stops. If you get lost, come back here:
+
+1. **A replica.** Postgres streaming replication, set up and watched.
+2. **Lag and stale reads.** How often a read from the replica misses a booking just made.
+3. **Read your own writes.** Wait for the replica to catch up, precisely, and the bug in the first attempt.
+4. **Synchronous replication.** Four levels of "committed", their price, and what happens when the standby dies.
+5. **Failover.** Promote the replica: lost bookings, and two primaries.
+6. **No leader.** Quorums on three nodes, stale reads, and conflicts you can see.
 
 </HeroCard>
 
-<ChapterTabs tabs={["Why Replicate", "Single-Leader", "Lag & Stale Reads", "Multi-Leader & Leaderless", "Quorums", "Conflicts & Resolution"]} />
+<ChapterTabs tabs={["A Replica", "Lag and Stale Reads", "Read Your Own Writes", "Synchronous Replication", "Failover", "No Leader"]} />
 
 <SpacedRecall
   role={"librarian"}
   items={[
     {
-      from: "SQL & databases (part 1, ch18)",
-      q: "A read replica serves…?",
-      options: ["writes", "reads (a synced copy of the data)", "backups only", "nothing"],
+      from: "Project: Cinema Booking (part 2, ch8)",
+      q: "Three replicas of the service each kept seats in memory. Why did A7 sell three times?",
+      options: ["A bug in the mutex", "Each replica's state was its own; none saw the others' holds", "Redis was slow", "The load balancer duplicated requests"],
       answer: 1,
-      tie: "This chapter explains replication from zero: why you keep copies (read scaling, failover) and the single/multi-leader/leaderless choices — plus the lag that complicates it all."
+      tie: "Database replicas are copies of the *same* state, but a copy that's behind is, for a moment, the same problem: an answer from state that doesn't include the latest writes."
     },
     {
-      from: "General",
-      q: "Replication lag means a read right after a write may return…?",
-      options: ["an error", "stale data", "a duplicate", "nothing"],
+      from: "Background Jobs (part 2, ch13)",
+      q: "When the Redis lease's leader froze and came back, why didn't it run the tick?",
+      options: ["Redis refused it", "It checked its own deadline instead of trusting its last answer from Redis", "cron skipped it", "It crashed"],
       answer: 1,
-      tie: "The read-after-write problem is the chapter's crux: you write to the leader, read from a lagging replica, and don't see your own change. Fixing that drives consistency design."
+      tie: "A database primary that comes back after a failover has the same problem at a larger scale: stop 5 measures what it does when nothing tells it that it's no longer the leader."
     },
   ]}
 />
-
 
 <PredictLab
-  prompt={"The Go 1.21 builtins: max(3, 7) and min(3, 7)?"}
+  prompt={"Postgres replicates asynchronously to one replica. The replica loses contact; the primary confirms 10 more bookings to customers; then the primary crashes, and the replica is promoted. How many of those 10 bookings does the new primary have?"}
   role={"librarian"}
-  code={`fmt.Println(max(3, 7), min(3, 7))`}
-  options={["7 3", "3 7", "7 7", "3 3"]}
-  answer={0}
-  output={`7 3`}
-  explain={"Go 1.21 added builtin min and max (variadic, work on any ordered type) \u2014 no import, no generics ceremony. max(3,7)=7, min(3,7)=3. In replication, max-of-timestamps is the heart of last-write-wins conflict resolution."}
+  code={`docker network disconnect repl pg-replica
+# 10 bookings confirmed on the primary
+docker kill pg-primary
+SELECT pg_promote();   -- on the replica`}
+  options={["All 10: Postgres replays them on promotion", "Some, whatever was in flight", "None: they never reached the replica, and the primary that had them is gone", "The promotion fails"]}
+  answer={2}
+  output={`10 more bookings made and confirmed to customers; the primary has 20
+the new primary has 10 bookings; row B: 0`}
+  explain={"Asynchronous replication means 'committed' is decided by the primary alone. Anything it committed and hadn't yet sent exists only on its disk. Promote a replica without those writes and they are gone, though ten customers hold confirmations for them."}
 />
 
-<Scene
-  title="One database is a single point of failure → replicate it"
-  actors={[
-    { id: "client", label: "Client" },
-    { id: "db", label: "Primary DB" }
-  ]}
-  rows={1}
-  cols={4}
-  frames={[
-    {
-      caption: "Meridian runs one database. Every read and write of every account balance goes to this single machine.",
-      beat: "neutral",
-      actors: [{ id: "client", state: "active" }, { id: "db", state: "active" }],
-      cells: [{ id: "A1", state: "active", label: "DB (only copy)" }, { id: "A2", state: "idle", label: "—" }, { id: "A3", state: "idle", label: "—" }, { id: "A4", state: "idle", label: "—" }]
-    },
-    {
-      caption: "The machine dies — disk failure, power loss, a kernel panic. There is no other copy. Every balance is unreachable. Meridian is fully down.",
-      beat: "problem",
-      actors: [{ id: "client", state: "bad" }, { id: "db", state: "bad" }],
-      cells: [{ id: "A1", state: "bad", label: "DB DOWN ✗" }, { id: "A2", state: "idle", label: "no copy" }, { id: "A3", state: "idle", label: "no copy" }, { id: "A4", state: "idle", label: "no copy" }]
-    },
-    {
-      caption: "Replication: the data lives on three machines. One leader takes writes and streams them to two followers. Any one can die and the others serve on.",
-      beat: "solution",
-      actors: [{ id: "client", state: "ok" }, { id: "db", state: "done" }],
-      cells: [{ id: "A1", state: "done", label: "leader" }, { id: "A2", state: "done", label: "follower 1" }, { id: "A3", state: "done", label: "follower 2" }, { id: "A4", state: "ok", label: "survives ✓" }]
-    }
-  ]}
-  caption="Replication trades one machine you fully understand for several machines that disagree. The rest of this chapter is about taming that disagreement."
-/>
+## The lab bench
 
-## Why Replicate
+Two Postgres 17 containers on a Docker network: `pg-primary` and `pg-replica`, the replica created from the primary with `pg_basebackup` and streaming its WAL. The cinema's `bookings` table (movie, seat, customer, booked_at). For stop 6, three Redis 8.10 containers, each behind its own Toxiproxy proxy so a node can be cut off. The experiments are Go programs in one module, `repl`.
 
-Let's start with the word itself, no assumptions.
+## A Replica
 
-<Define term="Replication" since="Replication (Part 2)">
-**Replication** means keeping a copy of the same data on more than one machine. Each copy is called a **replica**. When data changes, every replica needs to find out about the change so the copies stay (roughly) the same. Why it matters: a single machine *will* fail — hardware breaks, networks drop, someone trips over a cable. Replication is how a system keeps working, and keeps your data alive, when an individual machine doesn't.
-</Define>
+*Stop 1 of 6.*
 
-You replicate for exactly three reasons. That's it — if a "reason" doesn't reduce to one of these, it's not a real reason:
+### Step 1: how Postgres replicates
 
-<ConceptGrid cols={3}>
-  <ConceptCard label="Stay up (availability)">If one machine dies, another already has the data and keeps serving. Meridian can lose a database server at 3am and customers never notice. Without replication, one dead disk is a company-wide outage.</ConceptCard>
-  <ConceptCard label="Serve more reads (scale)">Reads can be spread across many replicas. If a million customers all check their balance, you don't hammer one machine — you fan the reads out across ten copies. (Writes are harder; we'll see why.)</ConceptCard>
-  <ConceptCard label="Be closer (latency)">Put a replica in each region. A customer in Lagos reads from a Lagos replica instead of waiting on a round trip to Virginia. Physical distance is real latency; a nearby copy erases it.</ConceptCard>
-</ConceptGrid>
+Postgres writes every change to its **write-ahead log** (WAL) before changing the data files: that's what makes a committed transaction survive a crash. A **streaming replica** is a second server that receives the primary's WAL as it's written and **replays** it, so its data files follow the primary's. It can answer read-only queries while it does (`hot_standby`). Setting one up:
 
-<Define term="Leader & follower (primary & replica)" since="Replication (Part 2)">
-In the most common setup, one replica is the **leader** (also called *primary* or *master*): it's the only one allowed to accept **writes** (changes). The others are **followers** (*replicas*, *secondaries*, *standbys*): they receive a stream of the leader's changes and apply them in the same order, and they can serve **reads**. Why it matters: funneling all writes through one leader is the simplest way to keep copies in agreement — there's one authority on what happened and in what order.
-</Define>
+```text
+$ docker run -d --name pg-primary --network repl … postgres:17 -c wal_level=replica -c max_wal_senders=5
+$ psql primary -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '…'"
+$ docker run --rm --network repl -v pgrepl:/var/lib/postgresql/data postgres:17 \
+    pg_basebackup -h pg-primary -U replicator -D /var/lib/postgresql/data -R -X stream -C -S replica1
+$ docker run -d --name pg-replica --network repl -v pgrepl:/var/lib/postgresql/data postgres:17
+```
 
-If replication were free and instant, this chapter would end here. It isn't. The copies take *time* to agree, and sometimes they're allowed to disagree — and that's where every interesting bug lives.
+`pg_basebackup` copies the primary's data files; `-R` writes the settings that make the copy start as a standby that connects back to the primary; `-S replica1` creates a **replication slot**, so the primary keeps any WAL the replica hasn't received yet. On the primary:
 
-## Single-Leader
+```text
+$ psql primary -xc "SELECT client_addr, state, sync_state, write_lag, replay_lag FROM pg_stat_replication"
+-[ RECORD 1 ]----------------
+client_addr | 172.20.0.3
+state       | streaming
+sync_state  | async
+write_lag   | 00:00:00.000281
+replay_lag  | 00:00:00.000281
+```
 
-The workhorse. One leader, N followers. Every write goes to the leader; the leader tells the followers; followers apply the changes in order. This is how Postgres, MySQL, and most SQL databases replicate by default — and it's what sits under the read-replica setup from [SQL & Databases in Go](/part-1/sql-databases).
+**async**: the primary commits without waiting for the replica. The lag, 0.28 ms, is on one machine with nothing else to do.
 
-<Define term="Single-leader replication" since="Replication (Part 2)">
-**Single-leader replication**: one replica (the leader) accepts all writes; it streams an ordered log of those changes to the followers, which replay them. Reads can go to the leader or any follower. Why it matters: because every write passes through one leader in one order, there's never a question of "which write happened first" — the leader decides. That single ordering authority is what makes single-leader the simplest and safest model, and why Meridian's ledger uses it.
-</Define>
+## Lag and Stale Reads
 
-Here's the write path. Watch where the time goes:
+*Stop 2 of 6.*
 
-<ExecTimeline
-  title="A write flowing from leader to followers"
-  lanes={[
-    { id: "client", label: "Client" },
-    { id: "leader", label: "Leader" },
-    { id: "f1", label: "Follower 1" },
-    { id: "f2", label: "Follower 2" }
-  ]}
-  steps={[
-    { lane: "client", kind: "run", label: "write: balance = 9000", note: "Client sends a write. It must go to the leader — followers reject writes." },
-    { lane: "leader", kind: "run", label: "apply + append to log", note: "Leader applies the change locally and records it in its replication log (an ordered list of every change)." },
-    { lane: "leader", kind: "done", label: "ACK to client", note: "With ASYNC replication, the leader confirms to the client NOW — before the followers have the change. Fast, but the followers are momentarily behind." },
-    { lane: "f1", kind: "recv", label: "receive + apply (later)", note: "Follower 1 receives the log entry over the network and applies it. This happens a few milliseconds after the client already got its ACK." },
-    { lane: "f2", kind: "recv", label: "receive + apply (later still)", note: "Follower 2 applies it too, maybe even later if it's farther away or busier. For a window, the followers disagree with the leader." }
-  ]}
-  caption="The gap between 'client got its ACK' and 'all followers applied it' is replication lag. With async replication that gap is where stale reads live."
-/>
+### Step 1: book, then look
 
-<UnderTheHood title="Synchronous vs asynchronous replication — the tradeoff you can't escape">
+The cinema's page, after a booking, asks "is this seat booked?" If that read goes to the replica (the point of having one), will it see the booking? `stale` books 200 seats on the primary, one at a time, and reads each back from the replica immediately:
 
-When the leader gets a write, it faces a choice: **wait** for followers to confirm before telling the client "done," or **don't wait**.
-
-- **Synchronous:** the leader waits until at least one follower confirms it has the write, *then* ACKs the client. Upside: that follower is guaranteed up to date, so if the leader dies, no data is lost. Downside: the client waits for the slowest follower in the chain, and if that follower is down, writes *block entirely*.
-- **Asynchronous:** the leader ACKs the client immediately and tells followers whenever it can. Upside: fast writes, and a slow/dead follower never blocks the leader. Downside: if the leader dies before a follower caught up, those last writes are **gone** — a client was told "saved" but the surviving replicas never got it.
-
-Most systems run **semi-synchronous**: one follower is synchronous (your safety net against data loss), the rest are async (for speed). Postgres exposes this exact knob (`synchronous_commit`, `synchronous_standby_names`). For Meridian's ledger, at least one synchronous follower is non-negotiable — we never tell a customer a transfer succeeded and then lose it. Money writes choose safety over speed.
-
-</UnderTheHood>
-
-Let's *see* replication lag — a write that's visible on the leader but not yet on a follower:
-
-<GoPlayground>
-
-```go
+```go noverify
+// stale books seats on the primary and immediately reads them back from
+// the replica, the way the cinema's page would after a booking: "is my
+// seat booked?". -ryw waits for the replica to replay the booking first.
 package main
 
 import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"slices"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	n := flag.Int("n", 200, "bookings")
+	ryw := flag.Bool("ryw", false, "read-your-writes: wait for the replica to replay the booking's LSN")
+	flag.Parse()
+	ctx := context.Background()
+	primary, err := pgxpool.New(ctx, "postgres://postgres:cinema@127.0.0.1:55501/cinema")
+	if err != nil {
+		log.Fatal(err)
+	}
+	replica, err := pgxpool.New(ctx, "postgres://postgres:cinema@127.0.0.1:55502/cinema")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := primary.Exec(ctx, "TRUNCATE bookings"); err != nil {
+		log.Fatal(err)
+	}
+	time.Sleep(time.Second) // let the replica catch up with the TRUNCATE
+
+	stale := 0
+	var visibleAfter []time.Duration // how long until the replica showed the booking
+	var readLatency []time.Duration
+	for i := range *n {
+		seat := fmt.Sprintf("%c%d", 'A'+i/40%26, 1+i%40)
+		if _, err := primary.Exec(ctx, "INSERT INTO bookings (movie, seat, customer) VALUES ('inception', $1, $2)",
+			seat, fmt.Sprint("customer-", i)); err != nil {
+			log.Fatal(err)
+		}
+		// The WAL position after the commit: it includes the commit record,
+		// which is what makes the booking visible. (Read inside the
+		// transaction, it would be before the commit record.)
+		var lsn string
+		if err := primary.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&lsn); err != nil {
+			log.Fatal(err)
+		}
+		committed := time.Now()
+		if *ryw {
+			// Wait until the replica has replayed at least this LSN.
+			for {
+				var caughtUp bool
+				if err := replica.QueryRow(ctx, "SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn", lsn).Scan(&caughtUp); err != nil {
+					log.Fatal(err)
+				}
+				if caughtUp {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+		var found bool
+		if err := replica.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM bookings WHERE movie = 'inception' AND seat = $1)", seat).Scan(&found); err != nil {
+			log.Fatal(err)
+		}
+		readLatency = append(readLatency, time.Since(committed))
+		if !found {
+			stale++
+		}
+		// Measure how long until the replica shows it at all.
+		for !found {
+			if err := replica.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM bookings WHERE movie = 'inception' AND seat = $1)", seat).Scan(&found); err != nil && err != pgx.ErrNoRows {
+				log.Fatal(err)
+			}
+		}
+		visibleAfter = append(visibleAfter, time.Since(committed))
+	}
+	q := func(d []time.Duration, p float64) time.Duration {
+		s := slices.Clone(d)
+		slices.Sort(s)
+		return s[int(p*float64(len(s)-1))].Round(10 * time.Microsecond)
+	}
+	fmt.Printf("%d bookings: %d reads from the replica didn't show the booking just made (%.0f%%)\n", *n, stale, 100*float64(stale)/float64(*n))
+	fmt.Printf("  time from commit to the read's answer: p50 %v, p99 %v\n", q(readLatency, 0.5), q(readLatency, 0.99))
+	fmt.Printf("  time from commit until the replica showed it: p50 %v, p99 %v, max %v\n", q(visibleAfter, 0.5), q(visibleAfter, 0.99), q(visibleAfter, 1))
+}
+```
+
+```text
+$ stale -n 200        # replica applying WAL as fast as it can
+200 bookings: 6 reads from the replica didn't show the booking just made (3%)
+  time from commit to the read's answer: p50 330µs, p99 3.33ms
+  time from commit until the replica showed it: p50 340µs, p99 3.33ms, max 22ms
+```
+
+**3% of the reads missed the booking just made**, on an idle laptop with a replica 0.3 ms behind. That's the nature of asynchronous replication: the primary answers "committed" and the replica catches up after; any read in between sees the past.
+
+### Step 2: a replica that's behind
+
+Real replicas fall behind: a long query holds up replay, a burst of writes, a replica in another region. `recovery_min_apply_delay` makes a replica apply each commit a set time late, which reproduces that on purpose:
+
+```text
+$ psql replica -c "ALTER SYSTEM SET recovery_min_apply_delay = '300ms'"; stale -n 50
+50 bookings: 50 reads from the replica didn't show the booking just made (100%)
+  time from commit to the read's answer: p50 360µs, p99 3.64ms
+  time from commit until the replica showed it: p50 300.87ms, p99 304.18ms, max 305.97ms
+$ stale -n 50 -ryw        # wait for the replica to replay the booking's LSN before reading
+50 bookings: 50 reads from the replica didn't show the booking just made (100%)
+  time from commit to the read's answer: p50 650µs, p99 13.47ms
+  time from commit until the replica showed it: p50 300.76ms, p99 303.22ms, max 303.41ms
+```
+
+Look at the first run only for now: 300 ms behind, **every** read missed the booking, and each booking appeared 300–306 ms after it was confirmed. The second run is stop 3's first attempt at a fix.
+
+<CinemaAnim
+  title="Booked on the primary, free on the replica"
+  kicker="replication lag · live"
+  noDesk
+  rows={3}
+  cols={6}
+  halls={[{ label: "primary", sub: "takes the booking" }, { label: "replica", sub: "300 ms behind" }]}
+  customers={[{ id: "a", label: "alice", look: "pink" }]}
+  events={[
+    { at: 0, who: "a", to: "lobby", note: "Alice books A3. The write goes to the primary; the page's reads go to the replica, 300 ms behind." },
+    { at: 0.8, who: "a", to: "A3@0" }, { at: 1.1, seat: "A3@0", state: "booked", by: "alice", note: "The primary commits: booked. Alice gets her confirmation." },
+    { at: 1.6, who: "a", to: "lobby", say: "is A3 mine?", mood: "wait", note: "The page reloads and asks the replica." },
+    { at: 2.1, who: "a", say: "A3 is free?!", mood: "bad", beat: "problem", note: "Measured: 50 of 50 reads missed the booking just made, 300 ms behind. With no delay at all: 6 of 200." },
+    { at: 2.6, seat: "A3@1", state: "booked", by: "alice", note: "300 ms after the commit, the replica applies it." },
+    { at: 3.4, who: "a", say: "waiting for LSN 0/3A1C2F8…", mood: "wait", beat: "solution", note: "Read your own writes: remember the primary's WAL position after the commit, and wait for the replica to replay past it before reading." },
+    { at: 4.2, who: "a", say: "A3 is mine ✓", mood: "ok", beat: "solution", note: "Measured: 0 of 50 stale, at the cost of waiting out the lag (p50 301 ms)." }
+  ]}
+  caption="A replica answers from the past. How far in the past is the question you have to design for."
+/>
+
+## Read Your Own Writes
+
+*Stop 3 of 6.*
+
+### Step 1: wait for the replica, precisely
+
+Customers don't mind that *other* people's bookings take a moment to appear. They do mind that *their own* booking vanishes after the confirmation page. That guarantee is called **read-your-writes**, and Postgres makes it exact: every commit has a position in the WAL (an **LSN**, log sequence number); the replica reports how far it has replayed (`pg_last_wal_replay_lsn()`). Remember the LSN after your write; before reading from the replica, wait until it has replayed at least that far.
+
+### Step 2: the first attempt was wrong
+
+The first version of `stale -ryw` read the LSN in the same statement as the insert:
+
+```sql
+WITH b AS (INSERT INTO bookings … RETURNING 1) SELECT pg_current_wal_lsn()::text FROM b
+```
+
+And it didn't help: the second run in stop 2's output, `-ryw`, still missed **50 of 50**. That LSN was taken *inside* the transaction, before its **commit record** was written. The replica replayed up to it (the inserted row's WAL) and reported itself caught up, but the row only becomes visible when the commit record is replayed, and `recovery_min_apply_delay` holds exactly the commit records back. The fix is to read the LSN **after** the commit:
+
+```go noverify
+// main.go, lines 41–65
+		if _, err := primary.Exec(ctx, "INSERT INTO bookings (movie, seat, customer) VALUES ('inception', $1, $2)",
+			seat, fmt.Sprint("customer-", i)); err != nil {
+			log.Fatal(err)
+		}
+		// The WAL position after the commit: it includes the commit record,
+		// which is what makes the booking visible. (Read inside the
+		// transaction, it would be before the commit record.)
+		var lsn string
+		if err := primary.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&lsn); err != nil {
+			log.Fatal(err)
+		}
+		committed := time.Now()
+		if *ryw {
+			// Wait until the replica has replayed at least this LSN.
+			for {
+				var caughtUp bool
+				if err := replica.QueryRow(ctx, "SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn", lsn).Scan(&caughtUp); err != nil {
+					log.Fatal(err)
+				}
+				if caughtUp {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+```
+
+```text
+$ stale -n 50 -ryw        # LSN read after the commit
+50 bookings: 0 reads from the replica didn't show the booking just made (0%)
+  time from commit to the read's answer: p50 301.3ms, p99 311.64ms
+  time from commit until the replica showed it: p50 301.3ms, p99 311.64ms, max 311.66ms
+$ stale -n 50             # the same, without waiting
+50 bookings: 50 reads from the replica didn't show the booking just made (100%)
+  time from commit to the read's answer: p50 310µs, p99 680µs
+  time from commit until the replica showed it: p50 300.49ms, p99 301.84ms, max 301.88ms
+```
+
+**0 of 50 stale.** The reads now wait out the lag (p50 301 ms), which is honest: the data isn't on the replica yet. In a real service you'd keep the LSN in the customer's session after a booking, and send their reads to the primary, or wait, only while the replica is behind it. Everyone else reads the replica freely.
+
+<QuickCheck
+  question="Why did reading pg_current_wal_lsn() inside the booking's transaction fail as a read-your-writes marker?"
+  options={[
+    "pg_current_wal_lsn is only valid on replicas",
+    "It's the WAL position before the transaction's commit record; the replica can replay up to it while the row is still invisible, because visibility comes from the commit record",
+    "LSNs aren't comparable between servers",
+    "The query was cached"
+  ]}
+  answer={1}
+  explain="Measured: 50 of 50 still stale with the early LSN, 0 of 50 with the LSN read after COMMIT. A position marker must be taken after the thing it marks."
+/>
+
+## Synchronous Replication
+
+*Stop 4 of 6.*
+
+### Step 1: what "committed" waits for
+
+Postgres can make a commit wait for the standby. With `synchronous_standby_names = '*'`, the `synchronous_commit` setting (per transaction, even) chooses how much:
+
+- **`local`**: flushed to the primary's disk only (asynchronous).
+- **`remote_write`**: the standby has received it and written it to its OS.
+- **`on`**: the standby has flushed it to disk. A committed booking now survives losing the primary.
+- **`remote_apply`**: the standby has *applied* it, so a read there sees it.
+
+`synclat` books 100 seats at each level, with the replica still applying 300 ms late, and reads each from the replica straight away:
+
+```text
+# replica applies WAL 300 ms late; synchronous_standby_names = '*'
+synchronous_  commit p50/p99 stale reads
+local         620µs  /15.49ms 100 of 100
+remote_write  570µs  /7.67ms  100 of 100
+on            710µs  /8.02ms  100 of 100
+remote_apply  305.86ms/313.77ms 0 of 100
+```
+
+`remote_write` and `on` cost almost nothing here (the standby is on the same machine; across regions they'd add a network round trip to every commit), and they make bookings **durable** on two machines, but they don't make the replica **current**: still 100 of 100 stale. Only `remote_apply` does, and it pays the whole apply delay, **306 ms**, on every commit.
+
+### Step 2: when the standby dies
+
+Synchronous replication has a failure mode that asynchronous doesn't:
+
+```text
+$ docker stop pg-replica          # the synchronous standby goes away
+$ psql primary -c "SET statement_timeout = '3s'" -c "INSERT INTO bookings VALUES ('inception', 'A1', 'alice')"
+SET
+WARNING:  canceling wait for synchronous replication due to user request
+DETAIL:  The transaction has already committed locally, but might not have been replicated to the standby.
+INSERT 0 1
+(returned after 135.1 s: statement_timeout never fired; another session ran pg_cancel_backend)
+$ psql primary -c "SELECT seat, customer FROM bookings"
+ seat | customer 
+------+----------
+ A1   | alice
+(1 row)
+
+
+[exited with code 0]
+```
+
+With the synchronous standby stopped, a commit **waited 135 seconds**, and `statement_timeout = '3s'` never fired: the statement had finished, and the timeout doesn't cover the wait for replication at commit. It only returned because another session cancelled it. Then read the warning: the transaction **had already committed locally**. The client got a warning after two minutes; a driver with its own timeout would have reported an error for a booking that exists. "Synchronous" means one machine's failure stops every writer, so production setups name two or more standbys (`ANY 1 (a, b)`) so that one can fail without stopping writes.
+
+<QuickCheck
+  question="The synchronous standby is down. A commit hangs; the client gives up and reports failure. What is the state of that booking?"
+  options={[
+    "Rolled back",
+    "Committed on the primary: the wait was for replication, after the local commit, so a client-side timeout reports failure for a booking that exists",
+    "Lost",
+    "Pending until the standby returns"
+  ]}
+  answer={1}
+  explain="Measured: 'The transaction has already committed locally, but might not have been replicated to the standby', and the row was there. Chapter 12's rule again: a timeout means unknown, not failed."
+/>
+
+## Failover
+
+*Stop 5 of 6.*
+
+### Step 1: promote the replica
+
+When the primary dies, a replica is **promoted**: it stops following and starts accepting writes. With asynchronous replication, anything the primary committed but hadn't sent is gone. `failover.sh` makes that happen deliberately:
+
+```text
+10 bookings made; the replica has 10
+$ docker network disconnect repl pg-replica     # the replica loses contact
+10 more bookings made and confirmed to customers; the primary has 20
+$ docker kill pg-primary                         # the primary crashes
+$ psql replica -c 'SELECT pg_promote()'           # failover: the replica becomes the primary
+t
+the new primary has 10 bookings; row B: 0
+$ # new customers book B1–B3, which the new primary says are free
+  B1 booked for newcomer-1
+  B2 booked for newcomer-2
+  B3 booked for newcomer-3
+$ docker start pg-primary                        # the old primary comes back, as a primary
+old primary: in recovery? f; B1 belongs to customer-11
+new primary: in recovery? f; B1 belongs to newcomer-1
+the old primary still accepts writes: C1 booked on it
+```
+
+Read it in order. Ten bookings reached both servers. The replica lost contact, and the primary confirmed **ten more**. The primary crashed; the replica was promoted: **it has 10 bookings, and row B is empty**. Ten customers hold confirmations the cinema no longer knows about, and the new primary cheerfully sold B1–B3 to newcomers.
+
+### Step 2: two primaries
+
+Then the old primary was restarted, and it came back **as a primary**: nothing told it that it had been replaced. Seat B1 belongs to `customer-11` there and to `newcomer-1` on the new primary, and the old one accepted a new booking (C1). This is **split brain**: two servers accepting writes for the same data, diverging with every write. Any client still pointed at the old primary (a stale DNS entry, a connection pool that reconnects to the old address) writes into a history that will be thrown away or has to be merged by hand.
+
+Preventing it takes more than Postgres itself: the failover tooling (Patroni, or a managed database's control plane) must **fence** the old primary, making sure it's stopped, or can't accept connections, before the new one takes writes, and clients must find the primary through something the failover updates. Chapter 23 builds fencing tokens; chapter 24, the consensus that decides who the leader is.
+
+<CinemaAnim
+  title="Failover: ten bookings lost, then two primaries"
+  kicker="async failover · live"
+  noDesk
+  rows={3}
+  cols={6}
+  halls={[{ label: "pg-primary", sub: "the old primary" }, { label: "pg-replica", sub: "promoted" }]}
+  customers={[{ id: "c", label: "customer-11" }, { id: "n", label: "newcomer-1" }]}
+  events={[
+    { at: 0, seat: "A1@0", state: "booked" }, { at: 0, seat: "A2@0", state: "booked" }, { at: 0, seat: "A1@1", state: "booked" }, { at: 0, seat: "A2@1", state: "booked", note: "Row A: booked on both. The replica then loses contact with the primary." },
+    { at: 0, who: "c", to: "lobby" }, { at: 0, who: "n", to: "lobby" },
+    { at: 1.0, hall: 1, banner: "disconnected" },
+    { at: 1.6, who: "c", to: "B1@0", say: "confirmed ✓", mood: "ok" }, { at: 1.9, seat: "B1@0", state: "booked", by: "customer-11" }, { at: 2.0, seat: "B2@0", state: "booked" }, { at: 2.1, seat: "B3@0", state: "booked", note: "The primary confirms ten more bookings. They exist only on its disk." },
+    { at: 3.0, hall: 0, banner: "docker kill: primary crashed", beat: "problem" }, { at: 3.0, hall: 1, banner: null },
+    { at: 3.8, hall: 1, banner: "SELECT pg_promote()", note: "The replica is promoted. Measured: it has 10 bookings; row B is empty." },
+    { at: 4.6, hall: 1, banner: null, who: "n", to: "B1@1", say: "B1 is free? booked!", mood: "ok" }, { at: 4.9, seat: "B1@1", state: "booked", by: "newcomer-1", beat: "problem", note: "A newcomer books B1 on the new primary. customer-11's confirmation now points at nothing." },
+    { at: 5.8, hall: 0, banner: "old primary restarts: still a primary", beat: "problem" },
+    { at: 6.4, seat: "B1@0", state: "clash" }, { at: 6.4, seat: "B1@1", state: "clash", note: "Split brain: B1 belongs to customer-11 on one server and newcomer-1 on the other, and both accept writes." },
+    { at: 6.6, who: "c", say: "B1 is mine!", mood: "bad" }, { at: 6.6, who: "n", say: "B1 is mine!", mood: "bad" },
+    { at: 7.8, hall: 0, banner: "fence it: stop the old primary first", beat: "solution", note: "The fix is outside Postgres: failover tooling must fence the old primary before promoting, and clients must follow the promotion." }
+  ]}
+  caption="Asynchronous failover trades the last seconds of writes for availability. Without fencing, it can also trade one history for two."
+/>
+
+<QuickCheck
+  question="After failover, the old primary restarted and accepted writes. Why didn't Postgres stop it?"
+  options={[
+    "A Postgres bug",
+    "Nothing told it: a server can't know from its own state that another was promoted while it was down. Stopping it (fencing) and pointing clients at the new primary is the failover system's job",
+    "It was read-only",
+    "The replication slot should have stopped it"
+  ]}
+  answer={1}
+  explain="Measured: 'old primary: in recovery? f' and it booked C1. Leadership is a fact about the cluster, not about one server; deciding it needs something outside both (chapter 24)."
+/>
+
+## No Leader
+
+*Stop 6 of 6.*
+
+### Step 1: quorums
+
+Leader-based replication funnels every write through one server. **Leaderless** replication (Amazon's Dynamo, Cassandra, Riak) sends each write to all **N** copies and treats it as done when **W** acknowledge; each read asks the copies and uses the first **R** answers. If **R + W > N**, every read quorum overlaps every write quorum, so some copy in every read has the latest write. `quorum` is a small implementation over three independent Redis servers, each value carrying a **version vector** (which writer wrote how many times) so a read can tell newer from concurrent:
+
+```go noverify
+// Package quorum is a leaderless, Dynamo-style replicated register over N
+// independent Redis nodes: a write goes to every node and succeeds when W
+// acknowledge; a read asks every node and returns when R have answered.
+// Each value carries a version vector, so a read can tell "newer" from
+// "concurrent" (a conflict).
+package quorum
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+type Store struct {
+	Nodes   []*redis.Client
+	Timeout time.Duration // per node
+}
+
+// Version is one write: a value, the vector clock it was written with
+// (writer → count), and the writer's wall-clock time (for last-writer-wins).
+type Version struct {
+	Value string         `json:"value"`
+	Clock map[string]int `json:"clock"`
+	At    time.Time      `json:"at"`
+}
+
+// descends reports whether a has seen everything b has.
+func descends(a, b map[string]int) bool {
+	for k, n := range b {
+		if a[k] < n {
+			return false
+		}
+	}
+	return true
+}
+
+var ErrQuorum = errors.New("quorum not reached")
+
+// Put writes v to every node in parallel and returns once w of them have
+// acknowledged (or fails when that becomes impossible).
+func (s *Store) Put(ctx context.Context, key string, v Version, w int) (acked int, err error) {
+	b, _ := json.Marshal(v)
+	results := make(chan error, len(s.Nodes))
+	for _, n := range s.Nodes {
+		go func() {
+			ctx, cancel := context.WithTimeout(ctx, s.Timeout)
+			defer cancel()
+			results <- n.Set(ctx, key, b, 0).Err()
+		}()
+	}
+	failed := 0
+	for range s.Nodes {
+		if err := <-results; err != nil {
+			failed++
+		} else {
+			acked++
+		}
+		if acked >= w {
+			return acked, nil
+		}
+		if failed > len(s.Nodes)-w {
+			break
+		}
+	}
+	return acked, fmt.Errorf("%w: %d of %d acknowledged, needed %d", ErrQuorum, acked, len(s.Nodes), w)
+}
+
+// Get asks every node and returns the versions from the first r replies,
+// reduced to those no other reply has superseded: one version normally,
+// several if they were written concurrently.
+func (s *Store) Get(ctx context.Context, key string, r int) ([]Version, error) {
+	type reply struct {
+		v   *Version
+		err error
+	}
+	replies := make(chan reply, len(s.Nodes))
+	for _, n := range s.Nodes {
+		go func() {
+			ctx, cancel := context.WithTimeout(ctx, s.Timeout)
+			defer cancel()
+			b, err := n.Get(ctx, key).Bytes()
+			if errors.Is(err, redis.Nil) {
+				replies <- reply{}
+				return
+			}
+			if err != nil {
+				replies <- reply{err: err}
+				return
+			}
+			var v Version
+			replies <- reply{v: &v, err: json.Unmarshal(b, &v)}
+		}()
+	}
+	var got []Version
+	answered, failed := 0, 0
+	for range s.Nodes {
+		rp := <-replies
+		if rp.err != nil {
+			failed++
+			if failed > len(s.Nodes)-r {
+				return nil, fmt.Errorf("%w: %d of %d answered, needed %d", ErrQuorum, answered, len(s.Nodes), r)
+			}
+			continue
+		}
+		answered++
+		if rp.v != nil {
+			got = append(got, *rp.v)
+		}
+		if answered >= r {
+			break
+		}
+	}
+	return latest(got), nil
+}
+
+// latest drops every version another one descends from.
+func latest(vs []Version) []Version {
+	var out []Version
+	for i, v := range vs {
+		superseded := false
+		for j, o := range vs {
+			if i != j && descends(o.Clock, v.Clock) && !descends(v.Clock, o.Clock) {
+				superseded = true
+				break
+			}
+		}
+		dup := false
+		for _, o := range out {
+			if descends(o.Clock, v.Clock) && descends(v.Clock, o.Clock) {
+				dup = true
+			}
+		}
+		if !superseded && !dup {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+```
+
+### Step 2: measured
+
+Node 3 is cut off (its Toxiproxy proxy disabled) while Alice holds A7 with W=2; then node 3 comes back, without her hold:
+
+```text
+== N=3. Node 3 is cut off while alice holds A7 with W=2.
+put alice W=2: 2 acknowledged, err=<nil>
+300 reads with R=1 (R+W=3, N=3): 116 said nobody holds A7
+300 reads with R=2 (R+W=4, N=3): 0 said nobody holds A7
+
+== A partition splits node 1 from nodes 2 and 3. Two customers hold B4, one on each side.
+web-1 (sees node 1 only):   put bob   W=1: 1 acknowledged, err=<nil>
+                            put bob   W=2: err=quorum not reached: 1 of 3 acknowledged, needed 2
+web-2 (sees nodes 2 and 3): put carol W=2: 2 acknowledged, err=<nil>
+partition healed; read R=3: CONFLICT: carolmap[web-2:1] bobmap[web-1:1]
+last-writer-wins would keep "carol" and silently drop the other hold
+```
+
+With **R=1** (R+W = N, no guaranteed overlap), **116 of 300 reads said nobody holds A7**: whenever node 3 answered first. With **R=2** (R+W > N), **0**: at least one of any two nodes has the hold, and the version vectors pick it.
+
+The first version of this experiment used `docker pause` to cut node 3 off, and saw **no** stale reads at all. The write to the paused node didn't fail: it sat in the connection's buffers, and was applied the moment the node resumed. The client had timed out and counted it as not acknowledged, but the write happened anyway. That's chapter 12's lost reply again, and the reason leaderless stores also need **read repair** and **anti-entropy** (writing newer versions back to stale nodes): "not acknowledged" doesn't mean "not written".
+
+### Step 3: concurrent writes
+
+Now a partition splits node 1 from nodes 2 and 3. Bob's server can reach only node 1; Carol's can reach 2 and 3. Both hold B4. Bob's W=2 write fails (only one node answered), so he retries with **W=1**, and it succeeds. After the partition heals, a read of all three returns **a conflict**: two versions, `bob {web-1:1}` and `carol {web-2:1}`, neither of which has seen the other. The version vectors *know* these are concurrent.
+
+**Last-writer-wins** (keep the one with the later timestamp) would quietly keep Carol and drop Bob's hold; Cassandra does exactly that by default. A seat can't be held twice, so the cinema must choose, and tell the loser. And the real lesson is one step earlier: with **W=2 on both sides**, only one side of a partition can reach a majority, so only one of Bob and Carol can succeed. Dropping to W=1 bought availability during the partition and paid for it with a conflict.
+
+<CinemaAnim
+  title="Three nodes, no leader: quorums and a conflict"
+  kicker="leaderless · live"
+  noDesk
+  rows={3}
+  cols={6}
+  halls={[{ label: "node 1" }, { label: "node 2" }, { label: "node 3" }]}
+  customers={[{ id: "a", label: "alice", look: "pink" }, { id: "b", label: "bob" }, { id: "c", label: "carol", look: "pink" }]}
+  events={[
+    { at: 0, who: "a", to: "lobby" }, { at: 0, who: "b", to: "lobby" }, { at: 0, who: "c", to: "lobby", note: "N=3 copies, no leader. Node 3 is cut off." },
+    { at: 0.6, hall: 2, banner: "cut off" },
+    { at: 1.2, seat: "A1@0", state: "held", by: "alice" }, { at: 1.2, seat: "A1@1", state: "held", by: "alice", note: "Alice holds A1 with W=2: nodes 1 and 2 acknowledge. Node 3 never hears of it." },
+    { at: 2.0, hall: 2, banner: null, who: "a", say: "R=1: who holds A1?", mood: "wait" },
+    { at: 2.8, who: "a", say: "node 3: nobody?!", mood: "bad", beat: "problem", note: "Measured: with R=1, 116 of 300 reads said nobody holds it. R+W = N: no guaranteed overlap." },
+    { at: 3.8, who: "a", say: "R=2: alice ✓", mood: "ok", beat: "solution", note: "With R=2, any two nodes include one that has the hold, and the version vector says it's newer. Measured: 0 of 300." },
+    { at: 4.8, hall: 0, banner: "partition: node 1 | nodes 2, 3", note: "A partition: bob's server reaches node 1 only; carol's reaches nodes 2 and 3." },
+    { at: 5.6, who: "b", to: "B4@0", say: "W=1 ✓", mood: "ok" }, { at: 5.8, seat: "B4@0", state: "held", by: "bob" },
+    { at: 6.2, who: "c", to: "B4@1", say: "W=2 ✓", mood: "ok" }, { at: 6.4, seat: "B4@1", state: "held", by: "carol" }, { at: 6.4, seat: "B4@2", state: "held", by: "carol" },
+    { at: 7.4, hall: 0, banner: null, seat: "B4@0", state: "clash" }, { at: 7.4, seat: "B4@1", state: "clash" }, { at: 7.4, seat: "B4@2", state: "clash", beat: "problem", note: "Healed. A read of all three: CONFLICT, bob {web-1:1} and carol {web-2:1}. Last-writer-wins would silently drop one hold." },
+    { at: 8.6, who: "b", say: "W=2 would have failed", mood: "wait", beat: "solution", note: "With W=2 on both sides, only the side with a majority could write. Bob's W=2 attempt did fail; W=1 is what made the conflict possible." }
+  ]}
+  caption="R + W > N makes every read see the latest write. Lower either for availability, and you get stale reads or conflicts to resolve."
+/>
+
+<QuickCheck
+  question="Why did R=2 never return a stale answer when W=2 and N=3?"
+  options={[
+    "Two nodes are faster than one",
+    "R + W > N: any 2 nodes read overlap the 2 nodes written in at least one, which has the hold, and the version vector identifies it as the newest",
+    "Node 3 was always slow",
+    "Redis replicated it"
+  ]}
+  answer={1}
+  explain="Measured: 0 of 300 with R=2, 116 of 300 with R=1. The overlap is arithmetic, not luck: 2 + 2 > 3."
+/>
+
+---
+
+## Exercises
+
+These use the Postgres pair and the three Redis nodes from this chapter.
+
+<Exercise n={1} title="Route the reads" level="easy">
+
+Design the cinema's read routing: which queries go to the primary and which to the replica, for (a) the public seat map; (b) a customer's "my bookings" page right after booking; (c) the box-office occupancy report; (d) the Hold that must check the seat is free.
+
+<Solution>
+
+(a) **Replica**: a second-old seat map is fine, and it's most of the traffic. (b) **Replica with read-your-writes**: remember the LSN of the customer's last write in their session; read from the replica only once it has replayed that far, otherwise from the primary. (c) **Replica**, or a dedicated reporting replica, so a long report never slows the primary. (d) **Primary, inside the write**: the check and the hold must be one atomic operation on the source of truth (chapter 8's lesson). A check on a replica followed by a write on the primary is a race with lag added.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Measure your lag" level="easy">
+
+Using `pg_stat_replication` on the primary and `pg_last_xact_replay_timestamp()` on the replica, write a query for each that an alert could use. Which one keeps growing when the primary is idle?
+
+<Solution>
+
+On the primary: `SELECT application_name, replay_lag FROM pg_stat_replication`, which is measured per standby from WAL positions and stops advancing (the view shows NULL after a while) when there's nothing new to replicate. On the replica: `SELECT now() - pg_last_xact_replay_timestamp()`, the age of the last replayed commit, which **keeps growing when the primary is idle**, since no new commits arrive. So alert on replay_lag (or the byte gap `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)`) rather than on replay-timestamp age, or combine the age with a check that the primary actually committed something.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Two synchronous standbys" level="medium">
+
+Add a second replica and set `synchronous_standby_names = 'ANY 1 (walreceiver, replica2)'` (use `application_name` in each standby's `primary_conninfo` to tell them apart). Repeat stop 4's experiment with one standby stopped. What changes, and what does it cost?
+
+<Solution>
+
+Commits wait for **any one** of the two standbys, so stopping one no longer stops writes: the other acknowledges. Durability stays "on two machines" as long as one standby is up. The cost is a third server, and commit latency becomes that of the faster standby (good). With `FIRST 1 (a, b)` instead, `a` is preferred and `b` takes over only when `a` is gone. Either way, a single standby failure no longer turns into a 135-second stall.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Lose less on failover" level="medium">
+
+Repeat stop 5 with `synchronous_commit = on` and a synchronous standby. What happens to the ten bookings made after the replica loses contact?
+
+<Solution>
+
+They never complete: each commit waits for the standby that can't be reached, and the customers see a hang instead of a confirmation (stop 4). When the primary is killed, those transactions had committed locally but were never acknowledged, so nobody holds a confirmation for them, and the promoted replica has every booking that *was* confirmed. That's the trade: synchronous replication turns "lost confirmed writes" into "writes that couldn't be confirmed", which is far better for bookings, at the cost of availability while the standby is unreachable.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Resolve the conflict" level="hard">
+
+Extend `quorum` so a write carries the clock of the version it read (a context), and a read with siblings returns them all. Then write the cinema's resolution for two concurrent holds on one seat, and the read repair that writes the resolved value back to every node.
+
+<Solution>
+
+`Put` takes the clock from the last read, merges it (max per writer), and increments its own writer's entry, so a write made after reading both siblings descends from both and supersedes them. For seats: pick the hold with the earlier `At` (first come, first served: arguably fairer than LWW's "latest wins"), give the loser a clear error and, if they already saw a confirmation, an apology and a hold on a nearby seat. Read repair: after resolving, `Put` the winner with the merged clock to all N nodes (W can be low: it's a background fix). Riak and Dynamo's descendants work this way; Cassandra instead resolves by timestamp per column, which is why conditional writes (lightweight transactions, using Paxos) are what you'd use for a seat.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Quorums and Version Vectors"
+  archetype="build-it"
+  difficulty="guided"
+  points={120}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Implement the three pieces of a leaderless store's client: compare two version vectors (Equal, Before, After, Concurrent); reduce read replies to the versions nothing supersedes (siblings when concurrent); and put a value to N nodes in parallel, returning as soon as W acknowledge, or with ErrQuorum as soon as W is out of reach."
+  starter={`package main
+
+import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
 
-// A tiny replicated store: a leader and one follower, each holding a balance.
-// The follower applies the leader's writes a beat LATER — that delay is lag.
-type Store struct {
-	mu      sync.Mutex
-	balance int64 // cents
+// Clock is a version vector: writer → how many writes it has made.
+type Clock map[string]int
+
+// Version is a value with the clock it was written with.
+type Version struct {
+	Value string
+	Clock Clock
 }
 
-func (s *Store) set(v int64) { s.mu.Lock(); s.balance = v; s.mu.Unlock() }
-func (s *Store) get() int64  { s.mu.Lock(); defer s.mu.Unlock(); return s.balance }
-
-func main() {
-	leader, follower := &Store{}, &Store{}
-	repl := make(chan int64, 10)
-
-	// The follower applies the leader's stream, but 50ms behind.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done() // (Go 1.25's wg.Go combines Add+go+Done into one call)
-		for v := range repl {
-			time.Sleep(50 * time.Millisecond) // replication lag
-			follower.set(v)
-		}
-	}()
-
-	// Client writes to the leader, then immediately reads the follower.
-	leader.set(9000)
-	repl <- 9000
-	fmt.Println("right after the write:")
-	fmt.Println("  leader   reads:", leader.get())   // 9000 — current
-	fmt.Println("  follower reads:", follower.get()) // 0    — STALE, hasn't caught up
-
-	time.Sleep(80 * time.Millisecond) // wait out the lag
-	fmt.Println("after lag settles:")
-	fmt.Println("  follower reads:", follower.get()) // 9000 — now agrees
-
-	close(repl)
-	wg.Wait()
-}
-```
-
-</GoPlayground>
-
-<Callout kind="warn" title="When the leader dies: failover and split-brain">
-
-If the leader fails, a follower must be promoted to the new leader — **failover**. This is where systems get hurt: (1) with async replication, the promoted follower may be missing the dead leader's last writes — **data loss**; (2) if the old leader wasn't really dead (just slow or network-partitioned) and comes back thinking it's still leader, you now have **two leaders** accepting conflicting writes — **split-brain**, the nightmare scenario. Real systems prevent this with automated leader election and fencing (a token that locks out the old leader). Failover is never as simple as "promote a follower" — it's the hardest part of running single-leader, which is why managed databases earn their fee.
-
-</Callout>
-
-<Scene
-  title="Failover: the crown moves — and the danger window"
-  actors={[
-    { id: "ld", label: "node 1", role: "leader" },
-    { id: "f1", label: "node 2" },
-    { id: "f2", label: "node 3" }
-  ]}
-  frames={[
-    {
-      caption: "Healthy single-leader: node 1 wears the crown and takes every write; nodes 2 and 3 replay its log.",
-      beat: "neutral",
-      actors: [
-        { id: "ld", state: "active", role: "leader" },
-        { id: "f1", state: "idle" },
-        { id: "f2", state: "idle" }
-      ]
-    },
-    {
-      caption: "Node 1 stops responding — crash? network partition? slow GC? Nobody can tell from the outside. It may STILL think it's leader.",
-      beat: "problem",
-      actors: [
-        { id: "ld", state: "warn", role: "leader", pose: "sleep" },
-        { id: "f1", state: "warn" },
-        { id: "f2", state: "warn" }
-      ]
-    },
-    {
-      caption: "Failover: node 2 is promoted — the crown materializes on it. Danger #1: with async replication, node 2 may be MISSING node 1's last acknowledged writes. Those are gone.",
-      beat: "problem",
-      actors: [
-        { id: "ld", state: "warn", role: "leader", pose: "sleep" },
-        { id: "f1", state: "ok", role: "leader" },
-        { id: "f2", state: "done" }
-      ]
-    },
-    {
-      caption: "Danger #2 — split-brain: node 1 wakes still wearing ITS crown. TWO leaders, both accepting writes for the same accounts. This is how ledgers fork.",
-      beat: "problem",
-      actors: [
-        { id: "ld", state: "bad", role: "leader" },
-        { id: "f1", state: "ok", role: "leader" },
-        { id: "f2", state: "warn" }
-      ]
-    },
-    {
-      caption: "Fencing ends it: every write carries the election term, node 1's stale term is rejected everywhere, and its crown is stripped. One leader again — this exact mechanism gets the full treatment in the consensus chapter.",
-      beat: "solution",
-      actors: [
-        { id: "ld", state: "bad", pose: "panic" },
-        { id: "f1", state: "done", role: "leader" },
-        { id: "f2", state: "done" }
-      ]
-    }
-  ]}
-  caption="Failover is a crown in motion: promotion can drop acknowledged writes (async lag), and a zombie leader makes two crowns — split-brain — until fencing strips the stale one."
-/>
-
-<ELI5
-  concept="Replication lag and read-after-write"
-  analogy="Posting a letter, then ringing a branch that hasn't opened the mail yet."
-  role="reader"
->
-
-Reads are sent to followers to spread the load. Followers are behind the leader by some amount — usually milliseconds, occasionally much more under load.
-
-Most of the time nobody notices. The case that always surfaces is the user's own write. They change their name, the page reloads, the read goes to a follower that hasn't caught up, and they see the old name. They assume it failed and do it again.
-
-That is **read-after-write consistency**, and it only concerns a user reading *their own* writes — nobody minds seeing someone else's change a second late. The usual fixes, cheapest first: send reads to the leader for a short window after that user writes; or remember the position of their write and route to a follower that has reached it; or, on a single page, just use the value you already have rather than re-reading it.
-
-The trap is testing on an idle system. Lag is near zero when nothing is happening, so the bug does not exist in staging and appears in production at peak.
-
-</ELI5>
-
-## Lag & Stale Reads
-
-That `0` the follower returned isn't a bug — it's the defining behavior of replication, and it has a name.
-
-<Define term="Replication lag & eventual consistency" since="Replication (Part 2)">
-**Replication lag** is the delay between a write being applied on the leader and that change reaching a follower — usually milliseconds, but seconds or worse under load. During that window a follower serves a **stale** (out-of-date) read. **Eventual consistency** is the promise that *if writes stop, all replicas eventually converge* to the same value — but it says nothing about *when*. Why it matters: "eventual" can mean the customer who just deposited ₦5,000 reloads and sees their old balance, because their read hit a follower that hadn't caught up. Correct, by the rules — and infuriating to that customer.
-</Define>
-
-This stale-read window breaks specific, predictable user expectations. Each has a name and a fix:
-
-<ConceptGrid cols={3}>
-  <ConceptCard label="Read-your-writes">You make a change and immediately want to see it. If your read hits a lagging follower, your own change vanishes. Fix: route a user's reads to the leader for a short window after they write — they always see their own work.</ConceptCard>
-  <ConceptCard label="Monotonic reads">You refresh twice and time appears to go backwards — first read hits an up-to-date follower (sees the deposit), second hits a laggy one (deposit gone). Fix: pin each user to one replica so they never see older data than they already saw.</ConceptCard>
-  <ConceptCard label="Consistent prefix">You see an effect before its cause — a reply before the message it answers. Happens when related writes land on followers out of order. Fix: keep causally-related writes in the same partition/order.</ConceptCard>
-</ConceptGrid>
-
-<ExecTimeline
-  title="Replication lag: the stale-read window, and how read-your-writes closes it"
-  lanes={[
-    { id: "ada", label: "Ada (just deposited)", role: "banker" },
-    { id: "leader", label: "leader", role: "leader" },
-    { id: "follower", label: "follower", role: "librarian" },
-    { id: "bob", label: "Bob (other user)", role: "operator" }
-  ]}
-  steps={[
-    { lane: "ada", kind: "send", label: "deposit ₦9,000", note: "Ada writes. All writes go to the single leader — the follower never takes writes directly." },
-    { lane: "leader", kind: "run", label: "apply: balance = 9000", note: "The leader applies the write and acknowledges. Ada's deposit is durable on the leader." },
-    { lane: "leader", kind: "send", label: "replicate → follower (in flight)", note: "The leader streams the change to the follower. This takes time — the replication lag window. Right now the follower is still behind." },
-    { lane: "follower", kind: "recv", label: "still balance = 0 (lagging)", note: "Mid-lag, the follower has NOT applied the deposit yet. Any read it serves here is stale — correct by the rules, but out of date." },
-    { lane: "ada", kind: "run", label: "Ada reads → routed to LEADER → 9000", note: "Read-your-writes: because Ada just wrote, her reads go to the leader for a short window. She sees her own ₦9,000 — never a vanishing deposit.", beat: "solution" },
-    { lane: "bob", kind: "run", label: "Bob reads → follower → 0 (stale, fine)", note: "Bob didn't write Ada's account. His read hits the cheaper follower; a little staleness on someone else's balance is harmless.", beat: "neutral" },
-    { lane: "follower", kind: "done", label: "lag resolves: balance = 9000", note: "Moments later the follower applies the change. The window closes; now every replica agrees. Eventual consistency, delivered — eventually." }
-  ]}
-  caption="The stale-read window is the gap between 'leader applied' and 'follower caught up'. Read-your-writes routes the writer's own reads to the leader during that window, so a customer never watches their own deposit disappear."
-/>
-
-**Read-your-writes** is the one you'll implement most. Here it is — route the writer's own reads to the leader, let everyone else read the (cheaper, lagging) follower:
-
-<GoPlayground>
-
-```go
-package main
-
-import "fmt"
-
-// After a user writes, send THEIR reads to the leader for a short window, so they
-// never see their own change disappear off a lagging follower. Other users still
-// read followers — it isn't their money, so a little staleness is harmless.
-type Router struct {
-	leaderBalance   int64
-	followerBalance int64  // lags behind the leader
-	recentWriter    string // the user who just wrote
-}
-
-func (r *Router) read(user string) int64 {
-	if user == r.recentWriter {
-		return r.leaderBalance // your own reads go to the up-to-date leader
-	}
-	return r.followerBalance // others read the follower (maybe stale — fine)
-}
-
-func main() {
-	// ada just deposited 9000; the follower hasn't caught up (still 0).
-	r := &Router{leaderBalance: 9000, followerBalance: 0, recentWriter: "ada"}
-
-	fmt.Println("ada reads:", r.read("ada")) // 9000 — sees her own deposit (leader)
-	fmt.Println("bob reads:", r.read("bob")) // 0    — stale follower, but not his account
-}
-```
-
-</GoPlayground>
-
-<Callout kind="note" title="You've already met one slice of this">
-
-[SQL & Databases in Go](/part-1/sql-databases) covered the *read-after-write anomaly* on Postgres read replicas, and its fix — route a user's reads to the primary for a few seconds after they write. That's read-your-writes, the database-specific case. This chapter is the general principle behind it: lag is fundamental to replication, and every consistency guarantee you want is a named technique for taming a specific symptom of lag.
-
-</Callout>
-
-<QuickCheck
-  question="A customer deposits money, sees a success message, then immediately refreshes and their balance shows the OLD amount. The deposit did succeed. What happened?"
-  options={[
-    "The deposit was rolled back",
-    "Their refresh read hit a follower that hadn't yet received the write from the leader — a stale read during replication lag",
-    "The database is corrupted",
-    "The leader lost the write"
-  ]}
-  answer={1}
-  explain="Classic stale read. The write succeeded on the leader, but the customer's refresh was served by a follower still catching up. The deposit isn't lost — the follower is just behind. The fix is read-your-writes: route that customer's reads to the leader for a short window after their deposit."
-/>
-
-## Multi-Leader & Leaderless
-
-Single-leader has one weakness: **one** machine takes all writes. If that leader is far away, or you want two data centers both accepting writes, or you want writes to keep working while offline — you need more than one writer. Two ways to get there, both of which buy write flexibility at the price of **conflicts**.
-
-<Define term="Multi-leader replication" since="Replication (Part 2)">
-**Multi-leader** replication allows more than one replica to accept writes — typically one leader per data center. Each leader applies local writes immediately and replicates them to the others. Why it matters: it keeps writes fast and available across regions (and offline — your phone's calendar editing offline then syncing is multi-leader), but because two leaders can change the *same* record at the *same* time, you inevitably get **write conflicts** that something must resolve.
-</Define>
-
-<Define term="Leaderless replication" since="Replication (Part 2)">
-**Leaderless** replication (Dynamo-paper style — Cassandra, Riak; AWS's DynamoDB descends from the same lineage but its product internals differ from the original Dynamo paper) has no leader at all. The client (or a coordinator) sends each write to *several* replicas directly, and reads from *several* replicas, using version numbers to figure out which value is newest. Why it matters: there's no leader to fail over, so it tolerates machine failures gracefully — but the client now does the work of deciding what's current, which is where **quorums** come in (next section).
-</Define>
-
-<ConceptGrid cols={3}>
-  <ConceptCard label="Single-leader">One writer, simple ordering, no write conflicts. Cost: the leader is a bottleneck and a failover risk. Best for: anything needing correctness over write-availability — Meridian's ledger.</ConceptCard>
-  <ConceptCard label="Multi-leader">Writers in every region, fast local writes, survives offline. Cost: concurrent edits to the same data conflict and must be merged. Best for: geo-distributed apps, collaborative editing.</ConceptCard>
-  <ConceptCard label="Leaderless">No leader to fail over; tolerates failures smoothly via quorums. Cost: the client resolves staleness; weaker guarantees. Best for: high-availability stores where some inconsistency is acceptable.</ConceptCard>
-</ConceptGrid>
-
-**On the job:** the question is never "which is best" — it's "what does this data tolerate?" A user's *avatar* can be multi-leader and resolve conflicts sloppily; nobody dies if the wrong photo wins. An *account balance* must be single-leader, because "two leaders both debited the same account and we merged it wrong" is *inventing or destroying money*. Match the replication model to the cost of being wrong about *that specific data*. Meridian uses single-leader for the ledger and can afford leaderless caches around the edges.
-
-## Quorums
-
-Leaderless replication poses a sharp question: if there's no leader and I write to *some* replicas and read from *some* replicas, how do I guarantee my read sees my write? The answer is a small, beautiful piece of arithmetic.
-
-<Define term="Quorum (N, W, R)" since="Replication (Part 2)">
-With **N** replicas holding a piece of data, a **quorum** write waits for acknowledgment from **W** replicas, and a quorum read collects answers from **R** replicas. The rule **W + R > N** guarantees that the set of replicas you wrote to and the set you read from **overlap by at least one**. In the simple case of a completed, versioned write and no concurrent conflict, that overlap gives the read a copy of the newest acknowledged value. Why it matters: it lets a cluster of individually-unreliable machines improve freshness without a single leader, just by counting — but it is not the same thing as linearizability.
-</Define>
-
-Why does `W + R > N` work? Pure **pigeonhole**: if you write to W replicas and read from R replicas out of N total, and W + R is *bigger* than N, the two groups can't be disjoint — they must share at least one replica. For a completed write in this simplified model, that shared replica has your write, and version numbers let the reader pick it as newest.
-
-<Scene
-  title="N=3, W=2, R=2: the write set and read set must overlap"
-  actors={[
-    { id: "w", label: "writer", role: "banker" },
-    { id: "rd", label: "reader", role: "detective" }
-  ]}
-  rows={1}
-  cols={3}
-  frames={[
-    {
-      caption: "Three replicas hold this key, all at version 0 (empty). No single leader — freshness will come from counting.",
-      beat: "neutral",
-      cells: [
-        { id: "A1", state: "idle", label: "R0 · v0" },
-        { id: "A2", state: "idle", label: "R1 · v0" },
-        { id: "A3", state: "idle", label: "R2 · v0" }
-      ]
-    },
-    {
-      caption: "Write to W=2 replicas — R0 and R1 — and wait for both to ack. v1=₦9,000 now lives on two of the three. R2 missed it.",
-      beat: "neutral",
-      actors: [{ id: "w", state: "active" }],
-      cells: [
-        { id: "A1", state: "done", label: "R0 · v1 ✓" },
-        { id: "A2", state: "done", label: "R1 · v1 ✓" },
-        { id: "A3", state: "warn", label: "R2 · v0" }
-      ]
-    },
-    {
-      caption: "Read from R=2 replicas — R1 and R2. Because W+R=4 > N=3, the read set CANNOT avoid the write set: R1 is in both. The reader sees v1 and picks it as newest.",
-      beat: "solution",
-      actors: [{ id: "rd", state: "ok" }],
-      cells: [
-        { id: "A1", state: "idle", label: "R0" },
-        { id: "A2", state: "done", label: "R1 · v1 ← overlap" },
-        { id: "A3", state: "ok", label: "R2 · v0" }
-      ]
-    },
-    {
-      caption: "Break the rule: W=1, R=1 → W+R=2, not > 3. Write only R0, read only R2 — disjoint sets, zero overlap. The read returns stale v0 and never learns about the write.",
-      beat: "problem",
-      cells: [
-        { id: "A1", state: "warn", label: "R0 · v1 (wrote)" },
-        { id: "A2", state: "idle", label: "R1" },
-        { id: "A3", state: "bad", label: "R2 · v0 (read — stale!)" }
-      ]
-    }
-  ]}
-  caption="W+R>N is pigeonhole, not magic: a write set of W and a read set of R out of N can't be disjoint once W+R exceeds N, so the read always touches at least one replica carrying the latest acknowledged write. Drop below the threshold and the sets can miss each other entirely."
-/>
-
-Let's prove it runs:
-
-<GoPlayground>
-
-```go
-package main
-
-import "fmt"
-
-// quorumOK reports whether the read and write sets are guaranteed to overlap.
-func quorumOK(n, w, r int) bool { return w+r > n }
-
-type replica struct {
-	version int
-	value   int64
-}
-
-// writeQuorum writes (ver,val) to the FIRST w of n replicas.
-func writeQuorum(reps []replica, w, ver int, val int64) {
-	for i := 0; i < w; i++ {
-		reps[i] = replica{ver, val}
-	}
-}
-
-// readQuorum reads the LAST r replicas and returns the newest version it finds.
-func readQuorum(reps []replica, r int) replica {
-	newest := replica{}
-	for i := len(reps) - r; i < len(reps); i++ {
-		if reps[i].version >= newest.version {
-			newest = reps[i]
-		}
-	}
-	return newest
-}
-
-func main() {
-	n, w, r := 3, 2, 2
-	fmt.Printf("N=%d W=%d R=%d -> W+R>N? %v  (overlap guaranteed)\n", n, w, r, quorumOK(n, w, r))
-
-	reps := make([]replica, n)    // 3 empty replicas (version 0)
-	writeQuorum(reps, w, 1, 9000) // write v1=9000 to 2 of 3 (indices 0,1)
-	got := readQuorum(reps, r)    // read 2 of 3 (indices 1,2) -> overlap at index 1
-	fmt.Printf("read sees: %d cents (version %d) — fresh\n", got.value, got.version)
-
-	// Break the rule: W=1, R=1 -> W+R=2, not > 3. Write index 0, read index 2: no overlap.
-	fmt.Printf("\nN=3 W=1 R=1 -> W+R>N? %v  (a read can MISS the latest write)\n", quorumOK(3, 1, 1))
-}
-```
-
-</GoPlayground>
-
-<UnderTheHood title="Tuning W and R, and why 'strict quorum' still isn't linearizable">
-
-`W + R > N` is one equation with room to tune. Common choices for N=3:
-
-- **W=2, R=2** — balanced; survives one replica down for both reads and writes.
-- **W=3, R=1** — fast reads, slow/fragile writes (all replicas must ack). Good for read-heavy data.
-- **W=1, R=3** — fast writes, slow reads. Good for write-heavy data you read rarely.
-
-Two honest caveats people skip. First, quorums tolerate failure but *reduce* it: with W=2 on N=3, one dead replica is fine; two dead and writes stop. Second — and this trips up even strong engineers — a strict quorum is **not** the same as **linearizability** (the illusion of a single, instantly-consistent copy). Edge cases break it: a write that reached only some of its W replicas before failing, reads concurrent with writes, replicas recovering from stale snapshots. Quorums give you *probably fresh, usually*, not *provably the latest, always*. When you genuinely need linearizability — and a ledger sometimes does — you reach for consensus (Raft/Paxos), which is its own chapter. Quorums are a pragmatic sweet spot, not a consistency guarantee you can lean your whole bank on.
-
-</UnderTheHood>
-
-<QuickCheck
-  question="You run N=5 replicas and want reads to always see the latest acknowledged write. You set W=3. What's the smallest R that guarantees overlap?"
-  options={[
-    "R = 1",
-    "R = 2",
-    "R = 3",
-    "R = 5"
-  ]}
-  answer={2}
-  explain="You need W + R > N, i.e. 3 + R > 5, so R > 2, so the smallest integer R is 3. With W=3 and R=3 on N=5, the write set and read set share at least one replica (3+3=6 > 5), so a read after a completed write includes at least one replica carrying that acknowledged write."
-/>
-
-## Conflicts & Resolution
-
-Multi-leader and leaderless both allow two writes to the same data at the same time. When the copies sync up, they disagree — a **conflict** — and something must pick a winner or merge them. This is the hardest part of giving up a single leader, and where you must be most careful with money.
-
-<Define term="Write conflict" since="Replication (Part 2)">
-A **write conflict** happens when two writes modify the same data **concurrently** — neither saw the other before happening — so there's no obvious "which came first." Example: account balance edited on the Lagos leader and the London leader in the same instant. When the two leaders sync, both have a different value and the system must resolve it. Why it matters: conflict resolution decides whether your system silently loses data, and a lost write to a balance is lost money.
-</Define>
-
-The simplest resolution strategy — and the most dangerous one for a ledger:
-
-<Define term="Last-writer-wins (LWW)" since="Replication (Part 2)">
-**Last-writer-wins** resolves a conflict by attaching a timestamp to every write and keeping the one with the latest timestamp; the others are **discarded**. Why it matters: it's dead simple and always converges, but it *throws away data* — the losing writes vanish silently. For a cache or a "last seen" field, fine. For two concurrent deposits to the same account, LWW means **one deposit just disappears** — which is why a ledger never resolves money conflicts this way.
-</Define>
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"time"
+type Order int
+
+const (
+	Equal Order = iota
+	Before
+	After
+	Concurrent
 )
 
-// Two replicas accepted concurrent writes to the same balance. Last-writer-wins
-// keeps the later timestamp and SILENTLY DROPS the other. Watch the lost write.
-type write struct {
-	value int64
-	ts    time.Time
+// compare reports how a relates to b: Before if b has seen everything a
+// has and more, After the other way round, Equal, or Concurrent if each
+// has seen a write the other hasn't. A missing writer counts as 0.
+func compare(a, b Clock) Order {
+	return Equal
 }
 
-func lww(a, b write) write {
-	if a.ts.After(b.ts) {
-		return a
+// latest reduces read replies to the versions nothing else supersedes:
+// drop any version that is Before another, and keep one copy of Equal
+// ones. One version normally; several (siblings) after concurrent writes.
+func latest(vs []Version) []Version {
+	return vs
+}
+
+// put writes v to every node in parallel and returns as soon as w have
+// acknowledged, with the count. It returns ErrQuorum as soon as enough
+// nodes have failed that w can no longer be reached. It must not wait for
+// slow nodes once the quorum is in.
+func put(ctx context.Context, nodes []Node, key string, v Version, w int) (int, error) {
+	acked := 0
+	for _, n := range nodes {
+		if err := n.Set(ctx, key, v); err == nil {
+			acked++
+		}
 	}
-	return b
+	return acked, nil
+}
+
+// ── below this line: do not edit ──
+
+var ErrQuorum = errors.New("quorum not reached")
+
+// Node is one replica. The harness's nodes stand in for Redis servers:
+// they can be slow, or down (refusing at once), and that's all that
+// matters to the quorum logic you're writing.
+type Node interface {
+	Set(ctx context.Context, key string, v Version) error
+}
+
+type memNode struct {
+	mu    sync.Mutex
+	data  map[string]Version
+	down  bool
+	delay time.Duration
+}
+
+func (n *memNode) Set(ctx context.Context, key string, v Version) error {
+	if n.down {
+		return errors.New("connection refused")
+	}
+	select {
+	case <-time.After(n.delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.data[key] = v
+	return nil
 }
 
 func main() {
-	t0 := time.Now()
-	lagos := write{value: 5000, ts: t0.Add(10 * time.Millisecond)}  // "deposit, balance 5000"
-	london := write{value: 7000, ts: t0.Add(12 * time.Millisecond)} // "deposit, balance 7000"
-
-	winner := lww(lagos, london)
-	fmt.Printf("LWW winner: %d cents (the later write)\n", winner.value) // 7000
-	fmt.Println("LOST: the 5000 write is gone — acceptable for a cache, FATAL for money")
-}
-```
-
-</GoPlayground>
-
-So what *does* a ledger do? Two answers, and you've already built toward both:
-
-1. **Don't allow the conflict.** Keep money on a **single leader** so two concurrent writes to one account are impossible — they queue in one order. This is exactly why Meridian's ledger is single-leader. Simplicity is a feature when the data is money.
-2. **Make writes that compose, not overwrite.** Model balance changes as an **append-only log of transactions** (debits and credits) rather than an overwrite of a single number. Two concurrent deposits become two log entries that *add up* — there's nothing to conflict because neither replaces the other. This is the double-entry ledger from Part 3, and it's why event-sourced money is conflict-resistant by design.
-
-<Define term="Version vector" since="Replication (Part 2)">
-A **version vector** is a set of counters — one per replica — attached to a value, tracking how many writes each replica has seen. Comparing two version vectors tells you whether one write *happened before* another (safe to drop the older) or whether they were truly **concurrent** (a real conflict needing a merge, not a silent discard). Why it matters: it's how leaderless systems detect *genuine* conflicts instead of guessing with timestamps — letting the application merge concurrent writes (e.g. union two shopping carts) rather than losing one to LWW.
-</Define>
-
-<Callout kind="pro" title="The senior instinct: design conflicts out, don't resolve them in">
-
-Junior engineers reach for clever conflict-resolution algorithms. Senior engineers reach for *data models where the conflict can't occur*. Single-leader removes write conflicts by construction. Append-only/event-sourced models turn overwrites (which conflict) into additions (which don't). Commutative structures (CRDTs — counters and sets that merge in any order) make order irrelevant. The best conflict resolution is the conflict you made impossible. For Meridian: money is single-leader and append-only, so there's no balance conflict to lose sleep — or deposits — over.
-
-</Callout>
-
-## Exercises
-
-Build the primitives. Each one is a real replication mechanism in miniature.
-
-<Exercise n={1} title="Quorum checker" level="easy">
-
-Write `wouldOverlap(n, w, r int) bool` returning whether a read and write quorum are guaranteed to overlap, and print results for N=3 across all valid (W, R) from 1 to 3. Which combinations are safe?
-
-<Solution>
-
-```go
-func wouldOverlap(n, w, r int) bool { return w+r > n }
-
-// For N=3: safe when W+R > 3.
-//   W=1: R=3 ✓        (1+3=4>3)
-//   W=2: R=2 ✓, R=3 ✓ (2+2=4>3)
-//   W=3: R=1 ✓, R=2 ✓, R=3 ✓
-// W=1,R=1 (2) and W=1,R=2 (3) and W=2,R=1 (3) are NOT > 3 — unsafe.
-```
-
-The rule is strict inequality: `W + R` must be *strictly greater* than N. `W + R == N` is not enough — the sets can be exactly disjoint, so a read can miss the latest write.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={2} title="Detect a stale read" level="easy">
-
-Given a leader value with version `lv` and a follower value with version `fv`, write `isStale(lv, fv int) bool` reporting whether a read from the follower would be stale (behind the leader). Explain why `fv > lv` should never happen in single-leader replication.
-
-<Solution>
-
-```go
-func isStale(lv, fv int) bool { return fv < lv }
-```
-
-A follower is stale when its version is *behind* the leader's. `fv > lv` should be impossible under single-leader replication: the leader assigns versions in order and followers only replay the leader's log, so a follower can be equal to or behind the leader, never ahead. If you ever observe `fv > lv`, something is deeply wrong — a split-brain (two leaders) or a follower that was wrongly promoted.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={3} title="Last-writer-wins with a tiebreak" level="medium">
-
-LWW must break ties deterministically — if two writes share a timestamp, every replica must pick the *same* winner or they won't converge. Extend `lww` to take a `replicaID string` per write and break timestamp ties by the higher ID.
-
-<Solution>
-
-```go
-type write struct {
-	value     int64
-	ts        time.Time
-	replicaID string
-}
-
-func lww(a, b write) write {
-	if a.ts.After(b.ts) {
-		return a
-	}
-	if b.ts.After(a.ts) {
-		return b
-	}
-	// Equal timestamps: break the tie by replicaID so ALL replicas agree.
-	if a.replicaID > b.replicaID {
-		return a
-	}
-	return b
-}
-```
-
-The tiebreak isn't cosmetic — it's required for convergence. If replicas broke ties differently (or randomly), two replicas resolving the same conflict could pick different winners and never agree. A deterministic tiebreak (highest ID wins) guarantees every replica computes the identical result.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={4} title="Monotonic-reads router" level="medium">
-
-Implement a router that gives a user **monotonic reads** — they never see data older than they've already seen. Map each user to a fixed replica index by hashing their ID, so every read for that user hits the same replica.
-
-<Solution>
-
-```go
-func replicaFor(user string, n int) int {
-	h := 0
-	for _, b := range []byte(user) {
-		h = h*31 + int(b) // simple deterministic hash
-	}
-	if h < 0 {
-		h = -h
-	}
-	return h % n
-}
-
-// read(user) always uses replicas[replicaFor(user, len(replicas))], so a user
-// is pinned to one replica and can't bounce between a fresh one and a laggy one.
-```
-
-Monotonic reads break when a user's two reads hit different replicas with different lag — the second can be *older* than the first, so time appears to go backward. Pinning each user to one replica (by hashing their ID) guarantees they always read from the same copy, which only moves forward. They might be slightly behind the leader, but never behind *themselves*.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={5} title="Why append-only beats LWW for money" level="hard">
-
-Model two concurrent deposits to one account two ways: (a) as overwrites resolved by LWW, and (b) as appends to a transaction log. Show that (a) loses a deposit and (b) doesn't. Compute the final balance each way from a start of 0, with deposits of 5000 and 7000.
-
-<Solution>
-
-```go
-// (a) Overwrite + LWW: each write sets the absolute balance. One wins, one is lost.
-//   write A: balance = 5000   write B: balance = 7000 (later)
-//   LWW keeps 7000. Final balance: 7000.  The 5000 deposit VANISHED.
-
-// (b) Append-only log: each deposit is an entry that ADDS to the balance.
-//   log = [+5000, +7000]   final balance = sum(log) = 12000.  Both deposits kept.
-
-func balanceFromLog(entries []int64) int64 {
-	var sum int64
-	for _, e := range entries {
-		sum += e
-	}
-	return sum
-}
-
-// balanceFromLog([]int64{5000, 7000}) == 12000 — correct.
-```
-
-The overwrite model represents a deposit as "set the balance to X," so two concurrent deposits conflict and LWW discards one — the customer loses 5000. The append-only model represents a deposit as "add X," which **commutes**: applying both in any order yields 12000. There's no conflict to resolve because neither write replaces the other. This is the heart of why ledgers are append-only event logs, not mutable balance fields — covered in depth in Part 3's double-entry ledger.
-
-</Solution>
-
-</Exercise>
-
-<Lab
-  title="Build a quorum read/write simulator"
-  archetype="build-it"
-  difficulty="scaffolded"
-  points={75}
-  hintCost={12}
-  objective="Build a leaderless quorum store over N=3 replicas. Implement write(reps, w, version, value) that writes a versioned value to the first w replicas, and read(reps, r) that reads the last r replicas and returns the value with the highest version. The self-check harness in main verifies: W=2/R=2 returns the fresh value 9000 (because the sets overlap at index 1), quorumOK correctly returns true for (3,2,2) and false for (3,1,1). Run to verify — the flag unlocks when the build is clean and output ends with ALL CHECKS PASS."
-  verify="self-check"
-  expect="ALL CHECKS PASS"
-  starter={`package main
-
-import "fmt"
-
-type Replica struct {
-	Version int
-	Value   int64
-}
-
-// quorumOK reports whether a write quorum of w and read quorum of r
-// must overlap on n replicas (i.e., w+r > n).
-func quorumOK(n, w, r int) bool { return w+r > n }
-
-// TODO: write writes (version, value) to the FIRST w replicas of reps.
-func write(reps []Replica, w, version int, value int64) {
-	// your code here
-}
-
-// TODO: read reads the LAST r replicas and returns the one with the highest Version.
-func read(reps []Replica, r int) Replica {
-	return Replica{} // your code here
-}
-
-// ── checks: do not edit. Run to verify your fix. ──
-func main() {
-	const n = 3
 	allOK := true
+	fail := func(format string, a ...any) { fmt.Printf("FAIL "+format+"\\n", a...); allOK = false }
+	names := map[Order]string{Equal: "Equal", Before: "Before", After: "After", Concurrent: "Concurrent"}
 
-	// W=2, R=2 on N=3: write hits indices 0,1; read hits 1,2; overlap at 1.
-	reps := make([]Replica, n)
-	write(reps, 2, 1, 9000)
-	got := read(reps, 2)
-	if got.Value != 9000 {
-		allOK = false
-		fmt.Printf("FAIL W=2/R=2: got %d, want 9000\\n", got.Value)
+	// Check 1: comparing clocks.
+	for _, tc := range []struct {
+		a, b Clock
+		want Order
+	}{
+		{Clock{"web-1": 1}, Clock{"web-1": 1}, Equal},
+		{Clock{"web-1": 1}, Clock{"web-1": 2}, Before},
+		{Clock{"web-1": 2}, Clock{"web-1": 1}, After},
+		{Clock{"web-1": 1}, Clock{"web-2": 1}, Concurrent},
+		{Clock{"web-1": 1}, Clock{"web-1": 1, "web-2": 1}, Before},
+		{Clock{"web-1": 2, "web-2": 1}, Clock{"web-1": 1, "web-2": 2}, Concurrent},
+		{Clock{}, Clock{"web-1": 1}, Before},
+		{Clock{"web-1": 0}, Clock{}, Equal},
+	} {
+		if got := compare(tc.a, tc.b); got != tc.want {
+			fail("compare(%v, %v) = %s, want %s", tc.a, tc.b, names[got], names[tc.want])
+		}
 	}
-	if !quorumOK(n, 2, 2) {
-		allOK = false
-		fmt.Println("FAIL quorumOK(3,2,2) should be true")
+
+	// Check 2: reducing replies.
+	alice1 := Version{"alice", Clock{"web-1": 1}}
+	alice2 := Version{"alice", Clock{"web-1": 2}}
+	bob := Version{"bob", Clock{"web-2": 1}}
+	for _, tc := range []struct {
+		name string
+		in   []Version
+		want []string
+	}{
+		{"one node behind", []Version{alice1, alice2, alice2}, []string{"alice"}},
+		{"the same version twice", []Version{alice2, alice2}, []string{"alice"}},
+		{"concurrent writes", []Version{alice1, bob}, []string{"alice", "bob"}},
+		{"concurrent, and a stale copy", []Version{alice1, bob, alice2}, []string{"bob", "alice"}},
+	} {
+		got := latest(tc.in)
+		var vals []string
+		for _, v := range got {
+			vals = append(vals, v.Value)
+		}
+		ok := len(vals) == len(tc.want)
+		for _, w := range tc.want {
+			found := false
+			for _, g := range vals {
+				found = found || g == w
+			}
+			ok = ok && found
+		}
+		if !ok {
+			fail("latest (%s): got %v, want %v", tc.name, vals, tc.want)
+		}
 	}
-	if quorumOK(n, 1, 1) {
-		allOK = false
-		fmt.Println("FAIL quorumOK(3,1,1) should be false")
+
+	// Check 3: W=2 of 3, one node slow (1 s): return as soon as two acknowledge.
+	nodes := []Node{&memNode{data: map[string]Version{}}, &memNode{data: map[string]Version{}}, &memNode{data: map[string]Version{}, delay: time.Second}}
+	start := time.Now()
+	acked, err := put(context.Background(), nodes, "seat:A7", alice1, 2)
+	if took := time.Since(start); err != nil || acked < 2 || took > 200*time.Millisecond {
+		fail("put W=2 with one slow node: %d acked, err=%v, took %v; want 2+, nil, well under 1s", acked, err, took.Round(time.Millisecond))
 	}
+
+	// Check 4: two of three down: W=2 must fail at once with ErrQuorum.
+	nodes = []Node{&memNode{data: map[string]Version{}}, &memNode{data: map[string]Version{}, down: true}, &memNode{data: map[string]Version{}, down: true}}
+	start = time.Now()
+	_, err = put(context.Background(), nodes, "seat:A7", alice1, 2)
+	if took := time.Since(start); !errors.Is(err, ErrQuorum) || took > 200*time.Millisecond {
+		fail("put W=2 with two nodes down: err=%v after %v, want ErrQuorum at once", err, took.Round(time.Millisecond))
+	}
+
 	if allOK {
 		fmt.Println("ALL CHECKS PASS")
 	}
-}
-`}
-  verifier="main runs three in-process assertions: the W=2/R=2 read returns the freshly written value 9000 (write and read sets overlap at index 1 of the 3-replica slice), quorumOK returns true when W+R>N, and false when it does not. The flag unlocks when the build is clean and stdout ends with ALL CHECKS PASS."
+}`}
+  verifier="Check 1: eight clock comparisons, including missing writers counting as 0 and a mixed case that's Concurrent. Check 2: reducing four sets of replies (a stale copy, duplicates, concurrent writes, both at once). Check 3: W=2 of 3 with one node taking 1 s must return in well under a second. Check 4: W=2 with two nodes down must return ErrQuorum at once. Prints ALL CHECKS PASS."
   hints={[
-    "write: loop i from 0 to w-1, set reps[i] = Replica{version, value}. read: loop i from len(reps)-r to len(reps)-1, track the Replica with the highest Version.",
-    "The overlap works by construction: write touches the FIRST w, read touches the LAST r. When w+r>n those index ranges must intersect, so the read sees the write. Trace indices for n=3,w=2,r=2: write hits 0,1; read hits 1,2; shared index is 1.",
-    "Initialize newest := Replica{} (Version 0). In read, use >= so a later replica at the same version still updates — though with a single write all written replicas share the version, any of them is correct."
+    "compare: walk the union of both clocks' writers; note whether a is ahead anywhere and whether b is ahead anywhere. Both: Concurrent. Only a: After. Only b: Before. Neither: Equal. A missing key reads as 0 from a Go map already.",
+    "latest: keep a version unless some other version is After it (compare(v, o) == Before), and skip it if an Equal one is already kept.",
+    "put: start one goroutine per node writing into a buffered channel, then count results as they arrive: return at acked == w, and give up when failed > len(nodes) - w. The buffer lets the slow node's goroutine finish later without anyone waiting for it."
   ]}
-  flag="GO{quorum_overlap_w_plus_r_greater_than_n}"
+  flag="GO{r_plus_w_greater_than_n}"
 >
 
-This is the quorum arithmetic made executable. Implement `write` and `read` so the overlap guarantee actually holds, watch the W=2/R=2 read return the fresh value, and confirm the rule rejects W=1/R=1. Get PASS and you've built — in miniature — the core of every leaderless database on earth.
+The chapter's `quorum` package is the same logic over real Redis nodes. Here the nodes are in-process stand-ins that can be slow or down, which is all the client logic can observe of a real node anyway.
 
 </Lab>
 
----
-
 <Recap>
 
-You now understand replication from the ground up — the copies, the lag, and the arithmetic that tames them:
-
-- **Replication** keeps copies of data on multiple machines, for three reasons only: **availability** (survive failures), **read scaling** (spread reads), and **latency** (a copy near the user). Each copy is a **replica**.
-- **Single-leader**: one leader takes all writes and streams an ordered log to **followers**. Simplest and safest — one authority on order, no write conflicts. It's what Postgres/MySQL and Meridian's ledger use.
-- **Synchronous vs asynchronous**: sync waits for a follower (no data loss, slower); async ACKs immediately (fast, can lose the last writes if the leader dies). Most run **semi-sync** — one sync follower, the rest async.
-- **Replication lag** causes **stale reads**; **eventual consistency** promises convergence but not *when*. Tame specific symptoms with **read-your-writes** (route a writer's reads to the leader), **monotonic reads** (pin a user to one replica), and **consistent prefix**.
-- **Multi-leader** (a leader per region) and **leaderless** (Dynamo-style, no leader) buy write flexibility at the cost of **write conflicts**.
-- **Quorums**: with N replicas, write to W and read from R; **W + R > N** guarantees the read and write sets overlap. In the simple completed-write case that improves freshness, but a strict quorum is *probably fresh*, not linearizable.
-- **Conflicts** from concurrent writes need resolution. **Last-writer-wins** is simple but *silently drops data* — fatal for money. The senior move is to design conflicts *out*: **single-leader** for money, **append-only/event-sourced** models where writes add instead of overwrite, **version vectors** to detect true concurrency. The best conflict resolution is the conflict you made impossible.
+- **Streaming replication** ships the WAL to a replica that replays it. Asynchronous by default: the primary commits alone, the replica follows (0.28 ms behind on an idle machine).
+- **Stale reads**: 6 of 200 reads right after a booking missed it with no delay; 50 of 50 with the replica 300 ms behind.
+- **Read-your-writes** by waiting for the replica to replay past the write's LSN: 0 of 50 stale. The LSN must be read **after** the commit; read inside the transaction, it's before the commit record and the fix silently doesn't work (50 of 50).
+- **Synchronous commit** levels: `local`, `remote_write` and `on` cost almost nothing on one machine but left 100 of 100 reads stale; `remote_apply` made them fresh at 306 ms a commit. With the only synchronous standby down, a commit **hung 135 s**, ignoring `statement_timeout`, and had committed locally.
+- **Async failover** lost **10 confirmed bookings**, and the restarted old primary accepted writes as a second primary: split brain, B1 sold twice. Fencing and client redirection are the failover system's job.
+- **Leaderless quorums** over three Redis nodes: R=1 missed a W=2 hold 116 times in 300; R=2 never (R+W>N). `docker pause` hid staleness because the "failed" write landed later. W=1 during a partition produced a conflict the version vectors detected and last-writer-wins would have hidden.
 
 </Recap>
 
 <Scoreboard
   streak={6}
   items={[
-    { label: "Quick check — stale read during replication lag", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — smallest R for W=3, N=5 quorum", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — quorum overlap checker", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 2 — detect a stale read", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 3 — LWW with deterministic tiebreak", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 4 — monotonic-reads router", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 5 — append-only beats LWW for money", kind: "exercise", points: 20, done: false }
+    { label: "Quick check: the early LSN", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: committed locally", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the returning primary", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: R + W > N", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: route the reads", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: measure your lag", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: two synchronous standbys", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: lose less on failover", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: resolve the conflict", kind: "exercise", points: 20, done: false }
   ]}
-  flag={{ label: "Lab — Quorum read/write simulator prints PASS", captured: false, points: 75 }}
+  flag={{ label: "Lab: Quorums and Version Vectors", captured: false, points: 120 }}
 />
-
-Replication — copies, lag, quorums, and the wisdom to keep money on a single leader where no conflict can eat a deposit. You now understand why your balance sometimes lags a second behind reality, and why that's a feature of physics, not a bug in the code. Next in the distributed-data track: **partitioning** — how you split data too big for one machine across many, and route every request to the right shard without losing the plot. The copies were the easy part. Let's go.

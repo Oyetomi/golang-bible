@@ -14,6 +14,8 @@ import { BadgesModal } from "./BadgesModal";
 import { ReadingProgress } from "@/components/nav/ReadingProgress";
 import { BookmarkButton } from "@/components/nav/BookmarkButton";
 import { openSearch } from "@/lib/search";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { eraForLevel, nextEra } from "@/lib/stickers";
 
 interface XpToast {
   id: number;
@@ -66,6 +68,8 @@ export function GamificationHeader() {
   }, []);
 
   const levelInfo = calculateLevelInfo(profile.xp);
+  const era = eraForLevel(levelInfo.level);
+  const upcoming = nextEra(levelInfo.level);
   const unlockedBadgesCount = Object.keys(profile.unlockedBadges || {}).length;
 
   const handleToggleSound = () => {
@@ -83,8 +87,8 @@ export function GamificationHeader() {
       <div className="gb-header-bar gb-header-placeholder">
         <div className="gb-header-inner">
           <div className="gb-level-badge">
-            <span className="gb-level-num">Lv. 1</span>
-            <span className="gb-level-title">Novice Gopher</span>
+            <span className="gb-level-num">1</span>
+            <span className="gb-level-title">Go 1 Gopher</span>
           </div>
         </div>
       </div>
@@ -96,20 +100,21 @@ export function GamificationHeader() {
       <ReadingProgress />
       <header className="gb-header-bar" role="region" aria-label="Player Stats & Navigation">
         <div className="gb-header-inner">
-          {/* Level & Rank Pill */}
+          {/* Level pill: levels are named after Go releases (lib/stickers.ts) */}
           <div
             className="gb-level-pill"
-            title={`Total XP: ${profile.xp.toLocaleString()} XP`}
+            title={`Level ${levelInfo.level} · ${profile.xp.toLocaleString()} XP total\n${era.release} (${era.year}): ${era.note}${
+              upcoming ? `\nNext: ${upcoming.name} at level ${upcoming.minLevel}` : ""
+            }`}
           >
-            <div className="gb-level-hexagon">
-              <span className="gb-lv-text">LV</span>
-              <span className="gb-lv-val">{levelInfo.level}</span>
-            </div>
+            <span className="gb-era-badge" aria-label={`Level ${levelInfo.level}`}>
+              {levelInfo.level}
+            </span>
             <div className="gb-title-col">
               <div className="gb-title-row">
-                <span className="gb-player-title">{levelInfo.title}</span>
-                <span className="gb-xp-pct">
-                  {levelInfo.isMaxLevel ? "MAX" : `${levelInfo.progressPct}%`}
+                <span className="gb-player-title">{era.name}</span>
+                <span className="gb-era-release">
+                  {era.release} · {era.year}
                 </span>
               </div>
               <div className="gb-xp-meta">
@@ -124,7 +129,7 @@ export function GamificationHeader() {
                     "MAX"
                   ) : (
                     <>
-                      <strong>{levelInfo.currentXP}</strong>/{levelInfo.xpNeededForNext}
+                      <strong>{levelInfo.currentXP}</strong>/{levelInfo.xpNeededForNext} XP
                     </>
                   )}
                 </span>
@@ -195,6 +200,9 @@ export function GamificationHeader() {
               </svg>
               <span className="gb-badge-count">{unlockedBadgesCount}/20</span>
             </button>
+
+            {/* Paper / dark */}
+            <ThemeToggle />
 
             {/* Sound Toggle */}
             <button

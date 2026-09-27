@@ -3,1498 +3,591 @@ title: "Performance Engineering"
 part: 2
 order: 10
 type: "course"
-description: "pprof, benchmarking, escape analysis, cutting allocations, sync.Pool, GC tuning; mechanical sympathy (caches, cache lines, false sharing); the execution tracer (runtime/trace, go tool trace); and profile-guided optimization (default.pgo) — feeding production profiles back into the compiler."
+description: "Make the cinema's seat map faster, measuring every step: pprof and allocation profiles, benchmarks with benchstat (−25% time, −76% allocations), escape analysis output, sync.Pool where it helps (gzip: 10×) and where it doesn't, GOGC and GOMEMLIMIT under load, false sharing (20×), the execution tracer, and PGO (−2%)."
 prerequisites: ["debugging-go"]
 ---
 
 <HeroCard label="Part 2 · Chapter 10" title="Performance Engineering">
 
-Listen up, sport. Every amateur I've ever fired — and there have been *many* — shared the same disease: they optimized by **feel**. They read a blog post, swapped a `[]string` for a `[]byte`, and announced they'd made things faster. Adorable. What they actually did was waste two days changing the wrong thing.
+The cinema's busiest endpoint is the seat map: every open browser tab asks for it every second, and in chapter 9 one laptop served about 54,000 of them a second. This chapter makes it faster, and uses it to learn every performance tool Go has, in the order you'd actually reach for them.
 
-Here's the truth only someone of my caliber can deliver: performance engineering is a **measurement discipline** first, last, and always. You profile. You read the numbers. You *then* fix what the numbers are pointing at — nothing else, nothing more. I once cut Meridian's ledger-report endpoint from 340ms to 11ms by fixing four lines the profiler found. Not forty. Four. Because I measured.
+The rule the whole chapter follows: **measure, change one thing, measure again.** Several things that "should" help didn't, and you'll see those numbers too.
 
-By the end of this chapter you'll wield Go's full performance toolkit: `pprof`, benchmarks, escape analysis, `sync.Pool`, GC tuning, mechanical sympathy, the execution tracer, and PGO — feeding production profiles back into the compiler itself. You'll profile a real slow endpoint, identify the waste, and eliminate it surgically. And when you're done, *maybe* you'll be worth keeping around.
+Seven stops. If you get lost, come back here:
+
+1. **pprof.** Where does the time go, and where do the allocations come from?
+2. **Benchmarking.** A benchmark of the real handler, and benchstat to tell a real change from noise.
+3. **Escape analysis and allocations.** What the compiler put on the heap, why, and the change that removed 41 of 54 allocations.
+4. **GC tuning.** `GOGC` and `GOMEMLIMIT` against the same load: collections, CPU, memory, throughput.
+5. **Mechanical sympathy.** A cache line is 128 bytes on this machine, and eight "independent" counters were 20× slower because of it.
+6. **The execution tracer.** Seeing goroutines wait, and why removing a wait didn't make the server faster.
+7. **Profile-guided optimization.** Feeding a production profile back to the compiler, and what it bought.
 
 </HeroCard>
 
 <ChapterTabs tabs={["pprof", "Benchmarking", "Escape Analysis & Allocations", "GC Tuning", "Mechanical Sympathy", "The Execution Tracer", "Profile-Guided Optimization"]} />
 
 <SpacedRecall
-  role={"mechanic"}
+  role={"analyst"}
   items={[
     {
-      from: "Data semantics (part 1, ch3)",
-      q: "A value that 'escapes' to the heap is…?",
-      options: ["freed instantly", "GC-managed (not stack-allocated)", "a leak", "copied"],
-      answer: 1,
-      tie: "Escape analysis is central here: keep values on the stack and you cut heap allocations — and fewer allocations means less GC pressure. pprof shows you where they escape."
+      from: "Debugging Go (part 2, ch9)",
+      q: "In the live CPU profile of the cinema server, most CPU went to…?",
+      options: ["the seat store", "JSON encoding", "socket syscalls (reading requests, writing responses)", "garbage collection"],
+      answer: 2,
+      tie: "76% was syscall.rawsyscalln. That's why this chapter benchmarks the handler itself: to see the part we control, without the network drowning it."
     },
     {
-      from: "Across the course",
-      q: "Go's garbage collector is generational?",
-      options: ["yes", "no — concurrent mark-sweep, non-generational"],
+      from: "Debugging Go (part 2, ch9)",
+      q: "GODEBUG=gctrace=1 showed 533 collections in 3 s. Why so many?",
+      options: ["a memory leak", "a tiny live heap (1 MB) means a tiny goal (4 MB), and every request allocates garbage", "GOGC was set to 1", "the race detector"],
       answer: 1,
-      tie: "A common myth. Go's GC is a concurrent tri-color mark-sweep with NO generations — so 'young/old' tuning intuition from Java doesn't transfer. GOGC and the pacer are what you actually tune."
+      tie: "Stop 3 cuts the garbage per request; stop 4 changes the goal. Both reduce collections, in different ways."
     },
   ]}
 />
 
-
 <PredictLab
-  prompt={"For \"h\u00e9llo\", what are len() and utf8.RuneCountInString()?"}
-  role={"scientist"}
-  code={`fmt.Println(len("héllo"), utf8.RuneCountInString("héllo"))`}
-  options={["6 5", "5 5", "6 6", "5 6"]}
-  answer={0}
-  output={`6 5`}
-  explain={"len() counts BYTES (\u00e9 is 2 bytes in UTF-8 \u2192 6), while RuneCountInString counts CODE POINTS (5). This byte-vs-rune gap is a classic perf-and-correctness trap: iterating a string with range gives runes, indexing gives bytes."}
+  prompt={"The seat map is built with fmt.Sprintf(\"%c%d\", 'A'+r, c+1) for each of 40 seats, on every request. Roughly how much of the handler's allocations does that line account for?"}
+  role={"analyst"}
+  code={`for r := range h.Rows {
+	for c := range h.Cols {
+		ids = append(ids, fmt.Sprintf("%c%d", 'A'+r, c+1))
+	}
+}`}
+  options={["almost none", "about a quarter of all allocated objects", "all of them", "it doesn't allocate: the compiler optimizes Sprintf away"]}
+  answer={1}
+  output={`1703962 23.54%  fmt.Sprintf`}
+  explain={"The allocation profile put fmt.Sprintf at 23.5% of all objects allocated, the largest single source. And the compiler's escape analysis explains part of why: each integer argument is boxed into an interface and escapes to the heap."}
 />
 
 ## pprof
 
-Let me set the scene: it's a Monday morning and your on-call page fires. Meridian's ledger-report endpoint — the one that aggregates transaction history per account — is timing out at the 99th percentile. Your CEO is watching the dashboard. You have twenty minutes.
+*Stop 1 of 7.*
 
-The amateur opens their editor and starts guessing. You open a profiler.
+### Step 1: the endpoint and a benchmark of it
 
-**On the job:** You hit the profiler the moment a latency SLO breach or an unexplained throughput drop lands in your inbox. Skipping it and editing code by instinct means fixing the wrong thing — and the page fires again next week.
-
-### What pprof gives you
-
-<Define term="CPU Profiling (pprof) & Statistical Sampling">
-**CPU profiling** in Go is a low-overhead statistical sampling mechanism. The OS kernel sets a periodic timer (`setitimer` / `SIGPROF`) firing every 10ms (100 Hz); upon each signal, the runtime records the call stack of the currently active goroutine on that thread. **Why it matters:** captures real-world CPU hotspots with under 1–2% runtime overhead, safe to run on production traffic. **Production hazard:** profiling CPU-bound tight loops without I/O or function calls can suffer from sampling bias (skid), where instructions immediately following a signal arrival are slightly over-represented; always collect at least 30–60 seconds of samples.
-</Define>
-
-`pprof` is Go's built-in profiling framework. It collects four kinds of profiles, and you need to know all four because they point at different problems:
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="CPU profile">Where is the CPU spending its time? Samples the current goroutine's call stack every 10ms (by default). Points you to hot functions. The first profile to reach for when things are *slow*.</ConceptCard>
-  <ConceptCard label="Heap profile">What is live on the heap? Also called the allocation profile — shows inuse objects and cumulative allocation sites. Points you to memory hogs and GC pressure.</ConceptCard>
-  <ConceptCard label="Block profile">Where are goroutines blocking on synchronization (channels, mutexes, `select`)? Essential for diagnosing contention. Disabled by default — you must call `runtime.SetBlockProfileRate`.</ConceptCard>
-  <ConceptCard label="Mutex profile">Which mutexes are being contested? Finer-grained than block for `sync.Mutex`/`sync.RWMutex` contention. Also disabled by default — call `runtime.SetMutexProfileFraction`.</ConceptCard>
-  <Gotcha>The goroutine profile (`/debug/pprof/goroutine`) shows a stack trace for every live goroutine. It's not a performance profile — it's a leak detector. If you see 50,000 goroutines where you expect 20, you have a leak, not a speed problem.</Gotcha>
-</ConceptGrid>
-
-### Three ways to collect a profile
-
-**1. In a test or benchmark (the easiest)**
-
-```go
-go test -bench=. -cpuprofile=cpu.out -memprofile=mem.out ./...
-```
-
-This is the cleanest path: `go test` drives the workload, dumps the profiles, and you inspect them offline. We'll use this form for most of the chapter.
-
-**2. In a long-running server with `net/http/pprof`**
-
-Drop one import and the endpoints appear on your HTTP mux, ready to sample whenever you need them — no restart required:
-
-```go
-package main
-
-import (
-	"net/http"
-	_ "net/http/pprof" // side-effect import registers handlers on http.DefaultServeMux
-)
-
-func main() {
-	// Your real mux...
-	http.ListenAndServe(":6060", nil)
-}
-```
-
-Then from a terminal:
-
-```
-go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
-```
-
-This connects, collects 30 seconds of CPU samples, and drops you into an interactive REPL.
-
-<Callout kind="warn" title="Never expose pprof endpoints publicly">
-
-`net/http/pprof` must be gated behind auth or bound only to a private interface. It lets anyone see your call stack, your heap layout, and your goroutine count — that is, everything an attacker needs. Expose it on a separate internal port (e.g. `:6060`) or protect it with `http.BasicAuth`.
-
-</Callout>
-
-**3. Programmatically with `runtime/pprof`**
-
-For precise control — profile only the hot section of a request, not the entire server lifetime:
-
-```go
-package main
-
-import (
-	"os"
-	"runtime/pprof"
-)
-
-func profiledSection() error {
-	f, err := os.Create("cpu.out")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if err := pprof.StartCPUProfile(f); err != nil {
-		return err
-	}
-	defer pprof.StopCPUProfile()
-
-	// The work you want to profile.
-	generateLedgerReport()
-	return nil
-}
-```
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"os"
-	"runtime/pprof"
-)
-
-// simulateLedgerReport does some allocating work so the profile has something to see.
-func simulateLedgerReport() []int {
-	rows := make([]int, 0, 10_000)
-	for i := range 10_000 {
-		rows = append(rows, i*i)
-	}
-	return rows
-}
-
-func main() {
-	f, err := os.CreateTemp("", "cpu*.out")
-	if err != nil {
-		fmt.Println("create:", err)
-		return
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-
-	if err := pprof.StartCPUProfile(f); err != nil {
-		fmt.Println("start cpu profile:", err)
-		return
-	}
-	result := simulateLedgerReport()
-	pprof.StopCPUProfile()
-
-	fmt.Printf("profiled: %d rows, wrote cpu profile to %s\n", len(result), f.Name())
-}
-```
-
-</GoPlayground>
-
-### Reading a profile: top, list, web
-
-Once you have a `.out` file, `go tool pprof` is your Swiss Army knife:
-
-```
-$ go tool pprof cpu.out
-(pprof) top10          # top 10 functions by self CPU time
-(pprof) top10 -cum     # top 10 by cumulative (self + callees)
-(pprof) list generateLedgerReport  # annotate source with per-line counts
-(pprof) web            # open a call graph in the browser (needs graphviz)
-```
-
-The two most important columns in `top` output:
-
-- **`flat`** — CPU time spent *inside* this function, not in its callees. A high `flat` means *this function* is the problem.
-- **`cum`** (cumulative) — time spent in this function *plus everything it calls*. A high `cum` with low `flat` means the function is just a pass-through into something deeper.
-
-### Reading a flame graph
-
-`go tool pprof -http=:8080 cpu.out` opens a web UI with a **flame graph** — the most information-dense view in profiling. As of Go 1.26, the flame graph is the default view when you open the pprof web UI (previously it opened a call-graph).
-
-<ExecTimeline
-  title="Reading a Flame Graph — what you see and what it means"
-  lanes={[{ id: "flame", label: "Flame graph" }]}
-  steps={[
-    { lane: "flame", kind: "run", label: "Y axis = call depth", note: "Bottom rows are callers; top rows are callees. main() sits at the bottom; the deepest nested calls are at the top." },
-    { lane: "flame", kind: "run", label: "X axis = time (not order)", note: "Width is proportional to total CPU time sampled in that function. A wide bar = a lot of time." },
-    { lane: "flame", kind: "run", label: "Find the widest top bar", note: "The widest bar with nothing (or little) above it is your hot leaf. That's where CPU is actually burning." },
-    { lane: "flame", kind: "run", label: "Tall narrow tower = deep call chain", note: "Lots of frames but each thin = overhead of many small calls, not one big computation. Think: reflection or interface dispatch." },
-    { lane: "flame", kind: "run", label: "Flat wide plateau = hot function", note: "A function that's wide and has no tall children above it is doing real work itself — ideal target for optimization." },
-    { lane: "flame", kind: "done", label: "Click to zoom → use `list`", note: "Click any frame to zoom in; then run `list FuncName` in the REPL to see per-line annotation in source." }
+<CinemaAnim
+  title="Every open tab asks for the seat map, every second"
+  kicker="why this endpoint · live"
+  noDesk
+  customers={[
+    { id: "v1", label: "tab 1", look: "pink" }, { id: "v2", label: "tab 2" }, { id: "v3", label: "tab 3", look: "pink" },
+    { id: "v4", label: "tab 4" }, { id: "v5", label: "tab 5" }, { id: "v6", label: "tab 6", look: "pink" }
   ]}
-  caption="Flame graphs tell you WHERE your CPU is — find the widest bar, fix it, re-profile."
-/>
-
-<UnderTheHood title="How the CPU profiler actually works (Go 1.26)">
-
-The CPU profiler works via **SIGPROF signals**. When you call `pprof.StartCPUProfile`, the runtime installs a signal handler and asks the OS to deliver `SIGPROF` at 100 Hz (every 10ms). When the signal fires, the runtime captures the current goroutine's call stack — a snapshot of the program counter chain from the leaf frame up to the root. These stack snapshots are counted and accumulated in a data structure. `StopCPUProfile` flushes it to the writer in pprof binary format.
-
-Because the profiler is **sample-based**, it introduces statistical error: a function that takes 8ms but runs rarely might never be sampled. The practical effect is that functions faster than ~1ms are invisible at 100 Hz — they never live long enough to be caught. For those you need **microbenchmarks**, not CPU profiles.
-
-The heap profiler is different: it instruments `mallocgc` directly, recording a stack sample every `N` bytes allocated (default: once per 512 KB, controlled by `runtime.MemProfileRate`). This makes the heap profile accurate even for fast, small allocations — it sees *every* allocation site, just subsampled.
-
-Both profiles write to the **pprof binary format**, a simple protocol buffer containing (count, stack-trace) pairs — which is why `go tool pprof` can read profiles from different architectures and machines.
-
-</UnderTheHood>
-
-<QuickCheck
-  question="You profile your ledger endpoint and find a function with high `cum` but near-zero `flat`. What does this tell you?"
-  options={[
-    "That function is the bottleneck — optimize it directly",
-    "The function is a thin pass-through; look at the callees it's delegating to",
-    "The profiler made an error — cum can't be high if flat is near zero",
-    "The function is spending its time in garbage collection"
+  events={[
+    { at: 0, who: "v1", to: "lobby" }, { at: 0, who: "v2", to: "lobby" }, { at: 0, who: "v3", to: "lobby" }, { at: 0, who: "v4", to: "lobby" }, { at: 0, who: "v5", to: "lobby" }, { at: 0, who: "v6", to: "lobby", note: "Opening night: thousands of browser tabs have the Inception seat map open. Each one refreshes it every second, whether or not anything changed." },
+    { at: 1.0, who: "v1", say: "GET /seats" }, { at: 1.1, who: "v2", say: "GET /seats" }, { at: 1.2, who: "v3", say: "GET /seats" }, { at: 1.3, who: "v4", say: "GET /seats" }, { at: 1.4, who: "v5", say: "GET /seats" }, { at: 1.5, who: "v6", say: "GET /seats" },
+    { at: 2.0, seat: "A7", state: "held", by: "alice" }, { at: 2.0, seat: "C4", state: "booked", by: "bob" }, { at: 2.0, seat: "E8", state: "held", by: "carol", note: "Each request builds all 40 seats and encodes them as JSON. Only a few seats ever change." },
+    { at: 3.2, hall: 0, banner: "54 allocations · 9.2 µs per seat map", beat: "problem", note: "Measured: 54 heap allocations and 9.2 µs of work per seat map, tens of thousands of times a second. The allocations are what keeps the garbage collector busy." },
+    { at: 4.4, who: "v1", say: null }, { at: 4.4, who: "v2", say: null }, { at: 4.4, who: "v3", say: null }, { at: 4.4, who: "v4", say: null }, { at: 4.4, who: "v5", say: null }, { at: 4.4, who: "v6", say: null },
+    { at: 5.4, hall: 0, banner: "13 allocations · 6.8 µs after stop 3", beat: "solution", note: "One change found by the allocation profile (build the seat names once) takes it to 13 allocations and 6.8 µs." }
   ]}
-  answer={1}
-  explain="High cumulative, low flat means the function itself does almost nothing — it just calls other things. Follow the call graph deeper to find the actual hot leaf where CPU time is burning."
-/>
-
----
-
-## Benchmarking
-
-Profiling tells you where the fire is. Benchmarks tell you whether your fix actually put it out — and by how much. They're your before/after measurement instrument.
-
-**On the job:** Always write a benchmark before you optimize and run it again after. Without a before/after number you cannot know whether your change helped, hurt, or did nothing. Gut feel is not evidence.
-
-### `testing.B` and the benchmark loop
-
-A Go benchmark is a test function named `BenchmarkXxx` that accepts `*testing.B`. The framework auto-tunes the iteration count so the total measured time is statistically meaningful.
-
-**Go 1.24+: prefer `b.Loop()` over `for range b.N`.**  
-Go 1.24 introduced `testing.B.Loop()`, which avoids the footgun of forgetting `b.ResetTimer()` in common patterns. Go 1.26 removed the inlining barrier inside `b.Loop` bodies, so it is suitable for micro-benchmarks. When you write `for b.Loop()`, the framework handles timer resets around the loop automatically. Use it for new benchmarks:
-
-```go
-func BenchmarkLedgerReport(b *testing.B) {
-	rows := generateTestRows(1000) // setup outside the measured loop
-	for b.Loop() {                 // Go 1.24+: preferred over for range b.N
-		_ = summarizeRows(rows)
-	}
-}
-```
-
-If you're on an older toolchain or need compatibility, the classic form still works:
-
-```go
-func BenchmarkLedgerReportCompat(b *testing.B) {
-	rows := generateTestRows(1000)
-	b.ResetTimer()       // required with for range b.N
-	for range b.N {
-		_ = summarizeRows(rows)
-	}
-}
-```
-
-Run it:
-
-```
-$ go test -bench=BenchmarkLedgerReport -benchmem ./...
-BenchmarkLedgerReport-8   12304   97.3 µs/op   45312 B/op   312 allocs/op
-```
-
-Let's read that output:
-
-<ConceptGrid cols={3}>
-  <ConceptCard label="12304">Number of iterations `b.N` ran. The framework chose this so the total run time is about 1 second — enough for a stable measurement.</ConceptCard>
-  <ConceptCard label="97.3 µs/op">Time per operation — what you're optimizing. This is wall-clock time divided by `b.N`.</ConceptCard>
-  <ConceptCard label="45312 B/op">Bytes allocated from the heap per operation. Enabled by `-benchmem` or `b.ReportAllocs()`. Your target for this chapter.</ConceptCard>
-  <ConceptCard label="312 allocs/op">Number of distinct heap allocation calls per operation. High counts drive GC pressure even if total bytes are small.</ConceptCard>
-  <ConceptCard label="-8 suffix">GOMAXPROCS at time of run. Always include this in comparisons so you know the parallelism level.</ConceptCard>
-  <Gotcha>Never compare benchmarks run on different machines, under different load, or at different `GOMAXPROCS`. The only trustworthy comparison is two runs on the same machine back to back, analyzed with `benchstat`.</Gotcha>
-</ConceptGrid>
-
-### `b.ReportAllocs()` — make the allocations visible
-
-Call `b.ReportAllocs()` at the top of any benchmark to force allocation reporting without needing `-benchmem` on the command line. Make it a habit: allocation regressions are invisible otherwise.
-
-### The optimize-away pitfall — always use a sink
-
-The Go compiler is smart enough to eliminate a computation whose result is never used. A benchmark that computes a value and throws it away may be benchmarking *nothing*. The fix: assign results to a package-level variable ("the sink"):
-
-<BeforeAfter
-  badLabel="Benchmarks nothing (compiler elides the call)"
-  goodLabel="Real benchmark (sink defeats dead-code elim)"
-  bad={`func BenchmarkSum(b *testing.B) {
-  for range b.N {
-    sum(ledgerRows) // result unused
-  }
-}`}
-  good={`var sink int64
-
-func BenchmarkSum(b *testing.B) {
-  var s int64
-  for range b.N {
-    s = sum(ledgerRows)
-  }
-  sink = s // escape to pkg-level var
-}`}
-/>
-
-The sink pattern is idiomatic and costs nothing at runtime — the compiler can't optimize across package boundaries.
-
-### `benchstat` — reading before/after with confidence
-
-A single benchmark run has noise. `benchstat` aggregates multiple runs and computes statistical significance:
-
-```
-$ go test -bench=BenchmarkLedgerReport -benchmem -count=10 . > before.txt
-# make your optimization
-$ go test -bench=BenchmarkLedgerReport -benchmem -count=10 . > after.txt
-$ benchstat before.txt after.txt
-```
-
-Output:
-
-```
-name              old time/op    new time/op    delta
-LedgerReport-8    97.3µs ± 2%   14.1µs ± 1%   -85.51%  (p=0.000 n=10+10)
-```
-
-The `±` is the variance, `p=0.000` means the improvement is statistically significant, and `-85.51%` is real. That's what a measurement-driven optimization looks like.
-
-<CodeWalk
-  title="Naive vs. fast summarize — allocation root cause"
-  steps={[
-    { lines: "9-14", note: "ledgerRow is the shape of one DB result row. 1000 rows is a realistic ledger report page. Nothing allocates here — the struct is plain value types.", pose: "idle", role: "analyst", state: "idle", beat: "neutral" },
-    { lines: "17-23", note: "naiveSummarize does out += ... in a loop. Each += allocates a new string that is the concatenation of the old string and the new fragment, then copies both into it. With 1000 rows that is 1000 allocations and O(n squared) bytes copied in total. The benchmarker will see this clearly in B/op.", pose: "blocked", role: "analyst", state: "warn", beat: "problem" },
-    { lines: "26-33", note: "fastSummarize uses strings.Builder. b.Grow pre-allocates a single backing buffer sized to the expected output. fmt.Fprintf writes directly into it without intermediate string allocations. The full report is one final copy via b.String().", pose: "run", role: "analyst", state: "active", beat: "solution" },
-    { lines: "35-50", note: "main builds 1000 rows and runs both paths. The outputs match — correctness is confirmed. In a real benchmark you would run go test -bench -benchmem and see naive report hundreds of allocs/op versus fast reporting near 1.", pose: "happy", role: "analyst", state: "done", beat: "solution" },
-  ]}
-  caption="strings.Builder vs string += is the classic allocation benchmark. One backing array, not O(n) copies."
->
-
-```go
-package main
-
-import (
-	"fmt"
-	"strings"
-)
-
-// ledgerRow mimics one row of a report query result.
-type ledgerRow struct {
-	AccountID string
-	AmountCents int64
-	Description string
-}
-
-// naiveSummarize builds a report string the slow way — lots of small allocs.
-func naiveSummarize(rows []ledgerRow) string {
-	var out string
-	for _, r := range rows {
-		out += fmt.Sprintf("%s: %d\n", r.Description, r.AmountCents)
-	}
-	return out
-}
-
-// fastSummarize uses a strings.Builder to avoid O(n²) string concatenation.
-func fastSummarize(rows []ledgerRow) string {
-	var b strings.Builder
-	b.Grow(len(rows) * 30) // preallocate a reasonable estimate
-	for _, r := range rows {
-		fmt.Fprintf(&b, "%s: %d\n", r.Description, r.AmountCents)
-	}
-	return b.String()
-}
-
-func main() {
-	rows := make([]ledgerRow, 1000)
-	for i := range rows {
-		rows[i] = ledgerRow{
-			AccountID:   fmt.Sprintf("acc-%d", i),
-			AmountCents: int64(i * 100),
-			Description: "transfer",
-		}
-	}
-
-	naive := naiveSummarize(rows)
-	fast := fastSummarize(rows)
-
-	fmt.Printf("naive output length:  %d bytes\n", len(naive))
-	fmt.Printf("fast  output length:  %d bytes\n", len(fast))
-	fmt.Println("outputs match:", naive == fast)
-}
-```
-
-</CodeWalk>
-
-<ExecTimeline
-  title="A benchmark loop under the hood (testing.B)"
-  lanes={[{ id: "fw", label: "testing.B" }, { id: "fn", label: "BenchmarkFn" }]}
-  steps={[
-    { lane: "fw", kind: "run", label: "probe: run once", note: "Framework starts with one iteration (equivalent to b.N=1), measuring how long it takes. With b.Loop() this is handled internally." },
-    { lane: "fn", kind: "run", label: "one iteration", note: "Your benchmark body runs once. Framework records elapsed time." },
-    { lane: "fw", kind: "run", label: "scale iterations upward", note: "If one iteration was fast, framework multiplies the count (e.g. 100, 10000, …) until total time >= 1 second." },
-    { lane: "fn", kind: "run", label: "full iteration count", note: "Your loop runs the final, stable number of times. With for b.Loop(), the framework manages this transparently." },
-    { lane: "fw", kind: "run", label: "divide: ns/op, B/op", note: "Framework divides total nanoseconds and total bytes by the iteration count to get per-op metrics." },
-    { lane: "fw", kind: "done", label: "print result", note: "Result line printed: time/op, B/op, allocs/op. Run -count=10 and use benchstat for statistical confidence." }
-  ]}
-  caption="The framework auto-tunes the iteration count so measurement noise is small relative to the signal. Go 1.24+'s b.Loop() handles timer resets automatically."
-/>
-
----
-
-## Escape Analysis & Allocations
-
-Here's the thing that separates a senior Go engineer from someone who just writes Go: **knowing where your memory lives**.
-
-**On the job:** Allocation pressure is the most common source of GC CPU overhead in Go services. Every extra allocation in a hot path means more GC work, more STW pause risk, and more latency tail. Fix the allocation count before reaching for `GOGC` tuning.
-
-### Stack vs. heap — the two places your data can be
-
-Every value in a Go program lives on the **stack** or the **heap**:
-
-- **Stack**: memory owned by a single goroutine. Allocation is extremely cheap, often just a pointer bump. Freed automatically when the function returns. Goroutine stacks start small (about 2 KB in current Go implementations) and grow dynamically up to runtime limits. *This is a simplified model; the runtime's actual stack management is more nuanced.*
-- **Heap**: shared memory managed by the GC. Allocation goes through `mallocgc`, which is lockless via per-P memory caches (mcache/mcentral) but still heavier than a stack bump. Freed asynchronously by the garbage collector — which costs CPU.
-
-Stack allocation is orders of magnitude cheaper than heap allocation. The goal of escape analysis is to keep as many values on the stack as possible.
-
-Here's an escape happening — one returned pointer turning a free stack slot into GC workload:
-
-<StackHeapAnim
-  title="A Report escaping Meridian's handler"
-  frames={[
-    {
-      note: "handleReport calls buildReport. Two stack frames; buildReport declares r (a Report) locally. So far r can live on the stack — created and destroyed with its frame, cost ≈ a pointer bump.",
-      stack: [
-        { fn: "handleReport()", vars: ["w", "req"] },
-        { fn: "buildReport()", vars: ["r Report"] }
-      ],
-      heap: []
-    },
-    {
-      note: "buildReport ends with return &r — a pointer to a local that will OUTLIVE its frame. The compiler proves this at build time, prints moved to heap: r, and relocates the value.",
-      beat: "problem",
-      stack: [
-        { fn: "handleReport()", vars: ["w", "req"] },
-        { fn: "buildReport()", vars: [] }
-      ],
-      heap: [],
-      escaping: "&r"
-    },
-    {
-      note: "buildReport returns; its frame pops for free. But r now sits on the heap — and the sweeper gopher owns it until the GC can PROVE nothing references it. One escape per request × thousands of requests = GC pressure.",
-      stack: [{ fn: "handleReport()", vars: ["w", "req", "rep *Report"] }],
-      heap: ["Report{…}"]
-    },
-    {
-      note: "Same handler under load: every request leaks one Report to the heap, and the sweeper starts sweating. The fix is usually shape, not magic: return the value, accept an out-param, or reuse via sync.Pool — all keep the hot path off the heap.",
-      beat: "solution",
-      stack: [{ fn: "handleReport()", vars: ["w", "req"] }],
-      heap: ["Report{…}", "Report{…}", "Report{…}"]
-    }
-  ]}
-  caption="Stack memory dies with the frame — free. Heap memory lives until the GC proves it dead — a debt. Escape analysis decides which side of the line every value lands on, at compile time."
+  caption="The cheapest endpoint, called the most: that's where performance work pays."
 />
 
 
-### `go build -gcflags=-m` — reading escape analysis output
-
-Pass `-gcflags=-m` (or `-gcflags="-m -m"` for more detail) to see the compiler's escape decisions:
-
-```
-$ go build -gcflags=-m ./...
-./report.go:14:6: moved to heap: report
-./report.go:23:12: new(LedgerRow) escapes to heap
-./report.go:31:18: []byte literal does not escape
-```
-
-- **"moved to heap"** — the compiler decided this value must outlive its stack frame, so it heap-allocates it.
-- **"does not escape"** — stays on the stack. This is what you want.
-- **"escapes to heap"** — same as "moved to heap" but for explicit allocations.
-
-### Why values escape
-
-Values escape to the heap when the compiler cannot prove they're safe to free when the function returns. Common triggers:
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Returning a pointer">If you return `&thing`, `thing` must outlive the function — it escapes. Return the value instead when you can.</ConceptCard>
-  <ConceptCard label="Storing in an interface">Assigning a concrete value to an interface can force a heap allocation when the compiler cannot keep the boxed value on the stack. The smaller the value, the more this hurts proportionally.</ConceptCard>
-  <ConceptCard label="Closure over a variable">A goroutine closure that captures a variable forces that variable to the heap so both the goroutine and the enclosing function can see it.</ConceptCard>
-  <ConceptCard label="Large values">Large local values are more likely to be moved to the heap when the compiler decides stack allocation is not a good fit. Keep large reusable buffers behind pointers or in `sync.Pool`.</ConceptCard>
-  <Gotcha>Passing a value to `fmt.Println` or any function that takes `any` (interface) will escape that value to the heap. In a hot inner loop, this is death by a thousand allocations. Use `slog` with typed fields, not `fmt.Printf`, in production hot paths.</Gotcha>
-</ConceptGrid>
-
-<ExecTimeline
-  title="Stack allocation vs. heap escape"
-  lanes={[{ id: "stack", label: "stack" }, { id: "heap", label: "heap / GC" }]}
-  steps={[
-    { lane: "stack", kind: "run", label: "fn() called", note: "A new stack frame is pushed. All local variables live here by default — cheap pointer-bump allocation." },
-    { lane: "stack", kind: "run", label: "x := 42 (stays)", note: "x is used only inside fn, never returned or captured. Compiler proves it doesn't escape — stays on stack." },
-    { lane: "stack", kind: "run", label: "p := &row (escapes!)", note: "A pointer to row is returned. The compiler sees row must outlive this frame — decides to heap-allocate row." },
-    { lane: "heap", kind: "run", label: "row allocated on heap", note: "mallocgc is called. row gets a heap address. The GC will eventually scan it. This is the allocation you see in benchmarks." },
-    { lane: "stack", kind: "done", label: "fn returns", note: "Stack frame is popped instantly — x is gone for free. But row on the heap lives on, waiting for the GC." },
-    { lane: "heap", kind: "block", label: "GC marks row live", note: "During the next GC cycle, the tri-color marker reaches row via the pointer. It's kept alive until no references remain." },
-    { lane: "heap", kind: "done", label: "GC sweeps row (free)", note: "Eventually all references drop. The sweep phase reclaims row's memory. This cost is amortized across your program." }
-  ]}
-  caption="Stack allocation is a pointer bump and costs nothing on return. Heap allocation costs GC CPU every cycle."
-/>
-
-### Reducing allocations: slice and map preallocation
-
-The most common source of unnecessary heap pressure is **growing containers from nothing**. Every time `append` outgrows a slice's backing array, it allocates a new one and copies the old contents. The fix is trivially cheap: tell Go the size upfront.
-
-<BeforeAfter
-  badLabel="Many reallocations and copies"
-  goodLabel="One allocation, right-sized"
-  bad={`rows := []LedgerRow{}
-for _, r := range dbResult {
-  rows = append(rows, r)
-}`}
-  good={`rows := make([]LedgerRow, 0, len(dbResult))
-for _, r := range dbResult {
-  rows = append(rows, r)
-}`}
-/>
-
-Same rule for maps — if you know the approximate size, pass it to `make`:
-
-```go
-seen := make(map[string]struct{}, len(accountIDs)) // one backing array, not 8 doublings
-```
-
-### `sync.Pool` — reusing expensive scratch buffers
-
-`sync.Pool` is a per-goroutine (actually per-P) cache of reusable objects. It's the right tool when you're allocating and discarding the same types of short-lived objects in a hot path — think byte buffers, encoder objects, or temporary slices.
-
-```go
-var bufPool = sync.Pool{
-	New: func() any {
-		// called only when the pool is empty
-		b := make([]byte, 0, 64*1024) // 64 KB scratch buffer
-		return &b
-	},
-}
-
-func generateLedgerReport(rows []LedgerRow) []byte {
-	bp := bufPool.Get().(*[]byte)
-	buf := (*bp)[:0] // reset length, keep capacity
-
-	for _, r := range rows {
-		buf = append(buf, r.Description...)
-		buf = append(buf, '\n')
-	}
-
-	result := append([]byte(nil), buf...) // copy out before returning
-
-	*bp = buf
-	bufPool.Put(bp) // return to pool for next caller
-	return result
-}
-```
-
-<Define term="sync.Pool & Zero-Allocation Reuse">
-**`sync.Pool`** is a concurrent, lock-free object cache designed to amortize memory allocations for short-lived temporary objects (like byte buffers, encoder scratch space, or decode structs). It maintains per-P local ring buffers that can be accessed without cross-core lock contention. **Why it matters:** reduces steady-state heap allocations to zero on hot request paths, eliminating GC CPU pressure. **Production hazard:** storing unbounded buffers in `sync.Pool` causes memory leaks; if a single 50MB payload causes a buffer to expand to 50MB and is returned to the pool, that 50MB allocation remains pinned in RAM until drained by subsequent GC cycles. Always reset buffer length and cap max capacity before calling `Put()`.
-</Define>
-
-<CodeWalk
-  title="sync.Pool — reuse scratch buffers across calls"
-  steps={[
-    { lines: "8-16", note: "bufPool is a package-level sync.Pool. New is called only when the pool has no available buffer — every other Get returns a buffer a previous call already allocated and returned. The pool holds *[]byte pointers, not []byte values, so the slice header is also reused.", pose: "idle", role: "sweeper", state: "idle", beat: "neutral" },
-    { lines: "23-25", note: "Get retrieves a buffer pointer from the pool. The (*bp)[:0] reset sets the length to zero while keeping the underlying array and its capacity. This is the crucial step: we reuse the allocated memory without zeroing or reallocating it.", pose: "carry", role: "sweeper", state: "active", beat: "neutral" },
-    { lines: "27-29", note: "Append the rows into the reused buffer. fmt.Appendf grows the buffer if needed but in steady state the capacity is already large enough and no allocation happens. The sweeper is doing its job: zero heap pressure per call in the hot path.", pose: "run", role: "sweeper", state: "active", beat: "solution" },
-    { lines: "31-35", note: "Copy out a fresh slice of exactly the right size — this is the one unavoidable allocation per call, but it is small and right-sized. Then write the buffer header back and Put it in the pool. Unused pool objects survive ~2 GC cycles via the victim cache before reclamation; that is intentional, not a bug.", pose: "happy", role: "sweeper", state: "done", beat: "solution" },
-  ]}
-  caption="Get, reset to [:0], fill, copy out, Put back. Zero steady-state allocations on the hot path."
->
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 1024)
-		return &b
-	},
-}
-
-type row struct {
-	desc   string
-	amount int64
-}
-
-func summarizeWithPool(rows []row) []byte {
-	bp := bufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-
-	for _, r := range rows {
-		buf = fmt.Appendf(buf, "%s: %d cents\n", r.desc, r.amount)
-	}
-
-	out := make([]byte, len(buf))
-	copy(out, buf)
-
-	*bp = buf
-	bufPool.Put(bp)
-	return out
-}
-
-func main() {
-	rows := []row{
-		{"transfer out", -5000},
-		{"transfer in", 12000},
-		{"fee", -250},
-	}
-	fmt.Print(string(summarizeWithPool(rows)))
-}
-```
-
-</CodeWalk>
-
-<UnderTheHood title="How sync.Pool avoids lock contention (Go 1.26)">
-
-*This is a simplified model of the pool internals; the actual implementation has additional complexity around victim caches and lock-free fast paths.*
-
-`sync.Pool` maintains **one local pool per P** (logical processor in the GMP model — covered in depth in the "The Go Scheduler (GMP), In Depth" chapter). A `Get` call first checks the local P's pool: no mutex needed, zero contention. Only if the local pool is empty does it fall through to the global shared pool (which does need a lock) and then calls `New`.
-
-This design means that in a server handling many concurrent requests, each goroutine typically gets a buffer from its own P's pool without ever contending with others — O(1) effectively lock-free in the common case.
-
-The sharp edge: **the GC drains the pool, but a victim cache lets an object survive one extra cycle.** Since Go 1.13, each GC moves the pool's live items into a "victim" cache and discards the *previous* victim cache — so an unused object is dropped after about **two** GC cycles, not on the first (the 1.13 release notes: "Pool no longer needs to be completely repopulated after every GC"). Either way the pool is not a cache for permanent objects: a 64 MB buffer left in it will eventually be reclaimed and the next `Get` calls `New`. It's a mechanism for *amortizing* transient allocations, not for storing things that must survive GC.
-
-As of Go 1.26, `sync.Pool` is one of the cheapest inter-goroutine object-sharing mechanisms available. A hand-rolled channel-based pool is slower and more complex. Prefer `sync.Pool`.
-
-</UnderTheHood>
-
-<QuickCheck
-  question="You call go build -gcflags=-m and see: 'x escapes to heap'. What caused this?"
-  options={[
-    "x is too large to fit in a register",
-    "The compiler could not prove x's lifetime is bounded by the function's stack frame",
-    "x was declared with var instead of :=",
-    "x contains a map, which always escapes"
-  ]}
-  answer={1}
-  explain="Escape to heap happens when the compiler cannot prove the value dies when the function returns — e.g. a pointer to x is returned, x is stored in an interface, or x is captured by a goroutine. The fix is to change the design so x stays local."
-/>
-
----
-
-<MentalModel preset="gc" />
-
-## GC Tuning
-
-Now let's talk about the engine running underneath everything: Go's garbage collector.
-
-**On the job:** GC tuning is a last resort, not a first instinct. First cut allocations (previous section). Only reach for `GOGC`/`GOMEMLIMIT` when profiling confirms GC CPU is a meaningful fraction of your service's budget.
-
-### Tri-color mark-sweep — the 90-second version
-
-Go's GC uses a **concurrent tri-color mark-sweep** algorithm. You don't need to memorize the algorithm — you need to understand the two costs it imposes, because that's what you're tuning:
-
-1. **CPU cost**: the GC runs concurrently with your goroutines, using CPU cycles for marking and scanning.
-2. **Stop-the-world (STW) pauses**: short STW phases still exist around a GC cycle. Go is designed to keep these pauses small, but the exact numbers are workload-dependent. Measure them with `gctrace`, `runtime/metrics`, pprof, or the execution tracer.
-
-Here is the algorithm itself, run over a real object graph — Meridian request objects, some reachable from the roots, some garbage:
-
-<GCAnim
-  title="Tri-color mark & sweep over Meridian's heap"
-  nodes={[
-    { id: "root", x: 40, y: 100, to: ["req", "cfg"] },
-    { id: "req", x: 140, y: 50, to: ["acct", "buf"] },
-    { id: "cfg", x: 140, y: 150 },
-    { id: "acct", x: 250, y: 30 },
-    { id: "buf", x: 250, y: 90 },
-    { id: "tmp", x: 250, y: 165, to: ["old"] },
-    { id: "old", x: 350, y: 165 }
-  ]}
-  frames={[
-    {
-      note: "Everything starts WHITE: 'presumed garbage until proven reachable'. tmp and old are an expired request's scratch objects — nothing points at them anymore, but the GC doesn't know that yet.",
-      colors: { root: "white", req: "white", cfg: "white", acct: "white", buf: "white", tmp: "white", old: "white" }
-    },
-    {
-      note: "Mark phase begins: the ROOTS (globals, every goroutine's stack) are shaded GREY — discovered, but their pointers not yet followed. Grey is the work queue.",
-      colors: { root: "grey", req: "white", cfg: "white", acct: "white", buf: "white", tmp: "white", old: "white" }
-    },
-    {
-      note: "The marker pops root from the grey queue, follows its pointers — req and cfg turn grey — then root turns BLACK: fully scanned, definitely alive. This runs CONCURRENTLY with your goroutines.",
-      colors: { root: "black", req: "grey", cfg: "grey", acct: "white", buf: "white", tmp: "white", old: "white" }
-    },
-    {
-      note: "Same move on req: its children acct and buf go grey, req goes black. cfg has no pointers, so scanning it is instant — straight to black.",
-      colors: { root: "black", req: "black", cfg: "black", acct: "grey", buf: "grey", tmp: "white", old: "white" }
-    },
-    {
-      note: "acct and buf scanned: black. The grey queue is EMPTY — marking is done. Look at tmp and old: still white. No root ever reached them. That whiteness is the proof they're garbage.",
-      colors: { root: "black", req: "black", cfg: "black", acct: "black", buf: "black", tmp: "white", old: "white" }
-    },
-    {
-      note: "Sweep: everything still white is reclaimed — tmp and old's memory returns to the allocator's free lists. No moving, no compaction; Go's sweeper is cheap and incremental.",
-      beat: "solution",
-      colors: { root: "black", req: "black", cfg: "black", acct: "black", buf: "black", tmp: "swept", old: "swept" }
-    }
-  ]}
-  caption="White = presumed garbage, grey = discovered but unscanned, black = proven alive. The invariant that makes this safe to run concurrently: no black object may ever point to a white one — that's what the write barrier enforces when your code mutates pointers mid-mark."
-/>
-
-**Go 1.26: Green Tea GC is the default.** Go 1.26 ships Green Tea as the default collector. The release notes describe it as improving marking and scanning performance for small objects through better locality and CPU scalability, with benchmark-dependent reductions in GC overhead. It activates automatically; no configuration change is needed. If you're comparing benchmark numbers across Go versions, note that GC behavior changed in 1.26 and that alone can shift latency p99 figures.
-
-### `GOGC` — the headroom knob
-
-`GOGC` controls when the GC triggers. Its value is a **percentage**: the next GC fires when the heap has grown by `GOGC%` since the last collection.
-
-- Default: `GOGC=100` — GC fires when live heap doubles.
-- `GOGC=200` — GC fires when live heap triples (less frequent, more memory used).
-- `GOGC=off` — GC disabled (dangerous; only for benchmarks or batch jobs with bounded memory).
-
-The math: if your live heap after last GC is 100 MB, and `GOGC=100`, the next GC fires at ~200 MB. Setting `GOGC=200` lets it grow to ~300 MB before the collector fires — less CPU spent on GC, but more RSS used.
-
-```go
-// Set programmatically (rarely needed; prefer the env var)
-import "runtime/debug"
-
-debug.SetGCPercent(200) // equivalent to GOGC=200
-```
-
-### `GOMEMLIMIT` — the soft memory limit (Go 1.19+)
-
-`GOGC` is a relative knob. In a container or a Kubernetes pod where you have a hard memory limit, you want the GC to chase an absolute memory target. That's `GOMEMLIMIT` — a **soft** limit: the runtime works hard to keep the heap under it (collecting more aggressively as you approach), but the docs are explicit that it "makes no guarantees that it will maintain this memory limit under all circumstances." It is a strong backpressure signal, not a wall:
-
-```
-GOMEMLIMIT=512MiB ./ledger-service
-```
-
-With `GOMEMLIMIT` set, the GC will aggressively collect to stay *under* the limit, even if `GOGC` says it's not time yet. Think of it as: "`GOGC` controls the comfortable operating zone; `GOMEMLIMIT` prevents OOM kills."
-
-In practice: set `GOMEMLIMIT` to ~90% of your container's memory limit, so the OOM killer doesn't fire before the GC gets a chance to clean up.
-
-```go
-import "runtime/debug"
-
-// Set in code (prefer the env var in production)
-debug.SetMemoryLimit(512 << 20) // 512 MB
-```
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="GOGC=100 (default)">GC fires at 2× live heap. Good for most services. Start here.</ConceptCard>
-  <ConceptCard label="GOGC=200–400">Reduce GC frequency for throughput-sensitive services that have RAM headroom. Trades memory for CPU.</ConceptCard>
-  <ConceptCard label="GOMEMLIMIT">Soft memory limit for containers — the GC chases it hard but it's not a guaranteed wall. Set to ~90% of pod memory limit. Greatly reduces OOM kills.</ConceptCard>
-  <ConceptCard label="GOGC=off">Disables GC. Only for batch programs with fixed inputs or microbenchmarks. Never in a long-lived server.</ConceptCard>
-  <Gotcha>Setting `GOGC` very high without `GOMEMLIMIT` in a container is asking to be OOM-killed. Always pair them. The GC will happily let your heap grow to 4× if `GOGC=400` with no ceiling — and your pod will die.</Gotcha>
-</ConceptGrid>
-
-<Define term="Tri-Color Mark-Sweep & Write Barriers">
-Go's concurrent garbage collection algorithm categorizes heap objects into three sets: **White** (unvisited/candidate garbage), **Grey** (visited but child pointer references not yet scanned), and **Black** (visited and all child pointers scanned). The **write barrier** is a small compiler-injected snippet executed during pointer writes that prevents live white objects from being hidden behind black objects while marking runs concurrently. **Why it matters:** allows GC to execute concurrently with user goroutines, capping Stop-The-World (STW) pauses below 1 millisecond. **Production hazard:** dense pointer graph modifications during active mark phases trigger heavy write barrier execution (`runtime.gcWriteBarrier`), consuming up to 25% of mutator CPU time.
-</Define>
-
-<Define term="Non-Generational GC vs Generational GC">
-Unlike Java HotSpot or V8 which partition memory into Young and Old generations (generational hypothesis: "most objects die young"), Go uses a **single-generation non-moving mark-sweep collector**. **Why it matters:** Go's aggressive escape analysis keeps almost all short-lived objects on the thread stack where they are freed at zero cost without GC involvement, eliminating the need for a nursery generation. **Production hazard:** expecting Java-style JVM generational tuning flags or ignoring stack-to-heap escapes can lead to excessive full-heap scanning overhead.
-</Define>
-
-<UnderTheHood title="Tri-color mark-sweep, write barriers, and why Go is non-generational">
-
-*This is a simplified model of GC internals. Go 1.26 ships the Green Tea GC, which changes some of the internal phases described below — treat these as a conceptual guide, not a precise specification.*
-
-Go's GC runs **mostly concurrently** with your goroutines. Here's the simplified model (baseline Go 1.26):
-
-1. **STW start**: all goroutines pause briefly so the GC can establish a consistent view of the heap roots (stacks, global variables, runtime structures).
-2. **Concurrent marking**: GC goroutines (running on a fraction of your P's) trace the object graph. They color objects: white (not yet seen), grey (seen but children not scanned), black (fully scanned).
-3. **Write barrier active**: while marking runs concurrently, your program keeps mutating pointers. The **tri-color invariant** (no black object may point directly to a white object) must hold. The write barrier records pointer writes so the GC doesn't miss a newly-created live object. You may see this cost in CPU profiles as `runtime.gcWriteBarrier`. Pointer-heavy layouts (linked lists, `[]*T` slices) amplify this cost; flat `[]T` slices largely avoid it.
-4. **STW finish**: goroutines pause again so the GC can drain the final grey queue and confirm marking is complete.
-5. **Concurrent sweep**: dead (white) objects are swept asynchronously. Memory is returned to span freelists; spans are returned to the OS lazily.
-
-### The Deep "Why": Why Go Chose a Non-Generational GC
-Virtually all other managed languages (Java, C#, JavaScript, Python) use generational collectors with moving compactions. Why did Go's designers deliberately choose a **non-generational, non-moving** collector?
-
-1. **Escape Analysis Solves Infant Mortality on the Stack:** Generational GCs exist because 95%+ of allocated objects die almost immediately ("infant mortality"). In Java, primitive arrays and small objects must live on the heap. In Go, structs and small buffers **do not escape to the heap** — they live on the stack and are destroyed instantly when the function returns (`add $size, %rsp`). The heap only receives long-lived data.
-2. **Zero Write Barrier Overhead in Steady State:** In a generational GC, every single pointer write in your application must execute a write barrier to track Old-to-Young inter-generational references (card marking). In Go, write barriers are **completely disabled** during normal execution and only activate during the brief concurrent mark phase.
-3. **Non-Moving Allocations Enable C-Interop and Direct Pointers:** A moving generational GC relocates objects during compaction, requiring pointer updating and forbidding interior pointers. Go allows interior pointers (`&s.Field`), direct unsafe casting, and zero-copy CGO memory sharing because heap object addresses remain strictly immutable throughout their lifetime.
-4. **Short stop-the-world pauses:** By keeping tracing concurrent and avoiding full-heap stop-the-world compaction, Go keeps pauses off the critical path and out of proportion to heap size. The Go GC guide publishes no pause bound — pauses scale with `GOMAXPROCS` and are typically dominated by the time to stop running goroutines — so treat sub-millisecond behaviour as what you should measure and verify, not as a guarantee you inherit.
-
-</UnderTheHood>
-
----
-
-## Mechanical Sympathy
-
-This is where it gets beautiful. You've cut allocations. You've tuned the GC. Now we go one level deeper — to the hardware your Go binary runs on.
-
-<Define term="False Sharing & CPU Cache Coherence (MESI)">
-**False sharing** is a hardware degradation occurring when two independent goroutines running on separate CPU cores concurrently modify distinct variables that reside within the same 64-byte CPU cache line. Under the **MESI** (Modified-Exclusive-Shared-Invalid) cache-coherence protocol, each core's write invalidates the other core's L1 cache copy, causing high-latency bus transactions. **Why it matters:** can degrade multi-threaded throughput by 10× to 40× despite the absence of a logical data race. **Production hazard:** closely-packed struct fields or adjacent array elements updated by parallel workers cause severe latency spikes; eliminate false sharing by padding shared fields to 64-byte boundaries with `_ [56]byte` or `cpu.CacheLinePad`.
-</Define>
-
-**On the job:** False sharing is a common culprit in concurrent Go services where throughput fails to scale with `GOMAXPROCS`. The race detector stays silent — it's not a data race — but the hardware contention is just as real. Profile throughput under different `GOMAXPROCS` values; if adding cores helps less than expected, false sharing is a prime suspect.
-
-### CPU caches and cache lines
-
-Your CPU has multiple levels of cache (L1, L2, L3). L1 is tiny (~32 KB) and fast (~1 ns). DRAM is large and slow (~100 ns, a 100× difference). The CPU fetches data from RAM in **cache lines** — fixed 64-byte chunks on every modern x86 and ARM64 processor. When the CPU reads one byte, it loads the entire 64-byte line into cache. This has two profound consequences:
-
-**1. Contiguous data is fast.**  
-If your data is laid out as a flat slice of structs, the CPU prefetches the next cache line speculatively — you get near-zero memory latency after the first access. If your data is a slice of *pointers to* structs, each access dereferences the pointer to an arbitrary location in RAM — a **cache miss** every time. This is why the "Data Semantics & Data-Oriented Design" chapter matters so much: it pays off right here.
-
-**2. False sharing is a goroutine performance trap.**  
-If two goroutines running on separate CPU cores both read and write variables that live in the **same 64-byte cache line**, they fight over that cache line. Core A writes → invalidates Core B's copy → Core B reloads from L2/L3 → latency spike. The variable writes don't overlap, so there's no data race — the race detector stays silent. But the cache thrashing is very real, and it can cost 40× throughput.
-
-Here's what that looks like at the hardware level, using Meridian's cache-hit and cache-miss counters as the example:
-
-<Scene
-  title="False sharing: two counters, one cache line"
-  actors={[
-    { id: "g1", label: "Goroutine 1 (Core 1)" },
-    { id: "g2", label: "Goroutine 2 (Core 2)" }
-  ]}
-  cells={[
-    { id: "A1", label: "hits", state: "idle" },
-    { id: "A2", label: "misses", state: "idle" },
-    { id: "A3", label: "·", state: "idle" },
-    { id: "A4", label: "·", state: "idle" },
-    { id: "A5", label: "·", state: "idle" },
-    { id: "A6", label: "·", state: "idle" },
-    { id: "A7", label: "·", state: "idle" },
-    { id: "A8", label: "·", state: "idle" }
-  ]}
-  rows={1}
-  cols={8}
-  frames={[
-    {
-      caption: "hits and misses counters share one 64-byte cache line. Goroutines 1 and 2 are idle.",
-      beat: "neutral",
-      actors: [{ id: "g1", state: "idle" }, { id: "g2", state: "idle" }],
-      cells: [
-        { id: "A1", label: "hits", state: "idle" },
-        { id: "A2", label: "misses", state: "idle" }
-      ]
-    },
-    {
-      caption: "Goroutine 1 increments hits. Core 1 marks the full cache line Modified.",
-      beat: "problem",
-      actors: [{ id: "g1", state: "active" }, { id: "g2", state: "idle" }],
-      cells: [
-        { id: "A1", label: "hits+1", state: "active" },
-        { id: "A2", label: "misses", state: "warn" }
-      ]
-    },
-    {
-      caption: "Goroutine 2 tries to increment misses — same cache line. Core 2's copy is now Invalid. It stalls, fetching the line from L2/L3.",
-      beat: "problem",
-      actors: [{ id: "g1", state: "idle" }, { id: "g2", state: "warn" }],
-      cells: [
-        { id: "A1", label: "hits+1", state: "warn" },
-        { id: "A2", label: "STALL", state: "bad" }
-      ]
-    },
-    {
-      caption: "This MESI ping-pong repeats every write. No data race — but throughput craters. 10–40× overhead observed in practice.",
-      beat: "problem",
-      actors: [{ id: "g1", state: "warn" }, { id: "g2", state: "warn" }],
-      cells: [
-        { id: "A1", label: "hits", state: "bad" },
-        { id: "A2", label: "misses", state: "bad" }
-      ]
-    },
-    {
-      caption: "Fix: pad each counter to 64 bytes. hits now owns cells A1–A8; misses lives on a separate line entirely.",
-      beat: "solution",
-      actors: [{ id: "g1", state: "ok" }, { id: "g2", state: "ok" }],
-      cells: [
-        { id: "A1", label: "hits", state: "done" },
-        { id: "A2", label: "pad", state: "idle" },
-        { id: "A3", label: "pad", state: "idle" },
-        { id: "A4", label: "pad", state: "idle" },
-        { id: "A5", label: "pad", state: "idle" },
-        { id: "A6", label: "pad", state: "idle" },
-        { id: "A7", label: "pad", state: "idle" },
-        { id: "A8", label: "pad", state: "idle" }
-      ]
-    },
-    {
-      caption: "Each goroutine now owns its cache line. Both cores write at full L1 speed. No invalidation, no stalls.",
-      beat: "solution",
-      actors: [{ id: "g1", state: "ok" }, { id: "g2", state: "ok" }],
-      cells: [
-        { id: "A1", label: "hits", state: "done" },
-        { id: "A2", label: "pad", state: "idle" },
-        { id: "A3", label: "pad", state: "idle" },
-        { id: "A4", label: "pad", state: "idle" },
-        { id: "A5", label: "pad", state: "idle" },
-        { id: "A6", label: "pad", state: "idle" },
-        { id: "A7", label: "pad", state: "idle" },
-        { id: "A8", label: "pad", state: "idle" }
-      ]
-    }
-  ]}
-  caption="False sharing: misses and hits counters on one cache line force Core 1 and Core 2 to fight over it. Padding each counter to 64 bytes gives each core its own line and eliminates the contention."
-/>
-
-<ExecTimeline
-  title="False sharing: one hot cache line, two goroutines"
-  lanes={[{ id: "g1", label: "goroutine 1 (core 1)" }, { id: "g2", label: "goroutine 2 (core 2)" }]}
-  steps={[
-    { lane: "g1", kind: "run", label: "write counters[0]", note: "Goroutine 1 writes counters[0]. The cache line containing both counters[0] and counters[1] is marked Modified in core 1's L1 cache." },
-    { lane: "g2", kind: "block", label: "cache miss on counters[1]", note: "Goroutine 2 tries to write counters[1]. It's on the SAME cache line. Core 2 must wait for core 1 to flush its modified line to L2/L3." },
-    { lane: "g1", kind: "run", label: "write counters[0] again", note: "Core 1 writes again. Line is Modified in L1 again — now core 2 waits again. Each goroutine's writes constantly invalidate the other's cache copy." },
-    { lane: "g2", kind: "block", label: "cache invalidated again", note: "Core 2's copy is Invalid. It stalls, fetches from L3. This MESI protocol ping-pong is false sharing. No data race, massive contention." },
-    { lane: "g1", kind: "run", label: "pad counters[0] to 64B", note: "Fix: add [56]byte padding after counters[0] so it occupies its own cache line. Now core 2's counter is on a completely separate line." },
-    { lane: "g2", kind: "run", label: "write counters[1] (own line)", note: "Core 2 now owns its cache line exclusively. No invalidation. Both goroutines write at full L1 speed." },
-    { lane: "g1", kind: "done", label: "throughput restored", note: "With padding, the false sharing is eliminated. Each counter lives in its own 64-byte line and each core operates independently." }
-  ]}
-  caption="False sharing is invisible to the race detector but costs 10–40× throughput. Fix it by padding hot variables to 64-byte cache line boundaries."
-/>
-
-Here's the false-sharing pattern and the fix:
-
-<BeforeAfter
-  badLabel="False sharing (both counters on one cache line)"
-  goodLabel="Padded (each counter owns its cache line)"
-  bad={`type Counters struct {
-  hits   int64
-  misses int64
-}
-// hits at offset 0, misses at offset 8
-// same 64-byte line → false sharing`}
-  good={`const cacheLineSize = 64
-
-type paddedCounter struct {
-  val int64
-  _   [cacheLineSize - 8]byte
-}
-type Counters struct {
-  hits   paddedCounter
-  misses paddedCounter
-}
-// hits.val at offset 0 (own 64B line)
-// misses.val at offset 64 (own 64B line)`}
-/>
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-	"sync/atomic"
-)
-
-const cacheLineSize = 64
-
-// falseSharingCounters: both fields share one 64-byte cache line.
-type falseSharingCounters struct {
-	hits   int64
-	misses int64
-}
-
-// paddedCounter: each value occupies its own cache line.
-type paddedCounter struct {
-	val int64
-	_   [cacheLineSize - 8]byte // pad to 64 bytes
-}
-
-type goodCounters struct {
-	hits   paddedCounter
-	misses paddedCounter
-}
-
-func main() {
-	// Demonstrate the structure sizes.
-	bad := falseSharingCounters{}
-	good := goodCounters{}
-
-	fmt.Printf("falseSharingCounters size: %d bytes (both on one cache line)\n", sizeOf(bad))
-	fmt.Printf("goodCounters size:         %d bytes (each on its own cache line)\n", sizeOf(good))
-
-	// Show atomic increments work correctly on the padded version.
-	var wg sync.WaitGroup
-	for range 1000 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			atomic.AddInt64(&good.hits.val, 1)
-		}()
-	}
-	wg.Wait()
-	fmt.Printf("hits after 1000 goroutines: %d\n", atomic.LoadInt64(&good.hits.val))
-}
-
-func sizeOf(v any) int {
-	switch v.(type) {
-	case falseSharingCounters:
-		return 16
-	case goodCounters:
-		return 128
-	}
-	return -1
-}
-```
-
-</GoPlayground>
-
-### Data layout for the hardware
-
-The payoff of the "Data Semantics & Data-Oriented Design" chapter is right here. If you designed your structs with access patterns in mind — keeping hot fields together, using flat `[]T` slices instead of `[]*T` — the hardware prefetcher can predict your access pattern and pre-load cache lines before you need them.
-
-A practical rule: **if you iterate over a slice of structs touching only some fields, consider splitting the struct into two slices** (one per field group). This is the "structure of arrays" (SoA) layout, and it's dramatically better for cache utilization in data-heavy loops like Meridian's ledger aggregation.
-
-<Callout kind="pro" title="Measure false sharing with pprof block profile + the execution tracer">
-
-Cache misses from false sharing won't show up in CPU profiles as obviously as CPU-burning functions — they manifest as increased latency and decreased throughput. The best way to detect them is to compare throughput with and without `GOMAXPROCS=1`: if single-threaded performance is much better proportionally than `GOMAXPROCS=8`, you likely have sharing issues. The execution tracer (next section) shows the scheduling overhead that false sharing causes.
-
-</Callout>
-
-<QuickCheck
-  question="Two goroutines update different int64 fields in the same struct. The race detector says no race. You notice throughput drops as GOMAXPROCS increases. What's likely happening?"
-  options={[
-    "A bug in the race detector — there must be a data race",
-    "False sharing: both fields are on the same 64-byte cache line, causing constant cache invalidation between cores",
-    "The goroutines are deadlocking on a hidden mutex",
-    "GOMAXPROCS is set too high for the available CPU cores"
-  ]}
-  answer={1}
-  explain="False sharing is not a data race — each goroutine touches a different field. But if both fields fit in one 64-byte cache line, every write by one core invalidates the other core's cached copy of the line, causing expensive reloads. Padding each field to 64 bytes fixes it."
-/>
-
----
-
-## The Execution Tracer
-
-`pprof` tells you *what* is slow. The execution tracer tells you *why* by recording a precise event log of everything the runtime does — goroutine scheduling, GC pauses, syscalls, network I/O — over time.
-
-<Define term="Execution Tracer (runtime/trace)">
-**`runtime/trace`** is Go's deep instrumentation engine that logs every runtime event (goroutine scheduling, GC phases, heap allocation, network I/O, and syscall transitions) with nanosecond hardware timestamps (`RDTSC`). **Why it matters:** exposes non-CPU latency bottlenecks — like lock contention, scheduler queues, and GC STW pauses — that cannot be detected by standard CPU statistical samplers. **Production hazard:** collecting continuous execution traces on high-throughput microservices generates gigabytes of event logs and incurs 5–10% CPU overhead; use `trace.FlightRecorder` in Go 1.25+ to maintain a rolling in-memory buffer without disk I/O.
-</Define>
-
-**On the job:** Reach for the execution tracer when `pprof` shows healthy CPU utilization but your latency p99 is still high. Scheduling stalls, GC interference, and goroutine pile-ups are invisible to the CPU profiler but obvious in a trace.
-
-### `runtime/trace` — collecting a trace
+The code under test is chapter 8's seat map: `GET /movies/inception/seats` asks the store for all 40 seats and encodes them as JSON. Rather than profile the whole server (where 76% is the network), benchmark the handler through the real mux and store, with no network:
 
 ```go noverify
 package main
 
 import (
-	"os"
-	"runtime/trace"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"cinema/booking"
 )
 
-func main() {
-	f, _ := os.Create("trace.out")
-	defer f.Close()
-
-	trace.Start(f)
-	defer trace.Stop()
-
-	// your workload here
-	runLedgerBatch()
+// BenchmarkSeatMap measures one GET /movies/inception/seats through the real
+// mux and store: build the seat list, encode it as JSON, write it.
+func BenchmarkSeatMap(b *testing.B) {
+	store := booking.NewMemoryStore()
+	for _, s := range []string{"A7", "B3", "C4", "D1", "E8"} {
+		store.Hold(context.Background(), "inception", s, "alice", time.Hour)
+	}
+	mux := newMux(&api{store: store, hold: time.Minute})
+	req := httptest.NewRequest("GET", "/movies/inception/seats", nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			b.Fatal(w.Code)
+		}
+	}
 }
 ```
 
-Or from a benchmark:
+`b.Loop()` (Go 1.24) runs the body as many times as needed for a stable measurement, and keeps the compiler from optimizing the work away. `b.ReportAllocs()` adds bytes and allocations per operation.
 
+```text
+$ go test -run '^$' -bench SeatMap -count 6 ./cmd/cinema/
+BenchmarkSeatMap-8   	  128691	      9235 ns/op	    5127 B/op	      54 allocs/op
+BenchmarkSeatMap-8   	  134934	      8903 ns/op	    5126 B/op	      54 allocs/op
+…
 ```
-$ go test -bench=. -trace=trace.out ./...
-$ go tool trace trace.out   # opens a browser UI
+
+About 9.2 µs, 5 KB and **54 allocations** per request. Is that a lot? Only a profile can say where it goes.
+
+### Step 2: CPU and allocation profiles
+
+The same benchmark can write both profiles:
+
+```text
+$ go test -run '^$' -bench SeatMap -benchtime 3s -cpuprofile cpu.prof -memprofile mem.prof -o cinema.test ./cmd/cinema/
+$ go tool pprof -top -nodecount 15 cinema.test cpu.prof
+      flat  flat%   sum%        cum   cum%
+     1.15s 35.49% 35.49%      1.15s 35.49%  runtime.kevent
+     0.42s 12.96% 48.46%      0.42s 12.96%  runtime.madvise
+     0.25s  7.72% 56.17%      0.55s 16.98%  encoding/json/v2.makeStructArshaler.func2
+     …
+     0.05s  1.54% 73.46%      0.60s 18.52%  cinema/booking.(*MemoryStore).Seats
+     0.03s  0.93% 76.85%      0.09s  2.78%  cinema/booking.(*MemoryStore).current
+     0.03s  0.93% 77.78%      0.33s 10.19%  cinema/booking.SeatIDs
+$ go tool pprof -top -nodecount 10 -sample_index=alloc_objects cinema.test mem.prof
+      flat  flat%   sum%        cum   cum%
+   1703962 23.54% 23.54%    1704873 23.55%  fmt.Sprintf
+   1247977 17.24% 40.78%    1247977 17.24%  net/http/httptest.NewRecorder
+   1076026 14.87% 55.65%    1076026 14.87%  net/http.Header.Clone (inline)
+    910194 12.57% 68.22%     910194 12.57%  net/textproto.MIMEHeader.Set (inline)
+    480607  6.64% 74.86%     480607  6.64%  reflect.unsafe_New
+    380646  5.26% 80.12%    2444718 33.77%  cinema/booking.(*MemoryStore).Seats
+    …
+    359199  4.96% 90.06%    2064072 28.52%  cinema/booking.SeatIDs
 ```
 
-<Callout kind="note" title="This is NOT distributed tracing">
+How to read them:
 
-`go tool trace` and `runtime/trace` are the Go **runtime execution tracer** — a low-level tool for watching the Go runtime itself. It is completely separate from distributed tracing (OpenTelemetry, Jaeger, Zipkin), which tracks requests across service boundaries. We cover distributed tracing in the "Observability: Telemetry & Acting On It" chapter. These are different tools for different problems.
+- **flat** is time (or allocations) in the function itself; **cum** includes everything it called. `SeatIDs` has little flat CPU but 10% cumulative: the cost is in what it calls.
+- **The CPU profile of a benchmark includes the runtime's background work.** `kevent` and `madvise` are the scheduler waiting and the GC returning memory; they're noise for our question.
+- **The allocation profile is clearer.** The biggest single allocator is `fmt.Sprintf` at 23.5%, and `SeatIDs` accounts for 28.5% cumulatively. `httptest.NewRecorder` and the header clones are the benchmark's own harness, not the server's work.
+
+That points at one function: `SeatIDs` builds the same 40 strings, A1 to E8, on every request.
+
+<Callout kind="warn" title="Profiles over HTTP are for your eyes only">
+
+`net/http/pprof` (chapter 9) lets you take the same profiles from a running server: `go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30`. Keep it on a localhost-only listener; a profile endpoint on the public port lets anyone burn your CPU.
 
 </Callout>
 
-### What `go tool trace` shows you
+<UnderTheHood title="How the CPU profiler samples">
 
-The browser UI at `localhost:PORT` has several views:
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Goroutine analysis">Every goroutine's lifetime: when it was created, how long it ran, when it was scheduled off the CPU, what it was waiting for. The critical view for goroutine leaks and scheduler stalls.</ConceptCard>
-  <ConceptCard label="GC timeline">GC events on a timeline: STW start/end, concurrent mark phases, sweep phases. Lets you see whether GC pauses are contributing to latency spikes.</ConceptCard>
-  <ConceptCard label="Processor (P) utilization">Each logical processor's goroutine scheduling. Are your P's busy? If a P sits idle while goroutines are runnable, you have a scheduling stall — likely a blocking syscall or channel wait without a worker to pick it up.</ConceptCard>
-  <ConceptCard label="Network and syscall blocking">Where goroutines blocked on I/O. Essential for finding whether a DB call or external API is the real bottleneck behind a slow endpoint.</ConceptCard>
-</ConceptGrid>
-
-### Micro vs. macro framing
-
-Before we close, the framing that makes you an actual performance engineer and not just someone who knows the tools:
-
-**Microbenchmarks** (`testing.B`) measure a single function in isolation. They're excellent for validating that a specific change — preallocation, using `sync.Pool`, removing an allocation — actually helped. They're terrible for measuring end-to-end latency, because they don't include the actual workload mix, concurrency, or memory pressure of production.
-
-**Macro profiling** (`pprof` on a real server, execution traces from integration tests) tells you what actually matters in the full system. A function that's 50% of CPU time in a microbenchmark might be 2% of wall time in production because it's dwarfed by database I/O.
-
-The workflow is: **macro profile first to find the hotspot → microbenchmark to measure the fix → macro profile again to confirm the win carried through**.
-
-<UnderTheHood title="What the execution tracer actually records (Go 1.26)">
-
-*The event names below are illustrative; the actual event schema is internal to the runtime and changes across versions. Treat this as a conceptual map.*
-
-The execution tracer works by having the runtime emit **structured events** into an in-memory ring buffer at every significant transition:
-
-- Goroutine lifecycle: start, stop, schedule, preempt, block, unblock
-- GC events: cycle start/done, sweep phases, STW start/stop
-- Heap: allocation and release events
-- Network poller and syscall enter/exit
-
-Each event is timestamped with the CPU's hardware counter (`RDTSC` on x86). The trace binary is compact — events are a few bytes each — but at high event rates (millions of goroutine switches per second) it can add measurable overhead (~5–10% CPU). Collect traces for short durations (1–30 seconds) under a realistic load sample, not continuously in production.
-
-**Go 1.25: `runtime/trace.FlightRecorder` is now stable.** Introduced as a proposal in Go 1.22 and stabilized in Go 1.25, `FlightRecorder` runs a continuously-spinning, fixed-size ring buffer — always collecting trace data but keeping only the last N seconds in memory. When something goes wrong in production, you call `fr.WriteTo(w)` to capture the recent history, without the cost of writing a trace file at all times. This is the right tool for "always-on but cheap" production tracing on Meridian's ledger service.
-
-```go
-fr := trace.NewFlightRecorder()
-fr.Start()
-// ... at incident time:
-f, _ := os.Create("incident.trace")
-fr.WriteTo(f)
-```
-
-The `go tool trace` browser UI parses the binary and renders goroutines as colored rectangles on time axes: running (blue), runnable (green), blocked (red). A healthy server trace shows dense blue — goroutines running, not waiting.
+When profiling starts, the runtime asks the OS for a timer signal (`SIGPROF`) about 100 times a second per thread using CPU (Go 1.18+ uses per-thread timers on Linux). The signal handler records the goroutine's current stack. A function's share of samples is its estimated share of CPU time, so short runs are noisy: 3 s at 100 Hz is only a few hundred samples per core. The allocation profile is sampled too: by default about one record per 512 KB allocated (`runtime.MemProfileRate`), scaled back up in the report, which is why its counts are estimates.
 
 </UnderTheHood>
 
----
-
-## Profile-Guided Optimization
-
-Everything in this chapter so far runs one loop: **you** measure, **you** read the profile, **you** change the code. Profile-guided optimization — PGO — closes a second loop most engineers never touch: the profile goes back into `go build`, and the **compiler** changes *its* decisions. Same source, faster binary. The machine does the work. That's how I like my machines.
-
-**On the job:** PGO is the cheapest real win in Go performance. The Go team measured **2–7%** CPU reduction on representative benchmarks when it shipped in Go 1.21, and the devirtualization work in 1.22 pushed some dispatch-heavy workloads past 10%. The price is one committed file and a refresh habit. If your service already exposes `net/http/pprof` — and after the first section of this chapter, it does — you are one `curl` away from the input.
-
-<Define term="Profile-guided optimization (PGO)">
-**Profile-guided optimization (PGO)** is a compiler optimization technique where a CPU profile (`default.pgo`) collected from real production traffic is fed into `go build`. The compiler uses execution frequencies to make smarter decisions: inlining hot functions past default size thresholds, devirtualizing frequent interface calls, and ordering basic blocks for optimal branch prediction. **Why it matters:** yields 2% to 14% CPU efficiency gains and latency reductions with zero application source code changes. **Production hazard:** feeding a stale or unrepresentative profile (e.g. captured during an abnormal incident or synthetic micro-benchmark) can cause the compiler to optimize the wrong paths, degrading steady-state performance.
-</Define>
-
-### Why the compiler guesses without you
-
-The compiler's static heuristics are tuned for the *average* of all Go programs, because at compile time that's all it can know. The inliner has a fixed cost budget per call site — small functions inline, anything past the budget stays a call. Interface method calls go through the itable indirection (the two-word interface header from the Idiomatic Go chapter) unless the compiler can statically prove the concrete type. Sane defaults — but your ledger service is not average. Production says most of its CPU lives in a handful of functions under `POST /transfers`: decode, validate, balance check. The compiler has no idea. The profile is how you tell it.
-
-The history explains the design. Classic PGO — GCC, MSVC, LLVM — demanded an **instrumented build**: compile a special counting binary, run a synthetic benchmark against it, rebuild using the recorded counts. Two builds, plus a benchmark that has to stay representative of production forever. In practice the benchmark rotted, the second build annoyed everyone, and teams quietly turned the whole thing off. Google's AutoFDO work flipped the model: *sample the production binary you already run* with an ordinary profiler, and accept slightly fuzzier counts in exchange for data that is true by construction. Go adopted the AutoFDO shape wholesale — the input is a stock pprof CPU profile, the exact bytes `/debug/pprof/profile` already serves. No instrumented build, no synthetic benchmark. Your fleet *is* the benchmark.
-
-### The loop
-
-<ExecTimeline
-  title="The PGO feedback loop, release to release"
-  lanes={[{ id: "prod", label: "Production" }, { id: "build", label: "CI / Build" }]}
-  steps={[
-    { lane: "prod", kind: "run", label: "v1.4 serves peak traffic", note: "Friday payroll spike — the workload you actually care about, not a synthetic benchmark." },
-    { lane: "prod", kind: "send", label: "sample 30s of CPU", note: "curl /debug/pprof/profile?seconds=30 on two or three pods. A few hundred KB each." },
-    { lane: "build", kind: "run", label: "merge into default.pgo", note: "go tool pprof -proto p1 p2 p3 — sample weights add, smoothing out per-pod noise." },
-    { lane: "build", kind: "run", label: "commit next to package main", note: "The profile is a build input: versioned, reviewed, auditable like source." },
-    { lane: "build", kind: "run", label: "go build ./cmd/ledger", note: "Toolchain auto-detects default.pgo: raises inline budgets on hot paths, devirtualizes hot interface calls." },
-    { lane: "build", kind: "done", label: "ship v1.5, ~2–7% less CPU", note: "Same source. The optimizations are aimed at YOUR hot path, not the average Go program." },
-    { lane: "prod", kind: "run", label: "repeat next release", note: "Profiles of a PGO-built binary feed the next build without oscillating — the docs call it iterative stability." }
+<QuickCheck
+  question="In the allocation profile, fmt.Sprintf has flat 23.5% and SeatIDs has cum 28.5%. What does that tell you?"
+  options={[
+    "SeatIDs allocates nothing itself",
+    "Most of what SeatIDs allocates comes from the Sprintf calls it makes; together they're over a quarter of all allocations",
+    "Sprintf is slow",
+    "The profile is wrong"
   ]}
-  caption="PGO turns profiling from a one-off investigation into a standing feedback loop: production teaches the compiler what to optimize, every release."
+  answer={1}
+  explain="cum includes callees. SeatIDs' own slice plus the 40 Sprintf results per call add up to 28.5% of allocated objects. Fixing SeatIDs removes both."
 />
 
-### Feeding the compiler
+## Benchmarking
 
-```shell
-# 1. Sample CPU during representative load — peak, not idle
-curl -o cpu-1.pprof 'https://ledger-1:6060/debug/pprof/profile?seconds=30'
-curl -o cpu-2.pprof 'https://ledger-2:6060/debug/pprof/profile?seconds=30'
+*Stop 2 of 7.*
 
-# 2. Merge pods into one profile (sample weights add)
-go tool pprof -proto cpu-1.pprof cpu-2.pprof > default.pgo
+### Step 1: one change
 
-# 3. It lives next to package main, versioned like source
-mv default.pgo cmd/ledger/
-git add cmd/ledger/default.pgo
+Seat names never change, so build them once, when the program starts:
 
-# 4. go build auto-detects it — no flag needed
-go build ./cmd/ledger
-
-# Audit what any binary was built with
-go version -m ledger | grep -- -pgo
-```
-
-`-pgo=off` builds without it; `-pgo=path/to/profile.pprof` overrides the default. The filename convention is deliberate: the profile is a **build input**, so it belongs in version control, goes through code review, and is recorded in the binary's build metadata — the same provenance discipline as the `-ldflags` build stamping from the Building & Shipping chapter.
-
-### What actually changes: the hot interface call
-
-Here's the optimization PGO unlocks that you cannot cleanly write by hand — not without wrecking your interface-based design. Watch the call site:
-
-<GoPlayground>
-
-```go
-package main
-
-import "fmt"
-
-// Validator is what the handler sees — an interface, so every call
-// is indirect: load the itable, load the method pointer, jump.
-type Validator interface {
-	Validate(amountCents int64) error
-}
-
-type TransferValidator struct{ maxCents int64 }
-
-func (v TransferValidator) Validate(amountCents int64) error {
-	if amountCents <= 0 || amountCents > v.maxCents {
-		return fmt.Errorf("amount %d out of range", amountCents)
-	}
-	return nil
-}
-
-func validateBatch(v Validator, amounts []int64) (ok int) {
-	for _, a := range amounts {
-		// The hot call. Statically, the compiler can't prove which
-		// concrete type is behind v. A production profile can:
-		// 99.8% of samples here hit TransferValidator.Validate.
-		// PGO specializes this exact call site.
-		if v.Validate(a) == nil {
-			ok++
+```go noverify
+// booking.go, lines 49–74
+// seatIDs holds every hall's seat names, built once at startup: they never
+// change, so there's no reason to format 40 strings on every request.
+var seatIDs = func() map[string][]string {
+	m := make(map[string][]string, len(Halls))
+	for movie, h := range Halls {
+		ids := make([]string, 0, h.Rows*h.Cols)
+		for r := range h.Rows {
+			for c := range h.Cols {
+				ids = append(ids, fmt.Sprintf("%c%d", 'A'+r, c+1))
+			}
 		}
+		m[movie] = ids
 	}
-	return ok
+	return m
+}()
+
+// SeatIDs lists a hall's seats in order: A1, A2, … B1, … The slice is
+// shared: callers must not modify it.
+func SeatIDs(movie string) ([]string, error) {
+	ids, ok := seatIDs[movie]
+	if !ok {
+		return nil, ErrNoSeat
+	}
+	return ids, nil
 }
 
-func main() {
-	amounts := []int64{4_999, -3, 12_000, 999_999_999}
-	v := TransferValidator{maxCents: 500_000_00}
-	fmt.Printf("%d of %d transfers pass validation\n",
-		validateBatch(v, amounts), len(amounts))
-}
 ```
 
-</GoPlayground>
+`SeatIDs` now returns a shared slice, so the comment says callers mustn't modify it: that's the price of sharing, and it has to be written down.
 
-Statically, the compiler usually can't prove which concrete type hides behind `Validator` at that call site — the value crosses a function boundary and could be anything. So it emits indirect dispatch. Cheap, but it blocks **inlining**, and inlining is the gateway optimization: once a body is inlined, escape analysis, bounds-check elimination, and constant propagation all get to see through it.
+### Step 2: benchstat, not eyeballs
 
-With a profile showing one type dominating the site, the compiler emits a **guarded devirtualization**:
+Benchmark numbers wobble by several percent from run to run. `benchstat` (`go install golang.org/x/perf/cmd/benchstat@latest`) compares two sets of runs and says whether the difference is bigger than the noise:
 
-```go
-// Conceptually, what the compiled hot path becomes:
-if tv, ok := v.(TransferValidator); ok {
-	err = tv.Validate(a) // direct call — now inlinable
-} else {
-	err = v.Validate(a) // rare path: normal interface dispatch
-}
+```text
+$ go test -run '^$' -bench SeatMap -count 6 ./cmd/cinema/ > before.txt   # old SeatIDs
+$ go test -run '^$' -bench SeatMap -count 6 ./cmd/cinema/ > after1.txt   # precomputed
+$ benchstat before.txt after1.txt
+goos: darwin
+goarch: arm64
+pkg: cinema/cmd/cinema
+cpu: Apple M1
+          │ before.txt  │             after1.txt             │
+          │   sec/op    │   sec/op     vs base               │
+SeatMap-8   9.153µ ± 3%   6.843µ ± 7%  -25.24% (p=0.002 n=6)
+
+          │  before.txt  │             after1.txt              │
+          │     B/op     │     B/op      vs base               │
+SeatMap-8   5.006Ki ± 0%   4.237Ki ± 0%  -15.35% (p=0.002 n=6)
+
+          │ before.txt │            after1.txt             │
+          │ allocs/op  │ allocs/op   vs base               │
+SeatMap-8   54.00 ± 0%   13.00 ± 0%  -75.93% (p=0.002 n=6)
 ```
 
-The fast path is one type-descriptor comparison, then a direct — now inlinable — call. The slow path still handles the other 0.2% correctly. Your interfaces stay clean; the binary gets concrete-call speed where it counts. This is the "PGO-guided devirtualization" the Idiomatic Go chapter promised when it showed you the itable.
+**−25% time, −76% allocations.** Each column is a median with its spread (`± 3%`); `p=0.002` means a difference this large would almost never appear by chance if nothing had changed, and `n=6` is how many runs it used. When benchstat prints `~` instead of a percentage, the change is within the noise, and you'll see one in stop 3.
 
-<UnderTheHood title="What the compiler does with default.pgo (Go 1.26)">
-
-*The thresholds below are internal tuning constants, not API — treat the numbers as illustrative.*
-
-1. **Parse and weight.** The pprof file decodes into a weighted call graph: nodes are functions, edge weights are stack-sample counts. Built once per `go build`, consulted as every package compiles.
-2. **Hot-callsite inlining (Go 1.21+).** Call edges in roughly the hottest few percent of cumulative weight get a raised inlining budget — a function too big to inline under the static rules inlines anyway *at hot call sites only*. Cold sites keep the default budget. That asymmetry is the point: the binary grows single-digit percent, not 2×.
-3. **Devirtualization (Go 1.22+).** Interface-call sites with a dominant concrete type in the profile compile to the guarded direct call you saw above. The guard costs one comparison; a miss falls back to ordinary dispatch.
-4. **Name-based matching.** Samples are keyed by symbol name. Rename or heavily reshape a function and its weight is silently orphaned — that call site just reverts to static heuristics. A stale, partial, or even corrupt-ish profile **never breaks a build**; the worst case is a slightly slower binary. That graceful-degradation contract is what makes committing `default.pgo` safe.
-5. **Iterative stability.** Profiles collected from a PGO-built binary attribute inlined frames back to their source functions, so feeding `profile(build(profile))` around the loop doesn't oscillate or compound. You can run the loop forever, release after release.
-6. **Cost.** Builds with a profile run more analysis — expect mid-single-digit-percent slower compiles. The runtime cost is zero; everything happens at compile time.
-
-</UnderTheHood>
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="default.pgo">Lives in the main package directory; auto-detected by `go build`. Commit it, review it, refresh it. Override with `-pgo=path`, disable with `-pgo=off`.</ConceptCard>
-  <ConceptCard label="The input">A stock pprof CPU profile — `/debug/pprof/profile?seconds=30` under peak production load. Merge several pods or days with `go tool pprof -proto a b > default.pgo`; weights add.</ConceptCard>
-  <ConceptCard label="Refresh cadence">Profiles age as code changes — renames orphan their weights silently. Re-collect per release or monthly, and automate it. Stale never breaks; it just fades toward baseline.</ConceptCard>
-  <ConceptCard label="What improves">Hot-path inlining and interface devirtualization: 2–7% CPU typically, more on dispatch-heavy services. Free money at fleet scale; invisible on a cold CLI tool.</ConceptCard>
-  <Gotcha>A profile of the wrong workload is worse than none: profile an idle staging pod and you optimize log flushing; profile a load test that hammers one endpoint and you tune the compiler away from the other twelve. Sample peak production, several pods, merged.</Gotcha>
+<ConceptGrid cols={3}>
+  <ConceptCard label="-count 6 or more">Run each side several times. One run of each is an anecdote; benchstat needs a distribution.</ConceptCard>
+  <ConceptCard label="Same machine, quiet machine">Close the browser, plug in the laptop. Thermal throttling and background work are the biggest sources of noise.</ConceptCard>
+  <ConceptCard label="Benchmark the real path">This benchmark goes through the real mux and store. A benchmark of a function in isolation can speed up while the endpoint doesn't.</ConceptCard>
 </ConceptGrid>
 
 <QuickCheck
-  question="You commit default.pgo, then a refactor renames half of the hot functions. What happens on the next go build?"
+  question="benchstat prints `~ (p=0.589 n=6)` for a change. What should you conclude?"
   options={[
-    "The build fails — the profile no longer matches the source",
-    "The compiler emits a warning and ignores the entire profile",
-    "Renamed functions silently lose their PGO boost, everything else keeps it, and the build succeeds",
-    "The binary panics at runtime when a renamed function is called"
+    "The change made it 0.589% faster",
+    "The difference is within the noise: you haven't shown the change helps",
+    "The change is 58.9% faster",
+    "Run it once more and pick the better number"
   ]}
-  answer={2}
-  explain="PGO matching is by symbol name. Weights for renamed functions are orphaned, and those call sites fall back to the static heuristics — silently. Nothing fails and nothing warns; the binary just drifts toward baseline speed. That is exactly why you refresh the profile on a cadence instead of treating it as one-time setup."
+  answer={1}
+  explain="~ means benchstat can't distinguish the two distributions. That's the result the sync.Pool experiment in stop 3 got, and the honest response is to not keep a change that adds complexity for no measured benefit."
 />
 
-<Callout kind="pro" title="Wire it into the release train">
-The collection step is the same pprof endpoint you stood up in the first section, so automate the loop: a scheduled CI job curls `/debug/pprof/profile` from two or three production pods during the weekly peak, merges them, and opens a PR updating `default.pgo`. Review is a sanity check on the `go tool pprof -top` diff — you are reviewing *what the compiler will believe about production*. If the top-10 looks wrong, the profile is lying, and the compiler will faithfully optimize the lie.
-</Callout>
+## Escape Analysis & Allocations
 
----
+*Stop 3 of 7.*
 
-## Exercises
+### Step 1: ask the compiler
 
-Stop reading. Start measuring.
+Every value lives either on a goroutine's **stack** (freed automatically when the function returns, no GC involved) or on the **heap** (freed only when the garbage collector proves nothing refers to it). The compiler decides which, by **escape analysis**, and will tell you:
 
-<Exercise n={1} title="Add pprof to a server" level="easy">
+```text
+$ go build -gcflags=-m ./booking      # the original SeatIDs and Seats
+booking/booking.go:55:13: make([]string, 0, h.Rows * h.Cols) escapes to heap
+booking/booking.go:58:45: 65 + r escapes to heap
+booking/booking.go:58:50: c + 1 escapes to heap
+booking/booking.go:58:16: append escapes to heap
+booking/memory.go:118:13: make([]Seat, len(ids)) escapes to heap
+booking/memory.go:121:37: movie + "/" + id does not escape
+```
 
-Write a minimal HTTP server that:
-1. Has one handler `/report` that does some work (a loop summing 100,000 integers).
-2. Exposes `net/http/pprof` endpoints on a **separate** listener at `:6060`.
-3. Does NOT expose pprof on the public `:8080` port.
+- **`65 + r escapes to heap`**: `'A'+r` (65 is `'A'`) is passed to `Sprintf` as an `any`. Putting an integer in an interface usually means storing it somewhere the interface can point to, and since `Sprintf` might keep it, the compiler can't prove it doesn't: heap. That's two allocations per seat before `Sprintf` even builds its string.
+- **`make([]Seat, …) escapes`**: the slice is returned to the caller, so it must outlive `Seats`' stack frame. That one is unavoidable without changing the API.
+- **`movie + "/" + id does not escape`**: a short concatenation used only inside the function gets a buffer on the stack. It costs CPU (`concatstrings` appeared in the profile) but no allocation. Not every line that looks expensive is.
 
-<Solution>
+<StackHeapAnim
+  title="Where SeatIDs' values end up"
+  frames={[
+    {
+      note: "The handler calls Seats, which calls SeatIDs. Each has a stack frame; locals like r and c live there, freed for free when the function returns.",
+      stack: [
+        { fn: "handler", vars: ["w", "r"] },
+        { fn: "Seats()", vars: ["movie"] },
+        { fn: "SeatIDs()", vars: ["r", "c", "ids"] }
+      ],
+      heap: []
+    },
+    {
+      note: "fmt.Sprintf takes its arguments as any. 'A'+r and c+1 are boxed into interfaces, and the compiler reports both 'escapes to heap': two allocations per seat, then a third for the resulting string.",
+      beat: "problem",
+      stack: [
+        { fn: "handler", vars: ["w", "r"] },
+        { fn: "Seats()", vars: ["movie"] },
+        { fn: "SeatIDs()", vars: ["r", "c"] }
+      ],
+      heap: ["'A'+r", "c+1", "\"A1\""],
+      escaping: "'A'+r"
+    },
+    {
+      note: "SeatIDs returns ids, so the slice (and its 40 strings) must outlive the frame: heap. Repeat for every request, and 54 allocations per seat map are mostly this.",
+      stack: [
+        { fn: "handler", vars: ["w", "r"] },
+        { fn: "Seats()", vars: ["movie", "ids"] }
+      ],
+      heap: ["ids []string", "\"A1\" … \"E8\"", "boxed ints…"]
+    },
+    {
+      note: "After the change, the 40 names are built once at startup and shared. Each request allocates the []Seat it returns and little else: 13 allocations, most of them the benchmark's own recorder.",
+      beat: "solution",
+      stack: [
+        { fn: "handler", vars: ["w", "r"] },
+        { fn: "Seats()", vars: ["movie", "ids (shared)"] }
+      ],
+      heap: ["out []Seat"]
+    }
+  ]}
+  caption="The stack is free; the heap is a debt the GC collects. -gcflags=-m tells you, line by line, which side each value lands on."
+/>
+
+### Step 2: sync.Pool, where it didn't help
+
+The next idea: the JSON encoder writes into a buffer; reuse buffers across requests with a `sync.Pool`:
 
 ```go
-package main
+var bufs = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-import (
-	"fmt"
-	"net/http"
-	_ "net/http/pprof"
-)
-
-func reportHandler(w http.ResponseWriter, r *http.Request) {
-	var sum int64
-	for i := range 100_000 {
-		sum += int64(i)
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	buf := bufs.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufs.Put(buf)
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
+		http.Error(w, "encoding failed", http.StatusInternalServerError)
+		return
 	}
-	fmt.Fprintf(w, "sum: %d\n", sum)
-}
-
-func main() {
-	// Public mux — no pprof here.
-	pub := http.NewServeMux()
-	pub.HandleFunc("/report", reportHandler)
-
-	// Internal mux — pprof registers on http.DefaultServeMux.
-	// Run both concurrently.
-	go func() {
-		if err := http.ListenAndServe(":6060", nil); err != nil {
-			panic(err)
-		}
-	}()
-
-	if err := http.ListenAndServe(":8080", pub); err != nil {
-		panic(err)
-	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(buf.Bytes())
 }
 ```
 
-Key insight: `_ "net/http/pprof"` registers handlers on `http.DefaultServeMux`. The public server uses an *explicit* `http.NewServeMux()` — so pprof is only reachable on the internal `:6060` listener. Never expose pprof publicly.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={2} title="Write and read a benchmark" level="easy">
-
-Write a benchmark for this function and run it with `-benchmem`. Identify the `allocs/op` count.
-
-```go
-func joinDescriptions(rows []string) string {
-	result := ""
-	for _, r := range rows {
-		result += r + ","
-	}
-	return result
-}
+```text
+$ benchstat after1.txt after2.txt
+          │ after1.txt  │          after2.txt          │
+          │   sec/op    │   sec/op     vs base         │
+SeatMap-8   6.843µ ± 7%   6.720µ ± 5%  ~ (p=0.589 n=6)
+          │ after1.txt │          after2.txt           │
+          │ allocs/op  │ allocs/op   vs base           │
+SeatMap-8   13.00 ± 0%   13.00 ± 0%  ~ (p=1.000 n=6) ¹
 ```
 
-Then rewrite `joinDescriptions` to use `strings.Builder` and benchmark the new version. Use `benchstat` (or just compare outputs manually) to report the speedup.
+Nothing. The original `json.NewEncoder(w).Encode(v)` already streamed into the response writer's own buffer, so there was no big buffer to save. The change came out again: more code, no measured benefit.
 
-<Solution>
+### Step 3: sync.Pool, where it's worth it
 
-```go
-package bench_test
+A pool pays off when the object is **expensive to create** and short-lived. The textbook case is compression: say the seat map is served gzipped. A `gzip.Writer` carries about a megabyte of compressor state.
+
+```go noverify
+// Compressing a seat-map response: a new gzip.Writer per response,
+// or one reused from a sync.Pool.
+package gzpool
 
 import (
-	"strings"
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"io"
+	"sync"
 	"testing"
+
+	"cinema/booking"
 )
 
-var testRows = []string{"transfer", "fee", "interest", "deposit", "withdrawal"}
-
-func joinNaive(rows []string) string {
-	result := ""
-	for _, r := range rows {
-		result += r + ","
+var body = func() []byte {
+	ids, _ := booking.SeatIDs("inception")
+	seats := make([]booking.Seat, len(ids))
+	for i, id := range ids {
+		seats[i] = booking.Seat{ID: id, Status: booking.Free}
 	}
-	return result
-}
+	b, _ := json.Marshal(seats)
+	return b
+}()
 
-func joinFast(rows []string) string {
-	var b strings.Builder
-	b.Grow(len(rows) * 12)
-	for _, r := range rows {
-		b.WriteString(r)
-		b.WriteByte(',')
-	}
-	return b.String()
-}
-
-var sink string
-
-func BenchmarkJoinNaive(b *testing.B) {
+func BenchmarkGzipNew(b *testing.B) {
 	b.ReportAllocs()
-	var s string
-	for range b.N {
-		s = joinNaive(testRows)
+	for b.Loop() {
+		zw := gzip.NewWriter(io.Discard)
+		zw.Write(body)
+		zw.Close()
 	}
-	sink = s
 }
 
-func BenchmarkJoinFast(b *testing.B) {
+var writers = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+
+func BenchmarkGzipPool(b *testing.B) {
 	b.ReportAllocs()
-	var s string
-	for range b.N {
-		s = joinFast(testRows)
+	for b.Loop() {
+		zw := writers.Get().(*gzip.Writer)
+		zw.Reset(io.Discard)
+		zw.Write(body)
+		zw.Close()
+		writers.Put(zw)
 	}
-	sink = s
+}
+
+func TestSameOutput(t *testing.T) {
+	var a, c bytes.Buffer
+	zw := gzip.NewWriter(&a)
+	zw.Write(body)
+	zw.Close()
+	zp := writers.Get().(*gzip.Writer)
+	zp.Reset(&c)
+	zp.Write(body)
+	zp.Close()
+	if !bytes.Equal(a.Bytes(), c.Bytes()) {
+		t.Fatal("pooled writer produced different bytes")
+	}
 }
 ```
 
-The naive version allocates once per concatenation — O(n) allocations for n rows. The `strings.Builder` version allocates once (the final string). For 5 rows you'll see ~5 allocs/op drop to 1 alloc/op.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={3} title="Diagnose an escape with -gcflags=-m" level="medium">
-
-Given this function:
-
-```go
-func newLedgerEntry(desc string, amount int64) *LedgerEntry {
-	e := LedgerEntry{Description: desc, AmountCents: amount}
-	return &e
-}
+```text
+$ go test -run '^$' -bench Gzip -count 6 ./gzpool
+BenchmarkGzipNew-8    	   20078	     60014 ns/op	 1076000 B/op	      14 allocs/op
+BenchmarkGzipPool-8   	  192762	      6233 ns/op	       5 B/op	       0 allocs/op
+$ benchstat -col /name gz.txt
+           │    sec/op    │
+GzipNew-8    61.70µ ± 69%
+GzipPool-8   6.291µ ±  1%
 ```
 
-Run `go build -gcflags=-m` and explain:
-1. Why does `e` escape to the heap?
-2. Rewrite the function to return a value instead of a pointer. Does the escape disappear?
-3. When would returning a pointer still be the right design choice despite the allocation?
+**10× faster, from 1 MB per response to nothing.** `Reset(w)` points a pooled writer at a new destination, and `TestSameOutput` checks the pooled writer produces byte-identical output. (The ±69% on the first line is the first run paying for page faults: 104 µs, then about 61 µs.)
 
-<Solution>
+<Define term="sync.Pool">
+A cache of temporary objects that goroutines can take (`Get`) and give back (`Put`). The runtime may drop pooled objects during any garbage collection, so a pool is for reducing allocation of reusable scratch objects, never for state that must survive. Each P has its own local pool, so `Get` and `Put` are usually lock-free. Always reset an object after `Get`, before use.
+</Define>
 
-```go
-package main
+<QuickCheck
+  question="Why did pooling gzip writers help 10× while pooling JSON buffers did nothing?"
+  options={[
+    "gzip is written in assembly",
+    "A gzip.Writer allocates about 1 MB of state when created; the JSON path had no large per-request object to save",
+    "sync.Pool only works with compress/gzip",
+    "The JSON benchmark was wrong"
+  ]}
+  answer={1}
+  explain="A pool saves the cost of creating the object. 1,076,000 B/op went to 5 B/op for gzip; the JSON encoder was already writing straight into the response buffer."
+/>
 
-import "fmt"
+<MentalModel preset="gc" />
 
-type LedgerEntry struct {
-	Description string
-	AmountCents int64
-}
+## GC Tuning
 
-// Returns value: e stays on the stack.
-func newLedgerEntry(desc string, amount int64) LedgerEntry {
-	return LedgerEntry{Description: desc, AmountCents: amount}
-}
+*Stop 4 of 7.*
 
-func main() {
-	e := newLedgerEntry("transfer", 5000)
-	fmt.Println(e.Description, e.AmountCents)
-}
+### Step 1: what the collector does
+
+Go's garbage collector finds live objects by following pointers from the roots (globals and every goroutine's stack) and frees the rest. It runs **concurrently** with your goroutines, pausing them only briefly at the start and end of each cycle (0.067 ms and 0.011 ms in chapter 9's trace).
+
+<GCAnim
+  title="Tri-color mark and sweep over the seat-map server's heap"
+  nodes={[
+    { id: "root", x: 40, y: 100, to: ["req", "store"] },
+    { id: "req", x: 140, y: 50, to: ["out", "enc"] },
+    { id: "store", x: 140, y: 150 },
+    { id: "out", x: 250, y: 30 },
+    { id: "enc", x: 250, y: 90 },
+    { id: "prev", x: 250, y: 165, to: ["old"] },
+    { id: "old", x: 350, y: 165 }
+  ]}
+  frames={[
+    {
+      note: "Everything starts WHITE: presumed garbage until proven reachable. prev and old are the []Seat and JSON buffer of a request that has already finished: nothing points to them any more.",
+      colors: { root: "white", req: "white", store: "white", out: "white", enc: "white", prev: "white", old: "white" }
+    },
+    {
+      note: "Marking starts at the roots (globals, every goroutine's stack), shaded GREY: found, but their pointers not yet followed.",
+      colors: { root: "grey", req: "white", store: "white", out: "white", enc: "white", prev: "white", old: "white" }
+    },
+    {
+      note: "The collector scans root: the current request and the store turn grey, root turns BLACK (scanned, alive). This runs alongside your goroutines.",
+      colors: { root: "black", req: "grey", store: "grey", out: "white", enc: "white", prev: "white", old: "white" }
+    },
+    {
+      note: "The request's seat list and encoder are reached; the store has no pointers into this heap, so it's done at once.",
+      colors: { root: "black", req: "black", store: "black", out: "grey", enc: "grey", prev: "white", old: "white" }
+    },
+    {
+      note: "No grey objects left: marking is finished. prev and old are still white: nothing reached them. That's the proof they're garbage.",
+      colors: { root: "black", req: "black", store: "black", out: "black", enc: "black", prev: "white", old: "white" }
+    },
+    {
+      note: "Sweep: white objects' memory goes back to the allocator. Each seat-map request leaves a few KB like this, and at 70,000 requests a second that's what keeps the collector busy.",
+      beat: "solution",
+      colors: { root: "black", req: "black", store: "black", out: "black", enc: "black", prev: "swept", old: "swept" }
+    }
+  ]}
+  caption="White: presumed garbage. Grey: found, not yet scanned. Black: proven alive. A write barrier keeps it correct while your code keeps changing pointers."
+/>
+
+Since Go 1.26 the default collector is **Green Tea**, which scans small objects page by page for better memory locality (it's still on by default in 1.27). You don't configure it; just know it when comparing GC numbers across versions.
+
+### Step 2: the two knobs, measured
+
+- **`GOGC`** (default 100): start the next collection when the heap has grown by this percentage over what was live after the last one. The minimum goal is 4 MB.
+- **`GOMEMLIMIT`** (Go 1.19): a soft ceiling on the Go runtime's total memory. The collector runs harder as memory approaches it. With `GOGC=off`, collection happens *only* as memory approaches the limit.
+
+The same server and load (`browse`, 32 clients, 4 s), `gctrace` on, two runs each:
+
+| setting | collections in 4 s | GC CPU | RSS | seat maps / s |
+|---|---|---|---|---|
+| `GOGC=100` (default) | 543–594 | 3% | 23 MB | 65,000–71,000 |
+| `GOGC=400` | 95–97 | 0% | 35 MB | 77,000–79,000 |
+| `GOGC=off GOMEMLIMIT=64MiB` | 27–29 | 0% | 69 MB | 74,000–80,000 |
+
+```text
+GOGC=400:            gc 97 @4.123s 0%: …, 15->15->1 MB, 16 MB goal, …
+GOGC=off, 64MiB:     gc 29 @3.972s 0%: …, 48->48->1 MB, 50 MB goal, …
 ```
 
-1. `&e` returns a pointer to a local variable. The compiler sees that `e` must outlive the function frame (the caller holds a reference), so it heap-allocates `e`.
-2. Returning `LedgerEntry` directly: `e` is copied to the caller's frame — no heap allocation. `-gcflags=-m` will no longer report the escape.
-3. Returning a pointer is still right when: (a) the struct is large enough that copying it is expensive and the pointer is passed widely; (b) the struct is intentionally mutable through the pointer (e.g. a `*sync.Mutex` embedded for a reason); (c) it implements an interface that requires a pointer receiver. Allocation isn't always wrong — it's only wrong when it's unnecessary and frequent.
+The live heap is 1 MB in every case. What changes is how much garbage the collector lets accumulate before cleaning up: 4 MB, 16 MB, or ~50 MB. With such a small live heap, the goal comes from the minimum heap size, which scales with `GOGC`: 4 MB × 400/100 = 16 MB. With `GOGC=off`, the goal is set by the memory limit instead. Fewer collections cost less CPU and bought roughly 10% more throughput, paid for in memory: 23, 35 and 69 MB. (The throughput spread is wide because the load generator shares the laptop.)
 
-</Solution>
+<ConceptGrid cols={2}>
+  <ConceptCard label="When to raise GOGC">Plenty of memory, GC showing up in CPU profiles or gctrace (this server: 3%). Doubling GOGC roughly halves collections.</ConceptCard>
+  <ConceptCard label="When to set GOMEMLIMIT">In a container with a hard memory limit: set it a bit below the limit so the runtime collects harder instead of being OOM-killed. With GOGC=off it also means "use the memory, collect only near the limit".</ConceptCard>
+  <Gotcha>GOMEMLIMIT is soft. If the live heap itself exceeds it, the GC runs constantly (the runtime caps GC at about 50% CPU to avoid a total death spiral) and you still run out. It is not a substitute for fixing a leak.</Gotcha>
+</ConceptGrid>
 
-</Exercise>
+<QuickCheck
+  question="The live heap is 1 MB. Why did GOGC=400 cut collections from ~570 to ~96?"
+  options={[
+    "It made each collection faster",
+    "The goal became about 16 MB instead of 4 MB, so garbage accumulated four times longer between collections",
+    "It stopped allocations",
+    "It enabled Green Tea"
+  ]}
+  answer={1}
+  explain="With a 1 MB live heap the goal is the minimum heap, 4 MB × GOGC/100: 16 MB at GOGC=400, measured as '16 MB goal'. Same garbage per request, collected in bigger, rarer batches."
+/>
 
-<Exercise n={4} title="Fix false sharing" level="medium">
+## Mechanical Sympathy
 
-A service tracks cache hit and miss counters. Two goroutines increment them concurrently. The current layout causes false sharing. Fix it:
+*Stop 5 of 7.*
 
-```go
-type CacheMetrics struct {
-	Hits   int64
-	Misses int64
-}
+### Step 1: memory moves in cache lines
+
+CPUs don't read single bytes from memory; they move fixed-size **cache lines** between memory and their private caches. When one core writes to a line, every other core's copy of that line is invalidated, and they must fetch it again. On this machine:
+
+```text
+$ sysctl hw.cachelinesize hw.l1dcachesize hw.l2cachesize
+hw.cachelinesize: 128
+hw.l1dcachesize: 65536
+hw.l2cachesize: 4194304
 ```
 
-Add padding so `Hits` and `Misses` each occupy their own 64-byte cache line. Write a test that increments both fields from separate goroutines 1,000,000 times each and asserts the final counts are correct.
+128-byte lines on Apple Silicon (most x86 CPUs use 64).
 
-<Solution>
+### Step 2: eight counters that aren't shared, but are
 
-```go
-package cache_test
+Each delivery worker counts its own deliveries with an atomic add, so a metrics endpoint can read them any time. No worker ever touches another's counter:
+
+```go noverify
+// Eight workers each count their own deliveries with an atomic add, so a
+// metrics endpoint can read the counters at any time. No counter is shared
+// between workers, in the program. Is anything shared in the hardware?
+package falseshare
 
 import (
 	"sync"
@@ -1502,135 +595,322 @@ import (
 	"testing"
 )
 
-const cacheLineSize = 64
+const workers = 8
 
-type paddedInt64 struct {
-	val int64
-	_   [cacheLineSize - 8]byte
+type packed struct {
+	n [workers]atomic.Int64 // 8 × 8 bytes: all in one 128-byte cache line
 }
 
-type CacheMetrics struct {
-	Hits   paddedInt64
-	Misses paddedInt64
-}
-
-func TestCacheMetrics(t *testing.T) {
-	const n = 1_000_000
-	var m CacheMetrics
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		for range n {
-			atomic.AddInt64(&m.Hits.val, 1)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for range n {
-			atomic.AddInt64(&m.Misses.val, 1)
-		}
-	}()
-
-	wg.Wait()
-
-	if got := atomic.LoadInt64(&m.Hits.val); got != n {
-		t.Errorf("Hits: want %d got %d", n, got)
+type padded struct {
+	n [workers]struct {
+		atomic.Int64
+		_ [120]byte // 8 + 120 = 128 bytes: one cache line per counter
 	}
-	if got := atomic.LoadInt64(&m.Misses.val); got != n {
-		t.Errorf("Misses: want %d got %d", n, got)
+}
+
+func run(add func(w int)) {
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Go(func() {
+			for range 1_000_000 {
+				add(w)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+func BenchmarkPacked(b *testing.B) {
+	var c packed
+	for b.Loop() {
+		run(func(w int) { c.n[w].Add(1) })
+	}
+}
+
+func BenchmarkPadded(b *testing.B) {
+	var c padded
+	for b.Loop() {
+		run(func(w int) { c.n[w].Add(1) })
 	}
 }
 ```
 
-Each `paddedInt64` occupies exactly 64 bytes. `Hits.val` is at offset 0; `Misses.val` is at offset 64. Different cache lines, different cores, zero invalidation. The atomics are still needed for correctness — padding removes the false sharing, not the data race.
+```text
+$ go test -run '^$' -bench . -count 6 ./falseshare
+$ benchstat -col /name fs.txt
+         │   sec/op    │
+Packed-8   275.0m ± 1%
+Padded-8   13.79m ± 4%
+```
+
+**20× slower** when the eight counters sit side by side. Eight `int64`s are 64 bytes: all in one 128-byte line. Every `Add` by one worker invalidates the line in the other seven cores' caches, so the line bounces between cores millions of times. That's **false sharing**: the program shares nothing, the hardware shares a cache line. Padding each counter to its own 128 bytes costs 1 KB and removes it.
+
+<RuntimeStage
+  title="Eight counters, one cache line"
+  kicker="false sharing · live"
+  zones={[
+    { id: "c1", label: "core 1", sub: "counts n[0]", x: 16, y: 16, w: 236, h: 150, kind: "cpu" },
+    { id: "c2", label: "core 2", sub: "counts n[1]", x: 262, y: 16, w: 236, h: 150, kind: "cpu" },
+    { id: "c3", label: "core 3", sub: "counts n[2]", x: 508, y: 16, w: 236, h: 150, kind: "cpu" },
+    { id: "mem", label: "one 128-byte cache line", sub: "n[0] n[1] … n[7]", x: 16, y: 186, w: 728, h: 110, kind: "chan" },
+    { id: "own", label: "padded: one line per counter", x: 16, y: 316, w: 728, h: 120, kind: "exit" }
+  ]}
+  actors={[
+    { id: "line", label: "the line", kind: "value" },
+    { id: "a", label: "line 0", kind: "value" }, { id: "b", label: "line 1", kind: "value" }, { id: "c", label: "line 2", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "line", to: "mem", note: "Packed: the eight atomic counters are 64 bytes, all inside one 128-byte cache line." },
+    { at: 1.0, id: "line", to: "c1", note: "Core 1 adds to n[0]: it needs the line exclusively, so every other core's copy is invalidated." },
+    { at: 2.0, id: "line", to: "c2", beat: "problem", note: "Core 2 adds to n[1], a different counter but the same line: it takes the line away from core 1." },
+    { at: 3.0, id: "line", to: "c3", beat: "problem", note: "Core 3 takes it next. The line bounces between cores on nearly every add. Measured: 275 ms." },
+    { at: 4.2, id: "line", to: "" }, { at: 4.2, id: "a", to: "c1" }, { at: 4.2, id: "b", to: "c2" }, { at: 4.2, id: "c", to: "c3", beat: "solution", note: "Padded: each counter has its own line, which stays in its own core's cache. Measured: 13.8 ms, 20× faster." }
+  ]}
+  caption="Independent variables in the same cache line aren't independent to the hardware."
+/>
+
+<Callout kind="pro" title="Data layout for the hardware">
+
+The same principle helps without atomics: code that walks memory in order (arrays of structs you read top to bottom, slices instead of pointer-chasing lists) keeps the prefetcher ahead of you. Part 1 chapter 3 measured it: a struct-of-arrays scan in 0.44 ms against 3.14 ms for shuffled pointers.
+
+</Callout>
+
+<QuickCheck
+  question="Why did padding each counter to 128 bytes, not 64, matter on this machine?"
+  options={[
+    "Go requires 128-byte alignment",
+    "Apple Silicon's cache line is 128 bytes (sysctl hw.cachelinesize); 64-byte padding would still put two counters in one line",
+    "atomic.Int64 is 128 bytes",
+    "It doesn't; 64 would be the same"
+  ]}
+  answer={1}
+  explain="False sharing happens at the granularity of the cache line, and the line size is a property of the CPU. The measured machine reports 128. Padding to 64 would leave pairs of counters sharing lines."
+/>
+
+## The Execution Tracer
+
+*Stop 6 of 7.*
+
+### Step 1: a trace of the live server
+
+A CPU profile says where CPU time goes. The **execution tracer** records *events*: every goroutine start, block, wake-up, syscall, GC phase, and what each P was running, with timestamps. `net/http/pprof` serves it too:
+
+```text
+$ curl -o trace.out 'localhost:6060/debug/pprof/trace?seconds=2'    # while browse runs
+$ ls -la trace.out
+12820819 trace.out
+$ go tool trace trace.out          # opens the viewer in a browser
+```
+
+The viewer shows a timeline per P and per goroutine. For a quick answer without it, `go tool trace -pprof=TYPE` turns the trace into a profile of where goroutines *waited*: `sync` (locks and channels), `net`, `syscall`, `sched` (runnable but not running):
+
+```text
+$ go tool trace -pprof=sync trace.out > sync.prof && go tool pprof -top -nodecount 6 sync.prof
+      flat  flat%   sum%        cum   cum%
+     5.05s 34.05% 34.05%      5.05s 34.05%  sync.(*Mutex).Lock
+     3.29s 22.15% 56.19%      3.29s 22.15%  sync.(*Cond).Wait
+     2.90s 19.57% 75.77%      2.90s 19.57%  runtime.chanrecv1
+        2s 13.48% 89.25%         2s 13.48%  runtime.selectgo
+     1.58s 10.63% 99.88%      1.58s 10.63%  runtime.gcMarkDone
+         0     0% 99.88%      5.06s 34.11%  cinema/booking.(*MemoryStore).Seats
+```
+
+Across all goroutines, **5.05 s** of waiting in `Mutex.Lock`, all from `MemoryStore.Seats`: 32 clients reading the seat map, queueing on the store's one mutex, although reads never conflict.
+
+### Step 2: removing the wait, and measuring what it bought
+
+Seats only reads, so give it a read lock: `sync.RWMutex`, with `RLock` in `Seats`. The trace confirms the wait is gone:
+
+```text
+$ go tool trace -pprof=sync trace2.out > sync2.prof && go tool pprof -top -nodecount 6 sync2.prof
+      flat  flat%   sum%        cum   cum%
+     3.44s 29.49% 29.49%      3.44s 29.49%  runtime.gcMarkDone
+     3.21s 27.49% 56.98%      3.21s 27.49%  sync.(*Cond).Wait
+     2.93s 25.06% 82.04%      2.93s 25.06%  runtime.chanrecv1
+        2s 17.13% 99.17%         2s 17.13%  runtime.selectgo
+```
+
+Then throughput, the only number the customer feels. Both builds, alternating, three runs each, no tracing:
+
+```text
+mutex: 291196 seat-map requests in 4s (72799/s)
+rw:    288520 seat-map requests in 4s (72130/s)
+mutex: 232314 seat-map requests in 4s (58078/s)
+rw:    296975 seat-map requests in 4s (74244/s)
+mutex: 284462 seat-map requests in 4s (71116/s)
+rw:    270197 seat-map requests in 4s (67549/s)
+```
+
+**No difference beyond the noise.** The waiting was real, but it wasn't the bottleneck: the server is CPU-bound on socket syscalls (chapter 9's profile), so while some goroutines waited for the mutex, others used every CPU. Removing the wait freed no CPU. The store keeps its plain `Mutex`, as chapter 8 decided.
+
+<Callout kind="note" title="This is not distributed tracing">
+
+The execution tracer sees one process, at the level of goroutines and Ps. Following a request across services (the checkout calling fraud and payments) is distributed tracing with OpenTelemetry, in chapter 11.
+
+</Callout>
+
+<UnderTheHood title="What the tracer records">
+
+Since Go 1.21 the tracer is cheap enough for production use (a few percent overhead): each P writes events to its own buffer, with timestamps from the CPU's counter and stacks recorded on demand. Events include goroutine creation, blocking and unblocking (with the reason: channel, mutex, select, sleep, syscall, network), GC phases, and processor start/stop. `-pprof=sync` sums the blocked time per stack; `sched` sums time goroutines were runnable but waiting for a P, the scheduling latency from chapter 5. Go 1.25 added `runtime/trace.FlightRecorder`, which keeps the last few seconds of trace in memory so you can write it out when something goes wrong.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="The tracer showed 5 s of goroutine time blocked on a mutex. Switching to RWMutex removed it, and throughput didn't change. Why?"
+  options={[
+    "RWMutex is slower than Mutex",
+    "The server was CPU-bound on syscalls; while goroutines waited, others kept every CPU busy, so the waiting wasn't what limited throughput",
+    "The trace was wrong",
+    "The benchmark didn't use the store"
+  ]}
+  answer={1}
+  explain="Blocked time is only lost time if the CPU would otherwise have been idle. Here it never was. Always measure the outcome the user sees after fixing what a profile or trace points at."
+/>
+
+## Profile-Guided Optimization
+
+*Stop 7 of 7.*
+
+### Step 1: feed a real profile to the compiler
+
+The compiler decides what to inline and how to lay out code without knowing which paths are hot. **PGO** (Go 1.21) gives it a CPU profile from real traffic: it inlines hot functions more aggressively, and turns hot interface calls into direct calls when one concrete type dominates. The loop:
+
+1. Collect a CPU profile from production (or a realistic load).
+2. Save it as `default.pgo` in the main package's directory.
+3. Build normally: `go build` uses `-pgo=auto`, which picks up `default.pgo`.
+
+```text
+$ go build -o cinema ./cmd/cinema && ./cinema -store locked &
+$ ./browse -clients 32 -for 12s &
+$ curl -o cmd/cinema/default.pgo 'localhost:6060/debug/pprof/profile?seconds=10'
+$ ls -la cmd/cinema/default.pgo
+23743 cmd/cinema/default.pgo
+```
+
+### Step 2: what it bought
+
+```text
+$ go test -run '^$' -bench SeatMap -count 10 -pgo=off  ./cmd/cinema/ > pgo-off.txt
+$ go test -run '^$' -bench SeatMap -count 10 -pgo=auto ./cmd/cinema/ > pgo-on.txt
+$ benchstat pgo-off.txt pgo-on.txt
+          │ pgo-off.txt │             pgo-on.txt             │
+          │   sec/op    │   sec/op     vs base               │
+SeatMap-8   6.742µ ± 1%   6.609µ ± 2%  -1.97% (p=0.004 n=10)
+$ go build -pgo=off -o c-off ./cmd/cinema && go build -pgo=auto -o c-on ./cmd/cinema
+$ ls -la c-off c-on
+12894322 c-off
+12943810 c-on
+$ go version -m c-on | grep pgo
+	build	-pgo=…/cmd/cinema/default.pgo
+```
+
+**−2%**, statistically real, for a 49 KB (0.4%) bigger binary and no code change. That's at the low end of the Go team's reported 2–14%, and the profile explains why: this service's hot path is socket syscalls and the standard library's JSON encoder, not inlinable code of ours. PGO does most for CPU-bound code with hot interface calls and small hot functions. The build records which profile it used (`go version -m`), so a binary can always be traced back to its profile.
+
+<ConceptGrid cols={2}>
+  <ConceptCard label="Commit default.pgo">It's a build input, like go.sum. Refresh it from production every release or two; a stale profile still helps, it just helps less.</ConceptCard>
+  <ConceptCard label="Measure it like any change">benchstat on a real benchmark, or throughput under realistic load. −2% here; your service may get more or less.</ConceptCard>
+</ConceptGrid>
+
+<QuickCheck
+  question="PGO made the seat map 2% faster. Why not more?"
+  options={[
+    "The profile was too short",
+    "Most of the time is in socket syscalls and standard-library JSON encoding, which PGO can't speed up much; it helps most with hot inlinable code and interface calls",
+    "PGO only works on Linux",
+    "The benchmark didn't use default.pgo"
+  ]}
+  answer={1}
+  explain="PGO changes inlining and devirtualization decisions. A kernel syscall doesn't get faster. The profile you already had (chapter 9: 76% syscalls) predicts the ceiling."
+/>
+
+---
+
+## Exercises
+
+These use the `cinema` module from this chapter.
+
+<Exercise n={1} title="Read the allocation profile yourself" level="easy">
+
+Run the benchmark with `-memprofile` against the original `SeatIDs`, and list `SeatIDs` with `go tool pprof -list SeatIDs`. Which line allocates, and how many objects per call?
+
+<Solution>
+
+```text
+$ go tool pprof -list 'booking.SeatIDs' -sample_index=alloc_objects v1.test mem.prof
+ROUTINE ======================== cinema/booking.SeatIDs in …/booking/booking.go
+    263065    1771327 (flat, cum) 33.45% of Total
+    263065     263065     55:	ids := make([]string, 0, h.Rows*h.Cols)
+         .    1508262     58:			ids = append(ids, fmt.Sprintf("%c%d", 'A'+r, c+1))
+```
+
+Line 58 accounts for 1.5 of `SeatIDs`' 1.77 million allocated objects (sampled); line 55's slice is the rest. Per call that's the 40 strings plus the boxed `'A'+r` and `c+1` escape analysis reported, plus the slice: consistent with the 54 − 13 = 41 allocations the change removed.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={5} title="Profile and fix the ledger endpoint" level="hard">
+<Exercise n={2} title="Did it really get faster?" level="easy">
 
-You have a `generateReport` function that's slow. Profile it, find the hot allocations, and fix them to bring `allocs/op` below 10.
-
-```go
-func generateReport(accounts []string, txns map[string][]int64) string {
-	var result string
-	for _, acc := range accounts {
-		for _, amount := range txns[acc] {
-			result += fmt.Sprintf("account=%s amount=%d\n", acc, amount)
-		}
-	}
-	return result
-}
-```
-
-Write a benchmark for it, run with `-benchmem`, identify the allocation sources (use `-gcflags=-m` too), then optimize using `strings.Builder` with preallocation.
+Run the seat-map benchmark twice with no code change (`-count 6` each) and compare with benchstat. What does it print, and why does that matter before you trust any "3% faster" result?
 
 <Solution>
 
-```go
-package bench_test
-
-import (
-	"fmt"
-	"strings"
-	"testing"
-)
-
-var accounts = []string{"acc-001", "acc-002", "acc-003"}
-var txns = map[string][]int64{
-	"acc-001": {1000, 2000, 3000},
-	"acc-002": {500, 1500},
-	"acc-003": {250, 750, 1250, 2500},
-}
-
-// Original: O(n) string allocations.
-func generateReportSlow(accounts []string, txns map[string][]int64) string {
-	var result string
-	for _, acc := range accounts {
-		for _, amount := range txns[acc] {
-			result += fmt.Sprintf("account=%s amount=%d\n", acc, amount)
-		}
-	}
-	return result
-}
-
-// Fixed: one Builder, one final allocation.
-func generateReportFast(accounts []string, txns map[string][]int64) string {
-	var b strings.Builder
-	b.Grow(256) // reasonable preallocate
-	for _, acc := range accounts {
-		for _, amount := range txns[acc] {
-			fmt.Fprintf(&b, "account=%s amount=%d\n", acc, amount)
-		}
-	}
-	return b.String()
-}
-
-var sink string
-
-func BenchmarkSlow(b *testing.B) {
-	b.ReportAllocs()
-	var s string
-	for range b.N {
-		s = generateReportSlow(accounts, txns)
-	}
-	sink = s
-}
-
-func BenchmarkFast(b *testing.B) {
-	b.ReportAllocs()
-	var s string
-	for range b.N {
-		s = generateReportFast(accounts, txns)
-	}
-	sink = s
-}
+```text
+$ benchstat n1.txt n2.txt
+          │   n1.txt    │            n2.txt            │
+          │   sec/op    │   sec/op     vs base         │
+SeatMap-8   6.545µ ± 4%   6.617µ ± 2%  ~ (p=0.937 n=6)
 ```
 
-The slow version does one `fmt.Sprintf` allocation plus one concatenation allocation per row = 2N allocations for N rows. With 9 rows: ~18 allocs/op. The fast version: `fmt.Fprintf` into a `Builder` (1–2 internal allocs) + `b.String()` = consistently < 5 allocs/op. The `b.Grow(256)` hint avoids the Builder's internal doubling for small outputs.
+`~` with p=0.937: the two sets of runs are indistinguishable, as they should be. Run-to-run spread on a laptop is several percent (the benchmark's own `± 7%` above), so a single-run "3% faster" is noise until benchstat says otherwise with `-count 6` or more on each side.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Size GOMEMLIMIT for a container" level="medium">
+
+The cinema server runs in a container with a 256 MiB memory limit. Choose `GOGC` and `GOMEMLIMIT`, and explain what happens if a bug makes the live heap grow to 300 MB.
+
+<Solution>
+
+`GOMEMLIMIT=230MiB` (about 90% of the container limit, leaving room for non-Go memory like thread stacks and the binary) with the default `GOGC=100`, or `GOGC=off` if you want to use the memory freely and collect only near the limit: measured above, that cut collections from ~570 to ~28 per 4 s. With a 300 MB live heap, no setting helps: the limit is soft, the collector runs almost continuously (capped at about half the CPU), latency collapses, and the kernel OOM-kills the container anyway. GOMEMLIMIT buys graceful behaviour near the limit, not immunity from a leak.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Pad for any machine" level="medium">
+
+The padded counter assumes a 128-byte line. How would you make it right on both Apple Silicon and x86 servers, without guessing?
+
+<Solution>
+
+Pad to the larger of the two (128 bytes): on 64-byte-line CPUs that just costs a little more memory, and it's correct everywhere. `golang.org/x/sys/cpu` exposes a `CacheLinePad` type sized for the build's architecture (for example `_ cpu.CacheLinePad` between fields), which is what the Go runtime does internally. Then prove it with the benchmark on the machines you deploy to.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="Take the trace, read the waits" level="hard">
+
+With the RWMutex store running under `browse`, take a 2-second trace and run `go tool trace -pprof=sched`. What does that profile measure, and what would it tell you if the server had fewer Ps than it needs?
+
+<Solution>
+
+`-pprof=sched` sums the time goroutines spent runnable but waiting for a P: scheduling latency, per stack.
+
+```text
+$ go tool trace -pprof=sched trace2.out > sched.prof && go tool pprof -top -nodecount 5 sched.prof
+      flat  flat%   sum%        cum   cum%
+     2.21s 10.77% 10.77%      2.21s 10.77%  runtime.systemstack_switch
+     0.22s  1.07% 11.84%      0.22s  1.07%  runtime.traceLocker.stack
+     0.15s  0.75% 12.59%      0.43s  2.09%  runtime.gcMarkDone
+     0.08s  0.37% 12.96%      0.08s  0.37%  sync.(*Cond).Broadcast
+     0.07s  0.32% 13.28%      0.07s  0.32%  runtime.asyncPreempt2
+```
+
+The top entries are the runtime's own transitions; no stack from our handlers waits noticeably for a P, because 8 Ps serving syscall-heavy work are rarely all busy with Go code. With too few Ps (say, a container limited to 1 CPU), runnable goroutines queue, the sched profile grows, and its stacks show which work was waiting: the same signal as chapter 5's `/sched/latencies` metric, but broken down by code path.
 
 </Solution>
 
@@ -1640,147 +920,132 @@ The slow version does one `fmt.Sprintf` allocation plus one concatenation alloca
 
 ## The Lab
 
-Listen very carefully, sport. I've seen a lot of engineers in my time. Most of them write code that works, then ship it, then wonder why their on-call rotation is miserable. Not you. Not after today.
-
-This is the ledger-report endpoint I'm talking about. It's slow. It allocates like a drunk sailor on payday. You're going to fix it. I've set the verifier myself, and it has *very* high standards — because *I* have very high standards. If your `allocs/op` doesn't come in under 15, the flag doesn't appear. That's the deal.
-
 <Lab
-  title="Cut the ledger report allocations"
-  archetype="optimize-it"
+  title="Render the Seat Map Without Allocating"
+  archetype="optimize"
   difficulty="guided"
-  points={80}
+  points={100}
   hintCost={15}
   verify="self-check"
   expect="ALL CHECKS PASS"
-  objective="generateLedgerReport concatenates strings with += and fmt.Sprintf per row, creating many heap allocations on every iteration. Optimise it using strings.Builder with b.Grow() preallocation and b.WriteString / strconv.AppendInt to write directly into the builder without intermediate string allocations. The self-check in main verifies two things: the output is byte-for-byte identical to the reference slow version, and the optimised path allocates at most 2 heap objects for a 20-row input (counted via runtime.ReadMemStats). Do not edit main."
+  objective="renderSeatMap builds the Inception hall's seat-map JSON for every page refresh: it formats every seat name with fmt.Sprintf and builds the result with string +=. Measured with testing.AllocsPerRun it makes 241 allocations per call. Rewrite it (you may add package-level variables) so it produces byte-identical output with at most 2 allocations per call."
   starter={`package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"runtime"
-	"strings"
-	// TODO: import "strconv" for strconv.AppendInt
+	"testing"
 )
 
-type Transaction struct {
-	AccountID   string
-	AmountCents int64
-	Description string
-}
-
-// generateLedgerReportSlow is the reference implementation. Do not change it.
-func generateLedgerReportSlow(txns []Transaction) string {
-	var out string
-	for _, t := range txns {
-		out += fmt.Sprintf("[%s] %s: %d cents\\n",
-			t.AccountID, t.Description, t.AmountCents)
-	}
-	return out
-}
-
-// BUG: generateLedgerReport is the same slow version — each row allocates
-// a new string from Sprintf and another from the concat.
-// Optimise: use strings.Builder with b.Grow(), b.WriteString, b.WriteByte,
-// and strconv.AppendInt (reusing a []byte buf) to avoid per-row allocations.
-// The check in main counts heap allocations — bring it to <= 2.
-func generateLedgerReport(txns []Transaction) string {
-	var out string
-	for _, t := range txns {
-		out += fmt.Sprintf("[%s] %s: %d cents\\n",
-			t.AccountID, t.Description, t.AmountCents)
-	}
-	return out
-}
-
-// buildInput creates the fixed 20-row input used by the self-check.
-func buildInput() []Transaction {
-	rows := make([]Transaction, 20)
-	for i := range rows {
-		rows[i] = Transaction{
-			AccountID:   fmt.Sprintf("acc-%03d", i),
-			AmountCents: int64((i + 1) * 500),
-			Description: "transfer",
+// renderSeatMap returns the Inception hall's seat map as JSON, the body of
+// GET /movies/inception/seats: [{"id":"A1","status":"free"}, …] for all 40
+// seats, rows A–E, seats 1–8. It is called for every page refresh, so it
+// must not allocate more than it has to. It is the only code you edit
+// (you may add package-level variables and helpers above the line).
+//
+// BUG: it formats every seat name with fmt.Sprintf on every call, and
+// builds the result by string +=, which copies the whole string each time.
+func renderSeatMap(held map[string]bool) []byte {
+	out := "["
+	for r := range 5 {
+		for c := range 8 {
+			id := fmt.Sprintf("%c%d", 'A'+r, c+1)
+			status := "free"
+			if held[id] {
+				status = "held"
+			}
+			if len(out) > 1 {
+				out += ","
+			}
+			out += fmt.Sprintf(\`{"id":%q,"status":%q}\`, id, status)
 		}
 	}
-	return rows
+	out += "]"
+	return []byte(out)
 }
 
-// ── checks: do not edit. Run to verify your fix. ──
+// ── below this line: do not edit ──
+
+type seat struct {
+	ID     string \`json:"id"\`
+	Status string \`json:"status"\`
+}
+
 func main() {
+	held := map[string]bool{"A7": true, "C4": true, "E8": true}
 	allOK := true
-	txns := buildInput()
 
-	// Check 1: output must be identical to the reference slow version.
-	want := generateLedgerReportSlow(txns)
-	got := generateLedgerReport(txns)
-	if got != want {
-		fmt.Printf("FAIL output: optimised output differs from reference\\n")
-		fmt.Printf("  want lines: %d\\n", strings.Count(want, "\\n"))
-		fmt.Printf("  got  lines: %d\\n", strings.Count(got, "\\n"))
+	// The expected body, built the obvious (slow) way.
+	var want []seat
+	for r := range 5 {
+		for c := range 8 {
+			id := string(rune('A'+r)) + fmt.Sprint(c+1)
+			st := "free"
+			if held[id] {
+				st = "held"
+			}
+			want = append(want, seat{id, st})
+		}
+	}
+	wantJSON, _ := json.Marshal(want)
+
+	got := renderSeatMap(held)
+	if !bytes.Equal(got, wantJSON) {
+		fmt.Printf("FAIL output: got %.60s…, want %.60s…\\n", got, wantJSON)
 		allOK = false
 	}
 
-	// Check 2: optimised path must allocate <= 2 heap objects for 20 rows.
-	// The slow version allocates ~60 (Sprintf + concat growth per row).
-	runtime.GC()
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	_ = generateLedgerReport(txns)
-	runtime.ReadMemStats(&after)
-	allocs := after.Mallocs - before.Mallocs
-	const maxAllocs = 2
-	if allocs > maxAllocs {
-		fmt.Printf("FAIL allocations: got %d heap allocs for 20 rows, want <= %d\\n", allocs, maxAllocs)
-		fmt.Println("  Hint: use strings.Builder with b.Grow() and fmt.Fprintf(&b, ...)")
+	allocs := testing.AllocsPerRun(200, func() { renderSeatMap(held) })
+	if allocs > 2 {
+		fmt.Printf("FAIL allocations: %.0f per call, want at most 2\\n", allocs)
 		allOK = false
 	}
+	fmt.Printf("renderSeatMap: %.0f allocations per call\\n", allocs)
 
 	if allOK {
 		fmt.Println("ALL CHECKS PASS")
 	}
 }`}
-  verifier="main compares generateLedgerReport output byte-for-byte against the reference slow version, then counts heap allocations via runtime.ReadMemStats and asserts the optimised path uses at most 2 allocations for a 20-row input. Codapi runs plain go run — no benchmarks, no -race flag, no hidden test runner. The flag unlocks when it prints ALL CHECKS PASS."
+  verifier="Compares renderSeatMap's output byte for byte with encoding/json's output for the same seats, then measures allocations per call with testing.AllocsPerRun(200). Fails if the output differs or allocations exceed 2. Prints ALL CHECKS PASS otherwise."
   hints={[
-    "Replace the body of generateLedgerReport with: `var b strings.Builder; b.Grow(len(txns) * 48)` before the loop. This preallocates the internal buffer so the builder never reallocates while writing.",
-    "Inside the loop, use b.WriteString and b.WriteByte instead of fmt.Sprintf. For the integer field, use `buf = strconv.AppendInt(buf[:0], t.AmountCents, 10); b.Write(buf)` where buf is a `[]byte` allocated once before the loop with `buf := make([]byte, 0, 20)`. This avoids the per-row string allocation that Sprintf creates.",
-    "Return `b.String()` at the end. With Grow + WriteString + AppendInt the function should allocate <= 2 heap objects total for 20 rows. fmt.Fprintf is convenient but allocates internally — use the direct write methods instead."
+    "Seat names never change: build the 40 names once, in a package-level variable, instead of calling Sprintf on every call.",
+    "string += copies the whole string each time. Allocate one []byte with enough capacity up front (40 seats × ~30 bytes) and append to it.",
+    "append(buf, `{\"id\":\"`...) appends a string's bytes without allocating when there's capacity. Check held[id] and append the right status literal."
   ]}
-  flag="GO{measure_first_allocate_less}"
+  flag="GO{measure_first_then_allocate_once}"
 >
 
-The slow implementation creates a new string on every row — sixty allocations for a twenty-row report. The optimised version preallocates once and writes once. Correctness first, then the allocation count. Get both and the flag is yours.
+This is stop 3's change in miniature, measured the same way. With the fix, `AllocsPerRun` may even report 0: when the call is inlined into a caller that doesn't keep the result, the compiler can put the buffer on the stack.
 
 </Lab>
 
 <Recap>
 
-You now own the full performance engineering stack:
-
-- **pprof** gives you four profiles — CPU, heap, block, mutex — each pointing at a different class of problem. Collect them from tests, running servers (`net/http/pprof`), or precise sections (`runtime/pprof`). Read them with `top`, `list`, and flame graphs.
-- **Benchmarks** (`testing.B`, `b.N`, `b.ReportAllocs`) are your before/after measurement instrument. Always use a **sink** variable to defeat dead-code elimination. Use `benchstat` over multiple runs for statistical confidence.
-- **Escape analysis** (`go build -gcflags=-m`) shows stack vs. heap decisions. Values escape when their lifetime exceeds their function frame — returning pointers, storing in interfaces, goroutine closures. Slice and map **preallocation** and `sync.Pool` cut heap pressure.
-- **GC tuning**: `GOGC` sets the relative headroom (default 100 = GC fires at 2× live heap). `GOMEMLIMIT` (Go 1.19+) sets a soft memory limit the GC chases aggressively (not a guaranteed wall) — always pair them in containers. Go's collector still has short STW phases and runs most tracing work concurrently.
-- **Mechanical sympathy**: data lives in 64-byte **cache lines**. Contiguous flat slices are cache-friendly; pointer-chased linked structures are cache-hostile. **False sharing** between goroutines on the same cache line causes constant invalidation — fix with padding to 64-byte boundaries. The payoff of data-oriented design (Part 1, Chapter 3).
-- **The execution tracer** (`runtime/trace`, `go tool trace`) records goroutine scheduling, GC pauses, and I/O events on a precise timeline — not to be confused with distributed tracing. Use it to find scheduler stalls and GC interference. The new flight recorder (stable in Go 1.25) keeps a ring buffer always ready.
-- **PGO** (`default.pgo`, stable since Go 1.21): a merged production CPU profile committed next to `package main` makes `go build` raise inlining budgets on hot call sites and devirtualize hot interface calls — 2–7% CPU typical, zero source changes. Matching is by function name, so stale profiles degrade silently and never break the build. Refresh per release.
-- The **micro vs. macro** discipline: profile the whole system first, benchmark the specific fix, then profile again to confirm the win carried through. Never optimize what the profiler hasn't pointed at.
+- **Profile first.** The allocation profile pointed at `fmt.Sprintf` in `SeatIDs` (23.5% of objects), not at anything a guess would have picked. In a benchmark's CPU profile, runtime background work (`kevent`, `madvise`) is noise.
+- **Benchmark and compare with benchstat.** Precomputing seat names: −25% time, −76% allocations (54 → 13), p=0.002. `~` means noise; the pooled JSON buffer got `~` and was removed.
+- **Escape analysis** (`-gcflags=-m`) explains allocations: boxed `Sprintf` arguments and returned slices escape; a short local concatenation doesn't. `sync.Pool` pays when creation is expensive: pooled gzip writers were 10× faster (61.7 µs → 6.3 µs, 1 MB → 0).
+- **GC knobs trade memory for CPU.** `GOGC=400` cut collections ~6× (23 → 35 MB RSS); `GOGC=off` with `GOMEMLIMIT=64MiB` ~20× (69 MB); both gained about 10% throughput. `GOMEMLIMIT` is soft.
+- **Hardware matters.** A 128-byte cache line made eight "independent" atomic counters 20× slower until padded.
+- **Trace, then measure the outcome.** The tracer found 5 s of mutex waiting; removing it didn't change throughput, because the CPU was never idle. **PGO** gave −2% for free: the ceiling is set by what's hot.
 
 </Recap>
 
 <Scoreboard
-  streak={8}
+  streak={6}
   items={[
-    { label: "Quick check — high cum, low flat", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — escape analysis", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — false sharing", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — PGO staleness", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — pprof on a server", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 2 — write and read a benchmark", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 3 — diagnose an escape", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 4 — fix false sharing", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 5 — profile and fix the ledger endpoint", kind: "exercise", points: 20, done: false }
+    { label: "Quick check: flat vs cum", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: benchstat ~", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: when sync.Pool pays", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: GOGC", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: 128-byte padding", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: waiting isn't the bottleneck", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: PGO's ceiling", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: read the allocation profile", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: noise", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: GOMEMLIMIT in a container", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: pad for any machine", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: read the waits", kind: "exercise", points: 20, done: false }
   ]}
-  flag={{ label: "Lab — Cut the ledger report allocations below the line", captured: false, points: 80 }}
+  flag={{ label: "Lab: Render the Seat Map Without Allocating", captured: false, points: 100 }}
 />
-
-Not bad. Genuinely. You've measured, you've cut, you've sympathized with the hardware. That's the discipline — that's what separates the engineers I respect from the ones I have to *endure*. Next we wire this all together with observability: structured logging, metrics, distributed tracing, SLOs, and what it actually means to be on-call for a service that's misbehaving at 3am. Onward, sport. I'll be watching your flame graphs.

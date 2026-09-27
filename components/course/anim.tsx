@@ -1094,9 +1094,15 @@ export function GraphAnim({
                   </text>
                 ) : (
                   <>
-                    <text x={n.x} y={n.y + 4} textAnchor="middle" className="grf-node-id">
-                      {n.id}
-                    </text>
+                    {/* The full name is in the tag below; inside the 15px circle only a
+                        short id fits. Longer ids got clipped ("domain" → "omai"). */}
+                    {n.id.length <= 3 ? (
+                      <text x={n.x} y={n.y + 4} textAnchor="middle" className="grf-node-id">
+                        {n.id}
+                      </text>
+                    ) : (
+                      <circle cx={n.x} cy={n.y} r="4" className="grf-node-dot" />
+                    )}
                     <g className="grf-tag">
                       <rect
                         x={n.x - label.length * 3.8 - 6}
@@ -3342,3 +3348,603 @@ export function DPTableAnim({
 }
 
 
+
+/* ════════════════════════════════════════════
+   InterfaceAnim — an interface variable drawn as
+   what it IS: a box with two slots, TYPE and VALUE.
+   Each frame runs one line of code; the slots fill
+   (or stay empty) and a detective gopher reads the
+   `== nil` verdict, which is true ONLY when both
+   slots are empty. Built for the typed-nil trap:
+   watch the type slot fill while the value is nil.
+   ════════════════════════════════════════════ */
+type IfaceFrame = {
+  code: string; // the line being executed this frame
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  type: string | null; // dynamic type slot (null = empty)
+  value: string | null; // dynamic value slot (null = empty)
+  ptr?: { name: string; value: string }; // optional plain pointer var shown beside the box
+};
+
+export function InterfaceAnim({
+  title = "Inside an interface value",
+  name = "err",
+  iface = "error",
+  frames,
+  caption,
+}: {
+  title?: string;
+  name?: string;
+  iface?: string;
+  frames: IfaceFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const isNil = f.type === null && f.value === null;
+  const trap = f.type !== null && (f.value === null || f.value === "nil");
+  return (
+    <AnimShell
+      title={title}
+      kicker="interface value"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ifa">
+        <code key={`c${st.cur}`} className="ifa-code">{f.code}</code>
+        <div className="ifa-row">
+          {f.ptr && (
+            <div className="ifa-ptr">
+              <span className="ifa-name">{f.ptr.name}</span>
+              <span key={f.ptr.value} className={`ifa-cell ${f.ptr.value === "nil" ? "nil" : "full"}`}>{f.ptr.value}</span>
+              <span className={`ifa-verdict ${f.ptr.value === "nil" ? "yes" : "no"}`}>
+                {f.ptr.name} == nil → {f.ptr.value === "nil" ? "true" : "false"}
+              </span>
+            </div>
+          )}
+          <div className="ifa-var">
+            <span className="ifa-name">
+              {name} <em>({iface})</em>
+            </span>
+            <div className={`ifa-box ${trap ? "trap" : ""}`}>
+              <div className="ifa-slot">
+                <span className="ifa-lbl">type</span>
+                <span key={`t${f.type}`} className={`ifa-cell ${f.type === null ? "empty" : "full"}`}>{f.type ?? "—"}</span>
+              </div>
+              <div className="ifa-slot">
+                <span className="ifa-lbl">value</span>
+                <span key={`v${f.value}`} className={`ifa-cell ${f.value === null ? "empty" : f.value === "nil" ? "nil" : "full"}`}>{f.value ?? "—"}</span>
+              </div>
+            </div>
+            <span className={`ifa-verdict ${isNil ? "yes" : trap ? "trap" : "no"}`}>
+              {name} == nil → {isNil ? "true" : "false"}
+            </span>
+          </div>
+          <span className="ifa-gopher">
+            <Gopher
+              pose={trap ? "panic" : isNil ? "idle" : "happy"}
+              state={trap ? "bad" : isNil ? "idle" : "ok"}
+              size={40}
+              role="detective"
+              title="nil inspector"
+            />
+          </span>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   IsolationAnim — a container is one process seen
+   two ways. Left column: what the HOST sees. Right
+   column: what the process INSIDE sees. Each row is
+   one thing a namespace can virtualize (hostname,
+   PIDs, filesystem, mounts…). When a frame switches
+   a namespace on, that row's two values split apart
+   and a wall drops between them.
+   ════════════════════════════════════════════ */
+type IsoRow = { label: string; host: string; inside: string; ns?: string };
+type IsoFrame = {
+  code?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  rows: IsoRow[];
+};
+
+export function IsolationAnim({
+  title = "One process, two views",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: IsoFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2300);
+  const f = frames[st.cur] ?? frames[0];
+  const walled = f.rows.filter((r) => r.host !== r.inside).length;
+  return (
+    <AnimShell
+      title={title}
+      kicker="namespaces"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="iso">
+        {f.code && <code key={`c${st.cur}`} className="iso-code">{f.code}</code>}
+        <div className="iso-grid">
+          <span className="iso-head">
+            <Gopher pose="idle" state="idle" size={30} role="operator" title="host" /> host sees
+          </span>
+          <span />
+          <span className="iso-head">
+            <Gopher pose={walled ? "happy" : "idle"} state={walled ? "ok" : "idle"} size={30} role="captain" title="container" /> inside sees
+          </span>
+          {f.rows.map((r) => {
+            const split = r.host !== r.inside;
+            return (
+              <Fragment key={r.label}>
+                <span className="iso-cell">
+                  <span className="iso-lbl">{r.label}</span>
+                  <span className="iso-val">{r.host}</span>
+                </span>
+                <span className={`iso-wall ${split ? "up" : ""}`} title={r.ns}>
+                  {split && <span className="iso-ns">{r.ns}</span>}
+                </span>
+                <span className={`iso-cell ${split ? "split" : "shared"}`}>
+                  <span className="iso-lbl">{r.label}</span>
+                  <span key={r.inside} className="iso-val">{r.inside}</span>
+                </span>
+              </Fragment>
+            );
+          })}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   CgroupAnim — cgroup limits drawn as meters. Each
+   meter is one controller file (memory.max,
+   pids.max, cpu.max). Usage bars grow frame by
+   frame; hitting the limit turns the bar red and
+   the kernel gopher acts: OOM-kill or refuse fork.
+   ════════════════════════════════════════════ */
+type CgMeter = { label: string; used: number; limit: number; unit?: string };
+type CgFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  meters: CgMeter[];
+  event?: string; // e.g. "OOM kill: tail (exit 137)"
+};
+
+export function CgroupAnim({
+  title = "cgroup limits, enforced by the kernel",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: CgFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2000);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="cgroups"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="cgr">
+        <div className="cgr-meters">
+          {f.meters.map((m) => {
+            const pct = Math.min(100, (m.used / m.limit) * 100);
+            const lvl = pct >= 100 ? "full" : pct >= 75 ? "hot" : "ok";
+            return (
+              <div key={m.label} className="cgr-meter">
+                <span className="cgr-lbl">{m.label}</span>
+                <span className="cgr-track">
+                  <span className={`cgr-bar ${lvl}`} style={{ width: `${pct}%` } as CSSProperties} />
+                </span>
+                <span className="cgr-num">
+                  {m.used}
+                  {m.unit ?? ""} / {m.limit}
+                  {m.unit ?? ""}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="cgr-kernel">
+          <Gopher
+            pose={f.event ? "carry" : "idle"}
+            state={f.event ? "bad" : "idle"}
+            size={40}
+            role="guard"
+            title="the kernel"
+          />
+          <span className="cgr-klbl">kernel</span>
+          {f.event && <span key={f.event} className="cgr-event">{f.event}</span>}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   OverlayAnim — how a container image becomes one
+   filesystem. Read-only layers stack bottom-up, a
+   writable layer sits on top, and the merged view
+   is what the process sees. Writes copy-up into the
+   top layer; deletes leave a whiteout marker there.
+   ════════════════════════════════════════════ */
+type OvFile = { name: string; state?: "normal" | "new" | "changed" | "whiteout" | "hidden" };
+type OvLayer = { name: string; ro?: boolean; files: OvFile[] };
+type OvFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  layers: OvLayer[]; // bottom first
+  merged: OvFile[];
+};
+
+export function OverlayAnim({
+  title = "Image layers → one filesystem",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: OvFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const chip = (x: OvFile) => (
+    <span key={`${x.name}-${x.state ?? "normal"}`} className={`ovl-file ${x.state ?? "normal"}`}>
+      {x.state === "whiteout" ? `✕ ${x.name}` : x.name}
+    </span>
+  );
+  return (
+    <AnimShell
+      title={title}
+      kicker="overlayfs"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ovl">
+        <div className="ovl-merged">
+          <span className="ovl-name">
+            <Gopher pose="idle" state="ok" size={28} role="captain" title="container" /> merged view (what the process sees)
+          </span>
+          <div className="ovl-files">{f.merged.map(chip)}</div>
+        </div>
+        <div className="ovl-stack">
+          {[...f.layers].reverse().map((l) => (
+            <div key={l.name} className={`ovl-layer ${l.ro ? "ro" : "rw"}`}>
+              <span className="ovl-name">
+                {l.name} <em>{l.ro ? "read-only" : "writable"}</em>
+              </span>
+              <div className="ovl-files">
+                {l.files.length === 0 ? <span className="ovl-empty">empty</span> : l.files.map(chip)}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   GoroutineAnim — goroutines as gophers in lanes.
+   `go f()` makes a gopher walk in; it works, blocks,
+   or finishes on its own lane while main keeps
+   going. When main returns, every gopher still on
+   stage is killed mid-task: the most surprising rule
+   of goroutines, drawn literally. A stdout strip
+   shows what actually got printed.
+   ════════════════════════════════════════════ */
+type GoLaneState = "run" | "blocked" | "done" | "killed";
+type GoFrame = {
+  code?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  main: "run" | "blocked" | "exited";
+  goroutines: { name: string; state: GoLaneState; task?: string }[];
+  stdout?: string[];
+};
+
+export function GoroutineAnim({
+  title = "What `go` actually does",
+  frames,
+  caption,
+}: {
+  title?: string;
+  frames: GoFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const pose = (s: GoLaneState | GoFrame["main"]): GopherPose =>
+    s === "run" ? "run" : s === "blocked" ? "blocked" : s === "done" ? "happy" : s === "killed" ? "panic" : "exit";
+  const state = (s: GoLaneState | GoFrame["main"]) =>
+    s === "run" ? "active" : s === "blocked" ? "warn" : s === "done" ? "done" : "bad";
+  return (
+    <AnimShell
+      title={title}
+      kicker="goroutines"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="gor">
+        {f.code && <code key={`c${st.cur}`} className="gor-code">{f.code}</code>}
+        <div className="gor-lanes">
+          <div className={`gor-lane main ${f.main}`}>
+            <span className="gor-name">main</span>
+            <span className="gor-actor">
+              <Gopher pose={pose(f.main)} state={state(f.main)} size={36} role="banker" title="main goroutine" />
+            </span>
+            <span className="gor-task">{f.main === "exited" ? "returned: program over" : f.main === "blocked" ? "waiting" : "running"}</span>
+          </div>
+          {f.goroutines.map((g) => (
+            <div key={g.name} className={`gor-lane ${g.state}`}>
+              <span className="gor-name">{g.name}</span>
+              <span key={`${g.name}-${g.state}`} className="gor-actor enter">
+                <Gopher pose={pose(g.state)} state={state(g.state)} size={36} role="courier" title={g.name} />
+              </span>
+              <span className="gor-task">{g.task ?? g.state}</span>
+            </div>
+          ))}
+        </div>
+        <div className="gor-out">
+          <span className="gor-out-lbl">stdout</span>
+          {(f.stdout ?? []).length === 0 ? (
+            <span className="gor-out-empty">(nothing printed)</span>
+          ) : (
+            (f.stdout ?? []).map((l, i) => (
+              <span key={`${i}-${l}`} className="gor-out-line">{l}</span>
+            ))
+          )}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   RendezvousAnim — an unbuffered channel is a
+   handshake, not a mailbox. The sender gopher holds
+   the value; whichever side arrives first PARKS; the
+   value physically travels across only when both
+   are present, and both wake together.
+   ════════════════════════════════════════════ */
+type RvSide = "away" | "running" | "parked" | "handoff" | "done";
+type RvFrame = {
+  code?: string;
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  sender: RvSide;
+  receiver: RvSide;
+  value?: string;
+  at?: "sender" | "channel" | "receiver"; // where the value is drawn
+};
+
+export function RendezvousAnim({
+  title = "Unbuffered channel: a handshake",
+  senderLabel = "sender goroutine",
+  receiverLabel = "receiver (main)",
+  frames,
+  caption,
+}: {
+  title?: string;
+  senderLabel?: string;
+  receiverLabel?: string;
+  frames: RvFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2100);
+  const f = frames[st.cur] ?? frames[0];
+  const pose = (s: RvSide): GopherPose =>
+    s === "parked" ? "blocked" : s === "handoff" ? "carry" : s === "done" ? "happy" : s === "away" ? "idle" : "run";
+  const gstate = (s: RvSide) =>
+    s === "parked" ? "warn" : s === "handoff" ? "active" : s === "done" ? "done" : "idle";
+  const label = (s: RvSide) =>
+    s === "parked" ? "parked (blocked)" : s === "handoff" ? "handing off" : s === "done" ? "unblocked" : s === "away" ? "not here yet" : "running";
+  return (
+    <AnimShell
+      title={title}
+      kicker="chan (cap 0)"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rdv">
+        {f.code && <code key={`c${st.cur}`} className="rdv-code">{f.code}</code>}
+        <div className="rdv-track">
+          <div className={`rdv-side ${f.sender}`}>
+            <Gopher pose={pose(f.sender)} state={gstate(f.sender)} size={44} role="courier" title={senderLabel} />
+            <span className="rdv-name">{senderLabel}</span>
+            <span className="rdv-state">{label(f.sender)}</span>
+          </div>
+          <div className="rdv-pipe">
+            <span className="rdv-pipe-lbl">meeting point (no storage)</span>
+            {f.value && (
+              <span className={`rdv-value at-${f.at ?? "sender"}`}>{f.value}</span>
+            )}
+          </div>
+          <div className={`rdv-side ${f.receiver}`}>
+            <Gopher pose={pose(f.receiver)} state={gstate(f.receiver)} size={44} role="banker" title={receiverLabel} />
+            <span className="rdv-name">{receiverLabel}</span>
+            <span className="rdv-state">{label(f.receiver)}</span>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   RaceAnim — the lost update, one CPU step at a
+   time. `balance += 100` is really READ → ADD →
+   WRITE. Two goroutines each copy the shared value
+   into their own register; when their steps
+   interleave, one WRITE overwrites the other and a
+   deposit vanishes. With a mutex, the second
+   goroutine waits at the door until the first is
+   completely done.
+   ════════════════════════════════════════════ */
+type RaceStep = "idle" | "read" | "add" | "write" | "wait" | "done";
+type RaceFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  shared: string;
+  expected?: string;
+  lock?: string | null; // name of the goroutine holding the mutex, if any
+  lanes: { name: string; step: RaceStep; local?: string }[];
+};
+
+export function RaceAnim({
+  title = "balance += 100, one CPU step at a time",
+  label = "balance",
+  frames,
+  caption,
+}: {
+  title?: string;
+  label?: string;
+  frames: RaceFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  // Only judge the result once every goroutine has finished: mid-way, a
+  // balance below the expected total is just work still in progress.
+  const finished = f.lanes.every((l) => l.step === "done");
+  const wrong = finished && f.expected !== undefined && f.expected !== f.shared;
+  const right = finished && f.expected !== undefined && f.expected === f.shared;
+  const steps: RaceStep[] = ["read", "add", "write"];
+  return (
+    <AnimShell
+      title={title}
+      kicker={f.lock !== undefined ? "mutex" : "data race"}
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rce">
+        {f.lanes.slice(0, 1).map((l) => lane(l))}
+        <div className={`rce-mem ${wrong ? "bad" : ""}`}>
+          <span className="rce-lbl">shared memory</span>
+          <span className="rce-var">{label}</span>
+          <span key={f.shared} className="rce-val">{f.shared}</span>
+          {f.expected !== undefined && (
+            <span className={`rce-exp ${wrong ? "bad" : right ? "ok" : ""}`}>
+              {wrong ? `expected ${f.expected}: deposit lost` : right ? `expected ${f.expected} ✓` : `expected ${f.expected}`}
+            </span>
+          )}
+          {f.lock !== undefined && (
+            <span className={`rce-lock ${f.lock ? "held" : ""}`}>🔒 {f.lock ? `held by ${f.lock}` : "unlocked"}</span>
+          )}
+        </div>
+        {f.lanes.slice(1).map((l) => lane(l))}
+      </div>
+    </AnimShell>
+  );
+
+  function lane(l: RaceFrame["lanes"][number]) {
+    const busy = l.step === "read" || l.step === "add" || l.step === "write";
+    return (
+      <div key={l.name} className={`rce-lane ${l.step}`}>
+        <Gopher
+          pose={l.step === "wait" ? "blocked" : l.step === "done" ? "happy" : busy ? "carry" : "idle"}
+          state={l.step === "wait" ? "warn" : l.step === "done" ? "done" : busy ? "active" : "idle"}
+          size={38}
+          role="banker"
+          title={l.name}
+        />
+        <span className="rce-name">{l.name}</span>
+        <div className="rce-steps">
+          {steps.map((s) => (
+            <span key={s} className={`rce-step ${l.step === s ? "on" : ""} ${steps.indexOf(s) < steps.indexOf(l.step as RaceStep) || l.step === "done" ? "past" : ""}`}>
+              {s}
+            </span>
+          ))}
+        </div>
+        <span className="rce-reg">
+          register: <b key={l.local ?? "-"}>{l.local ?? "—"}</b>
+        </span>
+        {l.step === "wait" && <span className="rce-wait">waiting for lock</span>}
+      </div>
+    );
+  }
+}

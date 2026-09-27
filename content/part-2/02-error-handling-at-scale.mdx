@@ -9,11 +9,19 @@ prerequisites: ["idiomatic-go-mindset"]
 
 <HeroCard label="Part 2 · Chapter 2" title="Error Handling at Scale">
 
-Let me be very clear about something. Every language has exceptions. Java throws them. Python raises them. JavaScript lets them bubble through async code and silently vanish into the void. And engineers — good engineers, even — spend entire careers chasing stack traces they don't own, catching things they didn't throw, and wondering why production is on fire at 2 a.m.
+Java throws exceptions, Python raises them, JavaScript lets them vanish inside async code. Go made errors ordinary values you return and inspect where they happen. This chapter is about doing that across a real service: a "card declined" that starts in a database call, travels through a domain layer, and leaves an HTTP handler as a clean 402 without leaking your internals.
 
-Go does none of that. Go made errors *values* — boring, inspectable, returnable values — and then handed you the discipline to handle them right there, at the call site, where you actually know what to do.
+Every program here was run on Go 1.27. Two popular beliefs didn't survive testing, and the chapter says so: a panic in an HTTP handler does **not** kill a `net/http` server (a panic in a goroutine *you* start does), and `go vet` has no check that catches the typed-nil trap.
 
-This chapter is about doing that at *scale*. Not in a toy example. In Meridian's payments service, where a "card declined" error has to travel from a database query, through a domain layer, up through an HTTP handler, and become a clean 402 response — without leaking your internal schema to the client. We are going to build that picture, and you will never fumble an error chain again. You're lucky to have me.
+Seven stops. If you get lost, come back here:
+
+1. **Errors are values.** Handle or propagate, never both.
+2. **Wrapping with `%w`.** How context is added without losing the cause.
+3. **Sentinel vs typed errors.** When a value is enough and when you need fields.
+4. **When to panic.** Almost never, and what `recover` really covers.
+5. **Structured error responses.** Mapping internal errors to a public API contract.
+6. **The typed-nil trap.** Why `err != nil` can be true when nothing failed.
+7. **The goroutine-panic footgun.** The one panic that does take the whole process down.
 
 </HeroCard>
 
@@ -54,11 +62,13 @@ fmt.Println(errors.Is(outer, ErrPaymentDeclined))`}
 
 ## Errors are values
 
+*Stop 1 of 7.*
+
 Here is the thing that separates Go engineers from everyone else: in Go, `error` is just an interface.
 
 ```go
 type error interface {
-    Error() string
+	Error() string
 }
 ```
 
@@ -71,14 +81,14 @@ You're on the payments team at Meridian. A `chargeCard` function calls the card 
 ```go
 // charge.go — Meridian payment domain layer
 func chargeCard(ctx context.Context, amountCents int, token string) error {
-    resp, err := cardNetwork.Charge(ctx, amountCents, token)
-    if err != nil {
-        return fmt.Errorf("chargeCard: %w", err)
-    }
-    if resp.Declined {
-        return ErrInsufficientFunds // sentinel — we'll define this shortly
-    }
-    return nil
+	resp, err := cardNetwork.Charge(ctx, amountCents, token)
+	if err != nil {
+		return fmt.Errorf("chargeCard: %w", err)
+	}
+	if resp.Declined {
+		return ErrInsufficientFunds // sentinel — we'll define this shortly
+	}
+	return nil
 }
 ```
 
@@ -100,18 +110,28 @@ Every time you see an error, you face a binary choice:
   <ConceptCard label="nil means success">An `error` return of `nil` is your function's promise: everything worked. Make that promise reliable — only return `nil` when you mean it.</ConceptCard>
 </ConceptGrid>
 
-<ExecTimeline
-  title="Error traveling from DB layer to HTTP handler"
-  lanes={[{ id: "call", label: "call stack" }]}
-  steps={[
-    { lane: "call", kind: "run", label: "db.QueryRow fails", note: "Meridian's database returns a connection timeout. The repo layer has no idea what HTTP status to use — it's the wrong layer to decide." },
-    { lane: "call", kind: "run", label: "repo wraps + returns", note: "repo.FindAccount wraps: fmt.Errorf(\"findAccount %s: %w\", id, err). The original error is preserved inside the chain." },
-    { lane: "call", kind: "run", label: "service receives err", note: "The service layer calls repo.FindAccount. It checks: is this a known sentinel I can handle? No. Wrap and propagate." },
-    { lane: "call", kind: "run", label: "service wraps + returns", note: "fmt.Errorf(\"chargeCard: %w\", err). The chain now has two wrapping layers and the original cause." },
-    { lane: "call", kind: "run", label: "handler receives err", note: "The HTTP handler is the right place to decide: map this error to a status code and a JSON response body." },
-    { lane: "call", kind: "done", label: "handler responds 500", note: "errors.Is(err, ErrInsufficientFunds)? No. Generic server error. Log the full chain here — once, at the top." }
+<RuntimeStage
+  title="One error, four layers, one decision"
+  kicker="propagate vs handle · live"
+  zones={[
+    { id: "db", label: "database driver", x: 16, y: 16, w: 170, h: 420, kind: "plain" },
+    { id: "repo", label: "repo.FindAccount", sub: "propagates", x: 196, y: 16, w: 176, h: 420, kind: "queue" },
+    { id: "svc", label: "service.ChargeCard", sub: "propagates", x: 382, y: 16, w: 176, h: 420, kind: "queue" },
+    { id: "http", label: "HTTP handler", sub: "handles: logs once, responds", x: 568, y: 16, w: 176, h: 420, kind: "exit" }
   ]}
-  caption="Each layer adds context. Only the top layer decides what to do and logs it."
+  actors={[
+    { id: "e0", label: "context deadline exceeded", kind: "value" },
+    { id: "e1", label: "findAccount acc_123: …", kind: "value" },
+    { id: "e2", label: "chargeCard: findAccount…", kind: "value" },
+    { id: "r", label: "log once + 500", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "e0", to: "db", note: "The query times out. The driver returns an error; it has no idea what an HTTP status is." },
+    { at: 1.2, id: "e1", to: "repo", note: "The repository can't decide what this means for the user either, so it adds what it was doing (which account) with %w and returns." },
+    { at: 2.4, id: "e2", to: "svc", note: "The service adds its context and returns. Neither layer logs: logging and returning would print the same failure two or three times." },
+    { at: 3.6, id: "r", to: "http", beat: "solution", note: "The handler is the first layer that knows the answer: it checks for known causes (errors.Is/As), logs the full chain once, and responds." }
+  ]}
+  caption="Lower layers add context and pass it up. The top layer decides, logs once, and responds."
 />
 
 <QuickCheck
@@ -139,6 +159,8 @@ Every time you see an error, you face a binary choice:
 
 ## Wrapping with %w
 
+*Stop 2 of 7.*
+
 In Go 1.13, the `errors` package gained the concept of **error wrapping** — a standard way to attach context to an error while keeping the original accessible for later inspection.
 
 The `%w` verb in `fmt.Errorf` is the mechanism:
@@ -155,12 +177,12 @@ The difference is enormous. `%v` gives you a string. `%w` gives you a **chain** 
 
 **On the job:** Every layer that wraps with `%w` instead of `%v` is paying a small forward — the handler that eventually maps the error to a 402 or 404 can inspect the whole chain, not just the outermost message.
 
-<UnderTheHood title="How %w builds a linked chain (Go 1.26)">
+<UnderTheHood title="How %w builds a linked chain">
 
-`fmt.Errorf` with `%w` returns a `*fmt.wrapError` (an unexported concrete type). (Go 1.26's `fmt` allocation improvement is on the *no-verb* path — `fmt.Errorf("plain message")` with no formatting directive now allocates as cheaply as `errors.New`; the `%w` wrapping path here is unchanged.)
+`fmt.Errorf` with one `%w` returns a `*fmt.wrapError` (an unexported type holding the message and the wrapped error).
 
 ```go
-// Simplified internals (conceptual model based on Go stdlib, go1.26)
+// Simplified from the standard library's fmt package
 type wrapError struct {
     msg string
     err error // the wrapped error — the "next link"
@@ -182,17 +204,26 @@ As of Go 1.20, you can also wrap *multiple* errors simultaneously with `fmt.Erro
 
 Let's trace exactly what a three-layer Meridian payments chain looks like:
 
-<ExecTimeline
-  title="Building and unwrapping an error chain"
-  lanes={[{ id: "chain", label: "error chain" }]}
-  steps={[
-    { lane: "chain", kind: "run", label: "ErrInsufficientFunds created", note: "errors.New creates a sentinel: a *errorString with message 'insufficient funds'. This is the root — the innermost link." },
-    { lane: "chain", kind: "run", label: "repo wraps with %w", note: "fmt.Errorf(\"findAccount acc_123: %w\", ErrInsufficientFunds) creates a *wrapError pointing at the sentinel." },
-    { lane: "chain", kind: "run", label: "service wraps with %w", note: "fmt.Errorf(\"chargeCard: %w\", repoErr) creates another *wrapError pointing at the repo error." },
-    { lane: "chain", kind: "run", label: "errors.Is walks the chain", note: "errors.Is(serviceErr, ErrInsufficientFunds): checks serviceErr == sentinel? No. Unwrap → repoErr == sentinel? No. Unwrap → sentinel == sentinel? YES." },
-    { lane: "chain", kind: "done", label: "match found — true", note: "errors.Is returns true. The sentinel was buried under two wrappers but the chain walk found it." }
+<RuntimeStage
+  title="errors.Is(serviceErr, ErrInsufficientFunds)"
+  kicker="walking the chain · live"
+  zones={[
+    { id: "l3", label: "service: chargeCard: %w", x: 16, y: 16, w: 470, h: 130, kind: "queue" },
+    { id: "l2", label: "repo: findAccount acc_123: %w", x: 16, y: 161, w: 470, h: 130, kind: "queue" },
+    { id: "l1", label: "sentinel: insufficient funds", x: 16, y: 306, w: 470, h: 130, kind: "queue" },
+    { id: "q", label: "is this the target?", x: 496, y: 16, w: 248, h: 420, kind: "exit" }
   ]}
-  caption="errors.Is unwraps the chain link by link until it finds an equal value or exhausts the chain."
+  actors={[
+    { id: "a", label: "no → Unwrap()", kind: "value" }, { id: "b", label: "no → Unwrap()", kind: "value" }, { id: "c", label: "== target ✓", kind: "value" },
+    { id: "t", label: "true", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "a", to: "l3", note: "Start at the outermost error: a *fmt.wrapError. Is it == ErrInsufficientFunds (or does its Is method say so)? No. Call its Unwrap()." },
+    { at: 1.4, id: "b", to: "l2", note: "The repo's wrapper: no again. Unwrap()." },
+    { at: 2.8, id: "c", to: "l1", note: "The sentinel itself: equal." },
+    { at: 3.8, id: "t", to: "q", beat: "solution", note: "errors.Is returns true. errors.As walks the same path but asks 'can this be assigned to your target's type?' and fills the target when it finds one." }
+  ]}
+  caption="Each %w wrapper keeps a pointer to the error inside it. Is and As follow those pointers until they match or run out."
 />
 
 ### `errors.Is` vs `errors.As`
@@ -205,15 +236,15 @@ These are your two forensic tools for inspecting a chain:
 ```go
 // errors.Is: sentinel comparison — does this chain contain ErrInsufficientFunds?
 if errors.Is(err, ErrInsufficientFunds) {
-    w.WriteHeader(http.StatusPaymentRequired) // 402
-    return
+	w.WriteHeader(http.StatusPaymentRequired) // 402
+	return
 }
 
 // errors.As: typed extraction — is there a *CardNetworkError anywhere in the chain?
 var cardErr *CardNetworkError
 if errors.As(err, &cardErr) {
-    // cardErr now holds the concrete value with its fields
-    log.Error("card network error", "decline_code", cardErr.DeclineCode)
+	// cardErr now holds the concrete value with its fields
+	log.Error("card network error", "decline_code", cardErr.DeclineCode)
 }
 ```
 
@@ -222,7 +253,7 @@ As of Go 1.26, the standard library also ships **`errors.AsType[T]`** — a gene
 ```go
 // Go 1.26: errors.AsType[T] — generic, no pointer-to-pointer dance
 if cardErr, ok := errors.AsType[*CardNetworkError](err); ok {
-    log.Error("card network error", "decline_code", cardErr.DeclineCode)
+	log.Error("card network error", "decline_code", cardErr.DeclineCode)
 }
 ```
 
@@ -306,6 +337,8 @@ func main() {
 
 ## Sentinel vs typed errors
 
+*Stop 3 of 7.*
+
 You have two fundamental tools for defining errors that callers can inspect: **sentinel values** and **typed errors**. Neither is always right — the choice is design.
 
 ### Sentinel errors
@@ -315,9 +348,9 @@ A sentinel is a package-level `error` variable, defined once, compared by identi
 ```go
 // payments/errors.go — Meridian domain layer
 var (
-    ErrInsufficientFunds = errors.New("insufficient funds")
-    ErrCardExpired       = errors.New("card expired")
-    ErrFraudHold         = errors.New("fraud hold — contact your bank")
+	ErrInsufficientFunds = errors.New("insufficient funds")
+	ErrCardExpired       = errors.New("card expired")
+	ErrFraudHold         = errors.New("fraud hold — contact your bank")
 )
 ```
 
@@ -325,7 +358,7 @@ Callers use `errors.Is` to check for them:
 
 ```go
 if errors.Is(err, payments.ErrInsufficientFunds) {
-    return http.StatusPaymentRequired
+	return http.StatusPaymentRequired
 }
 ```
 
@@ -340,16 +373,16 @@ A typed error is a struct that implements the `error` interface:
 ```go
 // payments/errors.go — Meridian domain layer
 type InsufficientFundsError struct {
-    AccountID string
-    Available int // cents
-    Requested int // cents
+	AccountID string
+	Available int // cents
+	Requested int // cents
 }
 
 func (e *InsufficientFundsError) Error() string {
-    return fmt.Sprintf(
-        "insufficient funds on account %s: have %d cents, need %d",
-        e.AccountID, e.Available, e.Requested,
-    )
+	return fmt.Sprintf(
+		"insufficient funds on account %s: have %d cents, need %d",
+		e.AccountID, e.Available, e.Requested,
+	)
 }
 ```
 
@@ -358,11 +391,11 @@ Callers use `errors.As` (or the Go 1.26 `errors.AsType[T]`) to extract the value
 ```go
 var fundsErr *InsufficientFundsError
 if errors.As(err, &fundsErr) {
-    log.Info("payment declined",
-        "account", fundsErr.AccountID,
-        "shortfall_cents", fundsErr.Requested-fundsErr.Available,
-    )
-    return http.StatusPaymentRequired
+	log.Info("payment declined",
+		"account", fundsErr.AccountID,
+		"shortfall_cents", fundsErr.Requested-fundsErr.Available,
+	)
+	return http.StatusPaymentRequired
 }
 ```
 
@@ -457,9 +490,11 @@ func main() {
 
 ## When to panic
 
+*Stop 4 of 7.*
+
 Short answer: almost never. Especially not in a library.
 
-A panic tears through the call stack, unwinding frames and running deferred functions, until something calls `recover` — or until the program crashes. In a web server, an unrecovered panic in one goroutine kills the *entire process*, taking every other request with it. That is not graceful; that is a crater.
+A panic unwinds the goroutine's call stack, running deferred functions as it goes, until a deferred function calls `recover`, or until it runs out of stack and the program exits. An unrecovered panic in any goroutine ends the whole process, taking every other request with it (with one important exception for HTTP handlers, below).
 
 Here are the legitimate uses, stated precisely:
 
@@ -478,22 +513,22 @@ The one pattern where `recover` shines is a top-level HTTP middleware that conve
 ```go
 // middleware/recovery.go
 func RecoveryMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        defer func() {
-            if rec := recover(); rec != nil {
-                // Log the stack trace for debugging.
-                buf := make([]byte, 4096)
-                n := runtime.Stack(buf, false)
-                slog.Error("panic recovered",
-                    "panic", rec,
-                    "stack", string(buf[:n]),
-                    "path", r.URL.Path,
-                )
-                http.Error(w, "internal server error", http.StatusInternalServerError)
-            }
-        }()
-        next.ServeHTTP(w, r)
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				// Log the stack trace for debugging.
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("panic recovered",
+					"panic", rec,
+					"stack", string(buf[:n]),
+					"path", r.URL.Path,
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 ```
 
@@ -545,21 +580,79 @@ func main() {
 
 </GoPlayground>
 
-<ExecTimeline
-  title="panic / recover flow in a goroutine"
-  lanes={[{ id: "g", label: "goroutine" }]}
-  steps={[
-    { lane: "g", kind: "run", label: "handler called", note: "The HTTP handler goroutine starts. A deferred recovery function is registered first — it runs on exit, whatever the cause." },
-    { lane: "g", kind: "run", label: "some code panics", note: "Deep in a call chain, panic(val) is called. The runtime starts unwinding the stack, running deferred functions in reverse order." },
-    { lane: "g", kind: "block", label: "stack unwinds", note: "Every deferred function in the goroutine runs as the stack unwinds — closing files, releasing locks — until the recover() call is reached." },
-    { lane: "g", kind: "recv", label: "recover() catches it", note: "recover() stops the unwinding and returns the panic value. Execution continues normally from the point of the recover() call." },
-    { lane: "g", kind: "run", label: "write 500 response", note: "The recovery handler logs the stack trace and writes a 500 Internal Server Error to the client." },
-    { lane: "g", kind: "done", label: "goroutine exits cleanly", note: "The handler goroutine finishes. The server is unharmed. Other requests continue as if nothing happened." }
+<RuntimeStage
+  title="panic → deferred calls → recover"
+  kicker="unwinding one goroutine · live"
+  zones={[
+    { id: "stack", label: "one goroutine's stack", x: 16, y: 16, w: 470, h: 420, kind: "queue" },
+    { id: "out", label: "result", x: 496, y: 16, w: 248, h: 420, kind: "exit" }
   ]}
-  caption="recover() intercepts the panic and turns a crash into a logged 500 — the server keeps running."
+  actors={[
+    { id: "f1", label: "safeCall: defer recover()", kind: "value" }, { id: "f2", label: "riskyOperation(0)", kind: "value" },
+    { id: "p", label: "panic(\"division by zero…\")", kind: "value" }, { id: "err", label: "returned as an error", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "f1", to: "stack", note: "safeCall defers a function that calls recover, then calls the risky code." },
+    { at: 1.0, id: "f2", to: "stack" },
+    { at: 2.0, id: "p", to: "stack", beat: "problem", note: "panic starts unwinding: riskyOperation's frame is abandoned, and deferred calls run as each frame is left." },
+    { at: 3.0, id: "f2", to: "" }, { at: 3.0, id: "p", to: "", note: "Reaching safeCall's deferred function, recover() returns the panic value and stops the unwinding." },
+    { at: 4.0, id: "err", to: "out", beat: "solution", note: "safeCall returns normally, with the panic turned into an ordinary error through its named result. The program continues." }
+  ]}
+  caption="recover only works inside a deferred function, in the goroutine that is panicking."
 />
 
+### What `net/http` already does for you
+
+"An unrecovered panic in a web server kills the whole process" is only half true. `net/http` runs each connection in its own goroutine and **recovers panics from your handlers**: it logs them, closes that connection, and keeps serving. Measured with a handler that writes to a nil map:
+
+<GoPlayground>
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/boom", func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]int
+		m["x"] = 1 // panics: assignment to entry in nil map
+	})
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "still serving")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, err := http.Get(srv.URL + "/boom")
+	fmt.Println("client saw:", err)
+
+	resp, err := http.Get(srv.URL + "/ok")
+	if err == nil {
+		b, _ := io.ReadAll(resp.Body)
+		fmt.Println("next request:", resp.StatusCode, string(b))
+	}
+}
+```
+
+</GoPlayground>
+
+```text
+2026/09/26 15:39:27 http: panic serving 127.0.0.1:58595: assignment to entry in nil map
+client saw: Get "http://127.0.0.1:58594/boom": EOF
+next request: 200 still serving
+```
+
+The client of the failing request gets a dropped connection (`EOF`), not a 500; everyone else is unaffected. So a recovery middleware is still worth having, because it turns that dropped connection into a proper 500 response and logs the request context and stack in your format. What `net/http` does **not** cover is any goroutine your handler starts with `go`: that panic takes down the process (Stop 7).
+
 ## Structured error responses for services
+
+*Stop 5 of 7.*
 
 An HTTP API is a contract. The client trusts you to tell them what went wrong clearly enough to act on it — without exposing your internal implementation to the world.
 
@@ -570,31 +663,31 @@ The pattern: every error response has a consistent JSON envelope, and internal e
 
 // APIError is the JSON envelope every error response uses.
 type APIError struct {
-    Code    string `json:"code"`
-    Message string `json:"message"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 // errorCode maps internal domain errors to API codes.
 // Only the handler layer knows about this mapping.
 func errorCode(err error) (int, APIError) {
-    switch {
-    case errors.Is(err, payments.ErrInsufficientFunds):
-        return http.StatusPaymentRequired, APIError{
-            Code:    "insufficient_funds",
-            Message: "Your account has insufficient funds for this transaction.",
-        }
-    case errors.Is(err, payments.ErrCardExpired):
-        return http.StatusPaymentRequired, APIError{
-            Code:    "card_expired",
-            Message: "The card on file has expired. Please update your payment method.",
-        }
-    default:
-        // Never leak internal error text to the client.
-        return http.StatusInternalServerError, APIError{
-            Code:    "internal_error",
-            Message: "An unexpected error occurred. Please try again.",
-        }
-    }
+	switch {
+	case errors.Is(err, payments.ErrInsufficientFunds):
+		return http.StatusPaymentRequired, APIError{
+			Code:    "insufficient_funds",
+			Message: "Your account has insufficient funds for this transaction.",
+		}
+	case errors.Is(err, payments.ErrCardExpired):
+		return http.StatusPaymentRequired, APIError{
+			Code:    "card_expired",
+			Message: "The card on file has expired. Please update your payment method.",
+		}
+	default:
+		// Never leak internal error text to the client.
+		return http.StatusInternalServerError, APIError{
+			Code:    "internal_error",
+			Message: "An unexpected error occurred. Please try again.",
+		}
+	}
 }
 ```
 
@@ -603,19 +696,19 @@ And the handler uses it:
 ```go
 // api/charge_handler.go — Meridian API layer
 func (h *ChargeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    // ... decode request ...
+	// ... decode request ...
 
-    if err := h.payments.Charge(r.Context(), req); err != nil {
-        status, apiErr := errorCode(err)
-        // Log the FULL internal error (with chain) for debugging.
-        slog.Error("charge failed", "error", err, "path", r.URL.Path)
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(status)
-        json.NewEncoder(w).Encode(apiErr)
-        return
-    }
+	if err := h.payments.Charge(r.Context(), req); err != nil {
+		status, apiErr := errorCode(err)
+		// Log the FULL internal error (with chain) for debugging.
+		slog.Error("charge failed", "error", err, "path", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(apiErr)
+		return
+	}
 
-    w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent)
 }
 ```
 
@@ -694,6 +787,8 @@ A handler that does `json.NewEncoder(w).Encode(map[string]string{"error": err.Er
 
 ## The typed-nil trap
 
+*Stop 6 of 7.*
+
 This is the one. The bug that has humiliated more Go engineers than any other. The one where `err != nil` *lies to your face*.
 
 Let me set the scene.
@@ -703,12 +798,12 @@ You have a database repository layer in Meridian's account service. The function
 ```go
 // BROKEN — this is the trap
 func findAccount(id string) *DBError {
-    // on success — we return nil, right?
-    return nil
+	// on success — we return nil, right?
+	return nil
 }
 
 func callFindAccount(id string) error {
-    return findAccount(id) // THE BUG IS HERE
+	return findAccount(id) // THE BUG IS HERE
 }
 ```
 
@@ -716,65 +811,32 @@ You call `callFindAccount`, check `err != nil`, and it's `true`. Even though `fi
 
 The answer is in the interface representation.
 
-<Scene
-  title="The typed-nil trap — when nil doesn't mean nil"
+<RuntimeStage
+  title="return findAccount(id) // a nil *DBError, returned as error"
+  kicker="the interface's two slots · live"
+  zones={[
+    { id: "fn", label: "findAccount returns", x: 16, y: 16, w: 236, h: 420, kind: "plain" },
+    { id: "box", label: "the error interface value", sub: "type slot | value slot", x: 262, y: 16, w: 236, h: 420, kind: "queue" },
+    { id: "chk", label: "err != nil ?", x: 508, y: 16, w: 236, h: 420, kind: "wait" }
+  ]}
   actors={[
-    { id: "repo", label: "repo.findAccount" },
-    { id: "svc", label: "service layer" },
-    { id: "handler", label: "HTTP handler" }
+    { id: "p", label: "(*DBError)(nil)", kind: "value" },
+    { id: "t", label: "type: *DBError", kind: "value" }, { id: "v", label: "value: nil", kind: "value" },
+    { id: "yes", label: "true: 'failure'", kind: "value" },
+    { id: "t0", label: "type: (none)", kind: "value" }, { id: "ok", label: "false: success", kind: "value" }
   ]}
-  rows={2}
-  cols={4}
-  frames={[
-    {
-      caption: "findAccount returns nil *DBError — looks like success.",
-      beat: "neutral",
-      actors: [{ id: "repo", state: "active" }],
-      cells: [
-        { id: "A1", state: "idle", label: "type=?" },
-        { id: "A2", state: "idle", label: "val=?" },
-        { id: "A3", state: "idle", label: "type=?" },
-        { id: "A4", state: "idle", label: "val=?" }
-      ]
-    },
-    {
-      caption: "Go converts *DBError → error interface. Type word is set to *DBError even though the pointer value is nil.",
-      beat: "problem",
-      actors: [{ id: "repo", state: "warn" }, { id: "svc", state: "active" }],
-      cells: [
-        { id: "A1", state: "bad", label: "type=*DB" },
-        { id: "A2", state: "warn", label: "val=nil" },
-        { id: "A3", state: "idle", label: "type=?" },
-        { id: "A4", state: "idle", label: "val=?" }
-      ]
-    },
-    {
-      caption: "err != nil checks if BOTH words are zero. Word 1 is set — so it returns true. The handler sees an error that isn't there.",
-      beat: "problem",
-      actors: [{ id: "handler", state: "bad" }],
-      cells: [
-        { id: "A1", state: "bad", label: "type=*DB" },
-        { id: "A2", state: "warn", label: "val=nil" },
-        { id: "A3", state: "bad", label: "err!=nil" },
-        { id: "A4", state: "bad", label: "TRUE!" }
-      ]
-    },
-    {
-      caption: "Fix: return error (bare nil). Both interface words are zero — err != nil is correctly false.",
-      beat: "solution",
-      actors: [{ id: "repo", state: "ok" }, { id: "svc", state: "ok" }, { id: "handler", state: "ok" }],
-      cells: [
-        { id: "A1", state: "done", label: "type=nil" },
-        { id: "A2", state: "done", label: "val=nil" },
-        { id: "A3", state: "done", label: "err!=nil" },
-        { id: "A4", state: "done", label: "false" }
-      ]
-    }
+  events={[
+    { at: 0, id: "p", to: "fn", note: "Success path: findAccount (declared to return *DBError) returns a nil pointer." },
+    { at: 1.2, id: "p", to: "" }, { at: 1.2, id: "t", to: "box" }, { at: 1.4, id: "v", to: "box", note: "Returning it as an error fills the interface's two slots: the TYPE slot gets *DBError, the value slot gets the nil pointer." },
+    { at: 2.8, id: "yes", to: "chk", beat: "problem", note: "An interface is nil only when both slots are empty. The type slot isn't, so err != nil is true, and the caller treats success as failure." },
+    { at: 4.2, id: "t", to: "" }, { at: 4.2, id: "v", to: "" }, { at: 4.2, id: "yes", to: "" },
+    { at: 4.2, id: "t0", to: "box", note: "Fixed: declare findAccount to return error and write return nil. Both slots stay empty." },
+    { at: 5.4, id: "ok", to: "chk", beat: "solution", note: "err != nil is false. Nothing failed, and the code agrees." }
   ]}
-  caption="A nil concrete pointer in a non-nil interface: the type word is set, so err != nil lies. Fix: always return the error interface, never a concrete pointer."
+  caption="An interface compares equal to nil only when it holds no type at all."
 />
 
-<UnderTheHood title="The interface's (type, value) word — why the nil check lies (Go 1.26)">
+<UnderTheHood title="The interface's two words: why the nil check lies">
 
 Every interface value in Go is secretly a **two-word structure**:
 
@@ -798,25 +860,11 @@ word 2: nil                 (no value)
 
 `err != nil` checks "is this interface zero?" — and it isn't. The type word is set. The check returns true, even though there is nothing useful inside.
 
-As of Go 1.26, `go vet` with the `nilness` analyzer catches more instances of this pattern than earlier versions, but it cannot catch every case — the fix is always structural: return a bare `nil`, not a typed nil pointer.
+Don't rely on tools to catch it: `go vet` has no check for this pattern (there's no `-nilness` flag; the `nilness` analyzer lives in `golang.org/x/tools` and in gopls, and it finds only some cases). The fix is structural: functions return `error`, and success is a bare `return nil`.
 
 *This is a simplification of the actual iface/eface layout — the runtime distinguishes interface-with-methods from empty interfaces, and may use pointer tagging in some cases. The key point — both words must be zero for `== nil` to be true — holds in all Go versions.*
 
 </UnderTheHood>
-
-<ExecTimeline
-  title="The typed-nil interface trap — interface words filling in"
-  lanes={[{ id: "iface", label: "error interface" }]}
-  steps={[
-    { lane: "iface", kind: "run", label: "findAccount returns nil", note: "findAccount returns a nil *DBError pointer. At this moment, the concrete value is nil." },
-    { lane: "iface", kind: "run", label: "implicit conversion to error", note: "callFindAccount's return type is error. Go converts *DBError → error interface automatically." },
-    { lane: "iface", kind: "run", label: "word 1 set: *DBError type", note: "The interface's type word is filled with a pointer to *DBError's itable. The type is known — word 1 is NOT nil." },
-    { lane: "iface", kind: "run", label: "word 2: nil pointer", note: "The interface's data word holds the nil *DBError pointer. The value is nil, but the type is not." },
-    { lane: "iface", kind: "block", label: "err != nil check runs", note: "err != nil checks if the WHOLE interface is nil — both words zero. Word 1 is set. So the check is TRUE." },
-    { lane: "iface", kind: "done", label: "BUG: err != nil is true!", note: "The caller thinks there's an error when there isn't. The typed-nil trap has sprung." }
-  ]}
-  caption="A nil concrete pointer inside a non-nil interface: the type word is set, so err != nil lies."
-/>
 
 Here is the trap, runnable so you can *watch* it happen:
 
@@ -912,87 +960,32 @@ func findAccount(id string) error {
 
 ## The goroutine-panic footgun
 
-Here is the single rule that takes down more Go production services than data races: **an unrecovered panic in ANY goroutine crashes the WHOLE process**. No exceptions. No isolation. Every in-flight request on that instance dies with it.
+*Stop 7 of 7.*
 
-And here is the part that trips up everyone who knows about `recover`: **`recover` only works inside a `defer` in the SAME goroutine that panicked**. A parent goroutine cannot catch a panic from a goroutine it spawned. The spawned goroutine's panic propagates independently, and if nothing in *that* goroutine catches it, the runtime calls `os.Exit(2)`.
+Here is the rule that takes down real Go services: **an unrecovered panic in any goroutine crashes the whole process**. Every in-flight request on that instance dies with it. (`net/http`'s own recovery, from Stop 4, covers only the handler's goroutine, not goroutines the handler starts.)
+
+And here is the part that trips up everyone who knows about `recover`: **`recover` only works inside a `defer` in the SAME goroutine that panicked**. A parent goroutine cannot catch a panic from a goroutine it spawned. The spawned goroutine's panic propagates independently, and if nothing in *that* goroutine catches it, the runtime prints the panic and stack and exits with status 2.
 
 **On the job:** One panic in a background worker — a settlement reconciler, a webhook dispatcher, a metrics flusher — takes down every in-flight Meridian request on that instance. No warning. All transfers in progress get a connection reset. The client retries. Depending on your idempotency story, you may or may not be in trouble.
 
-<Scene
-  title="Goroutine panic blast radius"
+<RuntimeStage
+  title="A background goroutine panics"
+  kicker="blast radius · live"
+  zones={[
+    { id: "proc", label: "one process", x: 16, y: 16, w: 470, h: 420, kind: "cpu" },
+    { id: "dead", label: "exit status 2", x: 496, y: 16, w: 248, h: 200, kind: "wait" },
+    { id: "safe", label: "contained", x: 496, y: 236, w: 248, h: 200, kind: "exit" }
+  ]}
   actors={[
-    { id: "req1", label: "Request 1" },
-    { id: "req2", label: "Request 2" },
-    { id: "worker", label: "BG Worker" },
-    { id: "proc", label: "Process" }
+    { id: "r1", label: "request 1", role: "courier" }, { id: "r2", label: "request 2", role: "courier" }, { id: "w", label: "reconciler", role: "worker" }
   ]}
-  rows={2}
-  cols={4}
-  frames={[
-    {
-      caption: "Three goroutines running: two request handlers and one background reconciliation worker.",
-      beat: "neutral",
-      actors: [
-        { id: "req1", state: "active" },
-        { id: "req2", state: "active" },
-        { id: "worker", state: "active" },
-        { id: "proc", state: "ok" }
-      ],
-      cells: [
-        { id: "A1", state: "ok", label: "req 1" },
-        { id: "A2", state: "ok", label: "req 2" },
-        { id: "A3", state: "active", label: "worker" },
-        { id: "A4", state: "ok", label: "process" }
-      ]
-    },
-    {
-      caption: "The background worker panics — a nil pointer dereference in the reconciler. The parent goroutine's recover() cannot catch it.",
-      beat: "problem",
-      actors: [
-        { id: "worker", state: "bad" },
-        { id: "proc", state: "warn" }
-      ],
-      cells: [
-        { id: "A1", state: "warn", label: "req 1" },
-        { id: "A2", state: "warn", label: "req 2" },
-        { id: "A3", state: "bad", label: "PANIC" },
-        { id: "A4", state: "warn", label: "..." }
-      ]
-    },
-    {
-      caption: "The runtime crashes the entire process. All in-flight requests die — not just the worker's.",
-      beat: "problem",
-      actors: [
-        { id: "req1", state: "bad" },
-        { id: "req2", state: "bad" },
-        { id: "worker", state: "bad" },
-        { id: "proc", state: "bad" }
-      ],
-      cells: [
-        { id: "A1", state: "bad", label: "DEAD" },
-        { id: "A2", state: "bad", label: "DEAD" },
-        { id: "A3", state: "bad", label: "DEAD" },
-        { id: "A4", state: "bad", label: "EXIT 2" }
-      ]
-    },
-    {
-      caption: "Fix: each goroutine has its own deferred recover. The worker's panic is contained — request handlers keep serving.",
-      beat: "solution",
-      actors: [
-        { id: "req1", state: "ok" },
-        { id: "req2", state: "ok" },
-        { id: "worker", state: "warn" },
-        { id: "proc", state: "ok" }
-      ],
-      cells: [
-        { id: "A1", state: "ok", label: "req 1" },
-        { id: "A2", state: "ok", label: "req 2" },
-        { id: "A3", state: "warn", label: "recovered" },
-        { id: "A4", state: "ok", label: "alive" }
-      ]
-    }
+  events={[
+    { at: 0, id: "r1", to: "proc", state: "running" }, { at: 0, id: "r2", to: "proc", state: "running" }, { at: 0, id: "w", to: "proc", state: "running", note: "Two handler goroutines and a background worker started with go, all in one process." },
+    { at: 1.6, id: "w", to: "proc", state: "parked", beat: "problem", note: "The worker dereferences a nil pointer. Its own stack unwinds; it has no deferred recover. main's recover is on a different goroutine and never runs." },
+    { at: 3.0, id: "w", to: "dead", state: "done" }, { at: 3.2, id: "r1", to: "dead", state: "done" }, { at: 3.4, id: "r2", to: "dead", state: "done", beat: "problem", note: "The runtime prints the panic and exits with status 2. Every goroutine dies with it, including the two requests mid-flight." },
+    { at: 5.0, id: "w", to: "safe", state: "done" }, { at: 5.0, id: "r1", to: "proc", state: "running" }, { at: 5.0, id: "r2", to: "proc", state: "running", beat: "solution", note: "Replay with a deferred recover at the top of the worker's own function: the panic becomes a logged error, and the requests keep going." }
   ]}
-  caption="One unrecovered panic anywhere in the process = total process death. Recover-per-goroutine contains the blast radius."
+  caption="A panic can only be recovered in the goroutine where it happens. Every goroutine you start needs its own recover, or none at all."
 />
 
 ### Why the parent cannot catch it
@@ -1001,17 +994,17 @@ This is the canonical trap:
 
 ```go
 func main() {
-    defer func() {
-        if r := recover(); r != nil {
-            fmt.Println("caught:", r) // THIS NEVER RUNS
-        }
-    }()
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("caught:", r) // THIS NEVER RUNS
+		}
+	}()
 
-    go func() {
-        panic("spawned goroutine panics") // crashes the process
-    }()
+	go func() {
+		panic("spawned goroutine panics") // crashes the process
+	}()
 
-    time.Sleep(time.Second) // waiting won't help
+	time.Sleep(time.Second) // waiting won't help
 }
 ```
 
@@ -1025,16 +1018,16 @@ Every long-lived or per-request goroutine you spawn needs its own deferred recov
 // safeGo launches fn in a goroutine with a deferred recover.
 // If fn panics, the error is sent to the provided channel instead of crashing.
 func safeGo(errCh chan<- error, fn func()) {
-    go func() {
-        defer func() {
-            if r := recover(); r != nil {
-                buf := make([]byte, 4096)
-                n := runtime.Stack(buf, false)
-                errCh <- fmt.Errorf("goroutine panic: %v\n%s", r, buf[:n])
-            }
-        }()
-        fn()
-    }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				errCh <- fmt.Errorf("goroutine panic: %v\n%s", r, buf[:n])
+			}
+		}()
+		fn()
+	}()
 }
 ```
 
@@ -1043,20 +1036,20 @@ For Meridian's background workers (settlement reconciler, webhook dispatcher, le
 ```go
 // worker/reconciler.go
 func (w *ReconcilerWorker) Start(ctx context.Context) {
-    go func() {
-        defer func() {
-            if r := recover(); r != nil {
-                buf := make([]byte, 4096)
-                n := runtime.Stack(buf, false)
-                slog.Error("reconciler panic — restarting",
-                    "panic", r,
-                    "stack", string(buf[:n]),
-                )
-                // Optionally: signal a supervisor to restart the worker.
-            }
-        }()
-        w.run(ctx)
-    }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("reconciler panic — restarting",
+					"panic", r,
+					"stack", string(buf[:n]),
+				)
+				// Optionally: signal a supervisor to restart the worker.
+			}
+		}()
+		w.run(ctx)
+	}()
 }
 ```
 
@@ -1068,24 +1061,6 @@ The rule of thumb:
 
 - **Recover** from panics in request handlers and per-goroutine workers where the panic is isolated and the rest of the system is fine.
 - **Do NOT recover** from panics that indicate corrupted shared state. Let the process crash, let the supervisor restart it, and let the monitoring page wake someone up.
-
-<ExecTimeline
-  title="Spawned-goroutine panic crashing the process — and the contained alternative"
-  lanes={[
-    { id: "main", label: "main goroutine" },
-    { id: "worker", label: "spawned goroutine" }
-  ]}
-  steps={[
-    { lane: "main", kind: "run", label: "main starts, defers recover", note: "main registers a deferred recover — but this only covers main's own goroutine stack." },
-    { lane: "main", kind: "spawn", label: "go worker()", note: "A new goroutine is spawned. It has its own separate stack. main's recover cannot reach it." },
-    { lane: "worker", kind: "run", label: "worker runs", note: "The worker goroutine processes Meridian's settlement records." },
-    { lane: "worker", kind: "run", label: "nil pointer dereference", note: "A nil account pointer is dereferenced. panic() fires inside the worker goroutine." },
-    { lane: "worker", kind: "block", label: "worker stack unwinds", note: "The runtime unwinds the worker's stack. No deferred recover in the worker — nothing stops the panic." },
-    { lane: "main", kind: "block", label: "main's recover does NOT fire", note: "main's defer runs only if main's goroutine panics. The worker's panic is on a different stack entirely." },
-    { lane: "worker", kind: "done", label: "os.Exit(2) — process dies", note: "The runtime calls os.Exit(2). Every goroutine — including all request handlers — is killed instantly." }
-  ]}
-  caption="The parent's recover is invisible to a spawned goroutine's panic. Add recover-per-goroutine or use a safe wrapper."
-/>
 
 <GoPlayground>
 
@@ -1157,7 +1132,7 @@ func main() {
     "The child goroutine is silently killed and the parent continues"
   ]}
   answer={2}
-  explain="Each goroutine has its own independent stack. recover() only intercepts panics on the goroutine where the deferred function is installed. A spawned goroutine's panic is invisible to the parent — if the child has no recover() of its own, the runtime calls os.Exit(2) and the entire process dies."
+  explain="Each goroutine has its own independent stack. recover() only intercepts panics on the goroutine where the deferred function is installed. A spawned goroutine's panic is invisible to the parent — if the child has no recover() of its own, the runtime exits with status 2 and the entire process dies."
 />
 
 ---
@@ -1319,16 +1294,19 @@ The function below has the typed-nil trap. Fix it so `isError()` returns `false`
 
 ```go
 type RecordError struct{ Msg string }
+
 func (e *RecordError) Error() string { return e.Msg }
 
 func findRecord(id string) *RecordError {
-    if id == "" { return &RecordError{Msg: "id required"} }
-    return nil
+	if id == "" {
+		return &RecordError{Msg: "id required"}
+	}
+	return nil
 }
 
 func isError() bool {
-    err := findRecord("abc")
-    return err != nil
+	err := findRecord("abc")
+	return err != nil
 }
 ```
 
@@ -1358,7 +1336,7 @@ func isError() bool {
 }
 
 func main() {
-	fmt.Println("isError() with valid id:", isError())        // false — correct
+	fmt.Println("isError() with valid id:", isError())            // false — correct
 	fmt.Println("direct check, empty id:", findRecord("") != nil) // true — correct
 }
 ```
@@ -1428,10 +1406,10 @@ func apiLayer(code string) int {
 }
 
 func main() {
-	fmt.Println("success:  ", apiLayer(""))            // 200
-	fmt.Println("not found:", apiLayer("NOT_FOUND"))   // 404
-	fmt.Println("duplicate:", apiLayer("DUPLICATE"))   // 409
-	fmt.Println("unknown:  ", apiLayer("CONSTRAINT"))  // 500
+	fmt.Println("success:  ", apiLayer(""))           // 200
+	fmt.Println("not found:", apiLayer("NOT_FOUND"))  // 404
+	fmt.Println("duplicate:", apiLayer("DUPLICATE"))  // 409
+	fmt.Println("unknown:  ", apiLayer("CONSTRAINT")) // 500
 }
 ```
 
@@ -1528,7 +1506,7 @@ The trap is subtle, the fix is surgical. Somewhere in that starter code, a `*Pay
 <Recap>
 
 - **Errors are values** — the `error` interface is `Error() string`. Return `nil` for success, an error value for failure. Handle or propagate — never both for the same error.
-- **`%w` wraps, `%v` doesn't** — `fmt.Errorf("context: %w", err)` builds a linked chain. `errors.Unwrap` walks it link by link. (Go 1.26 made the *no-verb* `fmt.Errorf("plain message")` allocate as cheaply as `errors.New`; the `%w` path is unchanged.)
+- **`%w` wraps, `%v` doesn't** — `fmt.Errorf("context: %w", err)` builds a linked chain. `errors.Unwrap` walks it link by link. 
 - **`errors.Is`** compares by identity down the chain — use for sentinels. **`errors.As`** matches by type and extracts the concrete value — use when you need fields. **`errors.AsType[T]`** (Go 1.26) is the generic, type-safe form of `errors.As`.
 - **Sentinels** (`errors.New`) for conditions; **typed errors** (structs implementing `error`) for data. Define errors in the package that owns the concept. Combine both with a custom `Is` method.
 - **Panic almost never** — not in libraries, not for expected failures. Use `recover` in goroutine-boundary middleware only. Return an error. Every time.

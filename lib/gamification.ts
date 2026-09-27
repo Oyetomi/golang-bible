@@ -8,6 +8,8 @@
    - Custom Event Dispatchers: gb:gamification, gb:confetti, gb:levelup, gb:xp-gain
    ───────────────────────────────────────────────────────────── */
 
+import { GO_ERAS } from "@/lib/stickers";
+
 export type BadgeId =
   | "first_code"
   | "quick_thinker"
@@ -228,25 +230,17 @@ export const BADGE_DEFINITIONS: Record<BadgeId, BadgeDefinition> = {
 
 const STORAGE_KEY = "gb-gamification-profile";
 
-export const TITLES_BY_LEVEL: { minLevel: number; title: string }[] = [
-  { minLevel: 50, title: "Grandmaster Gopher" },
-  { minLevel: 45, title: "High-Frequency Maestro" },
-  { minLevel: 40, title: "Kernel Warlock" },
-  { minLevel: 35, title: "Zero-Alloc Titan" },
-  { minLevel: 30, title: "Distributed Systems Sage" },
-  { minLevel: 25, title: "Production Architect" },
-  { minLevel: 20, title: "Backend Craftsman" },
-  { minLevel: 15, title: "Goroutine Whisperer" },
-  { minLevel: 10, title: "Concurrency Apprentice" },
-  { minLevel: 5, title: "Syntax Scout" },
-  { minLevel: 1, title: "Novice Gopher" },
-];
+/** Levels are named after Go releases; see GO_ERAS in lib/stickers.ts. */
+export const TITLES_BY_LEVEL: { minLevel: number; title: string }[] = GO_ERAS.map((e) => ({
+  minLevel: e.minLevel,
+  title: e.name,
+}));
 
 export function getTitleForLevel(level: number): string {
   for (const t of TITLES_BY_LEVEL) {
     if (level >= t.minLevel) return t.title;
   }
-  return "Novice Gopher";
+  return GO_ERAS[GO_ERAS.length - 1].name;
 }
 
 /** Cumulative XP required to reach each level (1 to 50). */
@@ -310,7 +304,7 @@ export function getDefaultProfile(): PlayerProfile {
   return {
     xp: 0,
     level: 1,
-    title: "Novice Gopher",
+    title: GO_ERAS[GO_ERAS.length - 1].name,
     streak: 1,
     lastActiveDate: getTodayString(),
     streakFreezes: 1,

@@ -13,6 +13,10 @@ const WITH_MODULES = process.argv.includes("--with-modules");
 // pass. Anti-pattern chapters and `noverify` blocks are already excluded, which
 // is what keeps vet from firing on the mistakes the book sets out to teach.
 const VET = process.argv.includes("--vet");
+// --record writes content/_verified.json: per-chapter build results, the exact
+// toolchain that produced them, and when. The site shows this under each
+// chapter title, so it must only ever describe a run that actually happened.
+const RECORD = process.argv.includes("--record");
 
 /**
  * Import paths declared by a snippet — only the ones inside an `import` clause.
@@ -102,7 +106,9 @@ let moduleTierCount = 0;
 let failedSnippets = [];
 let moduleTierFailures = [];
 
+const perFile = {};
 for (const file of files) {
+  const tally = (perFile[file] = { built: 0, failed: 0 });
   const content = fs.readFileSync(file, "utf8");
   const lines = content.split("\n");
 
@@ -178,6 +184,7 @@ for (const file of files) {
             timeout: thirdParty ? 120000 : 60000,
           });
           passedCount++;
+          tally.built++;
         } catch (err) {
           const stderr = err.stderr ? err.stderr.toString() : err.message;
           const timedOut = err.killed === true || err.signal === "SIGTERM";
@@ -189,6 +196,7 @@ for (const file of files) {
           const failure = { file, line: startLine, error: detail || "compile error" };
           if (thirdParty) moduleTierFailures.push(failure);
           else failedSnippets.push(failure);
+          tally.failed++;
         }
       }
       continue;
@@ -200,8 +208,43 @@ for (const file of files) {
   }
 }
 
+let toolchain = "";
+try {
+  // Run inside the scratch module so the reported version is the toolchain
+  // that built the snippets (its go.mod can trigger an automatic switch).
+  toolchain = execSync("go env GOVERSION", { cwd: tmpDir }).toString().trim();
+} catch {
+  toolchain = "";
+}
+
 // Clean up scratchpad
 fs.rmSync(tmpDir, { recursive: true, force: true });
+
+if (RECORD) {
+  const lastChanged = (file) => {
+    try {
+      return execSync(`git log -1 --format=%cs -- "${file}"`).toString().trim();
+    } catch {
+      return "";
+    }
+  };
+  const today = new Date().toISOString().slice(0, 10);
+  const chapters = {};
+  for (const [file, t] of Object.entries(perFile)) {
+    const rel = path.relative(CONTENT_DIR, file);
+    // A chapter with uncommitted edits was checked in its current form today.
+    let dirty = false;
+    try {
+      dirty = execSync(`git status --porcelain -- "${file}"`).toString().trim() !== "";
+    } catch {
+      dirty = false;
+    }
+    chapters[rel] = { built: t.built, failed: t.failed, updated: dirty ? today : lastChanged(file) || today };
+  }
+  const out = { toolchain, checked: today, modules: WITH_MODULES, chapters };
+  fs.writeFileSync(path.join(CONTENT_DIR, "_verified.json"), JSON.stringify(out, null, 2) + "\n");
+  console.log(`[test-snippets] recorded ${Object.keys(chapters).length} chapters to content/_verified.json (${toolchain})`);
+}
 
 console.log("\n=======================================================");
 console.log("            GO SNIPPET VERIFICATION BASELINE           ");

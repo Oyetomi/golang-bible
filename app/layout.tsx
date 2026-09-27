@@ -1,16 +1,21 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import Script from "next/script";
-import { Bricolage_Grotesque, Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
+import { Hanken_Grotesk, JetBrains_Mono, Newsreader } from "next/font/google";
 import "./globals.css";
 import "../components/course/course.css";
 import "../components/gamification/gamification.css";
 import { AppShell } from "@/components/AppShell";
 
-const display = Bricolage_Grotesque({
+/* Editorial serif for display-scale headings only (chapter titles, section
+   heads, the hero). Small UI headings use the body sans: see --font-display
+   in globals.css. */
+const serif = Newsreader({
   subsets: ["latin"],
-  variable: "--font-display",
+  variable: "--font-serif",
   display: "swap",
-  fallback: ["ui-sans-serif", "system-ui", "sans-serif"],
+  style: ["normal", "italic"],
+  axes: ["opsz"],
+  fallback: ["ui-serif", "Georgia", "serif"],
 });
 const body = Hanken_Grotesk({
   subsets: ["latin"],
@@ -66,6 +71,17 @@ export const metadata: Metadata = {
   },
 };
 
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#fbf7ef" },
+    { media: "(prefers-color-scheme: dark)", color: "#09090b" },
+  ],
+};
+
+/* Runs before first paint so a reader who chose dark never sees a flash of
+   paper. Light is the default; the choice lives in localStorage "gb-theme". */
+const themeScript = `try{if(localStorage.getItem("gb-theme")==="dark")document.documentElement.dataset.theme="dark"}catch(e){}`;
+
 export default function RootLayout({
   children,
 }: {
@@ -74,9 +90,12 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${display.variable} ${body.variable} ${mono.variable}`}
+      className={`${serif.variable} ${body.variable} ${mono.variable}`}
       suppressHydrationWarning
     >
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+      </head>
       <body>
         <AppShell>{children}</AppShell>
         {/* Codapi powers the runnable <GoPlayground> blocks (Go sandbox). */}

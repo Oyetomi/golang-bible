@@ -71,7 +71,7 @@ export function GopherCompanion() {
     const handleBadgeUnlock = (e: CustomEvent<BadgeDefinition>) => {
       const badge = e.detail;
       showTemporarySpeech(
-        `Achievement Unlocked: [${badge.title}] — ${badge.description}`,
+        `New sticker for the book: ${badge.title}!`,
         "wave",
         6000
       );

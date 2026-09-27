@@ -1,6 +1,6 @@
 import data from "@/content/_manifest.json";
 
-export type Part = 1 | 2 | 3 | "appendix";
+export type Part = 1 | 2 | 3 | 4 | "appendix";
 
 export type Chapter = {
   slug: string;
@@ -18,12 +18,13 @@ export type Chapter = {
 
 export const chapters = data as Chapter[];
 
-export const PART_ORDER: Part[] = [1, 2, 3, "appendix"];
+export const PART_ORDER: Part[] = [1, 2, 3, 4, "appendix"];
 
 export const PART_TITLES: Record<string, string> = {
   "1": "The Language",
   "2": "Becoming a Badass Go Engineer",
   "3": "Fintech in Go",
+  "4": "Infrastructure",
   appendix: "DS&A & Coding Interviews",
 };
 
@@ -31,6 +32,7 @@ export const PART_SUBTITLES: Record<string, string> = {
   "1": "Zero to Backend",
   "2": "Production-grade engineering",
   "3": "The domain capstone",
+  "4": "From process to platform",
   appendix: "Optional interview-prep track",
 };
 

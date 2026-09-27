@@ -4,6 +4,7 @@ import { renderChapter, chapterExists } from "@/lib/content";
 import { ComingSoon } from "@/components/course/server";
 import { ChapterPagination } from "@/components/nav/ChapterPagination";
 import { ReaderBar } from "@/components/course/ReaderBar";
+import { ChapterMeta } from "@/components/nav/ChapterMeta";
 
 export const dynamicParams = true;
 
@@ -74,6 +75,7 @@ export default async function ChapterPage({
   return (
     <article className="prose">
       <ReaderBar wordCount={stats.words} animCount={stats.anims} />
+      <ChapterMeta chapter={chapter} />
       {content}
       <ChapterPagination prev={prev} next={next} />
     </article>

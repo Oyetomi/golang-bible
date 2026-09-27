@@ -6,6 +6,10 @@ import { PredictLab } from "@/components/course/predictlab";
 import { SpacedRecall } from "@/components/course/spacedrecall";
 import { Golings } from "@/components/course/golings";
 import { CodeWalk } from "@/components/course/CodeWalk";
+import { RuntimeStage } from "@/components/course/RuntimeStage";
+import { CinemaAnim } from "@/components/course/CinemaAnim";
+import { BankAnim } from "@/components/course/BankAnim";
+import { PostRoomAnim } from "@/components/course/PostRoomAnim";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
 import { ProjectCode } from "@/components/course/ProjectCode";
 
@@ -53,7 +57,18 @@ export const mdxComponents = {
   StackQueueAnim: A.StackQueueAnim,
   SlidingWindowAnim: A.SlidingWindowAnim,
   DPTableAnim: A.DPTableAnim,
+  InterfaceAnim: A.InterfaceAnim,
+  IsolationAnim: A.IsolationAnim,
+  CgroupAnim: A.CgroupAnim,
+  OverlayAnim: A.OverlayAnim,
+  GoroutineAnim: A.GoroutineAnim,
+  RendezvousAnim: A.RendezvousAnim,
+  RaceAnim: A.RaceAnim,
   CodeWalk,
+  RuntimeStage,
+  CinemaAnim,
+  BankAnim,
+  PostRoomAnim,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
   Gotcha: S.Gotcha,
