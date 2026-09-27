@@ -4250,3 +4250,279 @@ export function ExpiryAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   RelationAnim — a mental-model diagram that
+   builds up one relationship at a time: boxes
+   (packages, files, types, interfaces, values)
+   and labelled arrows between them. Each frame
+   says which boxes and arrows exist yet, which
+   are lit, and where the gopher stands. Made for
+   "how does X find / satisfy / wrap Y" pictures:
+   imports, method sets, interface values.
+   ════════════════════════════════════════════ */
+export type RelationNode = {
+  id: string;
+  label: string;
+  sub?: string;
+  /** centre, as a percentage of the stage's width and height */
+  x: number;
+  y: number;
+  kind?: "pkg" | "file" | "cmd" | "type" | "iface" | "value" | "tool";
+};
+
+export type RelationEdge = { from: string; to: string; label?: string; dashed?: boolean };
+
+export type RelationFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** node ids and edge ids ("from>to") visible in this frame; omit to show everything */
+  show?: string[];
+  /** ids lit up in this frame */
+  hot?: string[];
+  /** ids drawn as broken/refused in this frame */
+  bad?: string[];
+  /** node the gopher stands on, and what it says */
+  at?: string;
+  say?: string;
+};
+
+export function RelationAnim({
+  title,
+  kicker = "mental model",
+  nodes,
+  edges,
+  frames,
+  role = "reader",
+  height = 60,
+  caption,
+}: {
+  title: string;
+  kicker?: string;
+  nodes: RelationNode[];
+  edges: RelationEdge[];
+  frames: RelationFrame[];
+  role?: GopherRole;
+  /** stage height as a percentage of its width */
+  height?: number;
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2100);
+  const f = frames[st.cur] ?? frames[0];
+  const eid = (e: RelationEdge) => `${e.from}>${e.to}`;
+  const visible = (id: string) => !f.show || f.show.includes(id);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const W = 1000;
+  const H = height * 10;
+  const at = f.at ? byId.get(f.at) : undefined;
+  // measure each box, in the SVG's units, so arrows can stop at its border
+  const stage = useRef<HTMLDivElement>(null);
+  const [sizes, setSizes] = useState<Record<string, { w: number; h: number }>>({});
+  useEffect(() => {
+    const el = stage.current;
+    if (!el) return;
+    const measure = () => {
+      const scale = W / (el.clientWidth || W);
+      const next: Record<string, { w: number; h: number }> = {};
+      el.querySelectorAll<HTMLElement>("[data-rel-id]").forEach((n) => {
+        next[n.dataset.relId!] = { w: (n.offsetWidth / 2) * scale + 4, h: (n.offsetHeight / 2) * scale + 4 };
+      });
+      setSizes(next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [W]);
+  return (
+    <AnimShell
+      title={title}
+      kicker={kicker}
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rel-scroll">
+      <div className="rel" ref={stage} style={{ aspectRatio: `${W} / ${H}` }}>
+        <svg className="rel-svg" viewBox={`0 0 ${W} ${H}`} aria-hidden>
+          <defs>
+            <marker id="rel-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="context-stroke" />
+            </marker>
+          </defs>
+          {edges.map((e) => {
+            const a = byId.get(e.from);
+            const b = byId.get(e.to);
+            if (!a || !b) return null;
+            const id = eid(e);
+            const x1 = (a.x / 100) * W, y1 = (a.y / 100) * H;
+            const x2 = (b.x / 100) * W, y2 = (b.y / 100) * H;
+            // clip the line at each box's edge, so the arrowhead lands on the border
+            const half = (n: RelationNode) => sizes[n.id] ?? { w: 90, h: 34 };
+            const clip = (n: RelationNode, dx: number, dy: number) => {
+              const { w, h } = half(n);
+              const t = Math.min(dx ? w / Math.abs(dx) : Infinity, dy ? h / Math.abs(dy) : Infinity);
+              return t;
+            };
+            const dx = x2 - x1, dy = y2 - y1;
+            const t1 = clip(a, dx, dy), t2 = clip(b, dx, dy);
+            const sx = x1 + dx * Math.min(t1, 0.45), sy = y1 + dy * Math.min(t1, 0.45);
+            const tx = x2 - dx * Math.min(t2, 0.45), ty = y2 - dy * Math.min(t2, 0.45);
+            // label: at the middle, pushed off the line on its upper/left side
+            const len = Math.hypot(dx, dy) || 1;
+            const steep = Math.abs(dx) < Math.abs(dy) * 0.4;
+            let nx = -dy / len, ny = dx / len;
+            // mostly-horizontal lines: label above; steep lines: label to the right
+            if (steep ? nx < 0 : ny > 0 || (ny === 0 && nx > 0)) { nx = -nx; ny = -ny; }
+            const lx = (sx + tx) / 2 + nx * 14, ly = (sy + ty) / 2 + ny * 18;
+            const anchor = steep ? "start" : "middle";
+            const cls = `rel-edge ${visible(id) ? "on" : ""} ${f.hot?.includes(id) ? "hot" : ""} ${f.bad?.includes(id) ? "bad" : ""} ${e.dashed ? "dashed" : ""}`;
+            return (
+              <g key={id} className={cls}>
+                <line x1={sx} y1={sy} x2={tx} y2={ty} markerEnd="url(#rel-arrow)" />
+                {e.label && (
+                  <text x={lx} y={ly + 6} textAnchor={anchor}>
+                    {e.label}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+        </svg>
+        {nodes.map((n) => (
+          <div
+            key={n.id}
+            data-rel-id={n.id}
+            className={`rel-node rel-${n.kind ?? "pkg"} ${visible(n.id) ? "on" : ""} ${f.hot?.includes(n.id) ? "hot" : ""} ${f.bad?.includes(n.id) ? "bad" : ""}`}
+            style={{ left: `${n.x}%`, top: `${n.y}%` }}
+          >
+            <span className="rel-label">{n.label}</span>
+            {n.sub && <span className="rel-sub">{n.sub}</span>}
+          </div>
+        ))}
+        {at && (
+          <div className="rel-gopher" style={{ left: `${at.x}%`, top: `${at.y}%` }}>
+            {f.say && <span className="rel-say">{f.say}</span>}
+            <Gopher role={role} pose={f.beat === "problem" ? "blocked" : f.beat === "solution" ? "happy" : "idle"} state="active" size={34} />
+          </div>
+        )}
+      </div>
+      </div>
+    </AnimShell>
+  );
+}
+
+/* ════════════════════════════════════════════
+   StreamAnim — reading a big file two ways. On
+   the left the file on disk, with a read head;
+   in the middle the reader; on the right the
+   process's memory as a gauge in MB, holding
+   whatever the program still references. Load-
+   all fills it; streaming holds one record and a
+   running total while the GC takes the rest.
+   ════════════════════════════════════════════ */
+export type StreamFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** how much of the file has been read, 0..1 */
+  read: number;
+  /** what the process is holding right now */
+  held: string[];
+  /** resident memory, in MB: the gauge's fill */
+  mb: number;
+  /** what the gauge says; defaults to "<mb> MB". Use it for in-between frames that weren't measured */
+  gauge?: string;
+  /** records the GC has freed so far (a label, e.g. "2,999,999") */
+  freed?: string;
+  /** the running result, e.g. a total */
+  total?: string;
+  /** what the reader gopher says */
+  say?: string;
+};
+
+export function StreamAnim({
+  title,
+  kicker = "memory · live",
+  file,
+  maxMb,
+  frames,
+  caption,
+}: {
+  title: string;
+  kicker?: string;
+  /** the file's label, e.g. "settle-3m.csv · 276 MB" */
+  file: string;
+  /** the gauge's full scale, in MB */
+  maxMb: number;
+  frames: StreamFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2000);
+  const f = frames[st.cur] ?? frames[0];
+  const pct = Math.min(100, (f.mb / maxMb) * 100);
+  const stripes = 24;
+  return (
+    <AnimShell
+      title={title}
+      kicker={kicker}
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="stm">
+        <div className="stm-col">
+          <span className="stm-k">on disk</span>
+          <div className="stm-file">
+            {Array.from({ length: stripes }, (_, i) => (
+              <i key={i} className={i / stripes < f.read ? "done" : ""} />
+            ))}
+            <span className="stm-head" style={{ top: `${f.read * 100}%` }} />
+          </div>
+          <span className="stm-name">{file}</span>
+        </div>
+        <div className="stm-reader">
+          {f.say && <span className="stm-say">{f.say}</span>}
+          <Gopher role="worker" pose={f.beat === "problem" ? "panic" : f.read > 0 && f.read < 1 ? "carry" : "idle"} state={f.beat === "problem" ? "bad" : "active"} size={44} title="the reader" />
+          <span className="stm-arrow" aria-hidden>→</span>
+        </div>
+        <div className="stm-col stm-memcol">
+          <span className="stm-k">the process's memory</span>
+          <div className="stm-mem">
+            <div className="stm-held">
+              {f.held.map((h, i) => (
+                <span key={h + i} className="stm-item">{h}</span>
+              ))}
+              {f.held.length === 0 && <span className="stm-empty">nothing held</span>}
+            </div>
+            <div className={`stm-gauge ${f.beat === "problem" ? "bad" : f.beat === "solution" ? "good" : ""}`}>
+              <div className="stm-fill" style={{ height: `${pct}%` }} />
+              <span className="stm-mb">{f.gauge ?? `${f.mb} MB`}</span>
+            </div>
+          </div>
+          <div className="stm-foot">
+            <span>GC freed: <b>{f.freed ?? "0"}</b> records</span>
+            {f.total && <span>total: <b>{f.total}</b></span>}
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}

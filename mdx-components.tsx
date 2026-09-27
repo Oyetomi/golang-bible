@@ -12,6 +12,7 @@ import { BankAnim } from "@/components/course/BankAnim";
 import { PostRoomAnim } from "@/components/course/PostRoomAnim";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
 import { ProjectCode } from "@/components/course/ProjectCode";
+import { ProjectMap } from "@/components/course/ProjectMap";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -26,6 +27,7 @@ export const mdxComponents = {
   BeforeAfter: S.BeforeAfter,
   GoPlayground: S.GoPlayground,
   ProjectCode,
+  ProjectMap,
   // Visual explainers
   ExecTimeline: C.ExecTimeline,
   Scene: C.Scene,
@@ -67,6 +69,8 @@ export const mdxComponents = {
   OdometerAnim: A.OdometerAnim,
   ErrorChainAnim: A.ErrorChainAnim,
   ExpiryAnim: A.ExpiryAnim,
+  RelationAnim: A.RelationAnim,
+  StreamAnim: A.StreamAnim,
   CodeWalk,
   RuntimeStage,
   CinemaAnim,
