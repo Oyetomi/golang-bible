@@ -3,1407 +3,1306 @@ title: "Project: A Concurrent Cinema Booking System"
 part: 2
 order: 8
 type: "project"
-description: "Build a seat-booking system and solve the double-booking race three ways: an in-memory store that fails under -race, a sync.RWMutex pessimistic-lock store that fixes it, and a Redis store (SET NX EX + PERSIST) for distributed holds — with a hold → confirm → release checkout session, DI/repository architecture, and a 100k-goroutine race test. The seat race is Meridian's two-transfers-on-one-balance race in a new skin."
+description: "Build a real seat-booking service: a Go module with a working seat map, an HTTP API and three stores. Measured: the unlocked store crashes with concurrent map writes, the mutex store is correct in one process and sells the same seat three times across three replicas, and a Redis store (SET NX, SET IFEQ, DELEX) sells it once, even when a customer's hold expires mid-payment."
 prerequisites: ["advanced-concurrency-correctness"]
 ---
 
 <HeroCard label="Part 2 · Chapter 8" title="Project: A Concurrent Cinema Booking System">
 
-Here's the thing, sport. You spent the last chapter learning about races, mutexes, and the memory model. Beautiful theory. Now we make it *real*.
+A cinema sells seats online. Customers click a seat, it's **held** for them while they pay, and then it's **booked**. A thousand people want the same seat for opening night, and they all click within the same second. Exactly one of them may get it.
 
-Meridian Pay — the fintech backbone we've been building all course — powers checkout for a cinema. Two users want the same seat. Both hit "Buy" at exactly the same moment. You know what happens without proper synchronization: both succeed, two tickets print for A7, and someone is standing in the aisle at showtime holding a receipt that means nothing. That is the two-transfers-on-one-balance race from the ledger chapter wearing a cinema seat costume. Same hazard. Same fix. You've seen this before — now you're going to *own* it.
+This chapter builds that service for real: a Go module you can run, with a seat map in the browser, a JSON API, and three storage back ends. Each one was hit with a thousand simultaneous customers, and the numbers are in the chapter: a store that crashed, a store that was correct until there were three copies of the service, and a Redis store that held up, after fixing a bug most tutorials ship.
 
-We'll build the whole system in stages: a naïve store that *compiles fine but is a ticking clock*, a `sync.RWMutex` store that fixes it with pessimistic locking, a Redis store for distributed holds across replicas, and a proper HTTP API. By the end you'll have the instinct, not just the knowledge.
+Six stops. If you get lost, come back here:
+
+1. **The problem and the design.** What we're building, how to run it, and the results up front.
+2. **Domain and architecture.** The `Store` interface everything depends on.
+3. **Store v1: a map without a lock.** Why a load test passed and the service still wasn't correct.
+4. **Store v2: a mutex.** Correct in one process, and three winners across three.
+5. **Store v3: Redis.** One winner across any number of replicas, hold expiry for free, and the late customer who can steal or free someone else's seat.
+6. **The web API and the seat map.** The handlers, the page, and a test for both.
 
 </HeroCard>
 
-<ChapterTabs tabs={["The problem & the design", "Domain & architecture", "Store v1 — in-memory and the race", "Store v2 — pessimistic locking", "Store v3 — Redis distributed holds", "The web API & real-time UI"]} />
+<ChapterTabs tabs={["The problem & the design", "Domain & architecture", "Store v1: a map without a lock", "Store v2: a mutex", "Store v3: Redis", "The web API & the seat map"]} />
 
 <SpacedRecall
   role={"operator"}
   items={[
     {
-      from: "Concurrency (part 1, ch4)",
-      q: "To stop two goroutines double-writing a shared map you use a…?",
-      options: ["bigger map", "mutex (or a channel owner)", "time.Sleep", "second map"],
+      from: "Advanced Concurrency & Correctness (part 2, ch7)",
+      q: "A read-then-write on a Postgres row lost 96% of deposits. What did -race report?",
+      options: ["the race, at the UPDATE line", "nothing: the shared state was outside the process", "a deadlock", "a warning in go vet"],
       answer: 1,
-      tie: "The project solves double-booking three ways — and a sync.RWMutex pessimistic lock is one. You'll watch the naive in-memory store fail, then fix it."
+      tie: "Stop 4 hits the same wall from the other side: a mutex protects memory inside one process, and three replicas are three processes."
     },
     {
-      from: "Advanced concurrency (ch7)",
-      q: "The unsynchronized in-memory store fails under…?",
-      options: ["go build", "go test -race", "go vet", "gofmt"],
+      from: "Advanced Concurrency & Correctness (part 2, ch7)",
+      q: "Check-then-act is safe when…?",
+      options: ["the check is fast", "the check and the act happen under the same lock (or as one atomic command)", "you retry on failure", "the code is reviewed"],
       answer: 1,
-      tie: "The project's first beat: the in-memory store passes normal tests but explodes under -race. Seeing the race detector fire is the lesson that motivates the fix."
+      tie: "Every store in this chapter is judged by exactly that rule: can anything happen between 'is this seat free?' and 'it's yours'?"
     },
   ]}
 />
 
-
 <PredictLab
-  prompt={"Two atomic adds to an int64 \u2014 what's the final value?"}
-  role={"banker"}
-  code={`var seats int64
-atomic.AddInt64(&seats, 5)
-atomic.AddInt64(&seats, 3)
-fmt.Println(atomic.LoadInt64(&seats))`}
-  options={["8", "5", "3", "53"]}
-  answer={0}
-  output={`8`}
-  explain={"atomic.AddInt64 increments without a lock and without a lost-update race; the two adds compose to 8. For a single counter (like seats booked), atomics are cheaper than a mutex \u2014 but for multi-field invariants you still need a lock."}
+  prompt={"Three replicas of the booking service, each with a correct, mutex-protected in-memory store, behind a round-robin load balancer. 1,000 customers try to hold seat A7 at once. How many are told they got it?"}
+  role={"worker"}
+  code={`// 3 processes, each with its own:
+type MemoryStore struct {
+	mu    sync.Mutex
+	seats map[string]entry
+}`}
+  options={["1", "3", "about 333", "0: they deadlock"]}
+  answer={1}
+  output={`1000 customers, 3 replica(s): 3 got the seat, 997 were told it's taken, 0 errors`}
+  explain={"Each replica's mutex works perfectly, for that replica. Each map starts empty, so the first request to reach each process wins there. Measured: three customers each think A7 is theirs. Stop 4 runs it."}
 />
 
 ## The problem & the design
 
-Let me set the scene precisely, because the scenario matters.
+*Stop 1 of 6.*
 
-**Meridian Pay is the payment rail for a cinema's online checkout.** Every "confirm booking" call flows through Meridian to charge the card. The cinema front-end handles the seat selection UI; Meridian handles the money. That means Meridian's correctness guarantee — no double-spend — must extend to the cinema's seat inventory. If two users book A7 and both payments go through, Meridian has failed *and* the cinema has double-sold a seat. These failures compose.
+### Step 1: what we're building
 
-The double-booking problem is structurally identical to the two-transfers-on-one-balance race:
+A cinema shows *Inception* in a hall of 40 seats (rows A to E, seats 1 to 8) and *Dune* in one of 24. A customer's journey is three calls:
 
-- **In the ledger**: two goroutines read balance `5000`, both compute `5000 - 3000 = 2000`, both write back. One transfer's effect is silently overwritten. Money appears from thin air.
-- **In the cinema**: two goroutines read seat A7 as `available`, both decide "nobody has it, I'll take it," both write `booked`. One booking's write is silently overwritten. A7 gets sold twice.
+1. **Hold**: "reserve A7 for me while I pay." It fails if anyone else holds or has booked A7. A hold expires on its own after a couple of minutes, so a customer who closes the tab doesn't lock the seat forever.
+2. **Confirm**: "I've paid, make A7 mine." It must succeed only if *this* customer still holds A7.
+3. **Release**: "I changed my mind." It must free the seat only if *this* customer holds it.
 
-The read-modify-write is unprotected in both cases. The fix is the same in both cases. Keep that tie-back in your head for the whole chapter — it's the same instinct you're hardening.
+The service is a Go module, `cinema`:
 
-### The UI: two films, a grid of seats
+```text
+cinema/
+├── booking/            the domain: Store interface, MemoryStore, RedisStore
+├── cmd/cinema/         the HTTP server and the seat-map page (index.html, embedded)
+└── cmd/rush/           a load test: N customers, one seat, at the same instant
+```
 
-We'll model two films:
+To run it you need Go and Docker (for Redis):
 
-- **Inception** — 5 rows × 8 columns = 40 seats, IDs `"A1"` through `"E8"`
-- **Dune Part Three** — 4 rows × 6 columns = 24 seats, IDs `"A1"` through `"D6"`
+```text
+$ docker run -d --name cinema-redis -p 127.0.0.1:6390:6379 redis:8-alpine
+$ go run ./cmd/cinema -store redis
+2026/09/27 01:05:25 cinema on http://127.0.0.1:8091, store=redis, holds last 2m0s
+```
 
-A seat ID is `"{row}{column}"` — `"A3"` means row A, column 3. Simple, no magic.
+Open `http://127.0.0.1:8091`, click a green seat, and it turns amber with your outline; pay, and it goes grey. Open a second tab and you're a second customer, who sees your hold appear within a second.
 
-Before a single line of Go, *watch the problem happen* — two users, one seat, no coordination — and then watch the lock fix it:
+### Step 2: the results, up front
 
-<Scene
-  title="Two users, one seat — the double-booking"
-  actors={[{ id: "u1", label: "User 1" }, { id: "u2", label: "User 2" }, { id: "pay", label: "Meridian Pay" }]}
-  rows={2}
-  cols={6}
-  frames={[
-    { caption: "Inception, row A–B. Seat A3 is free. Two users are both looking at it.", beat: "neutral",
-      cells: [{ id: "A3", state: "idle" }] },
-    { caption: "Both click A3 in the same instant. Each one's request reads the seat as 'available'.", beat: "problem",
-      actors: [{ id: "u1", state: "active" }, { id: "u2", state: "active" }],
-      cells: [{ id: "A3", state: "warn" }] },
-    { caption: "No lock: both requests decided 'nobody has it' and both wrote 'booked'. One write silently overwrote the other — A3 is sold twice.", beat: "problem",
-      cells: [{ id: "A3", state: "bad", label: "✕✕" }] },
-    { caption: "Both users reach Meridian Pay to confirm — and Meridian charges two cards for one seat. The failures compose.", beat: "problem",
-      actors: [{ id: "pay", state: "bad" }],
-      cells: [{ id: "A3", state: "bad", label: "✕✕" }] },
-    { caption: "The fix: a lock serialises the contenders. User 1 takes the lock, books A3, pays. User 2 finds it taken — before any card is charged.", beat: "solution",
-      actors: [{ id: "u1", state: "ok" }, { id: "u2", state: "idle" }, { id: "pay", state: "ok" }],
-      cells: [{ id: "A3", state: "done", label: "U1" }] },
-  ]}
-  caption="This is the two-transfers-on-one-Meridian-balance race wearing a cinema seat. One resource, two unsynchronised writers — and the same fix."
-/>
+Every row is the same `rush` load test: 1,000 customers, one seat, all released at the same instant.
 
-### The design escalation
+| store | where it runs | customers told they got A7 |
+|---|---|---|
+| map, no lock | 1 process, via HTTP | 1 (three runs), but `-race` reports the race |
+| map, no lock | 1,000 goroutines calling it directly | the process died: `fatal error: concurrent map writes` |
+| map + mutex | 1 process | 1 |
+| map + mutex | 3 replicas | **3** |
+| Redis | 3 replicas | 1 |
 
-This is the chapter's core pedagogical arc, and it maps directly onto real engineering history. Let me walk it:
-
-**Stage 1 — A single physical ticket counter.** One person handles all bookings. Correct: no two customers can be served simultaneously, so no double-booking. Problem: doesn't scale. The queue stretches around the block during a blockbuster opening.
-
-**Stage 2 — Two parallel counters.** Open a second window. Faster — but now two clerks can *simultaneously* reach for the last seat, both mark it sold, and hand out two receipts. Uncoordinated parallelism breaks correctness. This is `go deposit(100, &wg)` all over again.
-
-**Stage 3 — A coordinator in the middle.** One master list. Clerks must check with the coordinator before marking a seat. The coordinator serializes conflicting requests. Slower than fully parallel, but correct. This is the mutex.
-
-**Stage 4 — Online booking.** The internet scales out the counters across many servers. Now the coordinator can't be an in-process mutex — it needs to be a shared external store. Enter Redis.
-
-The progression is: **correct → fast-but-broken → correct-again-with-mutex → distributed-correct-with-Redis.**
-
-And because cinema seat selection is high-contention by design (every seat in a sold-out hall is a contested resource), we'll choose **pessimistic locking** over optimistic. We'll discuss that tradeoff in Store v2.
-
-Now watch the uncoordinated race in action:
-
-<ExecTimeline
-  title="Two users racing on seat A7 — no coordination"
-  lanes={[
-    { id: "u1", label: "User 1 goroutine" },
-    { id: "u2", label: "User 2 goroutine" },
-    { id: "store", label: "MemoryStore map" }
-  ]}
-  steps={[
-    { lane: "u1", kind: "run", label: "read A7 → available", note: "User 1 checks the map: seat A7 is not in the bookings map. It looks free." },
-    { lane: "u2", kind: "run", label: "read A7 → available", note: "User 2 ALSO checks: A7 still not in the map. Also looks free. This is the race — both read before either writes." },
-    { lane: "u1", kind: "send", label: "write A7 = booking#1", note: "User 1 writes booking #1 for A7. Correct so far." },
-    { lane: "u2", kind: "send", label: "write A7 = booking#2", note: "User 2 ALSO writes booking #2 for A7 — silently overwrites #1. Double booking achieved." },
-    { lane: "store", kind: "done", label: "A7 has two owners", note: "The map holds only booking #2. Booking #1 is gone. Two tickets printed. One angry customer." }
-  ]}
-  caption="The gap between read and write is the race. Both goroutines see 'available,' both decide to book, both write. One wins the map slot; the other's booking is overwritten but the payment already went through."
-/>
+And the bug that isn't about concurrent clicks at all: with holds lasting 1 second, a customer whose hold expired mid-payment and whose confirm then arrived late, **took the seat** from the customer who held it next, with the "store it in Redis" code most tutorials show. Both were charged. Stop 5 reproduces it and fixes it with two Redis commands.
 
 <QuickCheck
-  question="The double-booking race and the double-spend balance race are structurally identical. What is the shared root cause?"
+  question="Why does 'hold' need to expire on its own?"
   options={[
-    "Both use Go maps, which are always unsafe",
-    "An unprotected read-modify-write across multiple goroutines with no synchronization",
-    "Both forget to check for nil",
-    "The Go scheduler preempts at inconvenient times"
+    "To save memory in Redis",
+    "Because customers abandon checkout (close the tab, lose signal), and without expiry their seats would stay locked with nobody paying for them",
+    "Because Redis requires a TTL on every key",
+    "To make confirm faster"
   ]}
   answer={1}
-  explain="The root cause is always an unprotected read-modify-write. One goroutine reads state, a second goroutine reads the same state before the first writes back, and both proceed as if they won. The fix — in both domains — is to serialize the check-and-write under a lock."
+  explain="An abandoned hold is a seat nobody can buy. A TTL frees it automatically, with no cleanup job that could itself fail. The cost, as stop 5 shows, is that a slow customer can now come back after their hold is gone."
 />
 
 ## Domain & architecture
 
-Before we write a single store, we design the domain. This is the architecture pattern Tiago's build uses, and it's the right one: **repository pattern + clean layered architecture + dependency injection.**
+*Stop 2 of 6.*
 
-<Define term="Repository pattern" since="Software Design & Architecture (Part 1)">
-The **repository pattern** wraps your storage details — a map, a Postgres table, a Redis key — behind a stable Go interface. The business layer calls `store.Book(b)` and never touches a raw map or a Redis command directly. This lets you swap the storage implementation (memory → mutex → Redis) without touching any caller. Every layer talks to the interface; only the constructor knows the concrete type.
-</Define>
+### Step 1: the types and the Store interface
 
-<Define term="Dependency injection" since="Software Design & Architecture (Part 1)">
-**Dependency injection** means a component receives its dependencies at construction time instead of creating them itself. `NewService(store BookingStore)` takes the store as an argument — the caller decides which implementation to pass. The payoff: tests pass a fast in-memory store; production passes the Redis store. No `if testing.Testing()` branches inside the component, no global variables to swap out.
-</Define>
+Everything the HTTP layer knows about storage is this file:
 
-### The domain types
-
-```go
-package booking
-
-import "errors"
-
-// Booking represents a confirmed or held seat reservation.
-type Booking struct {
-	ID      string // unique booking ID, e.g. "bk-uuid"
-	MovieID string // e.g. "inception"
-	SeatID  string // e.g. "A7" (row + column)
-	UserID  string // the customer
-	Status  string // "held", "confirmed", "released"
-}
-
-// ErrSeatAlreadyBooked is the sentinel error returned when a seat
-// is unavailable. Callers check for it with errors.Is.
-var ErrSeatAlreadyBooked = errors.New("seat already booked")
-```
-
-The sentinel error is load-bearing. It lets callers distinguish "seat taken" (a business-logic result worth surfacing to the user) from unexpected errors like database failures. `errors.Is` + a sentinel is the Go idiom; we don't use string comparison.
-
-### The BookingStore interface
-
-```go
-// BookingStore is the repository interface every store implementation must satisfy.
-// The Service depends on this interface, never on a concrete type.
-type BookingStore interface {
-	Book(b Booking) (Booking, error)
-	ListBookings(movieID string) ([]Booking, error)
-}
-```
-
-Two methods. That's it. Go interfaces are small by convention — only what the consumer needs. This interface has exactly what the `Service` layer requires and nothing else.
-
-### The Service layer
-
-```go
-// Service implements booking business logic.
-// It depends on a BookingStore — injected at construction, never hard-coded.
-type Service struct {
-	store BookingStore
-}
-
-// NewService creates a Service with the given store.
-// Swap the store implementation (memory → concurrent → Redis) without
-// changing a single line of Service code. That's dependency injection.
-func NewService(store BookingStore) *Service {
-	return &Service{store: store}
-}
-
-func (s *Service) BookSeat(b Booking) (Booking, error) {
-	return s.store.Book(b)
-}
-
-func (s *Service) GetMovieBookings(movieID string) ([]Booking, error) {
-	return s.store.ListBookings(movieID)
-}
-```
-
-### Why dependency injection matters here
-
-The `Service` doesn't know whether the store is in-memory, mutex-guarded, or Redis-backed. It doesn't care. It calls `store.Book(b)` and gets back a `(Booking, error)`. You swap the store by passing a different implementation to `NewService`. The service's test suite runs against a `MemoryStore` (fast, no external deps). Production uses `RedisStore`. Integration tests use `ConcurrentStore`.
-
-This is **implicit interface satisfaction** — Go's magic. `ConcurrentStore` doesn't declare `implements BookingStore`. It just provides `Book` and `ListBookings` with matching signatures, and the compiler verifies the contract at the assignment site. No `implements` keyword, no ceremony.
-
-<ConceptGrid cols={3}>
-  <ConceptCard label="Repository pattern">The store interface hides storage details behind a stable API. The business layer never touches maps, Redis commands, or SQL directly.</ConceptCard>
-  <ConceptCard label="Dependency injection">Pass concrete implementations at construction time. Swap them for tests, different environments, or A/B experiments — no changes to callers.</ConceptCard>
-  <ConceptCard label="Implicit satisfaction">In Go, a type satisfies an interface by having the right method signatures — no declaration needed. The compiler checks it at the assignment site.</ConceptCard>
-  <Gotcha>Never embed a concrete type in Service. If Service holds a `*ConcurrentStore` instead of a `BookingStore`, you cannot swap it for tests or Redis without touching Service. Depend on the interface, always.</Gotcha>
-</ConceptGrid>
-
-<UnderTheHood title="How Go verifies interface satisfaction at compile time">
-
-When you write `var _ BookingStore = (*MemoryStore)(nil)` (a common idiom for a compile-time assertion), the compiler checks that `*MemoryStore` implements `BookingStore` without running any code. Internally, it compares the concrete type's method set with the interface's required method set. At runtime, a non-empty interface value carries type metadata plus the concrete value, and dynamic dispatch uses runtime metadata to find the right method. The exact layout and caching strategy are implementation details, but the stable rule is simple: small consumer-owned interfaces are cheap enough for normal service code, and the compiler can sometimes devirtualize calls when the concrete type is known.
-
-</UnderTheHood>
-
-## Store v1 — in-memory and the race
-
-<Define term="Data race" since="Advanced Concurrency & Correctness (Part 2)">
-A **data race** is when two goroutines access the same memory location concurrently, at least one of the accesses is a write, and there is no synchronisation between them. The result is not governed by a happens-before edge — the outcome depends on which goroutine wins the scheduler lottery and what values the memory model permits the read to observe. In Go, the race detector (`-race`) instruments every memory access and fires the instant it detects unsynchronised concurrent access. A data race is not just a timing bug you can fix by running faster: it is a correctness violation that can silently corrupt data, panic the process, or produce wrong answers that look plausible.
-
-**On the job:** a data race on a booking map means two payments go through for one seat. Meridian charges two cards; neither customer gets a valid ticket. Races in financial code are refund incidents.
-</Define>
-
-Here's the simplest store. It compiles. It looks fine. It is a ticking clock.
-
-```go
-package booking
-
-import "fmt"
-
-// MemoryStore is an unsynchronized in-memory store.
-// DO NOT use this in concurrent code — it has a data race.
-type MemoryStore struct {
-	bookings map[string]Booking // keyed by seatID within a movie
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
-		bookings: make(map[string]Booking),
-	}
-}
-
-// Book checks if the seat is taken, then books it.
-// BUG: the check and the write are not atomic — this is the race.
-func (s *MemoryStore) Book(b Booking) (Booking, error) {
-	key := fmt.Sprintf("%s:%s", b.MovieID, b.SeatID)
-	if _, exists := s.bookings[key]; exists {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-	s.bookings[key] = b
-	return b, nil
-}
-
-func (s *MemoryStore) ListBookings(movieID string) ([]Booking, error) {
-	var result []Booking
-	for _, b := range s.bookings {
-		if b.MovieID == movieID {
-			result = append(result, b)
-		}
-	}
-	return result, nil
-}
-```
-
-Now the concurrency test. We fire 100,000 goroutines, all trying to book the same seat (`"inception:A7"`). With a correct implementation exactly one should succeed. With `MemoryStore`, things go wrong.
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"errors"
-	"fmt"
-	"sync"
-	"sync/atomic"
-)
-
-// --- domain ---
-
-type Booking struct {
-	ID      string
-	MovieID string
-	SeatID  string
-	UserID  string
-	Status  string
-}
-
-var ErrSeatAlreadyBooked = errors.New("seat already booked")
-
-// --- MemoryStore (racy) ---
-
-type MemoryStore struct {
-	bookings map[string]Booking
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{bookings: make(map[string]Booking)}
-}
-
-func (s *MemoryStore) Book(b Booking) (Booking, error) {
-	key := b.MovieID + ":" + b.SeatID
-	if _, exists := s.bookings[key]; exists {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-	s.bookings[key] = b
-	return b, nil
-}
-
-// --- race demo ---
-
-func main() {
-	store := NewMemoryStore()
-	const N = 1000 // reduced for playground; use 100_000 locally with -race
-
-	var (
-		wg        sync.WaitGroup
-		successes atomic.Int64
-	)
-
-	for i := range N {
-		wg.Go(func() {
-			b := Booking{
-				ID:      fmt.Sprintf("bk-%d", i),
-				MovieID: "inception",
-				SeatID:  "A7",
-				UserID:  fmt.Sprintf("user-%d", i),
-				Status:  "confirmed",
-			}
-			if _, err := store.Book(b); err == nil {
-				successes.Add(1)
-			}
-		})
-	}
-	wg.Wait()
-
-	fmt.Printf("goroutines: %d  successes: %d\n", N, successes.Load())
-	if successes.Load() == 1 {
-		fmt.Println("PASS: exactly one booking succeeded")
-	} else {
-		fmt.Printf("FAIL: %d bookings succeeded — double-booking occurred!\n", successes.Load())
-	}
-}
-```
-
-</GoPlayground>
-
-Run that locally with `go run -race main.go` and you'll see the race detector fire immediately:
-
-```
-==================
-WARNING: DATA RACE
-Read at 0x... by goroutine 42:
-  main.(*MemoryStore).Book()
-      main.go:32
-
-Previous write at 0x... by goroutine 41:
-  main.(*MemoryStore).Book()
-      main.go:35
-==================
-```
-
-**Go maps are not concurrency-safe.** This is documented and deliberately guarded in common cases — the runtime often detects concurrent map writes or read/write races and terminates the program. The race detector is the tool that catches the data race reliably in tests. Two goroutines reading and writing the same map key — the seatID — is the same hazard as two goroutines reading and writing the same `balance` integer. Same bug. Different field name.
-
-<Callout kind="warn" title="Go maps are not safe for concurrent use">
-
-The Go runtime deliberately detects many concurrent map misuse cases and reports fatal errors such as `"concurrent map writes"` or `"concurrent map read and map write"`. A concurrent read and write is still a data race; use `-race` to catch it reliably. The fix is not to rely on runtime detection, and not automatically to use `sync.Map` — it is to wrap your map with a `sync.RWMutex` so you control the locking semantics precisely. We'll do that next.
-
-</Callout>
-
-<ExecTimeline
-  title="Two goroutines racing on the MemoryStore map"
-  lanes={[
-    { id: "g1", label: "goroutine 1" },
-    { id: "g2", label: "goroutine 2" }
-  ]}
-  steps={[
-    { lane: "g1", kind: "run", label: "read map[inception:A7]", note: "Goroutine 1 reads the map: key not found, seat appears available." },
-    { lane: "g2", kind: "run", label: "read map[inception:A7]", note: "Goroutine 2 ALSO reads: key still not found. Both goroutines now believe the seat is free." },
-    { lane: "g1", kind: "send", label: "write map[inception:A7]=bk-1", note: "Goroutine 1 writes booking bk-1 to the map." },
-    { lane: "g2", kind: "send", label: "write map[inception:A7]=bk-2", note: "Goroutine 2 ALSO writes bk-2 — overwriting bk-1. Data race detected by -race." },
-    { lane: "g2", kind: "done", label: "two successes returned", note: "Both Book() calls returned nil error. Seat A7 is double-booked. This is the ledger race, new skin." }
-  ]}
-  caption="The map read and write are separate operations. The scheduler can preempt between them. That gap is the race — and it's the same gap from the balance chapter."
-/>
-
-<ELI5
-  concept="Why the in-memory store races"
-  analogy="Two people writing the last seat number on the same whiteboard at once."
-  role="reader"
->
-
-The v1 store looks obviously correct: check whether the seat is free, then mark it taken. Two lines, read then write.
-
-That gap between them is the bug. Two requests for the last seat can both run the check before either runs the write. Both see "free", both write "taken", and the cinema has sold one seat twice. Nothing errored, and the code reads exactly like the rule it is implementing.
-
-This is the same shape as the lost update in the ledger chapter, and it is worth noticing that it appears here in plain Go with no database involved. The pattern is not about databases — it is about any check-then-act on shared state.
-
-A mutex closes it by making the pair **atomic**: hold the lock across *both* the check and the write, so no other goroutine can act in between. Not a lock around the check, and not one around the write — one lock spanning the decision and its consequence.
-
-And that is why `go test -race` matters more than the tests passing. A racing booking store will pass functional tests all day, because tests usually do one thing at a time. The race detector finds it whether or not the run produced a wrong answer.
-
-</ELI5>
-
-## Store v2 — pessimistic locking
-
-<Define term="Mutex / sync.RWMutex" since="Advanced Concurrency & Correctness (Part 2)">
-A **mutex** (mutual exclusion lock) is a synchronisation primitive that allows only one goroutine at a time to execute a protected section of code. Any goroutine that tries to acquire the lock while another holds it blocks — it parks and waits until the lock is released. This serialises concurrent accesses and closes the race gap.
-
-`sync.RWMutex` is Go's read-write variant. It has two modes: `mu.Lock()` / `mu.Unlock()` for **exclusive write access** (one holder, all others blocked), and `mu.RLock()` / `mu.RUnlock()` for **shared read access** (many holders allowed simultaneously, as long as no writer holds the lock). Use `Lock` when you modify shared state; use `RLock` when you only read it. The result: reads scale horizontally while writes remain serialised and safe.
-
-**On the job:** forget the mutex and two goroutines silently overwrite each other's booking. Add it and the check-then-write becomes atomic from every other goroutine's perspective — exactly one goroutine can be inside `Book` at a time.
-</Define>
-
-The fix is the same fix from the balance chapter: a `sync.RWMutex`. The `ConcurrentStore` is identical logic to `MemoryStore`, plus one embedded mutex and three lines of locking discipline.
-
-Here's what that mutex does to the double-booking, seat by seat:
-
-<LockAnim
-  title="Seat G7 on premiere night — two buyers, one lock"
-  resource="seat G7"
-  frames={[
-    {
-      note: "Premiere night. Seat G7 is free. Buyer A and buyer B both tap 'Book' within the same millisecond — two goroutines heading for the same map entry.",
-      waiting: [],
-      value: "free"
-    },
-    {
-      note: "Without the mutex both goroutines pass the 'is it free?' check simultaneously — both see 'free', both write their booking. B's write lands last and silently overwrites A. Two people, one seat, refunds at the door.",
-      beat: "problem",
-      holder: "A + B (!)",
-      waiting: [],
-      value: "booked ×2 ✗",
-      corrupted: true
-    },
-    {
-      note: "With mu.Lock() the check-then-write is one atomic unit. Buyer A's goroutine takes the lock and enters; buyer B's goroutine blocks at the door — parked free of charge by the runtime.",
-      beat: "solution",
-      holder: "buyer A",
-      waiting: ["buyer B"],
-      value: "free → held(A)"
-    },
-    {
-      note: "A books G7 and unlocks. ONLY NOW does B enter — and its 'is it free?' check sees held(A) and correctly fails with ErrSeatTaken. No double-booking possible, by construction.",
-      beat: "solution",
-      holder: "buyer B",
-      waiting: [],
-      value: "held(A) — B rejected"
-    }
-  ]}
-  caption="The mutex makes check-then-write atomic: B can't even LOOK at the seat until A's booking is complete. Same race as two transfers on one balance — same cure."
-/>
-
-```go
-package booking
-
-import (
-	"fmt"
-	"sync"
-)
-
-// ConcurrentStore is a thread-safe in-memory store backed by sync.RWMutex.
-// Book() acquires a write lock (exclusive). ListBookings() acquires a read lock
-// (shared — many concurrent reads are fine; they only block on writes).
-type ConcurrentStore struct {
-	mu       sync.RWMutex
-	bookings map[string]Booking
-}
-
-func NewConcurrentStore() *ConcurrentStore {
-	return &ConcurrentStore{
-		bookings: make(map[string]Booking),
-	}
-}
-
-func (s *ConcurrentStore) Book(b Booking) (Booking, error) {
-	s.mu.Lock()         // exclusive write lock
-	defer s.mu.Unlock() // released when Book returns
-
-	key := fmt.Sprintf("%s:%s", b.MovieID, b.SeatID)
-	if _, exists := s.bookings[key]; exists {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-	s.bookings[key] = b
-	return b, nil
-}
-
-func (s *ConcurrentStore) ListBookings(movieID string) ([]Booking, error) {
-	s.mu.RLock() // shared read lock — multiple readers OK simultaneously
-	defer s.mu.RUnlock()
-
-	var result []Booking
-	for _, b := range s.bookings {
-		if b.MovieID == movieID {
-			result = append(result, b)
-		}
-	}
-	return result, nil
-}
-```
-
-The critical insight: `mu.Lock()` before the read *and* the write. The lock serializes the entire check-then-write sequence — no goroutine can interleave between the "is it available?" check and the "write the booking" step. The race gap is closed.
-
-Swap it into the same goroutine test via dependency injection — nothing changes in the test logic, only the store passed to `NewService`:
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"errors"
-	"fmt"
-	"sync"
-	"sync/atomic"
-)
-
-// --- domain ---
-
-type Booking struct {
-	ID      string
-	MovieID string
-	SeatID  string
-	UserID  string
-	Status  string
-}
-
-var ErrSeatAlreadyBooked = errors.New("seat already booked")
-
-// --- ConcurrentStore (race-free) ---
-
-type ConcurrentStore struct {
-	mu       sync.RWMutex
-	bookings map[string]Booking
-}
-
-func NewConcurrentStore() *ConcurrentStore {
-	return &ConcurrentStore{bookings: make(map[string]Booking)}
-}
-
-func (s *ConcurrentStore) Book(b Booking) (Booking, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := b.MovieID + ":" + b.SeatID
-	if _, exists := s.bookings[key]; exists {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-	s.bookings[key] = b
-	return b, nil
-}
-
-func (s *ConcurrentStore) ListBookings(movieID string) ([]Booking, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var result []Booking
-	for _, b := range s.bookings {
-		if b.MovieID == movieID {
-			result = append(result, b)
-		}
-	}
-	return result, nil
-}
-
-// --- 100k goroutine race test ---
-
-func main() {
-	store := NewConcurrentStore()
-	const N = 100_000
-
-	var (
-		wg        sync.WaitGroup
-		successes atomic.Int64
-	)
-
-	for i := range N {
-		wg.Go(func() {
-			b := Booking{
-				ID:      fmt.Sprintf("bk-%d", i),
-				MovieID: "inception",
-				SeatID:  "A7",
-				UserID:  fmt.Sprintf("user-%d", i),
-				Status:  "confirmed",
-			}
-			if _, err := store.Book(b); err == nil {
-				successes.Add(1)
-			}
-		})
-	}
-	wg.Wait()
-
-	fmt.Printf("goroutines: %d  successes: %d\n", N, successes.Load())
-	if successes.Load() == 1 {
-		fmt.Println("PASS: exactly one booking succeeded — mutex held the line")
-	} else {
-		fmt.Printf("FAIL: %d bookings succeeded\n", successes.Load())
-	}
-}
-```
-
-</GoPlayground>
-
-Run this with `go run -race main.go` — the race detector is silent. Exactly one goroutine succeeds. The mutex serialized 100,000 concurrent attempts on one seat to a single winner.
-
-<ExecTimeline
-  title="RWMutex serializing two goroutines on seat A7"
-  lanes={[
-    { id: "g1", label: "goroutine 1" },
-    { id: "g2", label: "goroutine 2" }
-  ]}
-  steps={[
-    { lane: "g1", kind: "run", label: "mu.Lock() — acquired", note: "Goroutine 1 acquires the write lock. The seat map is now exclusively owned by G1." },
-    { lane: "g2", kind: "block", label: "mu.Lock() — blocked", note: "Goroutine 2 calls Lock() and immediately parks — G1 holds it. No race possible." },
-    { lane: "g1", kind: "run", label: "read + write A7=bk-1", note: "G1 safely checks 'not exists' and writes booking #1. No interleaving possible." },
-    { lane: "g1", kind: "done", label: "mu.Unlock() — released", note: "G1 defers Unlock on return. The lock is released. G2 unparks." },
-    { lane: "g2", kind: "run", label: "read A7 → exists", note: "G2 acquires the lock, reads the map: A7 is already booked. Returns ErrSeatAlreadyBooked." },
-    { lane: "g2", kind: "done", label: "returns error", note: "One winner, one seat. The mutex closed the race gap. This is the balance fix, new domain." }
-  ]}
-  caption="The write lock is a turnstile. One goroutine passes; all others queue. The check-and-write is atomic from the perspective of every other goroutine."
-/>
-
-### `RWMutex`: write-lock vs read-lock
-
-`sync.RWMutex` has two lock modes:
-- **`mu.Lock()` / `mu.Unlock()`** — exclusive write lock. Only one goroutine holds it at a time. All other callers (readers *and* writers) block.
-- **`mu.RLock()` / `mu.RUnlock()`** — shared read lock. Any number of goroutines can hold a read lock simultaneously — reads don't block each other. But a pending write lock blocks all new read locks, and vice versa.
-
-For `ListBookings` (read-only), `RLock` lets hundreds of concurrent seat-map polls proceed without blocking each other. For `Book` (read+write), `Lock` serializes everything. This is the right tradeoff for a cinema: reads are frequent (every user polling for available seats), writes are rare (actual bookings).
-
-<BeforeAfter
-  badLabel="Plain Mutex — over-serializes reads"
-  goodLabel="RWMutex — reads flow freely"
-  bad={`func (s *Store) ListBookings(id string) []Booking {
-  s.mu.Lock()
-  defer s.mu.Unlock()
-  // all readers serialize — unnecessary
-  return s.filter(id)
-}`}
-  good={`func (s *Store) ListBookings(id string) []Booking {
-  s.mu.RLock()
-  defer s.mu.RUnlock()
-  // readers run concurrently; writes still exclusive
-  return s.filter(id)
-}`}
-/>
-
-### Pessimistic vs optimistic locking
-
-<Define term="Pessimistic locking" since="Transactions, Consistency & Sagas (Part 3)">
-**Pessimistic locking** assumes contention will happen and acquires a lock *before* even reading the shared state. No other goroutine can touch the data while you hold the lock. Cost: every access pays the lock-acquisition overhead, even when nobody is actually contending. Benefit: zero retry storms, clean single-winner semantics, and simple code. This is what `sync.RWMutex.Lock()` does, and it is what `SELECT ... FOR UPDATE` does in a database.
-</Define>
-
-<Define term="Optimistic locking" since="Transactions, Consistency & Sagas (Part 3)">
-**Optimistic locking** assumes contention is rare and reads without a lock. When it's time to write, it does a compare-and-swap: "write only if nobody changed the value since I read it." If someone did change it, the operation retries from scratch. Cost: under high contention, many goroutines spin-retry and burn CPU. Benefit: reads are lock-free and fast under low contention. Go's `atomic.CompareAndSwap` and database `WHERE version = $old_version` UPDATE patterns are optimistic.
-</Define>
-
-We chose **pessimistic locking** for cinema seats. Here's the reasoning:
-
-- **Pessimistic** (what we built): assume contention will happen; lock before you even check. Cost: lock acquisition on every `Book` call, even if uncontested. Benefit: zero double-bookings, no retry storms. The UX is clean — you either get the seat or you don't, atomically.
-- **Optimistic** (what we didn't build): read without locking, compute the new state, then write with a compare-and-swap that fails if somebody else changed it in the meantime. Cost: you may retry; under high contention, retry storms can be worse than just locking. Benefit: better throughput at low contention.
-
-For a sold-out opening-night showing, contention is high by design — dozens of users competing for the last row J seats. Pessimistic is the right call. For a quiet Tuesday matinee, optimistic would be fine. The Transactions, Consistency & Sagas chapter covers optimistic locking with version columns and compare-and-swap in databases — read it when you're designing your next inventory system.
-
-<Callout kind="pro" title="go vet catches mutex copies">
-
-The `go vet` `waitgroup` analyzer (shipped in Go 1.25) and the existing `copylocks` analyzer both fire if you accidentally copy a `sync.RWMutex` — passing a `ConcurrentStore` by value instead of by pointer, for instance. Never copy a mutex. Embed it by value in the struct, pass the struct by pointer. `go vet ./...` in CI catches this.
-
-</Callout>
-
-<QuickCheck
-  question="Why does ListBookings use RLock() instead of Lock() in ConcurrentStore?"
-  options={[
-    "RLock is faster and we don't care about correctness for reads",
-    "Multiple goroutines can hold a read lock simultaneously — reads don't race with reads, only with writes",
-    "RLock prevents writes from occurring while we read",
-    "Lock() would cause a deadlock if called from ListBookings"
-  ]}
-  answer={1}
-  explain="sync.RWMutex allows many concurrent read-holders (RLock). Reads don't race with reads — only a write racing with anything is dangerous. Using RLock for read-only operations lets hundreds of concurrent seat polls proceed without serializing each other, while Book's exclusive Lock still blocks all concurrent access."
-/>
-
-<UnderTheHood title="sync.RWMutex internals: the readerCount and writerSem">
-
-`sync.RWMutex` is implemented in `sync/rwmutex.go`. It contains a regular `sync.Mutex` (the write lock), an atomic `readerCount` int32, a `readerWait` int32, and two semaphores (`writerSem`, `readerSem`).
-
-**RLock path (Go 1.26):** atomically increments `readerCount`. If the result is negative (a write lock is pending — the writer set `readerCount -= rwmutexMaxReaders`), the reader parks on `readerSem`. Otherwise, it proceeds immediately. No OS call in the uncontested case — just an atomic add.
-
-**Lock path (write):** acquires the embedded `Mutex` (exclusive with other writers), then sets `readerCount -= rwmutexMaxReaders` to signal pending writers to readers. It then waits for any active readers (`readerWait`) to drain via `writerSem`. This makes `RWMutex` **write-preferring**: once a writer is waiting, new readers queue behind it — preventing writer starvation under sustained read load.
-
-**When to prefer `RWMutex` over `Mutex`:** when reads significantly outnumber writes and read critical sections are non-trivial (e.g., iterating a map). For a single counter (`balance += amount`), a plain `Mutex` or `atomic.Int64` is cheaper. For `ListBookings` scanning a large map under read-heavy cinema traffic, `RWMutex` is the right tool.
-
-</UnderTheHood>
-
-## Store v3 — Redis distributed holds
-
-The `ConcurrentStore` works perfectly for a single process. But what happens when the cinema scales to three booking-service replicas behind a load balancer? Each replica has its own in-memory map, protected by its own mutex — and they know nothing about each other. User 1 hits replica 1, books A7; User 2 hits replica 2, *also* books A7 from its own empty map. Double-booking is back.
-
-The fix: move the shared state out of the process and into a shared external store. **Redis** is the canonical choice for distributed locking and short-lived state.
-
-<Define term="Redis" since="Caching & Redis (Part 1)">
-**Redis** is an in-memory key-value store. Every key maps to a value (a string, list, hash, sorted set, etc.) and operations on individual keys are atomic — Redis's command executor is single-threaded, so two commands on the same key cannot interleave. Redis is used here for two reasons: (1) it is shared across all replicas, so a lock in Redis is visible to every booking-service process, and (2) keys can carry a **TTL** (time-to-live) so temporary holds auto-expire without a cleanup job.
-
-**On the job:** without a shared external store, running two replicas means two isolated mutex-guarded maps — and a double-booking the moment two users hit different replicas for the same seat.
-</Define>
-
-<Define term={`SET … NX EX and PERSIST`} since="Caching & Redis (Part 1)">
-These are three Redis commands combined into one atomic operation:
-
-- **`SET key value NX`** — "set this key only if it does **N**ot e**X**ist." If the key already exists, the command returns `nil` (not set). This is the distributed lock: only one caller can win.
-- **`EX seconds`** — attach a TTL. The key auto-deletes after `seconds` seconds. This is the hold timer: if the user abandons checkout, the seat unlocks automatically.
-- **`PERSIST key`** — remove the TTL from an existing key. Called on confirm: the hold becomes a permanent booking with no expiry.
-
-Together they implement the hold → confirm lifecycle entirely inside Redis, with no background cleanup job.
-</Define>
-
-### Why Redis for this
-
-- Redis is **single-threaded** for command execution. Two `SET NX` commands can't interleave. One wins, one doesn't — atomically, guaranteed.
-- Redis is **fast**: simple key operations are commonly sub-millisecond on a local network, though real latency depends on deployment, payload size, and load.
-- Redis **TTL** (`EX` / `EXPIRE`) gives us auto-expiring holds without a cleanup job.
-- Redis **survives replica restarts** (if configured with persistence) — in-process maps don't.
-
-### The checkout session: hold → confirm → release
-
-<Define term="Hold → confirm → release (checkout session pattern)">
-The **checkout session** (also called a "soft hold" or "reservation hold") is a three-step lifecycle for contested resources:
-
-1. **HOLD** — atomically claim the resource for a session ID and start a TTL countdown. Other requesters see it as unavailable. The user has not paid yet.
-2. **CONFIRM** — user completes payment. Make the hold permanent (remove the TTL, update status to `"confirmed"`). The resource is now owned.
-3. **RELEASE** — user cancels or navigates away before paying. Explicitly free the resource immediately, rather than waiting for the TTL to expire.
-
-The TTL is the key UX win: if the user abandons checkout (browser crash, tab closed, card declined), the hold expires automatically after the timeout and the seat re-enters the available pool. No admin intervention, no stuck seats, no "ghost bookings." The failure path is handled by the store's own time-based mechanism.
-</Define>
-
-Cinema and e-commerce seat selection uses this three-step pattern — the same one flight booking sites use. You've experienced it: "Seat B4 is held for you for 2 minutes. Complete your purchase before the timer runs out."
-
-The three operations:
-
-1. **HOLD** — atomically grab the seat for a session. If it's already held or confirmed, fail immediately. The hold has a TTL so abandoned selections auto-expire — no cleanup job needed.
-2. **CONFIRM** — user completes payment through Meridian Pay. Make the hold permanent.
-3. **RELEASE** — user cancels or navigates away. Immediately free the seat.
-
-Here's the Redis implementation. This is non-runnable (needs a Redis server), labeled accordingly:
-
-```go
-// store_redis.go — non-runnable without a Redis server.
-// Run: docker compose up (redis + redis-commander)
+```go noverify
+// Package booking holds seats for cinema customers while they pay, then
+// books them. Every Store implementation must give each seat at most one
+// holder at a time, however many requests arrive at once.
 package booking
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+)
+
+type Status string
+
+const (
+	Free   Status = "free"
+	Held   Status = "held"   // reserved while the customer pays; expires
+	Booked Status = "booked" // paid for; permanent
+)
+
+// Seat is one seat's state as the seat map shows it.
+type Seat struct {
+	ID     string `json:"id"`
+	Status Status `json:"status"`
+	User   string `json:"user,omitempty"`
+}
+
+var (
+	ErrTaken     = errors.New("seat is held or booked by someone else")
+	ErrNotHolder = errors.New("you don't hold this seat (or your hold expired)")
+	ErrNoSeat    = errors.New("no such movie or seat")
+)
+
+// Store is what the HTTP handlers depend on. Implementations: MemoryStore
+// (one process) and RedisStore (any number of processes).
+type Store interface {
+	Hold(ctx context.Context, movie, seat, user string, ttl time.Duration) error
+	Confirm(ctx context.Context, movie, seat, user string) error
+	Release(ctx context.Context, movie, seat, user string) error
+	Seats(ctx context.Context, movie string) ([]Seat, error)
+}
+
+// Halls: rows × seats per row for each film we're showing.
+var Halls = map[string]struct{ Rows, Cols int }{
+	"inception": {Rows: 5, Cols: 8}, // A1 … E8
+	"dune":      {Rows: 4, Cols: 6}, // A1 … D6
+}
+
+// SeatIDs lists a hall's seats in order: A1, A2, … B1, …
+func SeatIDs(movie string) ([]string, error) {
+	h, ok := Halls[movie]
+	if !ok {
+		return nil, ErrNoSeat
+	}
+	ids := make([]string, 0, h.Rows*h.Cols)
+	for r := range h.Rows {
+		for c := range h.Cols {
+			ids = append(ids, fmt.Sprintf("%c%d", 'A'+r, c+1))
+		}
+	}
+	return ids, nil
+}
+
+func validSeat(movie, seat string) bool {
+	ids, err := SeatIDs(movie)
+	if err != nil {
+		return false
+	}
+	for _, id := range ids {
+		if id == seat {
+			return true
+		}
+	}
+	return false
+}
+```
+
+Three things to notice:
+
+- **The errors are the API.** `ErrTaken` means "someone else got there first" and `ErrNotHolder` means "you're not (or no longer) the one holding it". The handlers turn both into HTTP 409, and anything else into 500. `errors.Is`, not string comparison.
+- **`Store` is the whole contract.** Four methods, each taking the customer's identity, each atomic with respect to the others. The handlers depend on this interface; `main` decides which implementation to pass in. That's **dependency injection**: swapping the in-memory store for Redis is a flag, not a rewrite, and tests can pass whichever store they like.
+- **The hall layout is fixed.** Seat IDs come from `Halls`, so `Seats` never has to search for keys (which matters in Redis, stop 5).
+
+### Step 2: why the interface is shaped like this
+
+A simpler design would be one method, `Book(seat)`. Real checkouts don't work like that: the time between "I want this seat" and "my card went through" is seconds to minutes, and during that time nobody else may take the seat, *and* the seat must come back if the customer disappears. That's why there are three operations and why each one names the user: `Confirm` and `Release` are only valid for the customer who holds the seat, and enforcing that is the store's job, not the handler's. The late-customer bug in stop 5 is exactly what happens when a store forgets it.
+
+<QuickCheck
+  question="The HTTP handlers depend on booking.Store, not *booking.RedisStore. What does that buy?"
+  options={[
+    "Faster method calls",
+    "The server can run with any store (memory for one process or tests, Redis for many replicas) chosen in main, and the handlers don't change",
+    "Redis connection pooling",
+    "Nothing; it's a style preference"
+  ]}
+  answer={1}
+  explain="That's dependency injection: main builds the store and hands it over. This chapter uses it to run the same server with four stores and compare them, and the handler test in stop 6 uses a MemoryStore with no Redis at all."
+/>
+
+## Store v1: a map without a lock
+
+*Stop 3 of 6.*
+
+### Step 1: the store
+
+The in-memory store keeps every seat in a map, keyed `"movie/seat"`. Each method does a **check** ("is this seat free?", "does this user hold it?") and then an **act** (write the map):
+
+```go noverify
+package booking
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// MemoryStore keeps seats in a map guarded by one mutex. It is correct
+// inside one process, and only inside one process.
+type MemoryStore struct {
+	mu    sync.Mutex
+	seats map[string]entry // "movie/seat" → state; guarded by mu
+	now   func() time.Time
+
+	// Unsafe skips the mutex. It exists only so the chapter can run this
+	// exact code without its lock and show what goes wrong.
+	Unsafe bool
+}
+
+type entry struct {
+	status  Status
+	user    string
+	expires time.Time // for holds
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{seats: map[string]entry{}, now: time.Now}
+}
+
+func (s *MemoryStore) lock() {
+	if !s.Unsafe {
+		s.mu.Lock()
+	}
+}
+
+func (s *MemoryStore) unlock() {
+	if !s.Unsafe {
+		s.mu.Unlock()
+	}
+}
+
+// current returns the seat's state, treating an expired hold as free.
+// The caller holds the lock.
+func (s *MemoryStore) current(key string) (entry, bool) {
+	e, ok := s.seats[key]
+	if ok && e.status == Held && !s.now().Before(e.expires) {
+		return entry{}, false
+	}
+	return e, ok
+}
+
+func (s *MemoryStore) Hold(_ context.Context, movie, seat, user string, ttl time.Duration) error {
+	if !validSeat(movie, seat) {
+		return ErrNoSeat
+	}
+	key := movie + "/" + seat
+	s.lock()
+	defer s.unlock()
+	if _, taken := s.current(key); taken { // check…
+		return ErrTaken
+	}
+	s.seats[key] = entry{status: Held, user: user, expires: s.now().Add(ttl)} // …then act
+	return nil
+}
+
+func (s *MemoryStore) Confirm(_ context.Context, movie, seat, user string) error {
+	key := movie + "/" + seat
+	s.lock()
+	defer s.unlock()
+	e, ok := s.current(key)
+	if !ok || e.status != Held || e.user != user {
+		return ErrNotHolder
+	}
+	s.seats[key] = entry{status: Booked, user: user}
+	return nil
+}
+
+func (s *MemoryStore) Release(_ context.Context, movie, seat, user string) error {
+	key := movie + "/" + seat
+	s.lock()
+	defer s.unlock()
+	e, ok := s.current(key)
+	if !ok || e.status != Held || e.user != user {
+		return ErrNotHolder
+	}
+	delete(s.seats, key)
+	return nil
+}
+
+func (s *MemoryStore) Seats(_ context.Context, movie string) ([]Seat, error) {
+	ids, err := SeatIDs(movie)
+	if err != nil {
+		return nil, err
+	}
+	s.lock()
+	defer s.unlock()
+	out := make([]Seat, len(ids))
+	for i, id := range ids {
+		out[i] = Seat{ID: id, Status: Free}
+		if e, ok := s.current(movie + "/" + id); ok {
+			out[i] = Seat{ID: id, Status: e.status, User: e.user}
+		}
+	}
+	return out, nil
+}
+```
+
+The `Unsafe` flag makes `lock` and `unlock` do nothing. It exists only so this chapter can run the same code with and without its mutex; with `Unsafe` set, this is the store most people write first.
+
+### Step 2: the load test passes
+
+`rush` releases 1,000 customers at the same instant, each asking the server to hold A7:
+
+```go noverify
+// rush: -users customers all try to hold the same seat at the same moment,
+// spread across one or more replicas of the cinema service.
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+func main() {
+	replicas := flag.String("urls", "http://127.0.0.1:8091", "comma-separated replicas")
+	users := flag.Int("users", 1000, "customers")
+	seat := flag.String("seat", "A7", "seat everyone wants")
+	flag.Parse()
+	urls := strings.Split(*replicas, ",")
+
+	var won, taken, other atomic.Int64
+	var winners sync.Map
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range *users {
+		wg.Go(func() {
+			base := urls[i%len(urls)] // round-robin, like a load balancer
+			user := fmt.Sprintf("user-%04d", i)
+			req, _ := http.NewRequest("POST", base+"/movies/inception/seats/"+*seat+"/hold", nil)
+			req.Header.Set("X-User", user)
+			<-start // everyone clicks at once
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				other.Add(1)
+				return
+			}
+			resp.Body.Close()
+			switch resp.StatusCode {
+			case http.StatusCreated:
+				won.Add(1)
+				winners.Store(user, base)
+			case http.StatusConflict:
+				taken.Add(1)
+			default:
+				other.Add(1)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	fmt.Printf("%d customers, %d replica(s): %d got the seat, %d were told it's taken, %d errors\n",
+		*users, len(urls), won.Load(), taken.Load(), other.Load())
+
+	for _, base := range urls {
+		resp, err := http.Get(base + "/movies/inception/seats")
+		if err != nil {
+			fmt.Println(base, err)
+			continue
+		}
+		var seats []struct{ ID, Status, User string }
+		json.NewDecoder(resp.Body).Decode(&seats)
+		resp.Body.Close()
+		for _, s := range seats {
+			if s.ID == *seat {
+				fmt.Printf("  %s says %s is %s by %s\n", base, s.ID, s.Status, s.User)
+			}
+		}
+	}
+}
+```
+
+Against the unlocked store, three runs:
+
+```text
+$ go run ./cmd/cinema -store unsafe &
+$ go run ./cmd/rush -users 1000
+1000 customers, 1 replica(s): 1 got the seat, 999 were told it's taken, 0 errors
+  http://127.0.0.1:8091 says A7 is held by user-0528
+```
+
+One winner, three times out of three. The bug is there, but the window between the check and the write is a few nanoseconds, while 1,000 HTTP requests arrive spread over microseconds. A load test through the network is a poor race test. The same server built with `-race`:
+
+```text
+$ go build -race -o cinema-race ./cmd/cinema && ./cinema-race -store unsafe
+WARNING: DATA RACE
+Read at 0x00c0000bf6e0 by goroutine 18:
+  runtime.mapaccess1_faststr()
+      …/internal/runtime/maps/runtime_faststr.go:114 +0x4c
+  cinema/booking.(*MemoryStore).current()
+      booking/memory.go:46 +0x84
+  cinema/booking.(*MemoryStore).Hold()
+      booking/memory.go:60 +0x10c
+```
+
+A read of the map in `current`, called from `Hold`, racing with a write. (The race-instrumented server is much slower, and 608 of the 1,000 requests failed to connect in time; the detector is for finding races, not for load tests.)
+
+### Step 3: the test that calls the store directly
+
+The race is in the store, so test the store: 1,000 goroutines released at once, calling `Hold` directly, with and without the lock.
+
+```go noverify
+package booking
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// rush makes n goroutines hold the same seat at the same moment and
+// returns how many were told they got it.
+func rush(s Store, n int) int64 {
+	var won atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			<-start
+			if s.Hold(context.Background(), "inception", "A7", fmt.Sprint("user-", i), time.Minute) == nil {
+				won.Add(1)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	return won.Load()
+}
+
+func TestOneWinner(t *testing.T) {
+	for _, unsafe := range []bool{true, false} {
+		t.Run(fmt.Sprintf("unsafe=%v", unsafe), func(t *testing.T) {
+			for round := range 5 {
+				s := NewMemoryStore()
+				s.Unsafe = unsafe
+				if won := rush(s, 1000); won != 1 {
+					t.Errorf("round %d: %d customers were told they have seat A7", round, won)
+				}
+			}
+		})
+	}
+}
+```
+
+```text
+$ go test ./booking/
+fatal error: concurrent map writes
+
+goroutine 2039 [running]:
+internal/runtime/maps.fatal({0x100b788f1?, 0x100a0aea8?})
+	…/runtime/panic.go:1195 +0x20
+cinema/booking.(*MemoryStore).Hold(…)
+	booking/memory.go:63 +0x1c4
+FAIL	cinema/booking	0.428s
+```
+
+Four runs out of four ended like this. Go's map implementation checks for concurrent writes and, when it catches one, stops the whole process with a **fatal error**: not a panic you can `recover`, not a double booking, a dead server, taking every other customer's request with it. That's the unlocked store's real failure mode in production: an outage under load, not a quiet double sale.
+
+<Callout kind="warn" title="Don't rely on the map crash">
+
+The runtime's check catches *some* concurrent writes, cheaply, so programs fail loudly instead of corrupting memory. It doesn't catch every race (a read racing with a write often goes unreported), and it's no substitute for `-race` in tests. The fix is a lock, not hoping the crash comes early.
+
+</Callout>
+
+<QuickCheck
+  question="The unlocked store passed a 1,000-customer HTTP load test three times. What's the right conclusion?"
+  options={[
+    "It's correct enough for production",
+    "Nothing: network timing hid a nanosecond race window. Test the store directly from many goroutines, with -race",
+    "The Go runtime serialises map access",
+    "HTTP handlers run one at a time"
+  ]}
+  answer={1}
+  explain="net/http runs each request on its own goroutine, so the handlers really are concurrent; the requests just rarely collided inside those few nanoseconds. Calling Hold directly from 1,000 goroutines crashed the process every time, and -race flagged the race even when the result looked right."
+/>
+
+## Store v2: a mutex
+
+*Stop 4 of 6.*
+
+### Step 1: the same code, with its lock
+
+Without `Unsafe`, every method takes `s.mu` before the check and releases it after the act, so no other request can run between them. That's the whole fix, and it's already in the file above: `lock()` at the top of each method, `defer unlock()` right after.
+
+```text
+$ go test -race -count=1 -run 'TestOneWinner/unsafe=false' ./booking/
+ok  	cinema/booking	1.821s
+$ go run ./cmd/cinema -store locked &
+$ go run ./cmd/rush -users 1000
+1000 customers, 1 replica(s): 1 got the seat, 999 were told it's taken, 0 errors
+```
+
+Five rounds of 1,000 goroutines, one winner each, no race reports.
+
+<Callout kind="note" title="Mutex or RWMutex?">
+
+`Seats` only reads, so it could take a read lock (`sync.RWMutex.RLock`) and let many seat-map refreshes run at once. With 40 seats and a lock held for microseconds, it made no measurable difference here, so the store uses a plain `sync.Mutex`: one kind of lock, nothing to get wrong. Switch when a profile shows readers queueing behind each other.
+
+</Callout>
+
+### Step 2: three replicas
+
+One process is a single point of failure, so services run several copies behind a load balancer. Three replicas of the correct mutex store, with `rush` spreading customers round-robin across them:
+
+```text
+$ for p in 8091 8092 8093; do go run ./cmd/cinema -store locked -addr 127.0.0.1:$p & done
+$ go run ./cmd/rush -users 1000 -urls http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093
+1000 customers, 3 replica(s): 3 got the seat, 997 were told it's taken, 0 errors
+  http://127.0.0.1:8091 says A7 is held by user-0096
+  http://127.0.0.1:8092 says A7 is held by user-0481
+  http://127.0.0.1:8093 says A7 is held by user-0056
+```
+
+Three customers were each told A7 is theirs, and each replica is sure it's right. Every mutex did its job: it serialized the requests *inside its own process*. Nothing serialized them across processes. A lock protects memory, and each replica has its own memory.
+
+<RuntimeStage
+  title="Three replicas, three correct mutexes, one seat"
+  kicker="per-process locks · live"
+  zones={[
+    { id: "lb", label: "load balancer (round-robin)", x: 16, y: 16, w: 728, h: 140, kind: "queue" },
+    { id: "r1", label: "replica 1: own map + mutex", x: 16, y: 176, w: 236, h: 260, kind: "cpu" },
+    { id: "r2", label: "replica 2: own map + mutex", x: 262, y: 176, w: 236, h: 260, kind: "cpu" },
+    { id: "r3", label: "replica 3: own map + mutex", x: 508, y: 176, w: 236, h: 260, kind: "cpu" }
+  ]}
+  actors={[
+    { id: "c1", label: "user-0096", role: "banker" }, { id: "c2", label: "user-0481", role: "banker" }, { id: "c3", label: "user-0056", role: "banker" },
+    { id: "h1", label: "A7: held", kind: "value" }, { id: "h2", label: "A7: held", kind: "value" }, { id: "h3", label: "A7: held", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "c1", to: "lb" }, { at: 0, id: "c2", to: "lb" }, { at: 0, id: "c3", to: "lb", note: "1,000 customers click A7 at once. The load balancer spreads them across three copies of the service." },
+    { at: 1.4, id: "c1", to: "r1", state: "running" }, { at: 1.5, id: "c2", to: "r2", state: "running" }, { at: 1.6, id: "c3", to: "r3", state: "running", note: "In each replica the first request takes the mutex, checks its map (empty), and holds A7." },
+    { at: 2.8, id: "h1", to: "r1" }, { at: 2.9, id: "h2", to: "r2" }, { at: 3.0, id: "h3", to: "r3", beat: "problem", note: "Each replica now says A7 is held, by a different customer. Every other request is correctly refused, by whichever replica it reached." },
+    { at: 4.4, id: "c1", state: "done" }, { at: 4.4, id: "c2", state: "done" }, { at: 4.4, id: "c3", state: "done", beat: "problem", note: "Measured: 3 got the seat, 997 were told it's taken. Three correct locks, one wrong answer: the state that must be shared isn't." }
+  ]}
+  caption="A mutex serializes goroutines in one process. Replicas need the seat state, and the check, in one shared place."
+/>
+
+<QuickCheck
+  question="Each replica's store is race-free under -race. Why are there still three winners?"
+  options={[
+    "The load balancer has a race",
+    "Each replica has its own map and its own mutex, so nothing orders requests that reach different replicas",
+    "Round-robin sends duplicate requests",
+    "The mutex is copied"
+  ]}
+  answer={1}
+  explain="-race and mutexes are about memory inside one process. Three processes hold three independent copies of the seat state. The check-and-act has to happen in one place every replica shares: a database or Redis."
+/>
+
+## Store v3: Redis
+
+*Stop 5 of 6.*
+
+### Step 1: one key per seat, one command per decision
+
+Move the seat state to a place every replica shares. **Redis** fits well: it keeps keys in memory, runs commands one at a time (so a single command can't be interleaved with another), and can expire a key by itself. Each seat is one key, `seat:inception:A7`, whose value says who holds or booked it: `held:alice` or `booked:alice`.
+
+```go noverify
+package booking
+
+import (
+	"context"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const holdTTL = 2 * time.Minute
-
-// RedisStore implements BookingStore using Redis for distributed holds.
-// It uses SET NX EX for atomic holds, PERSIST for confirms, DEL for releases.
+// RedisStore keeps each seat as one Redis key, so every replica of the
+// service sees the same seats. Values are "held:<user>" or "booked:<user>".
+// It needs Redis 8.4 or later for SET … IFEQ and DELEX.
 type RedisStore struct {
-	client *redis.Client
+	rdb *redis.Client
 }
 
-func NewRedisStore(client *redis.Client) *RedisStore {
-	return &RedisStore{client: client}
+func NewRedisStore(rdb *redis.Client) *RedisStore { return &RedisStore{rdb: rdb} }
+
+func seatKey(movie, seat string) string { return "seat:" + movie + ":" + seat }
+
+// Hold: SET key held:<user> NX PX <ttl>. NX makes it succeed only if the
+// key doesn't exist; Redis runs commands one at a time, so of any number
+// of concurrent holds exactly one gets OK.
+func (s *RedisStore) Hold(ctx context.Context, movie, seat, user string, ttl time.Duration) error {
+	if !validSeat(movie, seat) {
+		return ErrNoSeat
+	}
+	err := s.rdb.SetArgs(ctx, seatKey(movie, seat), "held:"+user, redis.SetArgs{Mode: "NX", TTL: ttl}).Err()
+	if errors.Is(err, redis.Nil) {
+		return ErrTaken
+	}
+	return err
 }
 
-func seatKey(movieID, seatID string) string {
-	return fmt.Sprintf("seat:%s:%s", movieID, seatID)
+// Confirm: SET key booked:<user> IFEQ held:<user>. It succeeds only if this
+// user's hold is still there, and because it has no expiry option it also
+// removes the hold's TTL: one atomic command.
+func (s *RedisStore) Confirm(ctx context.Context, movie, seat, user string) error {
+	err := s.rdb.Do(ctx, "SET", seatKey(movie, seat), "booked:"+user, "IFEQ", "held:"+user).Err()
+	if errors.Is(err, redis.Nil) {
+		return ErrNotHolder
+	}
+	return err
 }
 
-// Hold atomically attempts to hold a seat for the given session.
-// Uses SET NX EX: set-if-not-exists with a 2-minute TTL.
-// NX is the distributed lock: Redis guarantees atomicity because it is
-// single-threaded — two concurrent SET NX commands cannot both succeed.
-func (s *RedisStore) Hold(ctx context.Context, b Booking) (Booking, error) {
-	data, err := json.Marshal(b)
+// Release: DELEX key IFEQ held:<user>. Deletes the key only if it is still
+// this user's hold.
+func (s *RedisStore) Release(ctx context.Context, movie, seat, user string) error {
+	n, err := s.rdb.Do(ctx, "DELEX", seatKey(movie, seat), "IFEQ", "held:"+user).Int()
 	if err != nil {
-		return Booking{}, fmt.Errorf("marshal booking: %w", err)
+		return err
 	}
-
-	key := seatKey(b.MovieID, b.SeatID)
-
-	// go-redis v9: SetArgs with Mode:"NX" (SetNX is deprecated).
-	// EX 120 — auto-expires in 2 minutes if not confirmed or released.
-	result, err := s.client.SetArgs(ctx, key, data, redis.SetArgs{
-		Mode: "NX",
-		TTL:  holdTTL,
-	}).Result()
-	if err != nil {
-		return Booking{}, fmt.Errorf("redis hold: %w", err)
+	if n == 0 {
+		return ErrNotHolder
 	}
-	if result != "OK" {
-		// NX failed — someone else holds or confirmed this seat.
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-
-	b.Status = "held"
-	return b, nil
-}
-
-// Confirm makes a held seat permanent: PERSIST removes the TTL.
-// Called after Meridian Pay charges the card successfully.
-func (s *RedisStore) Confirm(ctx context.Context, b Booking) error {
-	key := seatKey(b.MovieID, b.SeatID)
-
-	// Update status to confirmed in the stored JSON.
-	b.Status = "confirmed"
-	data, err := json.Marshal(b)
-	if err != nil {
-		return fmt.Errorf("marshal booking: %w", err)
-	}
-
-	// SET overwrites (no NX — we already own the key).
-	if err := s.client.Set(ctx, key, data, 0).Err(); err != nil {
-		return fmt.Errorf("redis confirm set: %w", err)
-	}
-	// PERSIST removes the TTL — the seat is now permanently booked.
-	if err := s.client.Persist(ctx, key).Err(); err != nil {
-		return fmt.Errorf("redis persist: %w", err)
-	}
-
 	return nil
 }
 
-// Release deletes the hold key — seat becomes available immediately.
-// Called when the user cancels or navigates away during checkout.
-func (s *RedisStore) Release(ctx context.Context, movieID, seatID string) error {
-	return s.client.Del(ctx, seatKey(movieID, seatID)).Err()
-}
-
-// Book implements BookingStore for the service layer.
-// In production, the flow is Hold → (Meridian charges) → Confirm.
-// This method is the combined path for simplicity.
-func (s *RedisStore) Book(b Booking) (Booking, error) {
-	ctx := context.Background()
-
-	held, err := s.Hold(ctx, b)
-	if err != nil {
-		return Booking{}, err
-	}
-	// In a real flow: call Meridian Pay here. If it fails, call Release.
-	// For demonstration, confirm immediately.
-	if err := s.Confirm(ctx, held); err != nil {
-		_ = s.Release(ctx, b.MovieID, b.SeatID)
-		return Booking{}, fmt.Errorf("confirm after hold: %w", err)
-	}
-	held.Status = "confirmed"
-	return held, nil
-}
-
-func (s *RedisStore) ListBookings(movieID string) ([]Booking, error) {
-	ctx := context.Background()
-	pattern := fmt.Sprintf("seat:%s:*", movieID)
-	keys, err := s.client.Keys(ctx, pattern).Result()
+// Seats reads every seat of the hall with one MGET.
+func (s *RedisStore) Seats(ctx context.Context, movie string) ([]Seat, error) {
+	ids, err := SeatIDs(movie)
 	if err != nil {
 		return nil, err
 	}
-	var result []Booking
-	for _, key := range keys {
-		data, err := s.client.Get(ctx, key).Bytes()
-		if errors.Is(err, redis.Nil) {
-			continue // key expired between KEYS and GET — normal with TTLs
-		}
-		if err != nil {
-			return nil, err
-		}
-		var b Booking
-		if err := json.Unmarshal(data, &b); err != nil {
-			return nil, err
-		}
-		result = append(result, b)
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = seatKey(movie, id)
 	}
-	return result, nil
+	vals, err := s.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Seat, len(ids))
+	for i, id := range ids {
+		out[i] = Seat{ID: id, Status: Free}
+		if v, ok := vals[i].(string); ok {
+			status, user, _ := strings.Cut(v, ":")
+			out[i] = Seat{ID: id, Status: Status(status), User: user}
+		}
+	}
+	return out, nil
+}
+
+// NaiveRedisStore is the version most tutorials show: confirm with a plain
+// SET plus PERSIST, release with a plain DEL. Neither checks who holds the
+// seat. It exists so the chapter can show what that costs.
+type NaiveRedisStore struct{ *RedisStore }
+
+func (s NaiveRedisStore) Confirm(ctx context.Context, movie, seat, user string) error {
+	key := seatKey(movie, seat)
+	if err := s.rdb.Set(ctx, key, "booked:"+user, 0).Err(); err != nil {
+		return err
+	}
+	return s.rdb.Persist(ctx, key).Err()
+}
+
+func (s NaiveRedisStore) Release(ctx context.Context, movie, seat, user string) error {
+	return s.rdb.Del(ctx, seatKey(movie, seat)).Err()
 }
 ```
 
-The key line is `SetArgs` with `Mode:"NX"`. `NX` means "set only if the key does Not eXist." Redis executes this as a single atomic command. Two concurrent `SET seat:inception:A7 ... NX` commands cannot both return `"OK"` — Redis's single-threaded command execution guarantees it. One gets `"OK"`, one gets `nil` (not set). That's the distributed lock.
+Each operation is **one** Redis command, so the check and the act can't be separated:
 
-<Callout kind="note" title="go-redis v9: SetNX is deprecated">
+| operation | command | succeeds only if |
+|---|---|---|
+| Hold | `SET seat:… held:<user> NX PX 120000` | the key doesn't exist (**N**ot e**X**ists), and it expires in 2 minutes |
+| Confirm | `SET seat:… booked:<user> IFEQ held:<user>` | the value is still this user's hold; no expiry option, so the TTL is removed |
+| Release | `DELEX seat:… IFEQ held:<user>` | the value is still this user's hold |
+| Seats | `MGET` of all 40 seat keys | (a read; one round trip) |
 
-The old `client.SetNX(ctx, key, val, ttl)` function is deprecated in `go-redis/v9`. Use `SetArgs` with `redis.SetArgs{Mode: "NX", TTL: holdTTL}` instead. The `go fix` modernizer in Go 1.26 handles some API migrations automatically — but third-party library deprecations still need manual updates. Check `go-redis`'s changelog on upgrades.
+`SET … IFEQ` and `DELEX` were added in Redis 8.4 (`COMMAND DOCS DELEX` says "since 8.4.0"); on older versions, the same compare-and-act runs as a short Lua script, shown in exercise 5. Note what `Seats` doesn't use: `KEYS seat:inception:*`, which scans every key in Redis and blocks all other clients while it does. The hall layout gives us the key names, so one `MGET` reads them all.
 
-</Callout>
+Three replicas, now backed by one Redis:
 
-Now watch the hold → confirm → release state machine, including the TTL auto-expiry path:
-
-<ExecTimeline
-  title="Hold → confirm → release (+ TTL auto-expiry)"
-  lanes={[
-    { id: "u1", label: "User 1 (buys)" },
-    { id: "u2", label: "User 2 (waits)" },
-    { id: "redis", label: "Redis" }
-  ]}
-  steps={[
-    { lane: "u1", kind: "send", label: "SET NX EX 120", note: "User 1 sends SET seat:inception:A7 NX EX 120. Redis atomically sets the key with a 2-minute TTL. Returns OK." },
-    { lane: "redis", kind: "run", label: "key held, TTL=120s", note: "Redis holds the key. Any other SET NX on the same key will return nil until this key expires or is deleted." },
-    { lane: "u2", kind: "block", label: "SET NX → nil", note: "User 2 tries to hold the same seat. Redis returns nil — NX fails. ErrSeatAlreadyBooked returned to user 2." },
-    { lane: "u1", kind: "run", label: "Meridian charges card", note: "User 1 completes payment through Meridian Pay. Hold converts to confirmed." },
-    { lane: "u1", kind: "send", label: "PERSIST → TTL removed", note: "User 1 calls Confirm: SET (update status) + PERSIST (remove TTL). The seat is now permanently booked." },
-    { lane: "redis", kind: "done", label: "key permanent", note: "Key has no TTL. Confirmed seat stays booked until explicitly deleted (e.g., refund flow)." }
-  ]}
-  caption="NX is the distributed lock. PERSIST converts a temporary hold into a permanent booking. If the user abandons the session, the key expires automatically after 2 minutes — no cleanup job required."
-/>
-
-The **abandoned-hold auto-expiry** is the elegant part. If a user starts checkout and closes the browser, the hold key expires after 2 minutes. The seat returns to the available pool automatically. No background job, no cron, no `DELETE WHERE expires_at < NOW()`. The TTL does it for free. That's good engineering: the failure mode (user leaves) is handled by the store's own time-based mechanism, not by a separate process that can itself fail.
-
-<Callout kind="note" title="Docker Compose for local Redis">
-
-To run `RedisStore` locally, you need Redis. A minimal `docker-compose.yml`:
-
-```yaml
-services:
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-  redis-commander:
-    image: rediscommander/redis-commander:latest
-    environment:
-      REDIS_HOSTS: local:redis:6379
-    ports: ["8081:8081"]
+```text
+$ for p in 8091 8092 8093; do go run ./cmd/cinema -store redis -addr 127.0.0.1:$p & done
+$ go run ./cmd/rush -users 1000 -urls http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093
+1000 customers, 3 replica(s): 1 got the seat, 999 were told it's taken, 0 errors
+  http://127.0.0.1:8091 says A7 is held by user-0263
+  http://127.0.0.1:8092 says A7 is held by user-0263
+  http://127.0.0.1:8093 says A7 is held by user-0263
+$ redis-cli --no-raw GET seat:inception:A7
+"held:user-0565"
+$ redis-cli PTTL seat:inception:A7
+119807
 ```
 
-`docker compose up` then browse `localhost:8081` to inspect keys as they're created. You'll see `seat:inception:A7` appear with a TTL counter ticking down.
+(The `redis-cli` lines are from the second run, won by `user-0565`.) One winner, and all three replicas agree who. The key has 119,807 ms of its 2-minute hold left.
 
-</Callout>
+### Step 2: holds that expire on their own
 
-<UnderTheHood title="Why Redis SET NX is atomic: the single-threaded command executor">
+With `-hold 5s`, a hold's whole life fits in a terminal:
 
-Redis processes commands in a single thread (the "event loop" thread, since Redis 6 with I/O threads for network, but command execution remains single-threaded by design). This means two `SET NX` commands sent by different clients cannot interleave at the command level — one completes fully before the other begins. There is no lock needed inside Redis for this guarantee.
+```text
+$ curl -X POST -H "X-User: alice" .../A7/hold
+201
+$ curl -X POST -H "X-User: bob" .../A7/hold
+{"error":"seat is held or booked by someone else"}
+409
+$ redis-cli GET seat:inception:A7
+held:alice
+$ redis-cli PTTL seat:inception:A7
+4868
+# 5.2 s later
+$ redis-cli EXISTS seat:inception:A7
+0
+{"id":"A7","status":"free"}
+$ curl -X POST -H "X-User: bob" .../A7/hold
+201
+```
 
-This is fundamentally different from the in-process `sync.Mutex` case: the mutex serializes goroutines within one process; Redis's single-threaded executor serializes commands across all processes and machines connected to that Redis instance.
+Alice held A7, didn't pay, and 5 seconds later Redis deleted the key: A7 was free again and Bob got it. No cleanup job, no cron, nothing that can itself crash. That's the reason to use a TTL.
 
-The tradeoff: Redis adds a network round-trip per command (often sub-millisecond in the same datacenter, but still nonzero). For a cinema booking — where the user is already spending 5+ seconds on the checkout form — Redis latency is typically invisible. For a high-frequency trading system doing millions of operations per second, an in-process atomic or CAS is the right tool.
+### Step 3: the customer who comes back late
 
-Redis 6+ introduced "threaded I/O" for reading client requests and writing responses, but command execution (the part that runs `SET NX`) remains single-threaded. The Go redis client (`go-redis/v9`) uses a connection pool and pipelines under the hood — multiple goroutines share a small set of connections, and commands are multiplexed. The pool is configured via `redis.Options{PoolSize: N}`.
+The TTL has a consequence. Alice holds A7, and her bank's 3-D Secure page takes longer than the hold. Her hold expires; Bob holds A7; then Alice's payment succeeds and her browser calls confirm. What happens depends on whether `Confirm` checks who holds the seat.
+
+`late.sh` runs exactly that against a real server with 1-second holds. First against `NaiveRedisStore`: the `Confirm` (plain `SET` + `PERSIST`) and `Release` (plain `DEL`) that most "seat booking with Redis" tutorials show, and that an earlier edition of this chapter used:
+
+```text
+$ go run ./cmd/cinema -store redis-naive -hold 1s &
+$ ./late.sh
+alice holds A7 (hold lasts 1s):             201
+1.2s later, bob holds A7:                   201
+alice's late confirm:                       200
+seat now:                                   {"id":"A7","status":"booked","user":"alice"}
+bob pays and confirms:                      200
+seat now:                                   {"id":"A7","status":"booked","user":"bob"}
+```
+
+Both confirms returned 200, so the payment flow charged **both** cards, and the seat ended up with whoever confirmed last. The release version is just as bad:
+
+```text
+$ ./late-release.sh
+alice holds A7 (hold lasts 1s):             201
+1.2s later, bob holds A7:                   201
+alice's late release:                       204
+carol holds A7:                             201
+bob confirms:                               200
+```
+
+Alice's late "release" deleted **Bob's** hold, Carol held the free seat, and then Bob's unconditional confirm overwrote Carol's hold. Three customers, one seat. The same two scripts against `RedisStore`:
+
+```text
+$ go run ./cmd/cinema -store redis -hold 1s &
+$ ./late.sh
+alice holds A7 (hold lasts 1s):             201
+1.2s later, bob holds A7:                   201
+alice's late confirm:                       409
+seat now:                                   {"id":"A7","status":"held","user":"bob"}
+bob pays and confirms:                      200
+seat now:                                   {"id":"A7","status":"booked","user":"bob"}
+$ ./late-release.sh
+alice holds A7 (hold lasts 1s):             201
+1.2s later, bob holds A7:                   201
+alice's late release:                       409
+carol holds A7:                             409
+bob confirms:                               200
+```
+
+Alice gets a 409, which the checkout turns into "your hold expired, we've refunded you"; Bob keeps his seat; Carol is correctly refused. Two commands made the difference: `SET … IFEQ held:alice` and `DELEX … IFEQ held:alice` compare and act in one step inside Redis.
+
+<RuntimeStage
+  title="Alice's hold expires while she pays"
+  kicker="ownership check · live"
+  zones={[
+    { id: "key", label: "Redis: seat:inception:A7", x: 16, y: 16, w: 728, h: 160, kind: "chan" },
+    { id: "alice", label: "alice's checkout", x: 16, y: 196, w: 356, h: 240, kind: "wait" },
+    { id: "bob", label: "bob's checkout", x: 388, y: 196, w: 356, h: 240, kind: "cpu" }
+  ]}
+  actors={[
+    { id: "va", label: "held:alice (1 s)", kind: "value" }, { id: "vb", label: "held:bob", kind: "value" },
+    { id: "bad", label: "booked:alice", kind: "value" }, { id: "ok", label: "booked:bob", kind: "value" },
+    { id: "a", label: "alice", role: "banker" }, { id: "b", label: "bob", role: "banker" },
+    { id: "r409", label: "409 for alice", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "va", to: "key" }, { at: 0, id: "a", to: "alice", state: "parked", note: "Alice holds A7 with SET NX PX 1000, then waits on her bank's payment page." },
+    { at: 1.6, id: "va", to: "", beat: "problem", note: "One second passes. Redis deletes the key: the hold has expired, and alice doesn't know." },
+    { at: 2.6, id: "vb", to: "key" }, { at: 2.6, id: "b", to: "bob", state: "running", note: "Bob holds A7. SET NX succeeds because the key is gone." },
+    { at: 3.8, id: "vb", to: "" }, { at: 3.8, id: "bad", to: "key", beat: "problem", note: "Naive confirm: alice's payment succeeds and her plain SET overwrites bob's hold. Both cards are charged; measured: both confirms returned 200." },
+    { at: 5.4, id: "bad", to: "" }, { at: 5.4, id: "vb", to: "key", beat: "solution", note: "Replay with SET booked:alice IFEQ held:alice: the value is held:bob, so Redis refuses and nothing changes." },
+    { at: 6.4, id: "r409", to: "alice", note: "Alice gets 409: refund and apologise." },
+    { at: 7.4, id: "vb", to: "" }, { at: 7.4, id: "ok", to: "key", beat: "solution", note: "Bob confirms: IFEQ held:bob matches, the seat is his, and the TTL is gone." }
+  ]}
+  caption="Expiry makes holds safe to abandon. It also means every confirm and release must check it's still the holder."
+/>
+
+<UnderTheHood title="Why one Redis command is atomic, and what that doesn't cover">
+
+Redis executes commands on one thread, one at a time. Since Redis 6 it can use extra threads to read requests from sockets and write replies, but command execution stays single-threaded, so `SET … NX`, `SET … IFEQ` and `DELEX … IFEQ` each run start to finish with no other command in between. That's why each store method is exactly one command: a `GET` followed by a `SET` from Go would be the check-then-act race again, just with a network hop in the middle.
+
+It doesn't make Redis a perfect lock service. With a single primary, a crash can lose the last writes that weren't persisted (`appendonly yes` with `appendfsync everysec` loses up to a second). With replication, a failover can promote a replica that hadn't received the latest hold. For seat holds that's an acceptable, rare, recoverable problem, and the payment step is where money is protected (by idempotency keys, Part 1 chapter 24). If a double booking must be impossible even across failures, the booking belongs in a database transaction with a unique constraint on (show, seat).
 
 </UnderTheHood>
 
-## The web API & real-time UI
+<QuickCheck
+  question="Why must Confirm check that the seat is still `held:<this user>`, rather than just setting it to booked?"
+  options={[
+    "To save a Redis round trip",
+    "Because the hold can expire during payment and someone else can hold the seat; an unconditional SET takes it from them (measured: both customers charged)",
+    "Because PERSIST requires it",
+    "Because Redis rejects SET on keys with a TTL"
+  ]}
+  answer={1}
+  explain="Holds expire on purpose. After that, the seat may belong to someone else, and only a compare-and-set (SET … IFEQ, or a Lua script on older Redis) can confirm atomically for the current holder only."
+/>
 
-The booking service needs HTTP endpoints. We use `net/http` with **Go 1.22's method+wildcard pattern syntax** — no external router needed.
+## The web API & the seat map
+
+*Stop 6 of 6.*
+
+### Step 1: the server
 
 ```go noverify
-// server.go — non-runnable snippet (requires full package setup)
+// cinema serves the seat map and the hold → confirm → release API.
+//
+//	go run ./cmd/cinema -store redis -addr :8091
 package main
 
 import (
+	"context"
+	"embed"
 	"encoding/json"
-	"log/slog"
+	"errors"
+	"flag"
+	"log"
 	"net/http"
+	"time"
 
-	"yourmodule/booking"
+	"cinema/booking"
+
+	"github.com/redis/go-redis/v9"
 )
 
-func main() {
-	store := booking.NewConcurrentStore()
-	svc := booking.NewService(store)
+//go:embed index.html
+var static embed.FS
 
-	mux := http.NewServeMux()
-
-	// Go 1.22 method+wildcard patterns: no external router needed.
-	mux.HandleFunc("GET /movies", handleListMovies(svc))
-	mux.HandleFunc("GET /movies/{movieID}/seats", handleListSeats(svc))
-	mux.HandleFunc("POST /movies/{movieID}/seats/{seatID}/hold", handleHold(svc))
-	mux.HandleFunc("PUT /movies/{movieID}/seats/{seatID}/confirm", handleConfirm(svc))
-	mux.HandleFunc("DELETE /movies/{movieID}/seats/{seatID}", handleRelease(svc))
-
-	// Serve the static UI (polls /seats every 2s for real-time feel).
-	mux.Handle("GET /", http.FileServer(http.Dir("./static")))
-
-	slog.Info("cinema booking service started", "addr", ":8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
-		slog.Error("server error", "err", err)
-	}
-}
-
-// r.PathValue extracts wildcard segments from Go 1.22 patterns.
-func handleHold(svc *booking.Service) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		movieID := r.PathValue("movieID")
-		seatID := r.PathValue("seatID")
-
-		b := booking.Booking{
-			ID:      newID(),
-			MovieID: movieID,
-			SeatID:  seatID,
-			UserID:  r.Header.Get("X-User-ID"),
-			Status:  "held",
-		}
-
-		result, err := svc.BookSeat(b)
-		if err != nil {
-			if errors.Is(err, booking.ErrSeatAlreadyBooked) {
-				writeJSON(w, http.StatusConflict, map[string]string{
-					"error": "seat already booked",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "internal error",
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, result)
-	}
+type api struct {
+	store booking.Store
+	hold  time.Duration
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	json.NewEncoder(w).Encode(v)
+}
+
+// fail maps store errors to HTTP statuses: the customer's problem (409, 404)
+// or ours (500).
+func fail(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, booking.ErrTaken), errors.Is(err, booking.ErrNotHolder):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	case errors.Is(err, booking.ErrNoSeat):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	default:
+		log.Printf("store error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	}
+}
+
+// seatAction wraps a hold/confirm/release call: it reads the path and the
+// X-User header and turns the result into a response.
+func (a *api) seatAction(ok int, do func(ctx context.Context, movie, seat, user string) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := r.Header.Get("X-User")
+		if user == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-User header required"})
+			return
+		}
+		if err := do(r.Context(), r.PathValue("movie"), r.PathValue("seat"), user); err != nil {
+			fail(w, err)
+			return
+		}
+		w.WriteHeader(ok)
+	}
+}
+
+// newMux wires the routes. Tests call it with any Store.
+func newMux(a *api) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /movies/{movie}/seats", func(w http.ResponseWriter, r *http.Request) {
+		seats, err := a.store.Seats(r.Context(), r.PathValue("movie"))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, seats)
+	})
+	mux.HandleFunc("POST /movies/{movie}/seats/{seat}/hold", a.seatAction(http.StatusCreated,
+		func(ctx context.Context, movie, seat, user string) error {
+			return a.store.Hold(ctx, movie, seat, user, a.hold)
+		}))
+	mux.HandleFunc("POST /movies/{movie}/seats/{seat}/confirm", a.seatAction(http.StatusOK, a.store.Confirm))
+	mux.HandleFunc("DELETE /movies/{movie}/seats/{seat}/hold", a.seatAction(http.StatusNoContent, a.store.Release))
+	mux.Handle("GET /", http.FileServerFS(static))
+	return mux
+}
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:8091", "listen address")
+	kind := flag.String("store", "locked", "unsafe | locked | redis | redis-naive")
+	redisAddr := flag.String("redis", "127.0.0.1:6390", "Redis address")
+	hold := flag.Duration("hold", 2*time.Minute, "how long a hold lasts")
+	flag.Parse()
+
+	var store booking.Store
+	switch *kind {
+	case "unsafe":
+		s := booking.NewMemoryStore()
+		s.Unsafe = true
+		store = s
+	case "locked":
+		store = booking.NewMemoryStore()
+	case "redis", "redis-naive":
+		rdb := redis.NewClient(&redis.Options{Addr: *redisAddr})
+		if err := rdb.Ping(context.Background()).Err(); err != nil {
+			log.Fatal(err)
+		}
+		store = booking.NewRedisStore(rdb)
+		if *kind == "redis-naive" {
+			store = booking.NaiveRedisStore{RedisStore: store.(*booking.RedisStore)}
+		}
+	default:
+		log.Fatalf("unknown -store %q", *kind)
+	}
+	a := &api{store: store, hold: *hold}
+
+	log.Printf("cinema on http://%s, store=%s, holds last %v", *addr, *kind, *hold)
+	log.Fatal(http.ListenAndServe(*addr, newMux(a)))
 }
 ```
 
-Key points:
+The shape worth copying:
 
-- **Go 1.22 patterns** like `"GET /movies/{movieID}/seats/{seatID}/hold"` match by method and path in the same string. No third-party router for standard CRUD APIs.
-- `r.PathValue("movieID")` extracts the `{movieID}` wildcard — available since Go 1.22.
-- `slog` for structured logging, not `fmt.Println` — in Go 1.26, `slog.NewMultiHandler` lets you fan logs to multiple sinks simultaneously.
-- `errors.Is(err, booking.ErrSeatAlreadyBooked)` gives a clean HTTP 409 Conflict for the business-logic case, separated from 500 for infrastructure errors.
+- **Routes use Go 1.22 patterns.** `"POST /movies/{movie}/seats/{seat}/hold"` matches the method and the path, and `r.PathValue("seat")` reads the wildcard: no router library.
+- **One wrapper, three actions.** `seatAction` reads the path and the `X-User` header, calls the store method, and maps errors: `ErrTaken` and `ErrNotHolder` to 409, `ErrNoSeat` to 404, anything else to a logged 500. `a.store.Confirm` and `a.store.Release` are passed as **method values**: functions with their receiver already bound.
+- **`newMux` is separate from `main`**, so a test can build the same routes around any store.
+- **The page is embedded.** `//go:embed index.html` compiles the file into the binary, and `http.FileServerFS(static)` serves it: one file to deploy.
 
-<Callout kind="note" title="Go 1.26: ServeMux subtree redirects use 307">
+`X-User` stands in for authentication here; in a real service the user comes from a verified session or token (Part 1 chapter 16), never from a header the client chooses (Part 1 chapter 20, Auth & API Design).
 
-ServeMux has long redirected requests for a registered subtree root to the slash form: registering `/static/` redirects `/static` to `/static/` unless `/static` is registered separately. Go 1.26 changes that automatic redirect to **307 Temporary Redirect**, preserving the request method.
+### Step 2: the seat map
 
-</Callout>
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title>Cinema: pick a seat</title>
+<style>
+  body { font: 15px system-ui, sans-serif; margin: 24px; background: #111; color: #eee; }
+  .screen { width: 360px; margin: 8px 0 16px; padding: 4px; text-align: center; background: #333; }
+  .grid { display: grid; gap: 6px; width: max-content; }
+  button.seat { width: 38px; height: 32px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .free { background: #2e7d32; color: #fff; }
+  .held { background: #f9a825; color: #000; }
+  .mine { outline: 3px solid #4fc3f7; }
+  .booked { background: #555; color: #999; cursor: not-allowed; }
+  #msg { margin-top: 12px; min-height: 1.4em; }
+</style>
+<h1>Inception, 20:00</h1>
+<p>You are <b id="me"></b>. Click a green seat to hold it, then pay to book it.</p>
+<div class="screen">screen</div>
+<div class="grid" id="grid" style="grid-template-columns: repeat(8, 38px)"></div>
+<p><button id="pay" disabled>Pay for my held seat</button> <button id="drop" disabled>Release it</button></p>
+<div id="msg"></div>
+<script>
+const movie = "inception";
+// One made-up customer name per browser tab, so two tabs are two customers.
+const me = sessionStorage.me || (sessionStorage.me = "guest-" + Math.random().toString(36).slice(2, 6));
+document.getElementById("me").textContent = me;
+let mine = null;
 
-### Real-time seat availability: polling vs WebSockets
+async function call(method, path) {
+  const r = await fetch(path, { method, headers: { "X-User": me } });
+  const json = r.headers.get("Content-Type")?.includes("json");
+  const body = json ? await r.json() : {};
+  return { status: r.status, body };
+}
 
-<Define term="Polling vs WebSockets" since="HTTP Servers: JSON, Streaming & WebSockets (Part 1)">
-**Polling** — the client sends a fresh HTTP request every N seconds ("any updates?"). Simple to implement; the server is stateless. Downside: latency = up to N seconds, and every client hammers the server on a fixed interval regardless of whether anything changed.
+async function refresh() {
+  const { body: seats } = await call("GET", `/movies/${movie}/seats`);
+  const grid = document.getElementById("grid");
+  grid.replaceChildren(...seats.map(s => {
+    const b = document.createElement("button");
+    b.className = `seat ${s.status}` + (s.user === me && s.status === "held" ? " mine" : "");
+    b.textContent = s.id;
+    b.title = s.user ? `${s.status} by ${s.user}` : "free";
+    b.onclick = () => hold(s.id);
+    return b;
+  }));
+  mine = seats.find(s => s.user === me && s.status === "held")?.id ?? null;
+  document.getElementById("pay").disabled = document.getElementById("drop").disabled = !mine;
+}
 
-**WebSockets** — after an HTTP upgrade handshake, the connection stays open. The server *pushes* events to the client the instant they happen. Latency is near-zero; the server only sends when there is something to send. Downside: the server must maintain one long-lived connection per client — stateful and harder to scale horizontally.
+async function hold(seat) {
+  const r = await call("POST", `/movies/${movie}/seats/${seat}/hold`);
+  say(r.status === 201 ? `${seat} is held for you. Pay before it expires.` : `${seat}: ${r.body.error}`);
+  refresh();
+}
+document.getElementById("pay").onclick = async () => {
+  const r = await call("POST", `/movies/${movie}/seats/${mine}/confirm`);
+  say(r.status === 200 ? `Booked. Enjoy the film.` : r.body.error);
+  refresh();
+};
+document.getElementById("drop").onclick = async () => {
+  await call("DELETE", `/movies/${movie}/seats/${mine}/hold`);
+  refresh();
+};
+function say(t) { document.getElementById("msg").textContent = t; }
 
-For a low-traffic cinema demo, polling every 2 seconds is fine. For a sold-out opening night with thousands of clients watching the seat grid update live, WebSockets (or Server-Sent Events) are the right tool.
-</Define>
-
-The front-end `index.html` polls `GET /movies/{movieID}/seats` every ~2 seconds. Each response is a JSON array of all current bookings for that movie. The UI colours booked seats red and available seats green. Simple, no state machine on the client.
-
-For a production cinema, you'd upgrade to **WebSockets** (or Server-Sent Events) so seats update in real-time the instant they're booked, without polling overhead. The HTTP Servers: JSON, Streaming & WebSockets chapter covers WebSocket upgrades in Go — turn to that when you're ready.
-
-```go
-// Static index.html polls for seat availability.
-// Non-runnable snippet — illustrative only.
-fetch('/movies/inception/seats')
-  .then(r => r.json())
-  .then(bookings => updateSeatGrid(bookings));
-
-setInterval(() => {
-  fetch('/movies/inception/seats')
-    .then(r => r.json())
-    .then(bookings => updateSeatGrid(bookings));
-}, 2000); // poll every 2 seconds
+refresh();
+setInterval(refresh, 1000); // everyone else's holds appear within a second
+</script>
 ```
+
+It polls `GET /movies/inception/seats` every second and redraws the grid: green free, amber held, grey booked, with an outline on your own hold. Each browser tab invents a guest name in `sessionStorage`, so two tabs are two customers. Polling is the simplest thing that works; for thousands of viewers of one hall, server-sent events or WebSockets (Part 1 chapter 19) push changes instead of 40-seat snapshots every second per tab.
+
+### Step 3: testing the API
+
+`httptest.NewServer(newMux(…))` runs the real routes on a real local port, with a `MemoryStore`, so the test needs no Redis:
+
+```go noverify
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"cinema/booking"
+)
+
+func TestSeatFlow(t *testing.T) {
+	srv := httptest.NewServer(newMux(&api{store: booking.NewMemoryStore(), hold: time.Minute}))
+	defer srv.Close()
+
+	steps := []struct {
+		name, method, path, user string
+		want                     int
+	}{
+		{"alice holds A7", "POST", "/movies/inception/seats/A7/hold", "alice", http.StatusCreated},
+		{"bob can't hold A7", "POST", "/movies/inception/seats/A7/hold", "bob", http.StatusConflict},
+		{"bob can't confirm A7", "POST", "/movies/inception/seats/A7/confirm", "bob", http.StatusConflict},
+		{"no user header", "POST", "/movies/inception/seats/A8/hold", "", http.StatusBadRequest},
+		{"no such seat", "POST", "/movies/inception/seats/Z9/hold", "alice", http.StatusNotFound},
+		{"no such movie", "GET", "/movies/barbie/seats", "", http.StatusNotFound},
+		{"alice confirms A7", "POST", "/movies/inception/seats/A7/confirm", "alice", http.StatusOK},
+		{"alice can't release a booked seat", "DELETE", "/movies/inception/seats/A7/hold", "alice", http.StatusConflict},
+	}
+	for _, st := range steps { // in order: each step depends on the ones before
+		req, _ := http.NewRequest(st.method, srv.URL+st.path, nil)
+		if st.user != "" {
+			req.Header.Set("X-User", st.user)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", st.name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != st.want {
+			t.Errorf("%s: got %d, want %d", st.name, resp.StatusCode, st.want)
+		}
+	}
+}
+```
+
+```text
+$ go test -v -count=1 ./cmd/cinema/
+--- PASS: TestSeatFlow (0.00s)
+PASS
+ok  	cinema/cmd/cinema	0.935s
+```
+
+The steps run in order because each depends on the ones before; that's a scenario test, not a table of independent cases, and it says so in the loop.
+
+<QuickCheck
+  question="Why is `X-User` fine for this chapter but wrong for production?"
+  options={[
+    "Headers are slower than cookies",
+    "Any client can send any X-User, so anyone could confirm or release someone else's hold; the user must come from verified authentication",
+    "Go can't read custom headers",
+    "Load balancers strip it"
+  ]}
+  answer={1}
+  explain="The store's ownership checks are only as good as the identity passed to them. In production the handler takes the user from a verified session or token."
+/>
 
 ---
 
 ## Exercises
 
-You've built the system. Now extend it, break it, and fix it. That's how instinct forms.
+Each uses the `cinema` module from the chapter.
 
-<Exercise n={1} title="Add the release endpoint" level="easy">
+<Exercise n={1} title="Two tabs, one seat" level="easy">
 
-The `handleRelease` function is stubbed in the server. Implement it: extract `{movieID}` and `{seatID}` from the path, call a `ReleaseBooking(movieID, seatID string) error` method on the service (which you'll also add), and delete the booking from `ConcurrentStore`. Return HTTP 204 No Content on success, 404 if the seat wasn't booked.
+Run `-store redis`, open the seat map in two tabs, and hold the same seat in both. Then do the same with `curl` and explain the status codes and the body.
 
 <Solution>
 
-```go
-// Service method:
-func (s *Service) ReleaseBooking(movieID, seatID string) error {
-	return s.store.Release(movieID, seatID)
-}
+The second tab shows "A7: seat is held or booked by someone else". Through the API:
 
-// ConcurrentStore method:
-func (s *ConcurrentStore) Release(movieID, seatID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := movieID + ":" + seatID
-	if _, exists := s.bookings[key]; !exists {
-		return ErrSeatNotFound // define this sentinel similarly to ErrSeatAlreadyBooked
-	}
-	delete(s.bookings, key)
-	return nil
-}
-
-// Handler:
-func handleRelease(svc *booking.Service) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		movieID := r.PathValue("movieID")
-		seatID := r.PathValue("seatID")
-		if err := svc.ReleaseBooking(movieID, seatID); err != nil {
-			if errors.Is(err, booking.ErrSeatNotFound) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "seat not booked"})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}
-}
+```text
+$ curl -X POST -H "X-User: alice" .../A7/hold
+201
+$ curl -X POST -H "X-User: bob" .../A7/hold
+{"error":"seat is held or booked by someone else"}
+409
 ```
 
-The delete from `ConcurrentStore` requires the write lock (`mu.Lock()`), not the read lock — it's a mutation. Return a new sentinel `ErrSeatNotFound` (same pattern as `ErrSeatAlreadyBooked`) so callers can distinguish "not found" from infrastructure errors. The handler maps it to HTTP 404.
+The first `SET NX` created the key; the second found it and returned nil, which `Hold` turns into `ErrTaken` and `fail` into 409 with the error's text. Within a second, the first tab's poll shows its own seat outlined and the second tab's shows it amber.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={2} title="Per-user hold limit" level="medium">
+<Exercise n={2} title="Limit holds per customer" level="medium">
 
-Add a per-user hold limit: no user may hold more than 4 seats at once (confirmed bookings don't count against the limit). Implement this in `ConcurrentStore.Book`: before writing, count how many `"held"` bookings exist for `b.UserID` across all movies. If the count is already 4, return a new sentinel `ErrHoldLimitReached`. The count and the write must both happen under the same lock.
+Stop one customer holding the whole hall: at most 4 held seats per user in `MemoryStore`, returning `ErrTooManyHolds`. Write a test where one customer tries 20 holds at once.
 
 <Solution>
 
+In `Hold`, after the seat check, still under the lock:
+
 ```go
-var ErrHoldLimitReached = errors.New("hold limit reached: maximum 4 seats per user")
-
-func (s *ConcurrentStore) Book(b Booking) (Booking, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Count active holds for this user.
-	holds := 0
-	for _, existing := range s.bookings {
-		if existing.UserID == b.UserID && existing.Status == "held" {
-			holds++
-		}
+holds := 0
+for k := range s.seats {
+	if e, ok := s.current(k); ok && e.status == Held && e.user == user {
+		holds++
 	}
-	if holds >= 4 {
-		return Booking{}, ErrHoldLimitReached
-	}
-
-	key := b.MovieID + ":" + b.SeatID
-	if _, exists := s.bookings[key]; exists {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-	s.bookings[key] = b
-	return b, nil
+}
+if holds >= MaxHolds {
+	return ErrTooManyHolds
 }
 ```
 
-The count and the seat-availability check must happen under the **same** write lock. If you released the lock between counting and writing, another goroutine could insert a booking for this user between those two operations, causing the limit to be exceeded. One lock acquisition, all checks inside — that's the atomic unit. This is exactly the same lesson as the seat race itself.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={3} title="Table-driven httptest for the book endpoint" level="medium">
-
-Write a table-driven test for `handleHold` using `net/http/httptest`. Test cases: (1) booking a free seat returns HTTP 201 and a valid JSON body, (2) booking the same seat twice returns HTTP 409 on the second request, (3) missing `X-User-ID` header returns HTTP 400. Use `httptest.NewRecorder` and `httptest.NewServer`.
-
-<Solution>
-
 ```go
-package main_test
-
-import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"testing"
-
-	"yourmodule/booking"
-)
-
-func TestHandleHold(t *testing.T) {
-	cases := []struct {
-		name       string
-		seatID     string
-		userID     string
-		wantStatus int
-	}{
-		{"free seat", "A1", "user-1", http.StatusCreated},
-		{"duplicate seat", "A1", "user-2", http.StatusConflict},
-		{"missing user ID", "A2", "", http.StatusBadRequest},
-	}
-
-	store := booking.NewConcurrentStore()
-	svc := booking.NewService(store)
-	handler := handleHold(svc)
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST",
-				"/movies/inception/seats/"+tc.seatID+"/hold", nil)
-			req.SetPathValue("movieID", "inception")
-			req.SetPathValue("seatID", tc.seatID)
-			if tc.userID != "" {
-				req.Header.Set("X-User-ID", tc.userID)
-			}
-
-			rr := httptest.NewRecorder()
-			handler(rr, req)
-
-			if rr.Code != tc.wantStatus {
-				t.Errorf("status: got %d, want %d (body: %s)",
-					rr.Code, tc.wantStatus, rr.Body.String())
-			}
-			if tc.wantStatus == http.StatusCreated {
-				var b booking.Booking
-				if err := json.NewDecoder(rr.Body).Decode(&b); err != nil {
-					t.Errorf("decode body: %v", err)
-				}
-				if b.SeatID != tc.seatID {
-					t.Errorf("seatID: got %q, want %q", b.SeatID, tc.seatID)
-				}
+func TestHoldLimit(t *testing.T) {
+	s := NewMemoryStore()
+	var ok, limited atomic.Int64
+	var wg sync.WaitGroup
+	for i := range 20 { // one customer, 20 tabs, 20 different seats at once
+		wg.Go(func() {
+			err := s.Hold(context.Background(), "inception", fmt.Sprintf("B%d", i%8+1), "greedy", time.Minute)
+			switch {
+			case err == nil:
+				ok.Add(1)
+			case errors.Is(err, ErrTooManyHolds):
+				limited.Add(1)
 			}
 		})
 	}
+	wg.Wait()
+	if ok.Load() != MaxHolds {
+		t.Errorf("customer got %d holds, want %d (%d refused by the limit)", ok.Load(), MaxHolds, limited.Load())
+	}
 }
 ```
 
-Note: `req.SetPathValue` (Go 1.22+) injects wildcard values into the test request so the handler's `r.PathValue("movieID")` works correctly without running a full `ServeMux`. This is the idiomatic test pattern for Go 1.22+ wildcard handlers — no mocking, no fake router.
+```text
+$ go test -race -count=3 -run TestHoldLimit -v ./booking/
+--- PASS: TestHoldLimit (0.00s)
+--- PASS: TestHoldLimit (0.00s)
+--- PASS: TestHoldLimit (0.00s)
+```
+
+The count and the new hold must happen under the same lock, or 20 concurrent requests could all count 3 and all succeed. For `RedisStore` the same rule needs the count and the `SET` in one atomic step: a Lua script, or a per-user set updated in a `MULTI`/`EXEC` transaction with `WATCH`.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={4} title="Convert Book to optimistic locking" level="hard">
+<Exercise n={3} title="Watch a hold expire" level="easy">
 
-Replace the `sync.RWMutex` in `ConcurrentStore` with an `atomic.Pointer[map[string]Booking]` (a copy-on-write map). Implement `Book` using a compare-and-swap loop: load the current map, check if the seat is taken, create a new map with the booking added, and `CompareAndSwap` the pointer. Retry if CAS fails. Benchmark it against the mutex version under low contention (few goroutines) and high contention (100k goroutines, one seat). Note when each approach wins.
+Run the server with `-hold 5s`, hold a seat with `curl`, and use `redis-cli PTTL` to watch it count down. What does the seat map show after 5 seconds, and why is no Go code involved?
 
 <Solution>
 
-```go
-package booking
-
-import (
-	"maps"
-	"sync/atomic"
-)
-
-// OptimisticStore uses copy-on-write with atomic pointer swap.
-// Better at low contention; degrades under high contention due to retries.
-type OptimisticStore struct {
-	ptr atomic.Pointer[map[string]Booking]
-}
-
-func NewOptimisticStore() *OptimisticStore {
-	s := &OptimisticStore{}
-	m := make(map[string]Booking)
-	s.ptr.Store(&m)
-	return s
-}
-
-func (s *OptimisticStore) Book(b Booking) (Booking, error) {
-	key := b.MovieID + ":" + b.SeatID
-	for {
-		old := s.ptr.Load()
-		if _, exists := (*old)[key]; exists {
-			return Booking{}, ErrSeatAlreadyBooked
-		}
-		// Copy-on-write: create a new map with the addition.
-		newMap := maps.Clone(*old)
-		newMap[key] = b
-		// Swap atomically. If another goroutine changed ptr since Load, retry.
-		if s.ptr.CompareAndSwap(old, &newMap) {
-			return b, nil
-		}
-		// CAS failed — another booking snuck in. Retry from scratch.
-	}
-}
-
-func (s *OptimisticStore) ListBookings(movieID string) ([]Booking, error) {
-	m := s.ptr.Load()
-	var result []Booking
-	for _, bk := range *m {
-		if bk.MovieID == movieID {
-			result = append(result, bk)
-		}
-	}
-	return result, nil
-}
-```
-
-**Benchmark findings:** under low contention (10 goroutines, many different seats), the optimistic store wins — no blocking, CAS rarely retries, `maps.Clone` is cheap for small maps. Under high contention (100k goroutines, one seat), the mutex wins — most goroutines retry repeatedly in the CAS loop, burning CPU. This validates our design choice: pessimistic for the cinema's contended opening-night scenario, optimistic for a quiet browsing session. The `maps.Clone` generic helper (Go 1.21) makes the copy-on-write one line.
+The chapter's transcript: `PTTL` returned 4868 ms right after the hold, `EXISTS` returned 0 at 5.2 s, and `GET /seats` showed A7 as free. Redis deletes the key itself when its TTL runs out (lazily when it's next accessed, and in a background sweep otherwise), so `MGET` simply finds nothing and `Seats` reports the seat free. There's no timer in the Go service, which is the point: a crashed or redeployed replica can't forget to release anything.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={5} title="Meridian Pay integration in the confirm path" level="hard">
+<Exercise n={4} title="Make the late customer's experience right" level="medium">
 
-In `RedisStore.Book`, the comment says "call Meridian Pay here." Implement a `MeridianClient` interface with a single method `Charge(ctx context.Context, userID string, amountCents int) error`. Wire it into the `RedisStore` confirm path: if `Charge` returns an error, call `Release` and return a wrapped error. Write a test using a mock `MeridianClient` that: (1) succeeds on the first call and verifies the seat is confirmed; (2) fails and verifies the seat hold is released (not left dangling).
+With the correct store, Alice's late confirm gets 409. Her card was charged. Describe what the checkout should do, in order, and which part must be idempotent.
 
 <Solution>
 
-```go
-// meridian.go
-package booking
+1. **Hold** the seat, then **authorize** the card (reserve the money, don't capture it).
+2. **Confirm** the seat with `SET … IFEQ`.
+3. If confirm succeeded, **capture** the payment. If it returned 409 (the hold expired and the seat may be someone else's), **void** the authorization and tell Alice her hold ran out, offering the next best seat.
 
-import "context"
-
-// MeridianClient is the payment rail interface.
-// The real implementation calls the Meridian Pay HTTP API.
-// Tests inject a mock.
-type MeridianClient interface {
-	Charge(ctx context.Context, userID string, amountCents int) error
-}
-
-// Updated RedisStore with injected payment client:
-type RedisStore struct {
-	client   *redis.Client
-	meridian MeridianClient
-}
-
-func (s *RedisStore) Book(b Booking) (Booking, error) {
-	ctx := context.Background()
-
-	held, err := s.Hold(ctx, b)
-	if err != nil {
-		return Booking{}, err
-	}
-
-	// Charge via Meridian Pay.
-	if err := s.meridian.Charge(ctx, b.UserID, b.AmountCents); err != nil {
-		// Payment failed — release the hold immediately so the seat
-		// doesn't stay locked for 2 minutes.
-		_ = s.Release(ctx, b.MovieID, b.SeatID)
-		return Booking{}, fmt.Errorf("payment failed: %w", err)
-	}
-
-	if err := s.Confirm(ctx, held); err != nil {
-		_ = s.Release(ctx, b.MovieID, b.SeatID)
-		return Booking{}, fmt.Errorf("confirm after payment: %w", err)
-	}
-	held.Status = "confirmed"
-	return held, nil
-}
-
-// Test (uses miniredis for an in-process Redis):
-type mockMeridian struct{ err error }
-
-func (m *mockMeridian) Charge(_ context.Context, _ string, _ int) error { return m.err }
-
-func TestBookPaymentFailureReleasesHold(t *testing.T) {
-	mr := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	store := NewRedisStore(client, &mockMeridian{err: errors.New("card declined")})
-
-	_, err := store.Book(Booking{MovieID: "inception", SeatID: "A7", UserID: "u1"})
-	if err == nil {
-		t.Fatal("expected error from failed payment")
-	}
-
-	// Verify the hold was released — key must not exist.
-	val, _ := client.Exists(context.Background(), "seat:inception:A7").Result()
-	if val != 0 {
-		t.Error("hold key was not released after payment failure")
-	}
-}
-```
-
-The critical invariant: if payment fails, the hold must be released immediately. A dangling hold would lock the seat for 2 minutes and block real customers. The release in the error path is the cinema equivalent of a transaction rollback — the distributed analog of `from.balance += amount` in the failed-transfer rollback. Note `miniredis` as an in-process Redis fake for tests — no Docker required.
+Capture and void must be idempotent (keyed by the booking attempt) because the service can crash between steps and retry, which Part 1 chapter 24 measured going wrong without an idempotency key. Ordering it this way means money is only taken once the seat is certainly hers. Charging first and hoping confirm succeeds is how the naive store charged both customers.
 
 </Solution>
 
 </Exercise>
+
+<Exercise n={5} title="Redis older than 8.4" level="hard">
+
+`SET … IFEQ` and `DELEX` need Redis 8.4. Write `Release` and `Confirm` for older Redis with Lua scripts, and check them with `redis-cli EVAL`.
+
+<Solution>
+
+A Lua script runs atomically inside Redis, like a single command:
+
+```text
+$ L="if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+$ redis-cli SET seat:inception:A7 held:bob PX 60000
+OK
+$ redis-cli EVAL "$L" 1 seat:inception:A7 held:alice     # alice's late release
+0
+$ redis-cli GET seat:inception:A7
+held:bob
+$ redis-cli EVAL "$L" 1 seat:inception:A7 held:bob       # bob's release
+1
+
+$ C="if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('SET', KEYS[1], ARGV[2]) else return false end"
+$ redis-cli SET seat:inception:A7 held:bob PX 60000
+OK
+$ redis-cli EVAL "$C" 1 seat:inception:A7 held:alice booked:alice
+
+$ redis-cli EVAL "$C" 1 seat:inception:A7 held:bob booked:bob
+OK
+$ redis-cli PTTL seat:inception:A7
+-1
+```
+
+In Go, `redis.NewScript(L)` and `script.Run(ctx, rdb, []string{key}, "held:"+user)` load the script once and call it by its SHA afterwards. The plain `SET` inside the confirm script has no expiry option, so it removes the TTL (`PTTL` −1), as `SET … IFEQ` does.
+
+</Solution>
+
+</Exercise>
+
+---
 
 ## The Lab
 
-You've watched me build three stores and prove the mutex holds the line. Now it's your turn to hold the line personally. I set this test myself — and I take a *keen* interest in whether the books balance and the seat stays single-owned.
-
-This is the ledger race wearing a cinema seat. You know what it is. Let's see if you can fix it.
-
 <Lab
-  title="One Seat, One Winner — Concurrent Booking Under Load"
-  archetype="load"
+  title="Confirm and Release Only for the Holder"
+  archetype="find-it"
   difficulty="guided"
   points={120}
   hintCost={15}
   verify="self-check"
   expect="ALL CHECKS PASS"
-  objective="ConcurrentBookingStore.Book has no synchronisation — concurrent goroutines all racing to book the same seat can all observe an empty map and all succeed, causing double-bookings. Add a sync.Mutex to the struct and lock it properly inside Book so the check-and-write is atomic. The self-check in main spawns goroutines, counts successes and failures, and asserts exactly one winner. Do not edit main."
+  objective="The chapter's in-memory store, with Hold done right and Confirm and Release shipped the naive way: neither checks who holds the seat. Edit only Confirm and Release so a customer whose hold expired can't book or free a seat someone else now holds, and nobody can release a booked seat. The checks move the store's clock forward by hand (a test double for time.Now) to expire a hold."
   starter={`package main
 
 import (
@@ -1411,134 +1310,163 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-var ErrSeatAlreadyBooked = errors.New("seat already booked")
+var (
+	ErrTaken     = errors.New("seat is held or booked by someone else")
+	ErrNotHolder = errors.New("you don't hold this seat (or your hold expired)")
+)
 
-type Booking struct {
-	ID      string
-	MovieID string
-	SeatID  string
-	UserID  string
+type entry struct {
+	status  string // "held" or "booked"
+	user    string
+	expires time.Time // for holds
 }
 
-// BUG: ConcurrentBookingStore has no mutex.
-// Multiple goroutines can read s.bookings, see no entry, and all write — double-booking.
-// Fix: add a sync.Mutex field named mu and lock/unlock it in Book.
-type ConcurrentBookingStore struct {
-	// TODO: add mu sync.Mutex here
-	bookings map[string]Booking
+// Store holds and books seats. now is the clock: time.Now in the service,
+// a clock the checks move forward by hand here.
+type Store struct {
+	mu    sync.Mutex
+	seats map[string]entry // guarded by mu
+	now   func() time.Time
 }
 
-func NewConcurrentBookingStore() *ConcurrentBookingStore {
-	return &ConcurrentBookingStore{bookings: make(map[string]Booking)}
+// current returns the seat's state, treating an expired hold as free.
+// The caller holds s.mu.
+func (s *Store) current(seat string) (entry, bool) {
+	e, ok := s.seats[seat]
+	if ok && e.status == "held" && !s.now().Before(e.expires) {
+		return entry{}, false
+	}
+	return e, ok
 }
 
-// Book MUST be safe for concurrent use. Currently it is NOT.
-// BUG: the check-and-write is not atomic. Fix: add s.mu.Lock() as the first
-// line and defer s.mu.Unlock() as the second line. You must also add the mu
-// field to the struct above.
-// To make the bug deterministic for the self-check, this starter forces a
-// double-success by never writing to bookings — so every call sees an empty map
-// and returns success. Fix it to use the mutex and actually write to bookings.
-func (s *ConcurrentBookingStore) Book(b Booking) (Booking, error) {
-	key := b.MovieID + ":" + b.SeatID
-	_ = key // BUG: not writing to s.bookings — every call sees empty map and succeeds
-	return b, nil // BUG: always succeeds, never returns ErrSeatAlreadyBooked
+// Hold is correct: check and act under one lock, expired holds count as free.
+func (s *Store) Hold(seat, user string, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, taken := s.current(seat); taken {
+		return ErrTaken
+	}
+	s.seats[seat] = entry{status: "held", user: user, expires: s.now().Add(ttl)}
+	return nil
 }
 
-// ── checks: do not edit. Run to verify your fix. ──
+// Confirm and Release are the functions you edit.
+//
+// BUG 1: Confirm books the seat for user without checking that user still
+// holds it. A customer whose hold expired takes the seat from whoever holds
+// it now, and both get charged.
+// BUG 2: Release deletes the seat without checking who holds it. A late
+// "release" frees someone else's hold.
+func (s *Store) Confirm(seat, user string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seats[seat] = entry{status: "booked", user: user}
+	return nil
+}
+
+func (s *Store) Release(seat, user string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.seats, seat)
+	return nil
+}
+
+// ── below this line: do not edit ──
+
+func (s *Store) state(seat string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.current(seat); ok {
+		return e.status + " by " + e.user
+	}
+	return "free"
+}
+
 func main() {
+	clock := time.Date(2026, 9, 26, 20, 0, 0, 0, time.UTC)
+	s := &Store{seats: map[string]entry{}, now: func() time.Time { return clock }}
 	allOK := true
-	store := NewConcurrentBookingStore()
-	const N = 1000
+	check := func(name string, got, want any) {
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			fmt.Printf("FAIL %s: got %v, want %v\\n", name, got, want)
+			allOK = false
+		}
+	}
 
-	var (
-		wg        sync.WaitGroup
-		successes atomic.Int64
-		failures  atomic.Int64
-	)
-
-	for i := range N {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			b := Booking{
-				ID:      fmt.Sprintf("bk-%d", idx),
-				MovieID: "inception",
-				SeatID:  "A7",
-				UserID:  fmt.Sprintf("user-%d", idx),
+	// 1. A thousand customers click A7 at once: one gets it.
+	var won atomic.Int64
+	var wg sync.WaitGroup
+	for i := range 1000 {
+		wg.Go(func() {
+			if s.Hold("A7", fmt.Sprint("user-", i), 2*time.Minute) == nil {
+				won.Add(1)
 			}
-			if _, err := store.Book(b); err == nil {
-				successes.Add(1)
-			} else if errors.Is(err, ErrSeatAlreadyBooked) {
-				failures.Add(1)
-			}
-		}(i)
+		})
 	}
 	wg.Wait()
+	check("rush for A7: customers who got it", won.Load(), 1)
 
-	s := successes.Load()
-	f := failures.Load()
-	if s != 1 {
-		fmt.Printf("FAIL double-booking: %d goroutine(s) succeeded, want exactly 1\\n", s)
-		allOK = false
-	}
-	if f != N-1 {
-		fmt.Printf("FAIL rejected: %d rejections, want %d\\n", f, N-1)
-		allOK = false
-	}
+	// 2. Alice holds B4, pays too slowly, and her hold expires. Bob holds B4.
+	check("alice holds B4", s.Hold("B4", "alice", 2*time.Minute), nil)
+	clock = clock.Add(3 * time.Minute)
+	check("bob holds B4 after alice's hold expired", s.Hold("B4", "bob", 2*time.Minute), nil)
+	check("alice's late confirm", s.Confirm("B4", "alice"), ErrNotHolder)
+	check("B4 after alice's late confirm", s.state("B4"), "held by bob")
+
+	// 3. Alice's late release must not free Bob's hold.
+	check("alice's late release", s.Release("B4", "alice"), ErrNotHolder)
+	check("carol tries B4", s.Hold("B4", "carol", 2*time.Minute), ErrTaken)
+
+	// 4. Bob pays in time.
+	check("bob confirms B4", s.Confirm("B4", "bob"), nil)
+	check("B4 at the end", s.state("B4"), "booked by bob")
+	check("bob can't release a booked seat", s.Release("B4", "bob"), ErrNotHolder)
 
 	if allOK {
 		fmt.Println("ALL CHECKS PASS")
 	}
 }`}
-  verifier="main spawns 1000 goroutines all racing to book seat A7 for movie 'inception'. It atomically counts successes (no error) and failures (ErrSeatAlreadyBooked) and asserts exactly 1 success and 999 failures. Without the mutex the map can be read and written concurrently, producing multiple winners or a runtime panic. Codapi runs plain go run — no race flag, no hidden test runner. The flag unlocks when it prints ALL CHECKS PASS."
+  verifier="Checks: 1,000 goroutines hold A7 and exactly one succeeds; alice's hold expires, bob holds B4, and alice's late Confirm and Release must return ErrNotHolder without changing the seat; carol must be refused; bob confirms; and bob can't release a booked seat. Prints ALL CHECKS PASS when every check holds."
   hints={[
-    "Add `mu sync.Mutex` as the first field of ConcurrentBookingStore. The zero value of sync.Mutex is an unlocked mutex — no initialisation in NewConcurrentBookingStore needed.",
-    "Inside Book(), add `s.mu.Lock()` as the very first line and `defer s.mu.Unlock()` as the second line. The defer fires when Book returns regardless of which return path is taken.",
-    "With s.mu.Lock() + defer s.mu.Unlock() the check (does key exist?) and the write (s.bookings[key] = b) are atomic with respect to other goroutines calling Book. The first caller writes the entry; every subsequent caller finds it and returns ErrSeatAlreadyBooked."
+    "Both methods need the same test Hold already uses: look the seat up with s.current (which treats an expired hold as free) while holding s.mu.",
+    "Confirm is valid only if the seat is currently held (status \"held\") by this user. Anything else, including a booked seat or an expired hold, is ErrNotHolder.",
+    "Release has the same condition, then deletes. Check and act under the same lock, as in Hold."
   ]}
-  flag="GO{one_seat_one_winner_mutex_closes_the_gap}"
+  flag="GO{only_the_current_holder_confirms_or_releases}"
 >
 
-One thousand goroutines. One seat. One winner. The ledger race wears a cinema seat this time — but you've seen this hazard before, you know the fix, and I expect you to be *bored* by how obvious it is once you've internalized it.
-
-The store's `Book` method is missing its mutex. Add it. Run the verifier. If it prints `ALL CHECKS PASS`, the flag is yours.
-
-And remember: Meridian Pay charges the card on the `Confirm` call. If two bookings slip through to Confirm, two charges go through. That's not a cinema problem anymore — that's a *Meridian* problem. Hold the line.
+These are the same two bugs stop 5 reproduced against real Redis with `late.sh`, in a form that runs in the browser. The clock is the one test double here: `s.now` is `time.Now` in the service and a variable the checks advance, so the lab doesn't have to wait two real minutes for a hold to expire.
 
 </Lab>
 
 <Recap>
 
-- **The double-booking race is the balance race in a new domain.** Same unprotected read-modify-write. Same fix. Build the instinct to recognize it anywhere.
-- **Repository pattern + dependency injection**: `Service` depends on `BookingStore` (interface), not on a concrete type. Swap `MemoryStore` → `ConcurrentStore` → `RedisStore` by changing the constructor argument. Interface satisfaction is implicit in Go — the compiler verifies it.
-- **`MemoryStore` fails under `-race`** because Go maps are not concurrency-safe. Concurrent reads and writes on the same map key is a data race that the race detector catches — and the runtime panics on concurrent writes in non-race builds.
-- **`ConcurrentStore` fixes it with `sync.RWMutex`**: `mu.Lock()` + `defer mu.Unlock()` in `Book` (exclusive write); `mu.RLock()` + `defer mu.RUnlock()` in `ListBookings` (shared reads). The write lock serializes the check-and-write atomically.
-- **Pessimistic vs optimistic**: pessimistic (mutex) for high-contention scenarios; optimistic (CAS loop) for low-contention. Cinema seat sales are high-contention by design. Part 3 covers optimistic locking with DB version columns.
-- **Redis `SET NX EX`**: the `NX` flag is the distributed lock — atomic because Redis is single-threaded. `EX 120` makes holds self-expiring. `PERSIST` converts a hold to a permanent booking. `DEL` releases. No cleanup job required.
-- **Go 1.22 `ServeMux`** handles method+wildcard patterns natively. `r.PathValue("movieID")` extracts wildcards. No external router for standard CRUD.
-- **`sync.WaitGroup.Go(func())`** (Go 1.25) replaces the manual `wg.Add(1)` + `defer wg.Done()` pattern in goroutine launches.
-- **`slog`** for structured logging; `slog.NewMultiHandler` (Go 1.26) for multi-sink fan-out.
-- Meridian Pay is the payment rail at `Confirm`. If the booking layer double-books, Meridian double-charges. Both failures compose. Hold the line at the store layer, and the payment layer stays clean.
+- **Hold → confirm → release** is the real checkout shape: a hold must be exclusive and must expire; confirm and release are valid only for the current holder.
+- **A map without a lock** passed a 1,000-customer HTTP load test and still wasn't correct: `-race` reported it, and calling `Hold` from 1,000 goroutines directly crashed the process with `fatal error: concurrent map writes`, every time.
+- **A mutex** made the store correct in one process (1 winner, race-free) and three replicas sold A7 **three times**: locks protect a process's memory, not state shared between processes.
+- **Redis** gave one winner across three replicas, each operation one atomic command: `SET NX PX` to hold, `SET … IFEQ` to confirm (and drop the TTL), `DELEX … IFEQ` to release, `MGET` to read the hall. Holds expired on their own (measured 5 s).
+- **Expiry cuts both ways.** A naive confirm (`SET` + `PERSIST`) and release (`DEL`) let a late customer take or free someone else's seat: both customers charged, three customers for one seat. The ownership check fixed both.
+- **Architecture:** handlers depend on a `Store` interface chosen in `main`; `newMux` is testable with `httptest` and a `MemoryStore`; the page is embedded with `go:embed`. `X-User` stands in for real authentication.
 
 </Recap>
 
 <Scoreboard
   streak={8}
   items={[
-    { label: "Quick check — double-booking root cause", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — RLock vs Lock", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — Release endpoint", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 2 — Per-user hold limit", kind: "exercise", points: 20, done: false },
-    { label: "Exercise 3 — httptest for hold endpoint", kind: "exercise", points: 20, done: false },
-    { label: "Exercise 4 — Optimistic locking", kind: "exercise", points: 25, done: false },
-    { label: "Exercise 5 — Meridian Pay integration", kind: "exercise", points: 30, done: false }
+    { label: "Quick check: why holds expire", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the Store interface", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the passing load test", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: three replicas", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: confirm must compare", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: X-User", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: two tabs", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: per-customer limit", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3: watch a hold expire", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 4: the late customer", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 5: Lua for older Redis", kind: "exercise", points: 25, done: false }
   ]}
-  flag={{ label: "Lab — One Seat, One Winner", captured: false, points: 120 }}
+  flag={{ label: "Lab: Confirm and Release Only for the Holder", captured: false, points: 120 }}
 />
-
-Not bad, sport. You built a concurrent seat-booking system, recognized the ledger race wearing a cinema costume, and fixed it three ways. The instinct is the asset — the specific API is just plumbing. The next time you see an unprotected read-modify-write on shared state, wherever it hides, you'll recognize it in under three seconds.
-
-That's the point. That's always been the point. Now go hold some lines.
