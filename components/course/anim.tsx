@@ -4526,3 +4526,101 @@ export function StreamAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   LRUAnim — a size-limited cache. Exact mode: the
+   recency list itself, most recent on the left;
+   a GET or SET slides that key's card to the front
+   and a full cache drops the card at the back.
+   Sampled mode (Redis): no list, each key carries
+   the time it was last used, and eviction compares
+   only a few sampled keys.
+   ════════════════════════════════════════════ */
+export type LRUFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** the command being run, e.g. "GET a" */
+  op?: string;
+  /** keys in the cache; exact mode: most recent first */
+  keys: string[];
+  /** sampled mode: last-used clock per key */
+  used?: Record<string, number>;
+  /** keys the eviction is looking at */
+  sample?: string[];
+  /** key just used (hit or set) */
+  hot?: string;
+  /** key leaving the cache in this frame */
+  evict?: string;
+  /** a GET that found nothing */
+  miss?: string;
+};
+
+export function LRUAnim({
+  title,
+  max,
+  frames,
+  caption,
+}: {
+  title: string;
+  /** the size limit */
+  max: number;
+  frames: LRUFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 1900);
+  const f = frames[st.cur] ?? frames[0];
+  const sampled = !!f.used;
+  const all = f.evict && !f.keys.includes(f.evict) ? [...f.keys, f.evict] : f.keys;
+  const slotW = 100 / Math.max(max + 1, all.length);
+  return (
+    <AnimShell
+      title={title}
+      kicker={sampled ? "eviction · sampled" : "eviction · exact LRU"}
+      note={f.note}
+      beat={f.beat ?? (f.evict ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="lru">
+        <div className="lru-top">
+          <Gopher role="librarian" pose={f.miss ? "blocked" : f.evict ? "carry" : "idle"} state={f.miss ? "warn" : "active"} size={38} title="the cache" />
+          {f.op && <code className="lru-op">{f.op}</code>}
+          {f.miss && <span className="lru-miss">miss: not in the cache</span>}
+          <span className="lru-cap">{f.keys.length} / {max} keys</span>
+        </div>
+        {!sampled && (
+          <div className="lru-ends">
+            <span>most recent</span>
+            <span>least recent: evicted first</span>
+          </div>
+        )}
+        <div className="lru-row">
+          {all.map((k) => {
+            const i = f.keys.indexOf(k);
+            const gone = f.evict === k;
+            const left = (gone ? f.keys.length : i) * slotW;
+            return (
+              <div
+                key={k}
+                className={`lru-card ${f.hot === k ? "hot" : ""} ${gone ? "gone" : ""} ${f.sample?.includes(k) ? "sampled" : ""}`}
+                style={{ left: `${left}%`, width: `calc(${slotW}% - 8px)` }}
+              >
+                <span className="lru-key">{k}</span>
+                {f.used && <span className="lru-used">used at {f.used[k] ?? "–"}</span>}
+              </div>
+            );
+          })}
+        </div>
+        {!sampled && <div className="lru-arrow" aria-hidden />}
+      </div>
+    </AnimShell>
+  );
+}

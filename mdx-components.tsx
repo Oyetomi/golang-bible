@@ -71,6 +71,7 @@ export const mdxComponents = {
   ExpiryAnim: A.ExpiryAnim,
   RelationAnim: A.RelationAnim,
   StreamAnim: A.StreamAnim,
+  LRUAnim: A.LRUAnim,
   CodeWalk,
   RuntimeStage,
   CinemaAnim,
