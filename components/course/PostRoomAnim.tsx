@@ -384,7 +384,7 @@ export function PostRoomAnim({
             return (
               <div
                 key={j.id}
-                className={`post-env ${start ? "moving" : ""} ${arrived ? "arrived" : ""} ${e.to === "dead" ? "dead" : ""} ${e.to === "retry" ? "retry" : ""}`}
+                className={`post-env ${start ? "moving" : ""} ${arrived ? "arrived" : ""} ${e.to === "dead" && binTone !== "neutral" ? "dead" : ""} ${e.to === "retry" ? "retry" : ""}`}
                 style={{ transform: `translate(${x}px, ${y}px) translate(-50%, -50%)` }}
               >
                 <span className="post-envflap" />
