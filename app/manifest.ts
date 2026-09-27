@@ -8,8 +8,8 @@ export default function manifest(): MetadataRoute.Manifest {
       "A visualization-heavy, Boot.dev-style Go course: from syntax to senior production engineer to fintech specialist.",
     start_url: "/",
     display: "standalone",
-    background_color: "#09090b",
-    theme_color: "#00add8",
+    background_color: "#fbf7ef",
+    theme_color: "#0b1b38",
     icons: [
       {
         src: "/favicon.svg",

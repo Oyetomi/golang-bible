@@ -14,6 +14,7 @@ import { BadgesModal } from "./BadgesModal";
 import { ReadingProgress } from "@/components/nav/ReadingProgress";
 import { BookmarkButton } from "@/components/nav/BookmarkButton";
 import { openSearch } from "@/lib/search";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 interface XpToast {
   id: number;
@@ -195,6 +196,9 @@ export function GamificationHeader() {
               </svg>
               <span className="gb-badge-count">{unlockedBadgesCount}/20</span>
             </button>
+
+            {/* Paper / dark */}
+            <ThemeToggle />
 
             {/* Sound Toggle */}
             <button
