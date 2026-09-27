@@ -3,661 +3,1209 @@ title: "Storage Engines: LSM-Trees vs B-Trees"
 part: 2
 order: 22
 type: "course"
-description: "What actually happens on disk when a database stores your data — explained from zero: the append-only log and the index trade-off, log-structured (LSM) engines with memtables, SSTables, compaction and Bloom filters, B-trees with pages, splits and the write-ahead log, how to choose between them (write amplification, sequential vs random writes), and why analytics uses column storage — all grounded in Meridian's ledger."
+description: "What a database does with the cinema's seat changes on disk, measured on real engines: a hand-built append-only log (8.8 ms scans, 1.1 µs with a hash index, 25x smaller after compaction), Pebble's LSM tree (397,000 writes/s, 3.2x write amplification, memtables, levels and compactions), Bloom filters that made absent-key lookups 4x faster or 10x slower depending on the cache, bbolt's B+tree (1 µs lookups, 151x write amplification on random updates, 8 ms per fsync'd commit), and Parquet reading 1.35 MB where CSV read 77.8 MB."
 prerequisites: ["sharding"]
 ---
 
-<HeroCard label="Part 2 · Chapter 21" title="Storage Engines: LSM-Trees vs B-Trees">
+<HeroCard label="Part 2 · Chapter 22" title="Storage Engines: LSM-Trees vs B-Trees">
 
-You've kept copies (replication) and split the data (sharding). Now we go down one more level — *inside a single shard* — to the thing that actually puts bytes on disk and finds them again: the **storage engine**. You will never write one from scratch. But you choose one every time you pick Postgres over Cassandra, or turn on a RocksDB backend, or wonder why your write-heavy table is slow — and those choices are unguessable until you know what the engine is doing under the hood.
+Chapters 20 and 21 moved the cinema's data across machines. This chapter goes inside one: when Postgres, Redis, etcd or CockroachDB is told "seat A7 is booked", what does it write, where, and how does it find it again? Almost every database answers with one of two designs. A **B-tree** keeps the data sorted in fixed-size pages and updates them in place. A **log-structured merge tree** (LSM) never updates in place: it appends, sorts in memory, writes sorted files, and merges them later.
 
-I'll teach this from absolute zero — no assumed knowledge of disks, trees, or indexes. We'll build the world's simplest database in a few lines, watch it fall over, and fix it twice, two completely different ways: the **log-structured (LSM)** way that powers Cassandra and RocksDB, and the **B-tree** way that powers Postgres and MySQL. By the end you'll know exactly why Meridian's transaction firehose loves one engine and its balance lookups love the other, what "write amplification" is and why it wears out your SSD, and why the finance dashboard stores the same data sideways. Let's go.
+The designs make opposite trade-offs, and the only way to feel them is to run them. So this chapter builds the simplest possible database first, then runs the same day of box-office traffic (a million seats, three million changes) through **Pebble**, the LSM engine inside CockroachDB, and **bbolt**, the B+tree engine inside etcd, and measures throughput, bytes written, bytes read and disk used. Then it looks at the other axis, rows versus columns, for the reports the box office runs at night.
+
+Six stops. If you get lost, come back here:
+
+1. **The simplest database.** Append to a file; the problem is finding things.
+2. **LSM trees.** Memtables, sorted runs, levels and compaction, in Pebble.
+3. **Bloom filters.** Skipping files that can't have the key, and when that backfires.
+4. **B-trees.** Pages, splits and copy-on-write, in bbolt.
+5. **LSM versus B-tree.** The same workload, side by side.
+6. **Rows versus columns.** Why the nightly reports want a different layout.
 
 </HeroCard>
 
-<ChapterTabs tabs={["The Index Trade-off", "LSM-Trees", "B-Trees", "LSM vs B-Tree", "Bloom Filters", "Row vs Column"]} />
+<ChapterTabs tabs={["The Simplest Database", "LSM Trees", "Bloom Filters", "B-Trees", "LSM versus B-Tree", "Rows versus Columns"]} />
 
 <SpacedRecall
-  role={"mechanic"}
+  role={"librarian"}
   items={[
     {
-      from: "SQL & databases (part 1, ch18)",
-      q: "Adding an index speeds reads at the cost of…?",
-      options: ["nothing", "slower writes / more space", "correctness", "security"],
+      from: "Replication (part 2, ch20)",
+      q: "What does a Postgres streaming replica receive from the primary?",
+      options: ["Copies of the data files", "The write-ahead log, which it replays", "SQL statements", "Snapshots every minute"],
       answer: 1,
-      tie: "That read-vs-write trade-off is this chapter on disk: B-trees favor reads, LSM-trees favor writes. The index IS the trade-off, made physical."
+      tie: "The WAL is an append-only log, the oldest trick in storage. Stop 1 builds one, and stop 2 shows an LSM tree is a log that keeps itself sorted."
     },
     {
-      from: "General",
-      q: "An append-only log makes writes…?",
-      options: ["slower", "sequential and fast (no in-place update)", "random", "impossible"],
-      answer: 1,
-      tie: "Sequential append is the foundation of log-structured (LSM) engines — fast writes now, compaction later. This chapter is what actually happens on the disk."
+      from: "Performance Engineering (part 2, ch10)",
+      q: "Why did the seat map get faster when the seat names were computed once at startup?",
+      options: ["Less work per request", "The compiler inlined it", "Redis cached it", "It didn't"],
+      answer: 0,
+      tie: "Storage engines are the same kind of accounting, in bytes: work done per write (write amplification) against work done per read."
     },
   ]}
 />
-
 
 <PredictLab
-  prompt={"sort.SearchInts finds 5 in [1 3 5 7] at index?"}
+  prompt={"3,000,000 random seat updates, 1,000 per transaction, into bbolt (a B+tree of 4 KB pages, copy-on-write). The keys and values total 303 MB. How many bytes of pages does bbolt write?"}
   role={"librarian"}
-  code={`fmt.Println(sort.SearchInts([]int{1, 3, 5, 7}, 5))`}
-  options={["2", "3", "5", "-1"]}
-  answer={0}
-  output={`2`}
-  explain={"sort.SearchInts binary-searches a SORTED slice and returns the index where 5 is (or would be inserted) \u2014 index 2. Storage engines lean on sorted runs + binary search (and its cousin, the B-tree/LSM lookup) for O(log n) reads."}
+  code={`db.Update(func(tx *bolt.Tx) error {
+	for range 1000 {
+		b.Put(randomSeatKey(), bookingJSON) // ~100 bytes
+	}
+	return nil
+})  // × 3,000`}
+  options={["About 303 MB: each byte once", "About 600 MB: data plus a log", "About 1 GB", "About 45 GB: every commit rewrites each page it touched"]}
+  answer={3}
+  output={`3,000,000 writes (303 MB) in random order: 31.257s, 95979 writes/s
+  page splits: 9807; pages written: 45753 MB (151.0× the data); file: 185.9 MB`}
+  explain={"Each transaction's 1,000 random keys land on about 1,000 different 4 KB leaf pages, and copy-on-write rewrites every one of them, plus the branch pages above, to change a hundred bytes each. That's write amplification: bytes written per byte of data. The LSM tree wrote the same data at 3.2x."}
 />
 
-<Scene
-  title="An append-only log grows forever → compaction reclaims it"
-  actors={[
-    { id: "writer", label: "Ledger writes" },
-    { id: "engine", label: "Storage engine" }
-  ]}
-  rows={1}
-  cols={5}
-  frames={[
-    {
-      caption: "Every write appends to a log — the fastest possible write. acct_7 is set to 5000, then updated to 9000. The old 5000 is still sitting there.",
-      beat: "neutral",
-      cells: [{ id: "A1", state: "active", label: "7=5000" }, { id: "A2", state: "active", label: "7=9000" }, { id: "A3", state: "idle", label: "—" }, { id: "A4", state: "idle", label: "—" }, { id: "A5", state: "idle", label: "—" }]
-    },
-    {
-      caption: "Thousands of updates later, the log is full of stale, overwritten versions. Reads slow down, disk fills with garbage. An append-only log that never cleans up runs out of space.",
-      beat: "problem",
-      cells: [{ id: "A1", state: "bad", label: "7=5000 ✗" }, { id: "A2", state: "bad", label: "7=9000 ✗" }, { id: "A3", state: "bad", label: "7=8800 ✗" }, { id: "A4", state: "warn", label: "7=9100" }, { id: "A5", state: "bad", label: "disk full" }]
-    },
-    {
-      caption: "Compaction merges the segments in the background, keeping only the newest value per key and discarding the rest. One live value for acct_7; the garbage is gone.",
-      beat: "solution",
-      cells: [{ id: "A1", state: "done", label: "7=9100 ✓" }, { id: "A2", state: "ok", label: "reclaimed" }, { id: "A3", state: "ok", label: "reclaimed" }, { id: "A4", state: "ok", label: "reclaimed" }, { id: "A5", state: "ok", label: "free" }]
-    }
-  ]}
-  caption="The whole story of a log-structured engine in one picture: append fast, then merge-and-compact in the background to keep only what's live. Everything else in this chapter is detail on top of this idea."
-/>
+## The lab bench
 
-## The Index Trade-off
+One Go module, `engines`, with four programs: `logdb` (a database in 100 lines), `lsm` (Pebble v2.1.7), `btree` (bbolt 1.5.0) and `columns` (parquet-go 0.32.0). The workload is the same for Pebble and bbolt: 25,000 showings of 40 seats, a million seat keys like `inception/show-12345/C6`, and three million changes of about 100 bytes each in random order, committed a thousand at a time. Everything runs on an Apple M1 with its SSD; absolute numbers will differ on your machine, the ratios much less.
 
-A database does exactly two things: you give it data, it stores it; you ask for data, it gives it back. Here's the entire thing, as simple as it can possibly be — an **append-only log**:
+## The Simplest Database
 
-<GoPlayground>
+*Stop 1 of 6.*
 
-```go
+### Step 1: append, and scan
+
+The simplest way to store seat states: append a line `key<TAB>value` for every change, and to read a key, the **last** line for it wins. Writing is as fast as a disk can go, because nothing is ever overwritten or reorganised.
+
+```go noverify
+// logdb is the simplest database there is: every change to a seat is
+// appended to a file, and the latest line for a key is its value. It
+// measures lookups by scanning, lookups through an in-memory hash index,
+// and what compaction does to the file.
 package main
 
-import "fmt"
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log"
+	"math/rand/v2"
+	"os"
+	"strings"
+	"time"
+)
 
-// The world's simplest storage engine: an append-only log of values, plus an
-// in-memory hash index mapping each key to the position of its NEWEST value.
-type Engine struct {
-	log   []string       // append-only; old values are never erased in place
-	index map[string]int // key -> position of newest entry in log
+// showings × seats: 200 showings of 40 seats = 8,000 seats.
+func seatKey(showing, seat int) string {
+	return fmt.Sprintf("inception/show-%03d/%c%d", showing, 'A'+seat/8, 1+seat%8)
 }
 
-func newEngine() *Engine { return &Engine{index: map[string]int{}} }
-
-func (e *Engine) set(key, val string) {
-	e.log = append(e.log, val) // O(1): appending is the cheapest write there is
-	e.index[key] = len(e.log) - 1
+type DB struct {
+	f     *os.File
+	index map[string]int64 // key → offset of its latest line (nil: no index)
 }
 
-func (e *Engine) get(key string) (string, bool) {
-	i, ok := e.index[key]
+func (db *DB) Set(key, value string) error {
+	off, err := db.f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(db.f, "%s\t%s\n", key, value); err != nil {
+		return err
+	}
+	if db.index != nil {
+		db.index[key] = off
+	}
+	return nil
+}
+
+// GetScan reads the whole file; the last line for key wins.
+func (db *DB) GetScan(key string) (string, bool) {
+	if _, err := db.f.Seek(0, io.SeekStart); err != nil {
+		log.Fatal(err)
+	}
+	sc := bufio.NewScanner(db.f)
+	var val string
+	found := false
+	for sc.Scan() {
+		k, v, _ := strings.Cut(sc.Text(), "\t")
+		if k == key {
+			val, found = v, true
+		}
+	}
+	return val, found
+}
+
+// GetIndexed seeks straight to the key's latest line.
+func (db *DB) GetIndexed(key string) (string, bool) {
+	off, ok := db.index[key]
 	if !ok {
 		return "", false
 	}
-	return e.log[i], true // O(1): the index jumps straight to the newest value
+	line, err := bufio.NewReader(io.NewSectionReader(db.f, off, 1<<16)).ReadString('\n')
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, v, _ := strings.Cut(strings.TrimSuffix(line, "\n"), "\t")
+	return v, true
+}
+
+func size(f *os.File) int64 {
+	st, err := f.Stat()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return st.Size()
 }
 
 func main() {
-	e := newEngine()
-	e.set("acct_7", "balance=5000")
-	e.set("acct_7", "balance=9000") // update: appended; the old value still lingers
-	bal, _ := e.get("acct_7")
-	fmt.Println("acct_7 ->", bal) // balance=9000 (newest)
-	fmt.Println("log holds", len(e.log), "entries (old version still present)")
+	dir, err := os.MkdirTemp("", "logdb")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	f, err := os.Create(dir + "/seats.log")
+	if err != nil {
+		log.Fatal(err)
+	}
+	db := &DB{f: f, index: map[string]int64{}}
+
+	// A day of the box office: 200,000 changes to 8,000 seats (holds,
+	// releases, bookings), so each seat changes about 25 times.
+	r := rand.New(rand.NewPCG(1, 2))
+	states := []string{"held:%d", "free", "booked:%d"}
+	t0 := time.Now()
+	for range 200_000 {
+		st := states[r.IntN(3)]
+		if strings.Contains(st, "%d") {
+			st = fmt.Sprintf(st, r.IntN(100_000))
+		}
+		if err := db.Set(seatKey(r.IntN(200), r.IntN(40)), st); err != nil {
+			log.Fatal(err)
+		}
+	}
+	fmt.Printf("200,000 appends in %v; the log is %.1f MB for %d live seats\n",
+		time.Since(t0).Round(time.Millisecond), float64(size(f))/1e6, len(db.index))
+
+	key := seatKey(137, 21)
+	t0 = time.Now()
+	v, _ := db.GetScan(key)
+	fmt.Printf("get %s by scanning the log:     %-8v → %s\n", key, time.Since(t0).Round(time.Microsecond), v)
+	t0 = time.Now()
+	for range 10_000 {
+		v, _ = db.GetIndexed(key)
+	}
+	fmt.Printf("get %s through the hash index: %-8v → %s  (average of 10,000)\n", key, (time.Since(t0) / 10_000).Round(100*time.Nanosecond), v)
+	fmt.Printf("the index: %d keys in memory, one offset each\n", len(db.index))
+
+	// Compaction: rewrite the log with only each key's latest line.
+	t0 = time.Now()
+	nf, err := os.Create(dir + "/seats.compacted")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ndb := &DB{f: nf, index: map[string]int64{}}
+	for k := range db.index {
+		v, _ := db.GetIndexed(k)
+		if err := ndb.Set(k, v); err != nil {
+			log.Fatal(err)
+		}
+	}
+	fmt.Printf("compaction: %.1f MB → %.2f MB in %v\n", float64(size(f))/1e6, float64(size(nf))/1e6, time.Since(t0).Round(time.Millisecond))
 }
 ```
 
-</GoPlayground>
+```text
+200,000 appends in 538ms; the log is 6.3 MB for 8000 live seats
+get inception/show-137/C6 by scanning the log:     8.82ms   → free
+get inception/show-137/C6 through the hash index: 1.1µs    → free  (average of 10,000)
+the index: 8000 keys in memory, one offset each
+compaction: 6.3 MB → 0.25 MB in 30ms
+```
 
-Two ideas in those few lines carry the whole chapter:
+200,000 changes appended in 538 ms. Reading one seat by scanning the log: **8.8 ms**, and it grows with every write the log has ever received.
 
-<Define term="Log (append-only file)" since="Storage Engines (Part 2)">
-A **log** in storage engine architecture is an **append-only sequence of immutable records on disk**. New records are appended strictly to the tail; existing bytes are never updated in place. **Why it matters:** sequential disk appends maximize drive throughput by saturating controller bandwidth and eliminating expensive disk head seeks or SSD random-write block-erase cycles. **Production hazard:** logs grow indefinitely; without background truncation or compaction, the host disk fills to 100%, causing the database process to crash fatally and lock out new transactions.
-</Define>
+### Step 2: an index, and compaction
 
-<Define term="Index" since="Storage Engines (Part 2)">
-An **index** is an auxiliary data structure derived from raw data that accelerates lookup operations (e.g. mapping a primary key to a file byte offset). **Why it matters:** transforms linear file scans (`O(n)`) into logarithmic or constant-time jumps (`O(log n)` or `O(1)`). **Production hazard:** every write, update, or deletion must synchronously update all attached indexes, multiplying disk write amplification and degrading write throughput under heavy ingest.
-</Define>
+The fix for reads is an **index**: a hash map from each key to the byte offset of its latest line. Then a read is one seek: **1.1 µs**, 8,000 times faster. Two new problems appear. The index lives in memory, so every key must fit in RAM. And the log keeps every old version: 6.3 MB for 8,000 live seats. **Compaction** rewrites it with only the latest value of each key: **0.25 MB**.
 
-<Callout kind="warn" title="The toy engine has three fatal flaws — and fixing them gives us real engines">
-
-Our append-log-plus-hash-index is fast, but: (1) it never reclaims space — stale values pile up until the disk is full; (2) the hash index must fit entirely in RAM, and rebuilding it on restart means rescanning everything; (3) **range queries are impossible** — "every transaction for acct_7 in March" has to look up each key individually. The two real engine families are two different ways of fixing all three. **LSM-trees** keep the log idea but sort and merge it. **B-trees** throw out the log and update sorted pages in place. Same goal, opposite philosophy.
-
-</Callout>
-
-## LSM-Trees
-
-The first fix keeps the append-only spirit but makes the on-disk files **sorted**. A sorted file of key-value pairs is called an **SSTable**, and the engine built around them is the **LSM-tree** (Log-Structured Merge-tree) — the heart of Cassandra, ScyllaDB, RocksDB, HBase, and Bigtable.
-
-<Define term="SSTable & memtable" since="Storage Engines (Part 2)">
-An **SSTable** (Sorted String Table) is an immutable on-disk file containing key-value pairs **sorted by key**. A **memtable** is an in-memory sorted buffer (typically a red-black tree or skiplist) that collects live writes. **Why it matters:** sorted keys allow binary search or sparse indexing, efficient range scans, and O(n) streaming multi-way merges. **Production hazard:** if background SSTable flushing falls behind heavy burst traffic, the memtable exhausts allocated RAM, forcing write stalls and throttling upstream client requests.
-</Define>
-
-Here is the write path. Notice every write is durable *before* it's acknowledged, via a separate write-ahead log:
-
-<ExecTimeline
-  title="The LSM write path"
-  lanes={[
-    { id: "client", label: "Ledger write" },
-    { id: "wal", label: "Write-ahead log" },
-    { id: "mem", label: "Memtable (RAM)" },
-    { id: "disk", label: "SSTables (disk)" }
-  ]}
-  steps={[
-    { lane: "client", kind: "run", label: "write acct_7=9000", note: "A transaction updates an account." },
-    { lane: "wal", kind: "send", label: "append to WAL", note: "First, append the write to an on-disk log. If we crash now, we can replay this to rebuild the memtable. Durability before acknowledgement." },
-    { lane: "mem", kind: "run", label: "insert into memtable", note: "Then insert into the in-memory sorted structure. Fast — it's RAM. The write is acknowledged here." },
-    { lane: "mem", kind: "block", label: "memtable full?", note: "When the memtable passes a threshold (a few MB), it's frozen and a fresh one takes over incoming writes." },
-    { lane: "disk", kind: "done", label: "flush as new SSTable", note: "The frozen memtable is written out in one sequential pass as a new immutable SSTable. Its slice of the WAL can now be discarded." }
-  ]}
-  caption="Writes hit RAM (fast) but survive crashes (WAL). The expensive disk work — flushing — happens in big sequential batches, not per write. That's the LSM superpower for write-heavy workloads like a ledger."
-/>
-
-Reads are trickier: a key might be in the memtable, or the newest SSTable, or an older one. You check **newest to oldest** and stop at the first hit (newer overrides older). Deletes are just another write — a special **tombstone** marker. And to avoid touching every SSTable for keys that aren't there, each SSTable carries a **Bloom filter** (its own section below). Left alone, SSTables would accumulate forever, so a background **compaction** merges them:
-
-<ExecTimeline
-  title="Compaction: merging two SSTables"
-  lanes={[
-    { id: "newer", label: "Newer SSTable" },
-    { id: "older", label: "Older SSTable" },
-    { id: "merge", label: "Merge (mergesort)" },
-    { id: "out", label: "Output SSTable" }
-  ]}
-  steps={[
-    { lane: "newer", kind: "run", label: "acct_7=9000, acct_9=del", note: "The newer segment has the latest value for acct_7 and a tombstone deleting acct_9." },
-    { lane: "older", kind: "run", label: "acct_7=5000, acct_8=200", note: "The older segment has a stale acct_7 and a live acct_8." },
-    { lane: "merge", kind: "run", label: "walk both, take lowest key", note: "Like the merge step of mergesort: read both sorted files side by side, emit the smallest key. On a tie, keep the NEWER value." },
-    { lane: "merge", kind: "block", label: "drop stale + tombstones", note: "The old acct_7=5000 is discarded (newer wins); acct_9's tombstone removes it entirely once merged into the oldest level." },
-    { lane: "out", kind: "done", label: "one clean sorted file", note: "Result: acct_7=9000, acct_8=200. Sorted, one value per key, garbage reclaimed. Old files are deleted." }
-  ]}
-  caption="Compaction is a background mergesort. It uses almost no memory (one key at a time per file) and turns a growing pile of segments back into a tidy set — reclaiming the space the toy engine never could."
-/>
-
-<Callout kind="note" title="Compaction strategies: size-tiered vs leveled">
-
-*When* and *which* SSTables to merge is configurable. **Size-tiered** merges smaller SSTables into successively bigger ones — great for write-heavy loads (data is rewritten only a few times). **Leveled** keeps fixed-size SSTables in growing levels (L0, L1, L2…), merging incrementally — uses less disk space and is faster for reads (fewer files to check). Rule of thumb: write-heavy → size-tiered; read-heavy → leveled. Meridian's transaction ingest (write-heavy) leans size-tiered; a read-heavy lookup table leans leveled. Most engines let you pick per table.
-
-</Callout>
-
-## B-Trees
-
-The other family throws out the log entirely. Instead of immutable sorted files, a **B-tree** divides the disk into fixed-size **pages** (typically 4–16 KiB) and **updates them in place**. It's the most widespread index structure on earth — every major relational database (Postgres, MySQL, SQL Server, Oracle) uses one.
-
-<Define term="B-tree (pages & branching factor)" since="Storage Engines (Part 2)">
-A **B-tree** (and its ubiquitous on-disk variant, the **B+tree**) is a self-balancing search tree that divides storage into fixed-size **pages** (typically 4 KB to 16 KB) aligned with OS page cache and hardware storage blocks. Internal pages hold routing keys with high **branching factors** (hundreds of child pointers), keeping tree depth to 3–4 levels even for terabytes of records. **Why it matters:** guarantees predictable `O(log n)` read latency requiring at most 3 to 4 page reads per lookup. **Production hazard:** concurrent inserts causing root-level page splits lock large subtrees, generating sudden P99 write latency spikes; random in-place updates fragment flash memory blocks.
-</Define>
-
-A lookup walks the tree from the root, following the one child whose range contains your key:
-
-<ExecTimeline
-  title="A B-tree lookup, then a page split"
-  lanes={[
-    { id: "q", label: "Query" },
-    { id: "root", label: "Root page" },
-    { id: "branch", label: "Branch page" },
-    { id: "leaf", label: "Leaf page" }
-  ]}
-  steps={[
-    { lane: "q", kind: "run", label: "find acct 251", note: "We want the value for key 251." },
-    { lane: "root", kind: "run", label: "251 is in 200-300", note: "The root says keys 200-300 live via this child reference. Follow it." },
-    { lane: "branch", kind: "run", label: "251 is in 250-270", note: "The branch page narrows further: 250-270 is over here. Follow that." },
-    { lane: "leaf", kind: "done", label: "read value at 251", note: "The leaf page holds key 251's value inline. Found in ~3 page reads, every time. Predictable." },
-    { lane: "leaf", kind: "block", label: "insert into a FULL page", note: "Now insert key 334 into a page that's full: the page SPLITS into two half-full pages, and the parent is updated to point at both. Splits can cascade to the root." }
-  ]}
-  caption="Reads are a short, predictable walk down the tree. Inserts can trigger a page split, and a split overwrites several pages at once — which is exactly where crashes get dangerous."
-/>
-
-<Define term="Write-ahead log (WAL) & in-place overwrite" since="Storage Engines (Part 2)">
-A **Write-Ahead Log (WAL)** is a persistent append-only file where transaction modifications are recorded and flushed to disk *before* any in-place page changes or memtable updates are applied. **Why it matters:** ensures strict Atomicity and Durability (ACID) — if power is lost mid-transaction, crash recovery replays the WAL to reconstruct a consistent state. **Production hazard:** returning a success response to a client before calling `file.Sync()` (`fsync`) leaves WAL data in the OS volatile page cache; an abrupt power cut or kernel panic causes silent data loss.
-</Define>
-
-So both families use a WAL for durability — but for opposite reasons. The LSM uses it to recover the in-memory memtable; the B-tree uses it to survive a dangerous in-place page overwrite. Same tool, different fear.
-
-<MentalModel
-  title="B-tree files a card immediately; LSM scribbles now and files later"
-  concept="LSM-trees vs B-trees"
-  metaphor="A librarian who reshelves on the spot versus one with an inbox"
-  analogy="A B-tree keeps everything in sorted order at all times, so a write must find the right page and update it in place — a random disk seek per write, but a read knows exactly where to look. An LSM-tree refuses to pay that at write time. It appends to a log and a small in-memory table, both sequential and fast, then merges sorted batches down into bigger files in the background, which is compaction. Writes get cheap; reads may have to look in several places, newest first, before they can say a key is absent."
-  realWorld="One librarian reshelving each returned book immediately — slow returns, instant lookups. Another dropping returns into an inbox and sorting them overnight — instant returns, and finding a book may mean checking the inbox as well as the shelf."
-  goCode="Postgres uses B-trees, so Meridian's ledger reads are predictable. RocksDB, Cassandra and most write-heavy stores are LSM. Neither is better; they price reads and writes differently."
-  takeaway="LSM's cost is not spread evenly — compaction arrives in bursts, so an LSM store has periodic latency spikes and write amplification a B-tree does not. That is the trade you accept for cheap writes."
-  role="librarian"
-/>
-
-## LSM vs B-Tree
-
-Now the decision you'll actually make. The one-line rule: **LSM-trees are better for writes, B-trees are better (and more predictable) for reads.** Here's *why*, in the four dimensions that matter.
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Sequential vs random writes">LSM flushes whole segments — big **sequential** writes. B-trees overwrite scattered pages — small **random** writes. Disks (even SSDs) do sequential far faster, so LSMs sustain higher write throughput on the same hardware.</ConceptCard>
-  <ConceptCard label="Write amplification">One logical write becomes several physical writes: LSM (WAL + flush + each compaction), B-tree (WAL + the full page, even for a few changed bytes). Lower amplification = more app writes per unit of disk bandwidth, and less SSD wear. LSMs usually win here.</ConceptCard>
-  <ConceptCard label="Read performance">B-tree: one page per level, ~3–4 reads, **predictable**. LSM: may check several SSTables (Bloom filters help), so reads are less predictable and range queries must merge segments. B-trees generally read faster.</ConceptCard>
-  <ConceptCard label="Disk space & latency spikes">LSM compresses SSTables well and rewrites them, so less fragmentation — but compaction competes with live traffic and can cause **latency spikes** under heavy writes. B-trees fragment over time (Postgres needs `VACUUM`).</ConceptCard>
-</ConceptGrid>
-
-<Define term="Write amplification" since="Storage Engines (Part 2)">
-**Write amplification (WA)** is the ratio of physical bytes written to underlying storage relative to the logical bytes requested by the application (`WA = Bytes_written_to_disk / Bytes_written_by_user`). **Why it matters:** high write amplification consumes storage bus bandwidth and exhausts SSD flash endurance limits. **Production hazard:** unoptimized compaction triggers write amplification factors above 30×, saturating NVMe controller I/O queues and prematurely destroying flash memory cells.
-</Define>
-
-<UnderTheHood title="Why sequential beats random on SSDs, kernel dirty pages, and fsync durability">
-
-### 1. Physical Flash Memory Architecture: Pages vs Erase Blocks
-Even though solid-state drives (SSDs) have no physical spinning heads:
-- Flash memory can be **read and written** only in fixed units called **pages** (typically 4 KB).
-- Flash memory can only be **erased** in large units called **erase blocks** (typically 2 MB to 4 MB).
-- When a B-tree modifies a single 50-byte record inside a 4 KB page, the drive must rewrite the entire 4 KB page. Over time, random in-place updates leave erase blocks fragmented with stale pages. The SSD controller's internal **Flash Translation Layer (FTL)** must perform background Garbage Collection — reading valid pages, writing them to a new block, and erasing the old block — stealing drive I/O bandwidth.
-- LSM-trees write large sequential chunks (64 MB+ SSTables), filling contiguous erase blocks that can later be erased in a single hardware cycle.
-
-### 2. OS Dirty Page Cache and fsync()
-When your Go program calls `file.Write([]byte)`, data is merely copied into the **Linux OS Page Cache** (kernel RAM).
-- The write is **not durable** yet.
-- You must invoke `file.Sync()` (which calls the `fsync()` or `fdatasync()` syscall) to issue hardware barrier commands to the NVMe/SATA controller, flushing the drive's volatile write cache onto non-volatile NAND flash.
-- In Go 1.26, high-throughput engines use `bufio.Writer` to batch log entries in user space, issuing a single `file.Sync()` per group commit.
-
-</UnderTheHood>
+That's a real design, not a toy: Bitcask (Riak's storage engine) is exactly this, with the log split into segments so compaction can run on old segments while new writes go to the current one. Its limits are the two above: all keys in memory, and no way to read a *range* ("all the seats of showing 137") without scanning, because a hash index has no order.
 
 <QuickCheck
-  question="Meridian's transaction ingest is overwhelmingly writes (every payment is an append), with occasional point lookups by account. Which storage engine family fits the ingest table best, and why?"
+  question="Why does the hash index make single-key reads fast but not 'all seats of show-137'?"
   options={[
-    "B-tree — it has predictable reads",
-    "LSM-tree — its large sequential flushes and lower write amplification sustain far higher write throughput, which is the bottleneck for a write-heavy ledger ingest",
-    "It makes no difference",
-    "Neither — use the in-memory toy engine"
+    "The index is in memory",
+    "A hash map has no order: seats of one showing are scattered through it, so a range needs a scan of every key",
+    "The log is too big",
+    "Compaction reorders the keys"
   ]}
   answer={1}
-  explain="Write-heavy means disk write bandwidth is the constraint. LSM-trees turn writes into big sequential flushes and have lower write amplification than B-trees (which must write a full page per change), so they push more writes per second and wear SSDs less. That's exactly why Cassandra/RocksDB-style engines back write-heavy ingest. The occasional point lookup is well-served by Bloom filters."
+  explain="Hashing is for exact matches. Keeping keys sorted, which both LSM trees and B-trees do, is what makes ranges cheap."
 />
 
-<ELI5
-  concept="Bloom filters"
-  analogy="A bouncer who can say 'definitely not on the list' but never 'definitely on it'."
-  role="reader"
->
+## LSM Trees
 
-An LSM read may have to check several files for a key. Most of those checks find nothing, and each one costs a disk read. A Bloom filter makes the misses cheap.
+*Stop 2 of 6.*
 
-It is a row of bits. To record a key you hash it a few different ways and set the bit at each resulting position. To test a key you hash it the same ways and look: if **any** of those bits is `0`, the key was definitely never added — because adding it would have set that bit. That answer is exact, and it is the one you wanted, since it lets you skip the file entirely.
+### Step 1: keep the log, but sorted
 
-If all the bits are `1`, the answer is only *probably* yes. Other keys may have set those same bits between them. So you go and check the file, and occasionally find nothing — a false positive, which costs you the read you were trying to avoid but never a wrong result.
+An LSM tree keeps the append-only log's fast writes and adds order:
 
-That asymmetry is the whole design: no false negatives, some false positives, in a structure small enough to keep in memory for millions of keys. You are trading exactness you do not need for a size you can afford.
+1. Every write is appended to a **write-ahead log** (for crash safety) and inserted into the **memtable**, a sorted structure in memory.
+2. When the memtable fills (4 MB here), it's **flushed**: written out as an immutable **sorted table** (an SSTable), with an index of its blocks. That write is sequential and whole.
+3. Tables pile up in **level 0**. **Compaction** merges tables into larger sorted runs in lower levels (L1…L6), keeping only the newest version of each key and dropping deleted ones.
+4. A read looks in the memtable, then the tables from newest to oldest, and stops at the first hit.
 
-</ELI5>
+### Step 2: Pebble with the day's traffic
+
+```go noverify
+// lsm writes a day of the cinema's seat changes into Pebble (the LSM-tree
+// engine inside CockroachDB) and reports what the engine did with them:
+// memtable flushes, sorted table files per level, compactions, bytes
+// written per byte of data, and what a read costs with and without Bloom
+// filters.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"math/rand/v2"
+	"os"
+	"time"
+
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
+)
+
+func key(showing, seat int) []byte {
+	return fmt.Appendf(nil, "inception/show-%05d/%c%d", showing, 'A'+seat/8, 1+seat%8)
+}
+
+func levels(db *pebble.DB) {
+	m := db.Metrics()
+	fmt.Printf("  memtable: %.1f MB\n", float64(m.MemTable.Size)/1e6)
+	for i, l := range m.Levels {
+		if l.TablesCount > 0 {
+			fmt.Printf("  L%d: %3d sorted tables, %6.1f MB\n", i, l.TablesCount, float64(l.TablesSize)/1e6)
+		}
+	}
+}
+
+func main() {
+	useBloom := flag.Bool("bloom", true, "Bloom filters on every level")
+	cacheMB := flag.Int64("cache", 12, "block cache size in MB")
+	l6 := flag.Bool("l6filters", false, "consult Bloom filters in L6 too (Pebble skips them there by default)")
+	flag.Parse()
+	dir, err := os.MkdirTemp("", "lsm")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	cache := pebble.NewCache(*cacheMB << 20) // smaller than the data (about 20 MB compressed)
+	defer cache.Unref()
+	opts := &pebble.Options{
+		MemTableSize: 4 << 20, // 4 MB memtables, to see flushes at this size
+		Cache:        cache,
+	}
+	for i := range opts.Levels {
+		if *useBloom {
+			opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10) // 10 bits per key
+		}
+	}
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 3,000,000 changes to 1,000,000 seats (25,000 showings × 40), in
+	// batches of 1,000, like a busy box office would commit them.
+	r := rand.New(rand.NewPCG(1, 2))
+	var userBytes int
+	t0 := time.Now()
+	for batch := range 3000 {
+		if batch == 1500 {
+			fmt.Println("halfway through the writes, the tree looks like this:")
+			levels(db)
+		}
+		b := db.NewBatch()
+		for range 1000 {
+			k := key(r.IntN(25000), r.IntN(40))
+			v := fmt.Appendf(nil, `{"status":"booked","customer":"customer-%06d","paid":"2026-09-27T19:%02d:00Z"}`, r.IntN(1_000_000), r.IntN(60))
+			userBytes += len(k) + len(v)
+			if err := b.Set(k, v, nil); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if err := b.Commit(pebble.NoSync); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		log.Fatal(err)
+	}
+	took := time.Since(t0)
+	time.Sleep(2 * time.Second) // let background compactions settle
+	m := db.Metrics()
+	tot := m.Total()
+	fmt.Printf("3,000,000 writes (%.0f MB of keys and values) in %v: %.0f writes/s\n", float64(userBytes)/1e6, took.Round(time.Millisecond), 3e6/took.Seconds())
+	fmt.Printf("memtable flushes: %d   compactions: %d\n", m.Flush.Count, m.Compact.Count)
+	fmt.Println("after the writes and the compactions they triggered:")
+	levels(db)
+	written := m.WAL.BytesWritten + tot.TableBytesFlushed + tot.TableBytesCompacted
+	fmt.Printf("bytes written to disk: WAL %.0f MB + flushes %.0f MB + compactions %.0f MB = %.0f MB (%.1f× the data)\n",
+		float64(m.WAL.BytesWritten)/1e6, float64(tot.TableBytesFlushed)/1e6, float64(tot.TableBytesCompacted)/1e6,
+		float64(written)/1e6, float64(written)/float64(userBytes))
+	fmt.Printf("on disk now: %.1f MB (1,000,000 live seats; old versions compacted away)\n", float64(m.DiskSpaceUsage())/1e6)
+
+	// A point lookup is a prefix seek; the iterator's statistics say how
+	// many bytes of blocks it had to read, and how many came from the cache.
+	read := func(label string, mk func() []byte) {
+		t0 := time.Now()
+		found := 0
+		var blockBytes, fromDisk uint64
+		for range 100_000 {
+			it, err := db.NewIter(&pebble.IterOptions{UseL6Filters: *l6})
+			if err != nil {
+				log.Fatal(err)
+			}
+			if it.SeekPrefixGE(mk()) {
+				found++
+			}
+			st := it.Stats().InternalStats
+			blockBytes += st.BlockBytes
+			fromDisk += st.BlockBytes - st.BlockBytesInCache
+			if err := it.Close(); err != nil {
+				log.Fatal(err)
+			}
+		}
+		fmt.Printf("%-30s %7v per lookup, %6d found, blocks read: %4.0f MB (%4.0f MB not in cache)\n", label,
+			(time.Since(t0) / 100_000).Round(10*time.Nanosecond), found, float64(blockBytes)/1e6, float64(fromDisk)/1e6)
+	}
+	read("100,000 lookups, seats that exist", func() []byte { return key(r.IntN(25000), r.IntN(40)) })
+	read("100,000 lookups, seats that don't", func() []byte { return key(r.IntN(25000), 40+r.IntN(8)) }) // row F: no such seats
+	if err := db.Close(); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+```text
+$ lsm -bloom=false
+halfway through the writes, the tree looks like this:
+  memtable: 4.2 MB
+  L0:  11 sorted tables,    8.2 MB
+  L6:   4 sorted tables,   13.7 MB
+3,000,000 writes (303 MB of keys and values) in 7.557s: 396973 writes/s
+memtable flushes: 108   compactions: 21
+after the writes and the compactions they triggered:
+  memtable: 4.2 MB
+  L6:   5 sorted tables,   18.8 MB
+bytes written to disk: WAL 312 MB + flushes 392 MB + compactions 261 MB = 965 MB (3.2× the data)
+on disk now: 30.4 MB (1,000,000 live seats; old versions compacted away)
+100,000 lookups, seats that exist  5.28µs per lookup,  94902 found, blocks read:  352 MB (  82 MB not in cache)
+100,000 lookups, seats that don't  5.53µs per lookup,      0 found, blocks read:  354 MB (  83 MB not in cache)
+$ lsm -cache 12 -bloom=true -l6filters
+100,000 lookups, seats that exist  5.94µs per lookup,  94902 found, blocks read: 24788 MB (  80 MB not in cache)
+100,000 lookups, seats that don't   1.3µs per lookup,      0 found, blocks read: 24568 MB (   1 MB not in cache)
+$ lsm -cache 4 -bloom=true -l6filters
+100,000 lookups, seats that exist 80.73µs per lookup,  94902 found, blocks read: 24788 MB (24788 MB not in cache)
+100,000 lookups, seats that don't 54.95µs per lookup,      0 found, blocks read: 24568 MB (24568 MB not in cache)
+```
+
+The first run (without filters) shows the whole life of the data:
+
+- **397,000 writes per second**: each write is an append to the WAL and an insert into memory.
+- **Halfway**, the tree is 11 small tables in L0 (recent flushes, overlapping key ranges) and 4 in L6 (merged, non-overlapping).
+- **108 memtable flushes and 21 compactions** later, everything is in **5 sorted tables in L6**, 18.8 MB for a million live seats (compressed; the old versions are gone).
+- **Write amplification 3.2x**: 312 MB of WAL, 392 MB of flushed tables and 261 MB of compaction output, for 303 MB of data. Every byte is written about three times, but always sequentially and in large pieces.
+
+<PostRoomAnim
+  title="Where a seat change goes in an LSM tree"
+  kicker="LSM write path · live"
+  ledgerLabel="write-ahead log"
+  queueLabel="memtable (sorted, in memory)"
+  retryLabel="L0: flushed tables, overlapping"
+  deadLabel="L6: merged, one version per key"
+  bookings={[{ id: "w1", label: "137/C6 booked" }, { id: "w2", label: "042/A1 held" }, { id: "w3", label: "137/C6 free" }, { id: "w4", label: "900/B2 booked" }]}
+  binTone="neutral"
+  workers={[{ id: "flush", label: "flush", role: "scribe" }, { id: "compact", label: "compaction", role: "sweeper" }]}
+  jobs={[{ id: "t1", label: "table 1" }, { id: "t2", label: "table 2" }, { id: "t3", label: "table 3" }, { id: "m", label: "merged" }]}
+  events={[
+    { at: 0, note: "A seat changes. Before anything else, the change is appended to the write-ahead log: if the process crashes, the log replays it." },
+    { at: 0.5, booking: "w1" }, { at: 1.0, booking: "w2" }, { at: 1.5, booking: "w3" }, { at: 2.0, booking: "w4", note: "Each change is also inserted into the memtable, sorted in memory. Measured: 397,000 changes a second." },
+    { at: 2.6, job: "t1", to: "queue", tag: "4 MB full" },
+    { at: 3.4, job: "t1", to: "w:flush", worker: "flush", say: "sort, write, fsync", note: "The memtable is full: flush it as one sorted, immutable table. A single sequential write." },
+    { at: 4.2, job: "t1", to: "retry", tag: null, worker: "flush", say: null },
+    { at: 4.6, job: "t2", to: "retry" }, { at: 5.0, job: "t3", to: "retry", note: "Flushes pile up in L0. Their key ranges overlap, so a read may have to look in each. Measured halfway: 11 tables in L0." },
+    { at: 5.8, job: "t1", to: "w:compact", worker: "compact", say: "merge, keep newest" }, { at: 5.9, job: "t2", to: "w:compact" }, { at: 6.0, job: "t3", to: "w:compact", note: "Compaction merges tables: show-137/C6 appears as 'booked' and later 'free'; only 'free' survives." },
+    { at: 7.0, job: "t1", to: "" }, { at: 7.0, job: "t2", to: "" }, { at: 7.0, job: "t3", to: "" },
+    { at: 7.2, job: "m", to: "dead", tag: "18.8 MB, 1M seats", worker: "compact", say: null, beat: "solution", note: "The result: 5 tables in L6 for a million seats. Every byte written about 3.2 times, always in big sequential writes." }
+  ]}
+  caption="Write fast by appending; stay readable by sorting; stay small by merging. The price is writing each byte several times, in the background."
+/>
+
+<QuickCheck
+  question="Why can an LSM tree accept writes so much faster than it can reorganise them?"
+  options={[
+    "It skips the disk",
+    "A write is only a log append and an in-memory insert; sorting to disk (flush) and merging (compaction) happen later, in bulk, in the background",
+    "It doesn't check for duplicates",
+    "It compresses first"
+  ]}
+  answer={1}
+  explain="The foreground cost is tiny; the background cost is the 3.2x write amplification. If writes arrive faster than compaction can merge, L0 grows and reads slow down, which is why LSM engines throttle writes when compaction falls behind."
+/>
 
 ## Bloom Filters
 
-An LSM read may have to check many SSTables — and most of them won't contain your key. Reading each one to discover that is wasteful. A **Bloom filter** is a tiny, fast, *probabilistic* gate that says "definitely not here" or "maybe here," letting you skip most SSTables without touching them.
+*Stop 3 of 6.*
 
-<Define term="Bloom filter" since="Storage Engines (Part 2)">
-A **Bloom filter** is a space-efficient, probabilistic data structure backed by a bit vector and `k` independent hash functions. It tests set membership with **zero false negatives** (a negative response guarantees absence) and a tunable, bounded rate of **false positives**. **Why it matters:** allows an LSM engine to verify if an SSTable on disk contains a key using ~10 bits per key in RAM, eliminating 99% of unnecessary disk I/O lookups. **Production hazard:** inserting significantly more keys than the filter was sized for causes the bit array to saturate with 1s, driving the false positive rate toward 100% and degrading reads to full disk scans.
-</Define>
+### Step 1: "definitely not here"
 
-The whole thing is just bit-setting and bitwise checks — watch it run:
+A read for a key that isn't in a table still has to check it: find the block the key would be in, read it, and look. For a key that exists in *none* of the tables, like row F in a hall that ends at E, that's a wasted block read per table. A **Bloom filter** is a small bit array per table that answers "is this key possibly here?" with no false negatives and a tunable rate of false positives (about 1% at 10 bits per key). If it says no, the table is skipped.
 
-<GoPlayground>
+### Step 2: measured, three ways
 
-```go
+The lookup lines of the three runs of `lsm` (the first, without filters, from stop 2's output):
+
+```text
+$ lsm -bloom=false
+100,000 lookups, seats that exist  5.28µs per lookup,  94902 found, blocks read:  352 MB (  82 MB not in cache)
+100,000 lookups, seats that don't  5.53µs per lookup,      0 found, blocks read:  354 MB (  83 MB not in cache)
+$ lsm -cache 12 -bloom=true -l6filters
+100,000 lookups, seats that exist  5.94µs per lookup,  94902 found, blocks read: 24788 MB (  80 MB not in cache)
+100,000 lookups, seats that don't   1.3µs per lookup,      0 found, blocks read: 24568 MB (   1 MB not in cache)
+$ lsm -cache 4 -bloom=true -l6filters
+100,000 lookups, seats that exist 80.73µs per lookup,  94902 found, blocks read: 24788 MB (24788 MB not in cache)
+100,000 lookups, seats that don't 54.95µs per lookup,      0 found, blocks read: 24568 MB (24568 MB not in cache)
+```
+
+With a 12 MB block cache, filters made lookups for **seats that don't exist 4x faster** (5.53 µs to 1.3 µs), and only 1 MB of blocks had to come from disk instead of 83 MB: the filter said "no" and the data block was never read. (The "blocks read" column counts the filter blocks too, about 245 KB per lookup, but from the cache.) Seats that exist got slightly slower: the filter says "maybe", and the data block is read anyway.
+
+With a **4 MB** cache, the same filters made everything **10x slower** (55 µs per absent lookup) and read **24.5 GB** from disk. Each table's filter block is about 250 KB, and Pebble's cache is split into 4 x NumCPU shards (32 here, so 128 KB each): a filter block can't be cached, so every lookup reads it from disk. A filter only helps if it's cheaper to consult than the data it saves you from reading.
+
+### Step 3: why Pebble had them off
+
+The first attempt at this measurement turned filters on and saw **no difference at all**. Pebble's source says why: by default it doesn't consult Bloom filters in **L6**, the bottom level, where (as here) almost all the data ends up. A key absent from the upper levels usually has to be looked for in L6 anyway, and L6's filters are the biggest, so Pebble spends the memory elsewhere; `IterOptions.UseL6Filters` turns them on for workloads, like "does this seat exist", where most lookups miss.
+
+<QuickCheck
+  question="Bloom filters made absent-key lookups 4x faster with a 12 MB cache and 10x slower with a 4 MB cache. Why?"
+  options={[
+    "The filters were wrong with the small cache",
+    "Filters save a data-block read only if the filter itself is cheap to check; when each ~250 KB filter block couldn't fit in a cache shard, every lookup read it from disk, 24.5 GB in all",
+    "The small cache disabled the filters",
+    "Pebble switched to L6 filters"
+  ]}
+  answer={1}
+  explain="An optimization that trades memory for I/O needs the memory. That's why engines pin filter and index blocks in memory, and why Pebble doesn't use L6 filters by default."
+/>
+
+## B-Trees
+
+*Stop 4 of 6.*
+
+### Step 1: sorted pages, updated where they are
+
+A B-tree keeps the keys sorted in fixed-size **pages** (4 KB here), arranged as a tree: **branch pages** hold keys and pointers to child pages, **leaf pages** hold the data. A lookup walks from the root to one leaf, a few pages for millions of keys, and a range scan walks leaves in order. A write finds its leaf and changes it. When a leaf fills up, it **splits** in two and the parent gets a new pointer. bbolt is a B+tree with **copy-on-write**: instead of overwriting a page (which could leave a torn page after a crash), a transaction writes changed pages to new locations, and the root pointer switches over at commit.
+
+```go noverify
+// btree writes the same seat changes into bbolt, a B+tree database (the
+// engine inside etcd): the data lives in 4 KB pages, updated in place by
+// copy-on-write, and a key's page is found by walking down from the root.
 package main
 
 import (
 	"fmt"
-	"hash/fnv"
+	"log"
+	"math/rand/v2"
+	"os"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
-// A Bloom filter: "is this key MAYBE in this SSTable?" No false negatives.
-type Bloom struct{ bits []bool }
-
-func newBloom(size int) *Bloom { return &Bloom{bits: make([]bool, size)} }
-
-// Derive two bit positions from one hash (cheap, good enough for a demo).
-func (b *Bloom) positions(key string) (uint32, uint32) {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	x := h.Sum32()
-	n := uint32(len(b.bits))
-	return x % n, (x>>13 | 1) % n
+func key(showing, seat int) []byte {
+	return fmt.Appendf(nil, "inception/show-%05d/%c%d", showing, 'A'+seat/8, 1+seat%8)
 }
 
-func (b *Bloom) add(key string) {
-	i, j := b.positions(key)
-	b.bits[i], b.bits[j] = true, true
-}
-
-func (b *Bloom) mightContain(key string) bool {
-	i, j := b.positions(key)
-	return b.bits[i] && b.bits[j] // any 0 -> definitely absent
-}
-
-func main() {
-	b := newBloom(128)
-	for _, k := range []string{"acct_7", "acct_42", "acct_99"} {
-		b.add(k)
+func open(noSync bool) (*bolt.DB, string) {
+	dir, err := os.MkdirTemp("", "btree")
+	if err != nil {
+		log.Fatal(err)
 	}
-	fmt.Println("acct_7  ->", b.mightContain("acct_7"))    // true  (present)
-	fmt.Println("acct_500 ->", b.mightContain("acct_500")) // almost always false
-	fmt.Println("A 'false' means SKIP this SSTable entirely — zero disk reads.")
+	db, err := bolt.Open(dir+"/seats.db", 0o600, &bolt.Options{NoSync: noSync})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error { _, err := tx.CreateBucket([]byte("seats")); return err }); err != nil {
+		log.Fatal(err)
+	}
+	return db, dir
 }
-```
 
-</GoPlayground>
+func fileMB(dir string) float64 {
+	st, err := os.Stat(dir + "/seats.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return float64(st.Size()) / 1e6
+}
 
-The magic is the asymmetry: a "no" is *guaranteed*, so it's always safe to skip. A "yes" might be a coincidence (other keys set those same bits), so you then do the real lookup — and on a false positive you've only wasted a little work. For an LSM checking a stack of segments for a key that doesn't exist, that's the difference between many disk reads and almost none.
-
-## Row vs Column
-
-One last twist, and it's about *layout*. Everything so far stored a whole record together — fine for "fetch account 7." But Meridian's finance dashboard asks different questions: *"sum the amount of every settled transaction this quarter."* That scans **millions of rows** but needs **one column**. Storing rows together makes you read everything to get a little.
-
-<Define term="Row-oriented vs column-oriented storage" since="Storage Engines (Part 2)">
-**Row-oriented storage** clusters all fields of a single record contiguously on disk/RAM (ideal for OLTP point lookups and complete record writes). **Column-oriented (columnar) storage** clusters all values of a given column contiguously across millions of rows (ideal for OLAP aggregate analytics queries like `SUM(amount)`). **Why it matters:** columnar engines skip unreferenced columns entirely during I/O and achieve 10× higher compression ratios (via run-length and dictionary encoding). **Production hazard:** attempting high-frequency single-record updates or inserts on columnar formats (like Parquet or ClickHouse) causes massive write amplification and metadata churn; buffer writes in row-oriented memtables first.
-</Define>
-
-The bytes-read difference is stark — one aggregate query, same data, two layouts:
-
-<GoPlayground>
-
-```go
-package main
-
-import "fmt"
-
-// One analytics query: SUM(amount) over a million transactions. It needs ONE
-// column out of ~20. Row storage must read every field of every row; column
-// storage reads only the amount column.
 func main() {
-	const rows, fields, fieldBytes = 1_000_000, 20, 8
+	// The LSM run's workload: 3,000,000 changes to 1,000,000 seats in
+	// random order, 1,000 per transaction, without fsync (as the LSM ran).
+	db, dir := open(true)
+	r := rand.New(rand.NewPCG(1, 2))
+	var userBytes int
+	t0 := time.Now()
+	for range 3000 {
+		err := db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("seats"))
+			for range 1000 {
+				k := key(r.IntN(25000), r.IntN(40))
+				v := fmt.Appendf(nil, `{"status":"booked","customer":"customer-%06d","paid":"2026-09-27T19:%02d:00Z"}`, r.IntN(1_000_000), r.IntN(60))
+				userBytes += len(k) + len(v)
+				if err := b.Put(k, v); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	took := time.Since(t0)
+	st := db.Stats().TxStats
+	fmt.Printf("3,000,000 writes (%.0f MB) in random order: %v, %.0f writes/s\n", float64(userBytes)/1e6, took.Round(time.Millisecond), 3e6/took.Seconds())
+	fmt.Printf("  page splits: %d; pages written: %.0f MB (%.1f× the data); file: %.1f MB\n",
+		st.GetSplit(), float64(st.GetPageAlloc())/1e6, float64(st.GetPageAlloc())/float64(userBytes), fileMB(dir))
 
-	rowStoreBytes := rows * fields * fieldBytes // whole rows, every field
-	colStoreBytes := rows * 1 * fieldBytes      // only the amount column
+	lookup := func(label string, mk func() []byte) {
+		t0 := time.Now()
+		found := 0
+		err := db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("seats"))
+			for range 100_000 {
+				if b.Get(mk()) != nil {
+					found++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("  100,000 lookups, %-15s %6v per lookup, %d found\n", label, (time.Since(t0) / 100_000).Round(10*time.Nanosecond), found)
+	}
+	lookup("seats that exist", func() []byte { return key(r.IntN(25000), r.IntN(40)) })
+	lookup("seats that don't", func() []byte { return key(r.IntN(25000), 40+r.IntN(8)) })
+	db.Close()
+	os.RemoveAll(dir)
 
-	fmt.Printf("row store reads %d MB\n", rowStoreBytes/1_000_000)
-	fmt.Printf("col store reads %d MB\n", colStoreBytes/1_000_000)
-	fmt.Printf("column storage reads %dx less for this query\n",
-		rowStoreBytes/colStoreBytes)
-	fmt.Println("...and a single column compresses far better (its values repeat).")
+	// The same 1,000,000 seats written once each, in key order.
+	db, dir = open(true)
+	t0 = time.Now()
+	for batch := range 1000 {
+		err := db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("seats"))
+			b.FillPercent = 1.0 // appending in order: fill pages completely
+			for i := range 1000 {
+				n := batch*1000 + i
+				if err := b.Put(key(n/40, n%40), []byte(`{"status":"booked","customer":"customer-000000","paid":"2026-09-27T19:00:00Z"}`)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	st = db.Stats().TxStats
+	fmt.Printf("1,000,000 writes in key order: %v; page splits: %d; file: %.1f MB\n", time.Since(t0).Round(time.Millisecond), st.GetSplit(), fileMB(dir))
+	db.Close()
+	os.RemoveAll(dir)
+
+	// What fsync costs: 200 single-booking transactions, with and without it.
+	for _, noSync := range []bool{true, false} {
+		db, dir = open(noSync)
+		t0 = time.Now()
+		for i := range 200 {
+			if err := db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("seats")).Put(key(i, 0), []byte("booked")) }); err != nil {
+				log.Fatal(err)
+			}
+		}
+		fmt.Printf("200 one-booking transactions, fsync=%-5v %v per commit\n", !noSync, (time.Since(t0) / 200).Round(time.Microsecond))
+		db.Close()
+		os.RemoveAll(dir)
+	}
 }
 ```
 
-</GoPlayground>
+```text
+$ btree
+3,000,000 writes (303 MB) in random order: 31.257s, 95979 writes/s
+  page splits: 9807; pages written: 45753 MB (151.0× the data); file: 185.9 MB
+  100,000 lookups, seats that exist 1.02µs per lookup, 94902 found
+  100,000 lookups, seats that don't  890ns per lookup, 0 found
+1,000,000 writes in key order: 717ms; page splits: 7211; file: 134.9 MB
+200 one-booking transactions, fsync=false 44µs per commit
+200 one-booking transactions, fsync=true  8.005ms per commit
+```
 
-<Callout kind="pro" title="The senior framing: it's the same data, stored for a different question">
+### Step 2: reading the numbers
 
-Don't think "row store good, column store bad" or vice versa. It's the OLTP/OLAP split you met at the start of Part 2, made physical. Meridian's *operational* ledger — "debit account 7, did it succeed?" — is row-oriented (Postgres B-tree or an LSM): it touches whole records, one at a time, with strong transactions. The *analytical* copy — "revenue by product by weekday this year" — is column-oriented (a warehouse): it scans few columns over billions of rows. The data flows from one to the other (you'll see how in the streaming chapters). Using a row store for analytics, or a column store for transactions, is the classic "wrong tool" mistake — and now you can explain exactly why each is wrong.
-
-</Callout>
+- **Lookups: about 1 µs**, for seats that exist or don't. bbolt memory-maps its file, and the whole 186 MB tree was in the operating system's page cache; a lookup is a walk down three or four pages in memory.
+- **Random writes: 96,000 a second, 151x write amplification.** 1,000 random keys per transaction touch about 1,000 different leaf pages; copy-on-write rewrites each (and the branch pages above them) to change about 100 bytes: **45.7 GB of pages written** for 303 MB of data. Turning off bbolt's freelist sync changed it by nothing (150.8x): it's the page writes.
+- **Sequential writes: 717 ms** for a million keys in key order, with `FillPercent = 1.0`: appends always go to the last leaf, which fills completely before splitting, and the file is 135 MB instead of 186 (random inserts leave pages half full after splits).
+- **fsync: 8 ms per commit** against 44 µs without it. Durability means waiting for the disk to confirm; on macOS, Go's `File.Sync` uses `F_FULLFSYNC`, which flushes the drive's own cache, so this is the honest price of "committed". It's why databases group many transactions into one sync (Postgres's group commit, Pebble's batches).
 
 <QuickCheck
-  question="The finance team's dashboard runs SELECT SUM(amount), category FROM transactions GROUP BY category over 2 billion rows, touching 2 of ~40 columns. Reads are slow on the operational Postgres database. What's the right fix?"
+  question="Why were bbolt's random updates amplified 151x, while inserting the same number of keys in order took under a second?"
   options={[
-    "Add more B-tree indexes to Postgres",
-    "Run the analytics on a column-oriented store (a warehouse): it reads only the 2 needed columns instead of dragging all 40 through memory, and compresses them heavily — orders of magnitude less I/O",
-    "Buy a bigger Postgres machine",
-    "Cache the query result forever"
+    "bbolt compresses sequential data",
+    "Random keys touch a different 4 KB page for nearly every write, and each commit rewrites every page it touched; in-order keys all land on the same last page, which fills up before being written",
+    "Random writes need fsync",
+    "The freelist"
   ]}
   answer={1}
-  explain="This is an OLAP query — a big aggregation over few columns. A row-oriented OLTP store must read every column of every row even though 38 of 40 are ignored. A column store reads just the 2 columns it needs and compresses them well, cutting disk I/O by orders of magnitude. The fix is the right storage layout (a columnar warehouse fed from Postgres), not more indexes or a bigger box."
+  explain="A B-tree writes whole pages. Locality decides how many bytes of page carry each byte of data: 1 in about 150 for random updates, nearly all of them for appends."
 />
 
-## Exercises
+## LSM versus B-Tree
 
-Build the engine internals. Each is a real storage-engine mechanism in miniature.
+*Stop 5 of 6.*
 
-<Exercise n={1} title="Append-only log with a hash index" level="easy">
+### Step 1: the same workload, side by side
 
-Implement `set(key, val)` and `get(key)` over an append-only `log []string` plus an `index map[string]int`. Updating a key appends a new value and repoints the index. Why does `get` stay fast even though old values are never erased?
+Three million random updates to a million seats, a thousand per batch, without fsync, on the same machine:
 
-<Solution>
+| | Pebble (LSM) | bbolt (B+tree) |
+|---|---|---|
+| random writes | **397,000/s** | 96,000/s |
+| bytes written per byte of data | **3.2x** (WAL, flushes, compactions) | 151x (page rewrites) |
+| size on disk for 1M live seats | **30 MB** (compressed tables) | 186 MB (half-full pages) |
+| point lookup, key exists | 5.3 µs (12 MB cache) | **1.0 µs** (file in page cache) |
+| point lookup, key absent | 5.5 µs, 1.3 µs with L6 filters | **0.9 µs** |
 
-```go
-func (e *Engine) set(key, val string) {
-	e.log = append(e.log, val)
-	e.index[key] = len(e.log) - 1 // index always points at the NEWEST value
-}
+### Step 2: what decides it
 
-func (e *Engine) get(key string) (string, bool) {
-	i, ok := e.index[key]
-	if !ok {
-		return "", false
-	}
-	return e.log[i], true
-}
-```
+- **Write-heavy, random keys** (event logs, time series, metrics, a busy box office's seat states): the LSM tree turns random writes into sequential ones and compresses well. That's why Cassandra, RocksDB-based systems, CockroachDB (Pebble) and ScyllaDB are LSM trees.
+- **Read-heavy, point lookups and ranges, predictable latency**: the B-tree's read path is short and has no background compaction competing for the disk. That's why Postgres, MySQL's InnoDB, SQLite and etcd (bbolt) are B-trees.
+- **Hidden costs**: an LSM tree's compaction runs in the background and can fall behind (reads slow down, writes get throttled); a B-tree's amplification is paid in the foreground, on every commit, and grows with randomness.
 
-`get` is fast because the index always points at the latest position for a key, so a lookup is a single hash-map hit plus one indexed read — `O(1)`. The stale old values still sitting in the log are never visited; they only cost *disk space*, not read time. Reclaiming that space is exactly what compaction does.
+Postgres, for all its B-trees, also appends every change to its WAL first (chapter 20): real engines borrow from both sides.
 
-</Solution>
-
-</Exercise>
-
-<Exercise n={2} title="Merge two sorted segments" level="medium">
-
-Write `merge(newer, older []KV) []KV` where each input is sorted by key and `KV` is `{Key, Val string}`. Produce one sorted slice with one entry per key, preferring `newer` on conflicts. This is the core of compaction.
-
-<Solution>
-
-```go
-type KV struct{ Key, Val string }
-
-func merge(newer, older []KV) []KV {
-	var out []KV
-	i, j := 0, 0
-	for i < len(newer) && j < len(older) {
-		switch {
-		case newer[i].Key < older[j].Key:
-			out = append(out, newer[i])
-			i++
-		case newer[i].Key > older[j].Key:
-			out = append(out, older[j])
-			j++
-		default: // same key: newer wins, advance both
-			out = append(out, newer[i])
-			i++
-			j++
-		}
-	}
-	out = append(out, newer[i:]...) // drain the rest
-	out = append(out, older[j:]...)
-	return out
-}
-```
-
-Walking both sorted inputs with two pointers and always emitting the smaller key keeps the output sorted with `O(n)` work and `O(1)` extra memory beyond the result — the merge step of mergesort. On a key tie, taking `newer` and advancing *both* pointers is what discards the stale value.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={3} title="Bloom filter with no false negatives" level="medium">
-
-Implement `add(key)` and `mightContain(key)` over a `[]bool`, using two derived bit positions. Then argue why `mightContain` can return a false *positive* but never a false *negative*.
-
-<Solution>
-
-```go
-func (b *Bloom) add(key string) { i, j := b.positions(key); b.bits[i], b.bits[j] = true, true }
-func (b *Bloom) mightContain(key string) bool {
-	i, j := b.positions(key)
-	return b.bits[i] && b.bits[j]
-}
-```
-
-When you `add` a key, you set *its* bits to 1, and bits are never cleared — so a key you added will always find all its bits set: **no false negatives**. A false *positive* can happen because a key you never added might hash to bits that *other* keys happened to set. That asymmetry is the whole point: a "no" is trustworthy (skip the SSTable safely), a "maybe" just triggers a real lookup.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={4} title="Tombstone deletes through compaction" level="medium">
-
-Extend `merge` to handle deletes. `KV` gains `Tomb bool`. A tombstone in `newer` must suppress the same key from `older`; once merged against the oldest segment, drop the tombstone entirely. Show that deleting then compacting removes the key.
-
-<Solution>
-
-```go
-type KV struct {
-	Key, Val string
-	Tomb     bool
-}
-
-func merge(newer, older []KV) []KV {
-	var out []KV
-	i, j := 0, 0
-	emit := func(kv KV) {
-		if !kv.Tomb {
-			out = append(out, kv)
-		}
-	} // drop tombstones
-	for i < len(newer) && j < len(older) {
-		switch {
-		case newer[i].Key < older[j].Key:
-			emit(newer[i])
-			i++
-		case newer[i].Key > older[j].Key:
-			emit(older[j])
-			j++
-		default: // same key: newer wins (a tombstone here suppresses older)
-			emit(newer[i])
-			i, j = i+1, j+1
-		}
-	}
-	for ; i < len(newer); i++ {
-		emit(newer[i])
-	}
-	for ; j < len(older); j++ {
-		emit(older[j])
-	}
-	return out
-}
-```
-
-A delete isn't an in-place erase — it's a *write* of a tombstone that shadows older values during the newest-to-oldest read. Compaction is where the deletion is finally *applied*: the tombstone wins over any older value for that key (suppressing it), and because `older` is the oldest segment, the tombstone itself is dropped from the output — the key is now truly gone.
-
-</Solution>
-
-</Exercise>
-
-<Exercise n={5} title="Write amplification calculator" level="hard">
-
-Write `lsmAmp(compactions int) int` and `btreeAmp(pageBytes, recordBytes int) int` returning the write amplification of each. Model LSM as `2 + compactions` (WAL + flush + one rewrite per compaction level) and B-tree as `1 + pageBytes/recordBytes` (WAL once, plus a full page written for a small record). Compare for a write-heavy workload.
-
-<Solution>
-
-```go
-func lsmAmp(compactions int) int              { return 2 + compactions }           // WAL + flush + per-level rewrite
-func btreeAmp(pageBytes, recordBytes int) int { return 1 + pageBytes/recordBytes } // WAL + a whole page
-
-// e.g. LSM with 3 compaction levels: amp = 5.
-// B-tree, 8 KiB page, 100-byte record: amp = 1 + 8192/100 ≈ 82.
-```
-
-For tiny records, a B-tree pays brutally: changing 100 bytes can force writing an entire 8 KiB page, so its amplification dwarfs an LSM's handful of rewrites. That's why write-heavy workloads with small records (a transaction ledger) favor LSM engines — lower amplification means more application writes fit in the disk's bandwidth, and the SSD lasts longer. (Real numbers depend on key/value sizes and overwrite patterns — always measure your workload, run long enough for compaction to kick in.)
-
-</Solution>
-
-</Exercise>
-
-<Lab
-  title="Implement LSM compaction"
-  archetype="build-it"
-  difficulty="scaffolded"
-  points={85}
-  hintCost={13}
-  objective="Build the beating heart of every log-structured engine: compaction. Implement compact(newer, older []Entry) []Entry that merges two key-sorted segments into one sorted segment, keeping the NEWER value on a key conflict and DROPPING tombstones (deletions) entirely — since `older` is the oldest segment, a deleted key disappears. The self-check harness in main runs a fixed case (key 'a' updated, key 'b' kept, key 'c' deleted via tombstone) and prints ALL CHECKS PASS only when the merge keeps the newest values, preserves sort order, and removes the tombstoned key."
-  verify="self-check"
-  expect="ALL CHECKS PASS"
-  starter={`package main
-
-import "fmt"
-
-type Entry struct {
-	Key  string
-	Val  string
-	Tomb bool // true = tombstone: this key was deleted
-}
-
-// compact merges two SORTED segments into one sorted segment.
-//   - newer wins over older for the same key
-//   - a tombstone removes the key from output (older is the oldest segment)
-// BUG: not implemented — returns nil.
-func compact(newer, older []Entry) []Entry {
-	// TODO: two-pointer merge (like mergesort merge step).
-	// Skip any entry where Tomb==true instead of appending it.
-	return nil
-}
-
-// ── checks: do not edit. Run to verify your fix. ──
-func main() {
-	newer := []Entry{{Key: "a", Val: "1"}, {Key: "c", Tomb: true}}
-	older := []Entry{{Key: "a", Val: "old"}, {Key: "b", Val: "2"}, {Key: "c", Val: "3"}}
-
-	got := compact(newer, older)
-	want := []Entry{{Key: "a", Val: "1"}, {Key: "b", Val: "2"}}
-
-	allOK := len(got) == len(want)
-	for i := range want {
-		if i >= len(got) || got[i] != want[i] {
-			allOK = false
-		}
-	}
-	if allOK {
-		fmt.Printf("compacted -> %v\\nALL CHECKS PASS\\n", got)
-	} else {
-		fmt.Printf("FAIL: got %v, want %v\\n", got, want)
-	}
-}
-`}
-  verifier="main runs one in-process merge assertion: compact must return [{a 1 false} {b 2 false}] — key 'a' takes the newer value '1', key 'b' is preserved from the older segment, and key 'c' (tombstoned in the newer segment) is dropped entirely. The flag unlocks when the build is clean and stdout ends with ALL CHECKS PASS."
-  hints={[
-    "Two pointers i, j over newer and older. Compare newer[i].Key with older[j].Key: if newer's key is smaller, take newer[i] and i++; if larger, take older[j] and j++; if equal, take newer[i] (it wins) and advance BOTH.",
-    "Wrap every append in a helper that skips tombstones: if e.Tomb, don't append it. That makes a deleted key vanish from the output. Apply it in all three branches and in the drain loops.",
-    "After the main loop, drain the leftovers: for the rest of newer, then the rest of older — still skipping tombstones. The fixed case expects exactly [{a 1 false} {b 2 false}]."
+<QuickCheck
+  question="The cinema's seat changes are random writes, and the page reads seat maps (ranges of 40 keys). Which engine fits better, going by these measurements?"
+  options={[
+    "bbolt: faster lookups",
+    "Pebble: 4x the random-write throughput at a 50th of the write amplification, and a seat map is one sorted range in either engine; B-tree lookups were faster, but reads are cached heavily anyway",
+    "Neither: use a log",
+    "It makes no difference"
   ]}
-  flag="GO{lsm_compaction_keeps_newest_drops_tombstones}"
->
+  answer={1}
+  explain="There's no universal winner. Here writes dominate and are random; the measured costs point to the LSM tree. A read-mostly catalogue of films would point the other way."
+/>
 
-This is the single most important operation in a log-structured engine, made executable. Merge the two segments, let the newer value win, and let a tombstone erase a key for good. Get PASS and you've built the core of RocksDB, Cassandra, and every LSM-tree on the planet — in one function.
+## Rows versus Columns
 
-</Lab>
+*Stop 6 of 6.*
+
+### Step 1: a different question
+
+Every engine so far stores a record's fields together: the right layout for "show me booking 42". The box office's nightly report asks something else: "revenue per film, this year", which needs two fields (film, price) from **every** booking. Stored by row, the report reads all seven fields of every row to use two. **Columnar** storage (Parquet, the format data warehouses read) stores each field of many rows together:
+
+```go noverify
+// columns stores a year of the cinema's bookings two ways, one row per
+// line (CSV) and one column at a time (Parquet), and answers the box
+// office's question "revenue per film" from each.
+package main
+
+import (
+	"bufio"
+	"encoding/csv"
+	"fmt"
+	"io"
+	"log"
+	"math/rand/v2"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/parquet-go/parquet-go"
+)
+
+type Booking struct {
+	ID         int64  `parquet:"id"`
+	Film       string `parquet:"film,dict"`
+	Showing    string `parquet:"showing"`
+	Seat       string `parquet:"seat"`
+	Customer   string `parquet:"customer"`
+	PriceCents int64  `parquet:"price_cents"`
+	PaidAt     string `parquet:"paid_at"`
+}
+
+var films = []string{"inception", "dune", "arrival", "interstellar", "tenet", "oppenheimer", "blade-runner", "heat"}
+
+func main() {
+	dir, err := os.MkdirTemp("", "columns")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	r := rand.New(rand.NewPCG(1, 2))
+	rows := make([]Booking, 1_000_000)
+	for i := range rows {
+		rows[i] = Booking{
+			ID:         int64(i),
+			Film:       films[r.IntN(len(films))],
+			Showing:    fmt.Sprintf("2026-%02d-%02dT%02d:00", 1+r.IntN(12), 1+r.IntN(28), 12+r.IntN(10)),
+			Seat:       fmt.Sprintf("%c%d", 'A'+r.IntN(5), 1+r.IntN(8)),
+			Customer:   fmt.Sprintf("customer-%06d", r.IntN(200_000)),
+			PriceCents: int64(900 + 100*r.IntN(8)),
+			PaidAt:     fmt.Sprintf("2026-%02d-%02dT%02d:%02d:%02dZ", 1+r.IntN(12), 1+r.IntN(28), r.IntN(24), r.IntN(60), r.IntN(60)),
+		}
+	}
+
+	// Rows: CSV.
+	f, err := os.Create(dir + "/bookings.csv")
+	if err != nil {
+		log.Fatal(err)
+	}
+	w := csv.NewWriter(bufio.NewWriter(f))
+	for _, b := range rows {
+		w.Write([]string{strconv.FormatInt(b.ID, 10), b.Film, b.Showing, b.Seat, b.Customer, strconv.FormatInt(b.PriceCents, 10), b.PaidAt})
+	}
+	w.Flush()
+	f.Close()
+	// Columns: Parquet, zstd-compressed.
+	if err := parquet.WriteFile(dir+"/bookings.parquet", rows, parquet.Compression(&parquet.Zstd)); err != nil {
+		log.Fatal(err)
+	}
+	for _, name := range []string{"bookings.csv", "bookings.parquet"} {
+		st, _ := os.Stat(dir + "/" + name)
+		fmt.Printf("%-17s %6.1f MB\n", name, float64(st.Size())/1e6)
+	}
+
+	// Revenue per film from the CSV: every byte of every row is read.
+	t0 := time.Now()
+	revenue := map[string]int64{}
+	f, err = os.Open(dir + "/bookings.csv")
+	if err != nil {
+		log.Fatal(err)
+	}
+	cr := csv.NewReader(bufio.NewReader(f))
+	cr.ReuseRecord = true
+	for {
+		rec, err := cr.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		p, _ := strconv.ParseInt(rec[5], 10, 64)
+		revenue[rec[1]] += p
+	}
+	st, _ := f.Stat()
+	f.Close()
+	fmt.Printf("revenue per film from rows:    %v, read %.1f MB\n", time.Since(t0).Round(time.Millisecond), float64(st.Size())/1e6)
+	csvRevenue := revenue
+
+	// From Parquet: open the file, read only the film and price columns.
+	t0 = time.Now()
+	f, err = os.Open(dir + "/bookings.parquet")
+	if err != nil {
+		log.Fatal(err)
+	}
+	st, _ = f.Stat()
+	pf, err := parquet.OpenFile(f, st.Size())
+	if err != nil {
+		log.Fatal(err)
+	}
+	filmCol, priceCol := -1, -1
+	for i, c := range pf.Schema().Fields() {
+		switch c.Name() {
+		case "film":
+			filmCol = i
+		case "price_cents":
+			priceCol = i
+		}
+	}
+	revenue = map[string]int64{}
+	var bytesRead int64
+	for _, rg := range pf.RowGroups() {
+		chunks := rg.ColumnChunks()
+		filmVals := readColumn(chunks[filmCol])
+		priceVals := readColumn(chunks[priceCol])
+		for i := range filmVals {
+			revenue[filmVals[i].String()] += priceVals[i].Int64()
+		}
+	}
+	for _, rg := range pf.Metadata().RowGroups {
+		bytesRead += rg.Columns[filmCol].MetaData.TotalCompressedSize + rg.Columns[priceCol].MetaData.TotalCompressedSize
+	}
+	f.Close()
+	fmt.Printf("revenue per film from columns: %v, read %.2f MB (2 of 7 columns)\n", time.Since(t0).Round(time.Millisecond), float64(bytesRead)/1e6)
+
+	names := make([]string, 0, len(revenue))
+	for n := range revenue {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	same := true
+	for _, n := range names {
+		same = same && revenue[n] == csvRevenue[n]
+	}
+	fmt.Printf("same answer from both: %v (inception: $%d)\n", same, revenue["inception"]/100)
+}
+
+func readColumn(cc parquet.ColumnChunk) []parquet.Value {
+	var out []parquet.Value
+	pages := cc.Pages()
+	defer pages.Close()
+	for {
+		p, err := pages.ReadPage()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		vals := make([]parquet.Value, p.NumValues())
+		n, err := p.Values().ReadValues(vals)
+		if err != nil && err != io.EOF {
+			log.Fatal(err)
+		}
+		out = append(out, vals[:n]...)
+		parquet.Release(p)
+	}
+}
+```
+
+```text
+$ columns
+bookings.csv        77.8 MB
+bookings.parquet    15.6 MB
+revenue per film from rows:    251ms, read 77.8 MB
+revenue per film from columns: 120ms, read 1.35 MB (2 of 7 columns)
+same answer from both: true (inception: $1563096)
+```
+
+### Step 2: two wins at once
+
+- **Read only what you need**: the report read **1.35 MB** (the film and price columns) instead of the whole 77.8 MB CSV, and finished in half the time even though Parquet decoding costs more per value than splitting a CSV line.
+- **Compress what's alike**: the whole Parquet file is **15.6 MB against 77.8 MB**. A column of eight film names, dictionary-encoded (`parquet:"film,dict"`), is a column of tiny integers; a column of prices from a few values compresses to almost nothing. Rows mix types and repeat nothing.
+
+The cost is the other way round: writing one booking touches seven columns, and reading one whole booking reads from seven places. So the cinema keeps its live data in row stores (Redis, Postgres) and exports bookings into a columnar format (or a column store like ClickHouse or DuckDB) for reporting.
+
+<QuickCheck
+  question="Why did the Parquet file read only 1.35 MB for 'revenue per film'?"
+  options={[
+    "Parquet caches results",
+    "Each column is stored separately, so the query read just the film and price columns, and those compress extremely well (a few distinct values each)",
+    "The CSV was corrupt",
+    "Parquet skips rows"
+  ]}
+  answer={1}
+  explain="Measured: 2 of 7 columns, 1.35 MB, same answer as scanning 77.8 MB of rows. Analytics reads few columns of many rows: columnar layout is built for exactly that."
+/>
 
 ---
 
+## Exercises
+
+These use the `engines` module.
+
+<Exercise n={1} title="Batch the fsyncs" level="easy">
+
+bbolt took 8 ms per commit with fsync. Using bbolt's `db.Batch`, commit 200 bookings from 200 goroutines and measure the time per booking. Why is it faster, and what does each caller give up?
+
+<Solution>
+
+`Batch` groups concurrent calls into one transaction and one fsync, so 200 bookings cost a handful of syncs instead of 200: per-booking time drops towards 8 ms divided by the batch size. Each caller waits until the batch commits (a few milliseconds more latency for the first ones), and if any function in the batch fails, bbolt reruns the others without it, so the functions must be idempotent. It's group commit, the same idea Postgres uses for its WAL.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Tune the memtable" level="medium">
+
+Rerun `lsm -bloom=false` with `MemTableSize` of 1 MB and 64 MB. How do the flush count, the L0 shape halfway through and the write amplification change?
+
+<Solution>
+
+A 1 MB memtable flushes about four times as often, making more, smaller L0 tables and more compaction work: write amplification rises. A 64 MB memtable flushes rarely and absorbs repeated writes to the same seats in memory (each flush writes only the latest version of each key), so both flushes and compactions write less: amplification falls. The costs: more memory, and a longer WAL to replay after a crash.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="A range query in both engines" level="medium">
+
+Add a scan of every seat of 1,000 random showings (40 keys each) to `lsm` and `btree`: a Pebble iterator with bounds, and a bbolt cursor with `Seek`. Compare the time per showing.
+
+<Solution>
+
+Both engines keep keys sorted, so a showing is one seek and 39 steps. bbolt walks one or two leaf pages from its memory-mapped file, typically a few microseconds. Pebble merges iterators over the memtable and each overlapping table, then reads the table blocks, so it costs somewhat more per seek, and the steps are cheap. Neither needs to read the other 999,960 seats, which is what the hash index of stop 1 couldn't avoid.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Deletes in an LSM tree" level="medium">
+
+Delete 500,000 of the million seats in `lsm` and measure the disk usage before and after a manual compaction (`db.Compact` over the whole key range). Where did the space go before the compaction?
+
+<Solution>
+
+A delete in an LSM tree is a write: a **tombstone** that hides older versions. Before compaction, disk usage *grows* (the tombstones are added, the old values stay). Compaction merges each tombstone with the value it hides and drops both once no older table can hold the key, and usage falls to about half. Until then, reads for deleted keys have to find the tombstone, and range scans step over them, which is why workloads that delete a lot (queues) are known to be hard for LSM trees.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="An index for the report" level="hard">
+
+The nightly report also needs "seats sold per showing of inception". Design it three ways (a secondary index in Pebble, a bbolt bucket keyed by film then showing, and a Parquet file sorted by film) and say what each costs at write time and at report time.
+
+<Solution>
+
+**Pebble secondary index**: write a second key `idx/film/showing/seat` with every booking, in the same batch, so it's atomic: twice the writes (amplified 3.2x each), and the report is one range scan over `idx/inception/`. **bbolt bucket by film/showing**: the same idea, but each booking now touches two random leaf pages instead of one, roughly doubling bbolt's already large write amplification. **Parquet sorted by film**: nothing at booking time (it's written by a nightly export), and the report reads only inception's row groups (Parquet records min/max per row group, so readers skip the others) and one or two columns. Live queries want the index; reports want the export.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Build a Tiny LSM Tree"
+  archetype="build-it"
+  difficulty="guided"
+  points={120}
+  hintCost={15}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="The LSM has a memtable, flushes it into sorted runs with a Bloom filter each, and should find the newest value of a key. Fix four things: Delete must write a tombstone; Get must search newest to oldest, stop at the first hit, treat a tombstone as not found, skip runs whose filter says no, and binary-search inside a run; Compact must merge every run into one, keeping only the newest entry per key and dropping tombstones; and the Bloom filter's Add and MayContain."
+  starter={`package main
+
+import (
+	"fmt"
+	"hash/fnv"
+	"slices"
+)
+
+// A small LSM tree for seat states. Writes go to the memtable; Flush turns
+// the memtable into an immutable sorted run (what Pebble writes as an
+// SSTable file); Get looks in the memtable, then the runs from newest to
+// oldest; Compact merges all runs into one.
+//
+// Fix the four marked methods (you may add helpers and fields).
+
+type entry struct {
+	key, value string
+	deleted    bool // a tombstone: "this key was deleted"
+}
+
+type run struct {
+	entries []entry // sorted by key, one entry per key
+	filter  *Bloom
+}
+
+type LSM struct {
+	mem  map[string]entry
+	runs []*run // oldest first
+	// RunsSearched counts how many runs Get looked inside (a run whose
+	// Bloom filter said "definitely not" doesn't count).
+	RunsSearched int
+}
+
+func NewLSM() *LSM { return &LSM{mem: map[string]entry{}} }
+
+func (l *LSM) Set(key, value string) { l.mem[key] = entry{key: key, value: value} }
+
+// FIX 1: Delete must hide older values of the key in the runs.
+func (l *LSM) Delete(key string) { delete(l.mem, key) }
+
+// Flush writes the memtable out as a new sorted run with a Bloom filter.
+func (l *LSM) Flush() {
+	if len(l.mem) == 0 {
+		return
+	}
+	r := &run{filter: NewBloom(len(l.mem), 10)}
+	for _, e := range l.mem {
+		r.entries = append(r.entries, e)
+		r.filter.Add(e.key)
+	}
+	slices.SortFunc(r.entries, func(a, b entry) int {
+		switch {
+		case a.key < b.key:
+			return -1
+		case a.key > b.key:
+			return 1
+		}
+		return 0
+	})
+	l.runs = append(l.runs, r)
+	l.mem = map[string]entry{}
+}
+
+// FIX 2: Get must return the newest value: memtable first, then runs from
+// newest to oldest; a tombstone means "not found"; use the filter to skip
+// runs; binary-search inside a run.
+func (l *LSM) Get(key string) (string, bool) {
+	if e, ok := l.mem[key]; ok {
+		return e.value, true
+	}
+	for _, r := range l.runs {
+		l.RunsSearched++
+		for _, e := range r.entries {
+			if e.key == key {
+				return e.value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// FIX 3: Compact merges every run into one: for each key keep only the
+// newest entry, and drop tombstones (nothing older is left for them to hide).
+func (l *LSM) Compact() {}
+
+// Bloom is a Bloom filter: m bits, k hash functions.
+type Bloom struct {
+	bits []uint64
+	m, k uint64
+}
+
+func NewBloom(n, bitsPerKey int) *Bloom {
+	m := uint64(max(64, n*bitsPerKey))
+	return &Bloom{bits: make([]uint64, (m+63)/64), m: m, k: 7}
+}
+
+// FIX 4: Add and MayContain. Derive the k bit positions from two hashes
+// of the key (h1 + i*h2, "double hashing"). MayContain must never say
+// false for a key that was added.
+func (b *Bloom) Add(key string)             {}
+func (b *Bloom) MayContain(key string) bool { return true }
+
+func hashes(key string) (uint64, uint64) {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	h1 := h.Sum64()
+	h.Write([]byte{0xff})
+	return h1, h.Sum64() | 1
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	allOK := true
+	fail := func(format string, a ...any) { fmt.Printf("FAIL "+format+"\\n", a...); allOK = false }
+	seat := func(i int) string { return fmt.Sprintf("inception/show-%03d/%c%d", i/40, 'A'+i%40/8, 1+i%8) }
+
+	// Three generations of writes, each flushed to its own run.
+	l := NewLSM()
+	for i := range 4000 {
+		l.Set(seat(i), "held")
+	}
+	l.Flush()
+	for i := range 2000 {
+		l.Set(seat(i), "booked")
+	}
+	l.Flush()
+	for i := range 500 {
+		l.Delete(seat(i)) // released
+	}
+	l.Flush()
+	l.Set(seat(3999), "booked") // still in the memtable
+
+	check := func(when string) {
+		for _, tc := range []struct {
+			i     int
+			want  string
+			found bool
+		}{{10, "", false}, {499, "", false}, {500, "booked", true}, {1999, "booked", true}, {2000, "held", true}, {3998, "held", true}, {3999, "booked", true}} {
+			v, ok := l.Get(seat(tc.i))
+			if v != tc.want || ok != tc.found {
+				fail("%s: Get(%s) = %q, %v; want %q, %v", when, seat(tc.i), v, ok, tc.want, tc.found)
+			}
+		}
+	}
+	check("before compaction")
+
+	// Bloom filters: absent keys should rarely be searched for in a run.
+	l.RunsSearched = 0
+	for i := range 10000 {
+		l.Get(fmt.Sprintf("dune/show-%03d/Z%d", i/40, i%40))
+	}
+	if l.RunsSearched > 3*10000/50 { // 3 runs; allow a 2% false-positive rate
+		fail("bloom: 10,000 lookups of absent keys searched inside %d runs; with working filters it's under %d", l.RunsSearched, 3*10000/50)
+	}
+	for _, r := range l.runs {
+		for _, e := range r.entries {
+			if !r.filter.MayContain(e.key) {
+				fail("bloom: MayContain(%q) = false for a key that was added", e.key)
+				break
+			}
+		}
+	}
+
+	l.Flush()
+	l.Compact()
+	if len(l.runs) != 1 {
+		fail("compact: %d runs left, want 1", len(l.runs))
+	} else if n := len(l.runs[0].entries); n != 3500 {
+		fail("compact: %d entries in the merged run, want 3500 (4000 seats, 500 deleted: no tombstones, no old versions)", n)
+	}
+	check("after compaction")
+
+	if allOK {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Three generations of seat states (4,000 held, 2,000 then booked, 500 released) plus one change still in the memtable must read back correctly before and after compaction. 10,000 lookups for keys that don't exist may search inside at most 600 runs (Bloom filters at 10 bits per key), and no added key may ever be reported absent. After compaction there must be exactly one run of 3,500 entries. Prints ALL CHECKS PASS."
+  hints={[
+    "Delete: put entry{key, deleted: true} in the memtable. Get: if the memtable has the key, answer from it (a tombstone means not found); then walk the runs with slices.Backward, skip any whose filter says no, and use slices.BinarySearchFunc on the sorted entries.",
+    "Compact: walk runs oldest to newest into a map (later runs overwrite earlier ones), drop the tombstones, sort, and build a fresh Bloom filter for the merged run.",
+    "Bloom: for i in 0..k-1, bit = (h1 + i*h2) mod m; Add sets those bits, MayContain returns false as soon as one of them is clear."
+  ]}
+  flag="GO{append_sort_merge}"
+>
+
+Pebble's memtable is a skiplist, its runs are files with block indexes, and its compactions are streaming merges, but the read path and the merge rule are the ones you're writing.
+
+</Lab>
+
 <Recap>
 
-You can now reason about what a database actually does on disk — and pick the right engine on purpose:
-
-- A database is an **append-only log** (fast writes) plus an **index** (fast reads). Indexes are the central trade-off: they speed reads and **slow writes**, because every write must update them.
-- **LSM-trees** keep the log idea: writes go to a **WAL** (durability) then a **memtable** (RAM); full memtables flush to immutable sorted **SSTables**; a background **compaction** merges them, keeping the newest value per key and dropping **tombstones**. Powers Cassandra, RocksDB, ScyllaDB, HBase.
-- **B-trees** abandon the log: sorted **pages** updated **in place**, in a shallow balanced tree (≈3–4 reads per lookup). A **WAL** guards the dangerous in-place page splits. Powers Postgres, MySQL, every major SQL DB.
-- **Choosing:** LSMs win **writes** (big **sequential** flushes, lower **write amplification**, less SSD wear); B-trees win **reads** (predictable, ≈one page per level). Meridian's write-heavy ingest leans LSM; predictable point lookups lean B-tree.
-- **Bloom filters** are a tiny probabilistic gate — **no false negatives** — that lets an LSM skip SSTables that can't hold a key, turning disk reads into one in-memory check.
-- **Row vs column** is the OLTP/OLAP split made physical: row storage for whole-record operational work (the ledger), **column storage** for aggregations over few columns of many rows (the analytics warehouse — reads less, compresses more).
-- Durability is only real after `file.Sync()` (`fsync`) — the engine is as safe as its last successful sync.
+- **An append-only log** writes as fast as the disk allows; a hash index makes lookups 1.1 µs instead of an 8.8 ms scan; compaction shrank 6.3 MB of history to 0.25 MB of current state. It can't do ranges.
+- **LSM trees** (Pebble): WAL plus a sorted memtable, flushed to immutable sorted tables, merged by compaction. 397,000 random writes/s at **3.2x** write amplification, a million seats in 18.8 MB of L6.
+- **Bloom filters** skip tables that can't hold a key: absent-key lookups went from 5.5 µs to 1.3 µs with filters that fit in cache, and to 55 µs (24.5 GB read) with filters that didn't. Pebble skips L6 filters by default for that reason.
+- **B-trees** (bbolt): sorted 4 KB pages, copy-on-write. 1 µs lookups, but random updates at **151x** amplification and 96,000/s; ordered inserts filled pages in 717 ms. An fsync'd commit cost 8 ms.
+- **Choose by workload**: random-write-heavy favours LSM (throughput, compression); read-heavy and latency-sensitive favours B-trees.
+- **Columns** for analytics: Parquet answered revenue-per-film reading 1.35 MB of a 15.6 MB file where CSV needed all 77.8 MB.
 
 </Recap>
 
 <Scoreboard
-  streak={8}
+  streak={6}
   items={[
-    { label: "Quick check — LSM for write-heavy ingest", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — column store for analytics", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — append-only log with hash index", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 2 — merge two sorted segments", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 3 — Bloom filter, no false negatives", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 4 — tombstone deletes through compaction", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 5 — write amplification calculator", kind: "exercise", points: 20, done: false }
+    { label: "Quick check: hashing has no order", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: writes now, work later", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: filters need memory", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: pages and locality", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: choose the engine", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: reading two columns", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: batch the fsyncs", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: tune the memtable", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: a range query in both engines", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: deletes in an LSM tree", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: an index for the report", kind: "exercise", points: 20, done: false }
   ]}
-  flag={{ label: "Lab — LSM compaction prints PASS", captured: false, points: 85 }}
+  flag={{ label: "Lab: Build a Tiny LSM Tree", captured: false, points: 120 }}
 />
-
-Storage engines — the log, the index, the trees, and the wisdom to know which one your workload wants. You now understand why a write-heavy ledger and a read-heavy lookup table want opposite engines, why your SSD wears out, and why the dashboard stores the data sideways. We've gone from copies, to splits, to the bytes on the disk. Next we look the danger in the eye: **The Trouble with Distributed Systems** — networks that lie, clocks that drift, and processes that freeze at the worst possible moment. Everything you've built so far assumed the machines mostly behave. They don't. Let's go.

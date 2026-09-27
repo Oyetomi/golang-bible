@@ -130,6 +130,7 @@ export function PostRoomAnim({
   mailLabel = "customers' inboxes · Mailpit",
   retryLabel = "retry · waiting out backoff",
   deadLabel = "archived · dead letters",
+  binTone = "alarm",
   countNoun = "email",
 }: {
   title: string;
@@ -139,6 +140,7 @@ export function PostRoomAnim({
   mailLabel?: string;
   retryLabel?: string;
   deadLabel?: string;
+  binTone?: "alarm" | "neutral"; // "neutral": the bins are just places, not failures
   countNoun?: string;
   workers: PostWorker[];
   customers?: PostCustomer[];
@@ -318,10 +320,10 @@ export function PostRoomAnim({
 
           {usesBins && (
             <>
-              <div className="post-bin retry" style={{ left: midL, top: bottomTop, width: half, height: bottomH }}>
+              <div className={`post-bin retry ${binTone === "neutral" ? "neutral" : ""}`} style={{ left: midL, top: bottomTop, width: half, height: bottomH }}>
                 <span className="post-zlabel">{retryLabel}</span>
               </div>
-              <div className="post-bin dead" style={{ left: midL + half + 12, top: bottomTop, width: half, height: bottomH }}>
+              <div className={`post-bin dead ${binTone === "neutral" ? "neutral" : ""}`} style={{ left: midL + half + 12, top: bottomTop, width: half, height: bottomH }}>
                 <span className="post-zlabel">{deadLabel}</span>
               </div>
             </>
