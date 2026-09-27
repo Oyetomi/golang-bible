@@ -1,6 +1,6 @@
 import data from "@/content/_manifest.json";
 
-export type Part = 1 | 2 | 3 | 4 | "appendix";
+export type Part = 1 | 2 | 3 | 4 | "redis" | "appendix";
 
 export type Chapter = {
   slug: string;
@@ -23,13 +23,14 @@ export type Chapter = {
 
 export const chapters = data as Chapter[];
 
-export const PART_ORDER: Part[] = [1, 2, 3, 4, "appendix"];
+export const PART_ORDER: Part[] = [1, 2, 3, 4, "redis", "appendix"];
 
 export const PART_TITLES: Record<string, string> = {
   "1": "The Language",
   "2": "Becoming a Badass Go Engineer",
   "3": "Fintech in Go",
   "4": "Infrastructure",
+  redis: "Build Your Own Redis",
   appendix: "DS&A & Coding Interviews",
 };
 
@@ -38,15 +39,20 @@ export const PART_SUBTITLES: Record<string, string> = {
   "2": "Production-grade engineering",
   "3": "The domain capstone",
   "4": "From process to platform",
+  redis: "A project track: one server, grown lesson by lesson until the real redis-cli talks to it",
   appendix: "Optional interview-prep track",
 };
 
 export function partLabel(part: Part): string {
-  return part === "appendix" ? "Appendix" : `Part ${part}`;
+  if (part === "appendix") return "Appendix";
+  if (part === "redis") return "Project Track";
+  return `Part ${part}`;
 }
 
 export function partDir(part: Part): string {
-  return part === "appendix" ? "appendix" : `part-${part}`;
+  if (part === "appendix") return "appendix";
+  if (part === "redis") return "track-redis";
+  return `part-${part}`;
 }
 
 export function chapterByHref(href: string): Chapter | undefined {
