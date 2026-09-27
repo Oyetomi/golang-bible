@@ -14,6 +14,11 @@ export type Chapter = {
   path: string;
   href: string;
   heavy?: boolean;
+  // Tracks group lessons into numbered modules ("Building the Store"), and
+  // mark practice lessons: a workshop builds something, a sidequest is an
+  // optional challenge.
+  module?: string;
+  kind?: "lesson" | "workshop" | "sidequest";
 };
 
 export const chapters = data as Chapter[];
