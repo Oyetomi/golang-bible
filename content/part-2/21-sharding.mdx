@@ -3,703 +3,600 @@ title: "Sharding: Splitting Data Across Machines"
 part: 2
 order: 21
 type: "course"
-description: "When one database is too small, you split the data across many machines — explained from zero: why you shard, choosing a partition key, key-range vs hash sharding, hot spots and skew, rebalancing without moving everything, routing a request to the right node, and sharding secondary indexes (local vs global) — all grounded in sharding Meridian's ledger."
+description: "Split the cinema's seats across a real Redis Cluster and measure each decision: hash slots and a MOVED redirect, the seat map failing with CROSSSLOT until hash tags put a film on one shard, the opening-night skew that then sent 90% of the load to one node (while giving 4.4x the throughput), resharding onto a fourth node under load (25% of keys moved, against 75% for modulo hashing, and 94 CLUSTERDOWN errors on the way), and why a global per-customer index can't be updated atomically with the hold."
 prerequisites: ["replication"]
 ---
 
-<HeroCard label="Part 2 · Chapter 20" title="Sharding: Splitting Data Across Machines">
+<HeroCard label="Part 2 · Chapter 21" title="Sharding: Splitting Data Across Machines">
 
-Last chapter you kept **copies** of Meridian's data on several machines — replication. That solves "what if a machine dies." It does *nothing* for a different problem: what if the data is simply **too big for any one machine**, or the writes come in faster than one machine can absorb them? You can copy a 50-terabyte database onto ten machines all day; every copy is still 50 terabytes. Copies don't shrink anything.
+Replication (chapter 20) copies all the data to every machine. That helps reads and survives failures, but every copy still holds everything and every write still goes everywhere. When the data, or the writes, outgrow one machine, you **shard**: split the data into pieces and give each machine some of them.
 
-So you do the other thing: you **split** the data. Machine A holds some accounts, machine B holds others, machine C the rest. No machine holds all of it. That's **sharding** (also called partitioning), and I'm going to teach it to you from absolute zero — no assumed knowledge of databases, hashing, or any of the vocabulary people use to sound clever. By the end you'll know exactly how a request finds the one machine holding *your* account out of a thousand, why a single celebrity can melt one shard while nine others nap, and the little trick that lets you add a machine without shuffling the entire dataset across the network. We shard Meridian's ledger the whole way. Let's go.
+The cinema's seats live in Redis. This chapter runs them on a **Redis Cluster**, a real sharded store: 16,384 hash slots divided among the masters, clients that route each key to its node, and resharding while the service runs. The cinema's own store code meets it unchanged, and immediately breaks: its seat map reads 40 keys in one command, and those 40 keys are now on three machines. Fixing that is a choice about what to keep together, and every choice has a cost that shows up under load.
+
+Six stops. If you get lost, come back here:
+
+1. **Keys to slots to nodes.** How a key finds its machine, and what happens when a client asks the wrong one.
+2. **Keep a film together.** The seat map breaks across shards; hash tags fix it.
+3. **Hot spots.** Opening night, and what co-location does to the load.
+4. **Rebalancing.** Add a machine under load: how much data moves, and what fails.
+5. **Modulo versus slots.** Why `hash % N` is the wrong way to place keys.
+6. **Indexes across shards.** "All of Alice's holds" when her holds are everywhere.
 
 </HeroCard>
 
-<ChapterTabs tabs={["Why Shard", "Key-Range", "Hash Sharding", "Hot Spots & Rebalancing", "Request Routing", "Secondary Indexes"]} />
+<ChapterTabs tabs={["Keys to Slots", "Keep a Film Together", "Hot Spots", "Rebalancing", "Modulo versus Slots", "Indexes Across Shards"]} />
 
 <SpacedRecall
   role={"librarian"}
   items={[
     {
-      from: "Replication (ch20)",
-      q: "Replication keeps COPIES; sharding…?",
-      options: ["also copies", "SPLITS the data across machines", "deletes data", "caches data"],
+      from: "Replication (part 2, ch20)",
+      q: "With N=3 copies, W=2 and R=2, why does every read see the latest write?",
+      options: ["Two is faster than one", "R + W > N: every read set overlaps every write set", "Redis replicates", "Luck"],
       answer: 1,
-      tie: "Distinguishing the two opens this chapter: replication is redundancy, sharding is division. Real systems do both — shards, each replicated."
+      tie: "Replication gives every node all the data. Sharding gives each node part of it, so the question changes from 'which copy is newest' to 'which node has this key at all'."
     },
     {
-      from: "General",
-      q: "A poorly chosen partition key causes…?",
-      options: ["faster reads", "hotspots / uneven load", "more replicas", "smaller data"],
+      from: "Project: Cinema Booking (part 2, ch8)",
+      q: "Why did holding a seat need Redis to be one atomic SET NX?",
+      options: ["Speed", "Check-then-set in two steps lets two customers both see the seat free", "Redis requires it", "For logging"],
       answer: 1,
-      tie: "Choosing the partition key is the chapter's central decision — get it wrong and one shard takes all the traffic (a hot key), erasing the point of sharding."
+      tie: "Atomic operations only work within one shard. Stop 6 measures what happens when an operation needs two."
     },
   ]}
 />
-
 
 <PredictLab
-  prompt={"Which shard does this FNV hash mod 4 select?"}
+  prompt={"The cinema's Redis store reads a film's seat map with one MGET of its 40 seat keys (seat:inception:A1 … E8). Pointed at a 3-master Redis Cluster, what does Seats(\"inception\") return?"}
   role={"librarian"}
-  code={`h := fnv.New32a()
-h.Write([]byte("user:42"))
-fmt.Println(h.Sum32() % 4)`}
-  options={["2", "0", "1", "3"]}
-  answer={0}
-  output={`2`}
-  explain={"A consistent hash of the key, mod the shard count, picks the shard deterministically \u2014 the same key always lands on the same shard. FNV is fast and non-cryptographic, ideal for sharding (not for security). (Real systems use consistent hashing so adding a shard moves few keys.)"}
+  code={`keys := []string{"seat:inception:A1", "seat:inception:A2", …, "seat:inception:E8"}
+vals, err := rdb.MGet(ctx, keys...).Result()`}
+  options={["The 40 seats: the client splits the MGET", "Only the seats on the node it asked", "An error: CROSSSLOT, the keys don't hash to the same slot", "It hangs"]}
+  answer={2}
+  output={`seat:inception:A1      slot 15270
+seat:inception:A7      slot  7008
+Seats(inception): 0 seats, err: CROSSSLOT Keys in request don't hash to the same slot`}
+  explain={"A multi-key command must touch keys in one hash slot, because one node has to execute it atomically. The 40 seats hash to slots all over the cluster. Either keep them in one slot (a hash tag), or read them with one command per key."}
 />
 
-<Scene
-  title="One database box is full → split the data across many"
-  actors={[
-    { id: "client", label: "Payments API" },
-    { id: "db", label: "Ledger DB" }
-  ]}
-  rows={1}
-  cols={4}
-  frames={[
-    {
-      caption: "Meridian's whole ledger lives on one machine. Every account, every transaction, every write — one box.",
-      beat: "neutral",
-      actors: [{ id: "client", state: "active" }, { id: "db", state: "active" }],
-      cells: [{ id: "A1", state: "active", label: "1 DB · 100% full" }, { id: "A2", state: "idle", label: "—" }, { id: "A3", state: "idle", label: "—" }, { id: "A4", state: "idle", label: "—" }]
-    },
-    {
-      caption: "Growth. The disk fills and writes arrive faster than one machine can commit them. You can't buy a bigger box forever — and copies (replication) don't help: every copy is still 100% full.",
-      beat: "problem",
-      actors: [{ id: "client", state: "warn" }, { id: "db", state: "bad" }],
-      cells: [{ id: "A1", state: "bad", label: "OVERLOADED ✗" }, { id: "A2", state: "idle", label: "no room" }, { id: "A3", state: "idle", label: "no room" }, { id: "A4", state: "idle", label: "no room" }]
-    },
-    {
-      caption: "Sharding: split the accounts into 4 pieces (shards). Each machine holds one quarter of the data and takes one quarter of the writes. Add machines, add capacity.",
-      beat: "solution",
-      actors: [{ id: "client", state: "ok" }, { id: "db", state: "done" }],
-      cells: [{ id: "A1", state: "done", label: "shard 0 · 25%" }, { id: "A2", state: "done", label: "shard 1 · 25%" }, { id: "A3", state: "done", label: "shard 2 · 25%" }, { id: "A4", state: "done", label: "shard 3 · 25%" }]
-    }
-  ]}
-  caption="Replication makes copies (survive failure). Sharding splits the data (survive size). Real systems do both: each shard is itself replicated. This chapter ignores the replication layer to focus on the split."
-/>
+## The lab bench
 
-## Why Shard
+Four Redis 8.10 containers in cluster mode on a Docker network; three form the cluster at first, and the fourth joins in stop 4. Container addresses aren't reachable from the macOS host, so the experiments (`shardlab`, in the cinema module) are cross-compiled for Linux and run in a container on the same network. The cinema's Redis store gets two changes: it accepts `redis.UniversalClient` (a single server *or* a cluster client), and an optional `HashTag` setting.
 
-Let's pin the word down before anything else.
+## Keys to Slots
 
-<Define term="Sharding (partitioning)" since="Sharding (Part 2)">
-**Sharding** means splitting one dataset into smaller pieces called **shards** (or **partitions**), and storing different shards on different machines, so that each record lives in exactly **one** shard. Why it matters: replication copies the *whole* dataset onto each machine — great for surviving failures, useless when the dataset itself is too big. Sharding is how a system grows past what a single machine can hold or how fast it can write, by spreading the load across many machines that each handle a slice.
-</Define>
+*Stop 1 of 6.*
 
-The two techniques are easy to confuse, so hold them apart:
+### Step 1: 16,384 slots
 
-<ConceptGrid cols={3}>
-  <ConceptCard label="Replication = copies">Every machine holds the *same* data. Buys you availability (survive a dead machine) and read-scaling (spread reads over copies). Does not reduce how much data each machine stores.</ConceptCard>
-  <ConceptCard label="Sharding = splits">Every machine holds a *different slice*. Buys you size and write-throughput — ten machines hold ten times the data and absorb ten times the writes. Does not, by itself, survive a machine dying.</ConceptCard>
-  <Gotcha>⚠ Use both. A shard with no replica is a single point of failure for *that slice*. Production = sharded **and** each shard replicated (a leader + followers, like last chapter). They're independent choices.</Gotcha>
-</ConceptGrid>
+A Redis Cluster doesn't assign keys to nodes directly. Every key belongs to one of **16,384 hash slots**: CRC16 of the key, modulo 16384. Each master owns ranges of slots. Creating a three-master cluster splits them evenly:
 
-The whole game rests on one decision: how do you decide which record goes in which shard? You pick a **partition key**.
+```text
+M: 172.21.0.2:6379   slots:[0-5460] (5461 slots) master
+M: 172.21.0.3:6379   slots:[5461-10922] (5462 slots) master
+M: 172.21.0.4:6379   slots:[10923-16383] (5461 slots) master
+[OK] All 16384 slots covered.
+```
 
-<Define term="Partition key" since="Sharding (Part 2)">
-The **partition key** is the field whose value decides a record's shard. All records sharing a partition key land in the same shard. For Meridian's ledger the natural key is the **account ID** — every transaction for an account lives with that account. Why it matters: if a request knows the partition key, it goes straight to the one shard that can answer — fast. If it *doesn't* know the key (e.g. "find every transaction over ₦10,000"), it has to ask *every* shard and combine the answers — slow. Choosing the partition key is the most consequential and hardest-to-undo decision in a sharded system.
-</Define>
+### Step 2: asking the wrong node
 
-<Callout kind="warn" title="Don't shard until you have to">
+```text
+$ redis-cli -h rc1 CLUSTER KEYSLOT seat:inception:A7
+7008
+$ redis-cli -h rc1 SET seat:inception:A7 held:alice        # without -c: not cluster-aware
+MOVED 7008 172.21.0.3:6379
 
-Sharding is a heavyweight solution. A single modern machine holds a *lot* and commits a *lot* of writes — often more than you think. Sharding adds permanent complexity: cross-shard queries are slow, a write that touches two accounts on two shards needs a **distributed transaction** (Chapter 23's territory, and far slower than a single-machine one), and the sharding scheme is painful to change later. The senior move is to stay on one (replicated) machine as long as it copes, and reach for sharding only when data volume or write throughput genuinely outgrow it. Meridian shards the ledger because it's at hundreds of millions of accounts — not because sharding is fashionable.
+$ redis-cli -c -h rc1 SET seat:inception:A7 held:alice     # -c follows redirects
+OK
+```
 
-</Callout>
+`seat:inception:A7` is in slot 7008, which the second master owns. Sent to the first, the command isn't forwarded: the node answers **MOVED 7008 172.21.0.3:6379**, telling the client where the slot lives. A cluster-aware client (`redis-cli -c`, or go-redis's `ClusterClient`) follows the redirect, and remembers the slot map so its next request for slot 7008 goes straight there. Routing is the client's job; the nodes only say "not here, there".
 
 <QuickCheck
-  question="Meridian's database is at 100% disk and read traffic is also too high. The team adds five read-replicas (copies). Disk is still at 100%. Why?"
+  question="A node receives a command for a key in a slot it doesn't own. What does it do?"
   options={[
-    "The replicas were configured wrong",
-    "Replication makes copies of the whole dataset — every copy is still full. To reduce data per machine you must shard (split), not replicate (copy)",
-    "Five replicas isn't enough",
-    "Replicas don't store data"
+    "Forwards the command to the right node",
+    "Replies MOVED with the slot and the right node's address; the client resends there and updates its slot map",
+    "Runs it anyway",
+    "Returns nil"
   ]}
   answer={1}
-  explain="Replication and sharding solve different problems. Copies fixed the read load (reads now spread across six machines), but every copy still holds 100% of the data, so disk stays full. Only sharding — splitting the data so each machine holds a slice — reduces bytes-per-machine."
+  explain="Measured: MOVED 7008 172.21.0.3:6379 from the non-cluster-aware client, OK with -c. Keeping routing in the client means no extra hop through a proxy."
 />
 
-## Key-Range
+## Keep a Film Together
 
-The first way to split: hand each shard a **contiguous range** of keys, sorted. Think of a printed encyclopedia — volume 1 is *A–B*, volume 7 is *M–N*, volume 12 is *T–Z*. To find "Meridian," you reach straight for the *M–N* volume. No searching the others.
+*Stop 2 of 6.*
 
-<Define term="Key-range sharding" since="Sharding (Part 2)">
-**Key-range sharding** assigns each shard a sorted, contiguous range of partition keys — shard 0 owns keys `aardvark`…`carrot`, shard 1 owns `carter`…`forest`, and so on. Within a shard, keys stay **sorted**. Why it matters: sorting makes **range scans** cheap — "every transaction for account 7 in March" is one sweep of one shard, because those rows sit next to each other. The catch (next paragraph) is that sorted ranges invite **hot spots**.
-</Define>
+### Step 1: the seat map breaks
 
-The boundaries can't be evenly spaced by *letter* — far more words start with *S* than *X*, so an even split has to give *X–Z* a wide range and *S* a narrow one. **The boundaries adapt to the data, not the alphabet.** Same with Meridian: if account IDs cluster, the ranges must too.
+The cinema's store, unchanged, on the cluster:
 
-The benefit is real — sorted keys give you free range queries:
+```text
+$ shardlab crossslot     # the cinema's Redis store, on a 3-master Redis Cluster
+== HashTag=false
+  seat:inception:A1      slot 15270
+  seat:inception:A7      slot  7008
+  seat:inception:C3      slot 15750
+  Hold(A7): <nil>
+  Seats(inception): 0 seats, err: CROSSSLOT Keys in request don't hash to the same slot
+== HashTag=true
+  seat:{inception}:A1    slot  6229
+  seat:{inception}:A7    slot  6229
+  seat:{inception}:C3    slot  6229
+  Hold(A7): <nil>
+  Seats(inception): 40 seats, err: <nil>
+```
 
-<ExecTimeline
-  title="A range scan on a key-range shard"
-  lanes={[
-    { id: "api", label: "Payments API" },
-    { id: "router", label: "Router" },
-    { id: "s2", label: "Shard 2 (acct 7)" }
-  ]}
-  steps={[
-    { lane: "api", kind: "run", label: "get acct 7, all of March", note: "We want every transaction for account 7 between Mar 1 and Mar 31." },
-    { lane: "router", kind: "run", label: "acct 7 -> shard 2", note: "The partition key (account 7) maps to exactly one shard. No need to ask the others." },
-    { lane: "s2", kind: "run", label: "sorted sweep", note: "Within shard 2, account 7's rows are stored sorted by timestamp — so March is one contiguous read off disk. Cheap." },
-    { lane: "s2", kind: "done", label: "return rows", note: "One shard touched, one sequential scan. This is what sorted key-range sharding buys you." }
-  ]}
-  caption="Because the key is sorted, a range query touches one shard and reads contiguous rows. Hash sharding (next section) destroys this — the rows scatter."
-/>
+With plain keys, `Hold(A7)` works (one key, one slot), and **the seat map fails with CROSSSLOT**: A1 is in slot 15270, A7 in 7008, C3 in 15750, and an `MGET` must run on one node, atomically. The service's most frequent request, broken by the change of deployment alone.
 
-The downside is the flip side of the same coin. If writes cluster on **nearby keys**, they all hit the **same shard** while the others idle:
+### Step 2: hash tags
 
-<Callout kind="warn" title="The classic hot-shard trap: a timestamp partition key">
+Redis's answer is the **hash tag**: if a key contains `{…}`, only the part inside the braces is hashed. `seat:{inception}:A7` hashes `inception`, so every seat of the film lands in slot 6229, on one node, and `MGET` works again (the second half of the output above). The store keeps both spellings behind a setting:
 
-Say you shard by *timestamp* (one shard per month). As transactions happen *right now*, every single write lands on the "this month" shard. That one shard is on fire; the eleven older shards sit idle. You sharded across twelve machines and your write bottleneck is still **one** machine. The fix is to not put the clustering field first: make the key `(account_id, timestamp)` instead of `timestamp`. Now writes for thousands of active accounts spread across all shards, and you *keep* the efficient "one account's March" range scan. The cost: "all accounts in March" is no longer one scan. You trade the query you rarely run for the write spread you always need.
+```go noverify
+// redisstore.go, lines 37–47
+func seatKey(movie, seat string) string { return "seat:" + movie + ":" + seat }
 
-</Callout>
-
-Rebalancing a key-range scheme is intuitive: when a shard gets too big, **split its range in two**; when adjacent shards shrink, **merge** them. (HBase splits at ~10 GB by default.) The split is expensive — it rewrites all that data into new files — and the shard that needs splitting is often the busy one, so you pay the cost at the worst time. Bigtable, HBase, CockroachDB, and MongoDB's range mode all shard this way.
-
-## Hash Sharding
-
-If you don't need range scans and you just want an **even spread**, run the key through a **hash function** first. A hash takes any input and returns a seemingly-random number — but the *same* input always gives the *same* number. Similar inputs (account 1000, account 1001) get wildly different hashes, so they scatter.
-
-<Define term="Hash sharding" since="Sharding (Part 2)">
-**Hash sharding** computes `hash(partition_key)` and uses the hash — not the raw key — to pick the shard. A good hash turns skewed, clustered keys into a uniform spread, so each shard gets a fair share. Why it matters: it kills the hot-shard problem that sorted key ranges have (sequential signups no longer pile on the last shard). The price: it **destroys ordering**, so range scans now have to hit every shard. You're trading cheap range queries for even load.
-</Define>
-
-The router in action — sequential signups scattering instead of piling up:
-
-<MapAnim
-  title="hash(account_id) % 4 — the shard router"
-  slots={2}
-  frames={[
-    {
-      note: "Four shards, empty. Five brand-new accounts are about to sign up with SEQUENTIAL ids (acct-1000…1004) — the exact pattern that murders key-range sharding by piling everything on the last shard.",
-      buckets: [[], [], [], []]
-    },
-    {
-      note: "acct-1000 arrives: hash(acct-1000) % 4 → shard 2. The hash gopher doesn't care that the id is sequential — the hash output is effectively random.",
-      hashing: "acct-1000",
-      to: { bucket: 2, slot: 0 },
-      buckets: [[], [], ["acct-1000"], []]
-    },
-    {
-      note: "acct-1001 — numerically ADJACENT to the last one — lands on shard 0. Adjacent inputs, wildly different hashes. This scattering is the entire point.",
-      hashing: "acct-1001",
-      to: { bucket: 0, slot: 0 },
-      buckets: [["acct-1001"], [], ["acct-1000"], []]
-    },
-    {
-      note: "acct-1002 → shard 3, acct-1003 → shard 1. Four accounts, four different shards. Under key-range, all four would be sitting on ONE shard right now while three idled.",
-      hashing: "acct-1003",
-      to: { bucket: 1, slot: 0 },
-      buckets: [["acct-1001"], ["acct-1003"], ["acct-1000"], ["acct-1002"]]
-    },
-    {
-      note: "The price tag: fetch accounts 1000–1004 as a RANGE and there is no shard to ask — they are everywhere, so a range scan must fan out to all four shards and merge. Even load bought by giving up locality.",
-      beat: "problem",
-      buckets: [["acct-1001", "acct-1004"], ["acct-1003"], ["acct-1000"], ["acct-1002"]]
-    }
-  ]}
-  caption="Same machinery as a hash map, scaled up: hash(key) % shards spreads load uniformly — and scatters ranges irrecoverably. Pick hash sharding when you query by key, key-range when you query by interval."
-/>
-
-
-Watch the difference. Five brand-new accounts, IDs assigned sequentially at signup — key-range dumps them all on one shard; hash scatters them:
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"hash/fnv"
-)
-
-// Meridian shards its ledger across 4 nodes; the partition key is the account ID.
-
-// byRange: IDs 0..999 -> shard 0, 1000..1999 -> shard 1, ... (sorted ranges).
-func byRange(accountID, perShard int) int { return accountID / perShard }
-
-// byHash: hash the ID first, then map onto the shards -> uniform spread.
-func byHash(accountID, shards int) int {
-	h := fnv.New32a()
-	fmt.Fprintf(h, "%d", accountID)
-	return int(h.Sum32()) % shards
-}
-
-func main() {
-	const shards = 4
-	newAccounts := []int{4000, 4001, 4002, 4003, 4004} // sequential signups
-
-	fmt.Println("key-range: every new signup piles onto ONE shard (hot)")
-	for _, id := range newAccounts {
-		fmt.Printf("  account %d -> shard %d\n", id, byRange(id, 1000))
+// key names a seat. With HashTag, the film's name is the key's hash tag
+// ("seat:{inception}:A7"), so on a Redis Cluster all of a film's seats are
+// in one hash slot: one node, and multi-key commands (MGET) work.
+func (s *Store) key(movie, seat string) string {
+	if s.HashTag {
+		return "seat:{" + movie + "}:" + seat
 	}
-	fmt.Println("hash: the same signups scatter across ALL shards (even)")
-	for _, id := range newAccounts {
-		fmt.Printf("  account %d -> shard %d\n", id, byHash(id, shards))
-	}
+	return seatKey(movie, seat)
 }
 ```
 
-</GoPlayground>
+Changing the key format of a running service is a **migration**: existing holds under the old names are invisible under the new ones. For holds that expire within minutes you can switch at a quiet moment; for durable data you'd dual-read (new name, then old) until the old keys are gone.
 
-So hashing spreads the load. But *which* shard does a hash map to? Your first instinct — `hash(key) % numberOfNodes` — is a trap, and it's worth feeling the pain to understand why every real system avoids it.
+### Step 3: or read across shards
 
-<Define term="The mod-N rebalancing trap" since="Sharding (Part 2)">
-Mapping a key to a node with `hash(key) % N` (where **N is the number of nodes**) seems natural — but when N changes, almost every key maps to a *different* node, so nearly the whole dataset has to move across the network. Why it matters: adding one machine to relieve load triggers a stampede that *adds* load — the opposite of what you wanted. The fix is to stop tying the math to the node count.
-</Define>
+The alternative is to leave the keys spread and read them with one `GET` per seat. go-redis's cluster client splits a **pipeline** by node, so it's one round trip per node rather than per key:
 
-Count the damage. Going from 3 nodes to 4 with `% N` relocates most of the dataset:
-
-<GoPlayground>
-
-```go
-package main
-
-import "fmt"
-
-// How many of 1000 keys land on a DIFFERENT node when we grow 3 -> 4 nodes,
-// using the naive node = hash % numberOfNodes scheme?
-func main() {
-	const keys = 1000
-	moved := 0
-	for k := 0; k < keys; k++ {
-		if k%3 != k%4 { // before: k%3 nodes,  after: k%4 nodes
-			moved++
+```go noverify
+// redisstore.go, lines 105–129
+// mget reads keys in one round trip per node: one MGET when they share a
+// slot (one server, or hash-tagged keys on a cluster), otherwise a
+// pipeline of GETs, which the cluster client splits by node.
+func (s *Store) mget(ctx context.Context, keys []string) ([]any, error) {
+	if _, cluster := s.rdb.(*redis.ClusterClient); !cluster || s.HashTag {
+		return s.rdb.MGet(ctx, keys...).Result()
+	}
+	cmds := make([]*redis.StringCmd, len(keys))
+	_, err := s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for i, k := range keys {
+			cmds[i] = p.Get(ctx, k)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	vals := make([]any, len(keys))
+	for i, c := range cmds {
+		if v, err := c.Result(); err == nil {
+			vals[i] = v
 		}
 	}
-	fmt.Printf("mod-N, 3 -> 4 nodes: %d of %d keys moved (%.0f%%)\n",
-		moved, keys, 100*float64(moved)/float64(keys))
-	// ~75%. Adding ONE node reshuffles three-quarters of the data. Unusable at scale.
+	return vals, nil
 }
 ```
 
-</GoPlayground>
-
-The fix used by virtually every sharded database: **decouple keys from nodes**. Create *many more shards than nodes* and pin a key to a shard with a constant — `hash(key) % numberOfShards`, where the shard count **never changes**. Then a key's shard is fixed for life. Rebalancing just **reassigns whole shards to nodes** — you move a few shards' worth of data, never recompute individual keys:
-
-<BeforeAfter
-  bad={`// node = hash % N   (N = node count)
-// Add a node: N changes 3 -> 4,
-// every key recomputed, ~75% move.
-node := hash(key) % numNodes`}
-  good={`// shard = hash % S   (S = 512, FIXED)
-// Add a node: only reassign a few
-// whole shards. Keys never move shard.
-shard := hash(key) % numShards
-node  := shardToNode[shard]`}
-  badLabel="mod-N (stampede)"
-  goodLabel="fixed shards (cheap)"
-/>
-
-<ExecTimeline
-  title="Rebalancing with a fixed shard count"
-  lanes={[
-    { id: "admin", label: "Cluster" },
-    { id: "n0", label: "Node 0" },
-    { id: "n1", label: "Node 1" },
-    { id: "n3", label: "Node 3 (new)" }
-  ]}
-  steps={[
-    { lane: "admin", kind: "run", label: "512 shards, 3 nodes", note: "Each node owns ~170 of the 512 fixed shards. Every key already has a permanent shard." },
-    { lane: "admin", kind: "spawn", label: "add node 3", note: "We want node 3 to take roughly a quarter of the load — ~128 shards." },
-    { lane: "n0", kind: "send", label: "hand off ~43 shards", note: "Node 0 ships about a third of its surplus shards to node 3. Whole shards move — the data inside them is untouched." },
-    { lane: "n1", kind: "send", label: "hand off ~43 shards", note: "Node 1 does the same. No key is recomputed; the shard a key belongs to is unchanged." },
-    { lane: "n3", kind: "done", label: "now owns ~128 shards", note: "Only the shard->node MAP changed. We moved ~25% of data (the minimum), not 75%." }
-  ]}
-  caption="Because the shard count is fixed, keys never change shard. Adding a node moves a minimal set of whole shards. This is the whole trick — Citus, Riak, Elasticsearch, and Couchbase all use it."
-/>
-
-<UnderTheHood title="Consistent hashing, hash-range sharding, and a Go footgun">
-
-The "fixed shard count" scheme has cousins. **Hash-range sharding** assigns each shard a *range of hash values* (shard 0 owns hashes 0–16383, etc.) so shards can split when they grow — Cassandra and ScyllaDB chop the hash space into many small ranges per node — ScyllaDB defaults to 256 randomly-placed tokens (imbalances average out by sheer count), while modern Cassandra uses just 16 tokens with a *deterministic* allocator that places boundaries to keep nodes balanced (the move away from many random tokens was made precisely because random placement at low token counts skews badly). **Consistent hashing** (the Karger et al. 1997 algorithm, plus rendezvous and jump hashing) is a family of functions designed so that changing the number of shards moves the *minimum* possible keys — that's all "consistent" means here, nothing to do with replica or ACID consistency.
-
-**The Go footgun:** do **not** shard with Go's built-in map hash. As of Go 1.14+, the runtime seeds map hashing with a per-process random value (and `hash/maphash` is explicitly per-process random), so the *same key hashes differently in different processes* — exactly what you don't want when every node must agree on where a key lives. (It's the Go counterpart to the well-known "a language's built-in `hashCode` isn't safe for distributed sharding" warning.) Use a **stable, explicit** hash: `hash/fnv` or `hash/crc32` for speed, or a real hash like SHA-256 (`crypto/sha256`) when you need quality. We assume Go 1.26 throughout; the `slices`/`maps` helpers (Go 1.21/1.22) are handy for managing the shard table, but the hash itself must be deterministic across machines.
-
-</UnderTheHood>
+Both now work. Which is better is stop 3's question.
 
 <QuickCheck
-  question="A team maps keys to nodes with hash(key) % numNodes. They add a 4th node to a 3-node cluster and the cluster nearly falls over from network traffic. What happened, and what's the fix?"
+  question="How does seat:{inception}:A7 end up in the same slot as seat:{inception}:C3?"
   options={[
-    "The new node was faulty; replace it",
-    "mod-N reshuffles ~75% of keys when N changes; use a fixed, large shard count (hash % numShards) and reassign whole shards instead",
-    "They needed to add two nodes at once",
-    "Hashing is the wrong approach entirely; switch to key-range"
+    "Redis stores keys with the same prefix together",
+    "Only the text inside the first {…} is hashed, so both keys hash 'inception' to slot 6229",
+    "The client sends them to the same node",
+    "MGET moves them"
   ]}
   answer={1}
-  explain="Tying the modulus to the node count means changing the count remaps almost everything. Fix: pick a fixed shard count far larger than the node count, map keys to shards with that constant, and rebalance by moving whole shards between nodes. Keys never change shard, so only a minimal slice of data moves."
+  explain="Measured: all three tagged keys in slot 6229. The tag is how you tell the cluster which keys must live, and be operated on atomically, together."
 />
 
-<MentalModel
-  title="Sharding fails on the key you chose, not on the volume"
-  concept="Hot spots and rebalancing"
-  metaphor="Ten tills, and everyone queueing at one of them"
-  analogy="Splitting data across shards only helps if the load splits too. Shard by customer and one enormous customer lands entirely on one node — that shard saturates while nine idle, and adding a tenth changes nothing because the problem is not capacity, it is distribution. Range sharding by timestamp is the classic version: all of today's writes go to the newest range, so exactly one shard is hot at any moment and every other is cold. Hash sharding distributes evenly but destroys range queries, since neighbouring keys are now deliberately far apart."
-  realWorld="Ten tills open and every customer queueing at one, because that is where the trolleys are. Opening an eleventh does not help."
-  goCode="Consistent hashing exists for the rebalancing half of the problem: with plain modulo, changing the node count remaps almost every key at once. Consistent hashing moves only the keys belonging to the node that changed."
-  takeaway="The shard key is the decision. Every other choice can be revised later; changing the shard key means moving all of the data, which is why it deserves more scrutiny than anything else in the design."
-  role="librarian"
-/>
+## Hot Spots
 
-## Hot Spots & Rebalancing
+*Stop 3 of 6.*
 
-Hashing spreads keys evenly — but **even key distribution is not even load**. If one *single key* is hammered, hashing doesn't help: that key is on one shard, and that shard burns.
+### Step 1: opening night
 
-<Define term="Hot spot / hot key" since="Sharding (Part 2)">
-A **hot spot** (or **hot shard**) is a shard with disproportionately high load while others sit idle — your bottleneck collapses back to one machine. A **hot key** is a single partition key so busy it overwhelms its shard. Why it matters: a uniform hash can't save you, because all traffic for one key lands on one shard by definition. For Meridian, a giant merchant account taking thousands of payments a second is a hot key — its shard melts while the rest nap.
-</Define>
+On opening night almost everyone wants the same film. `shardlab load` runs 32 workers fetching seat maps for 5 seconds, 90% for *inception* and 10% for *dune*, and counts the commands each master processed:
 
-One mitigation: **split the hot key** by appending a small random suffix, turning one scorching key into many lukewarm ones across different shards. The cost is that **reads must now fan out** to every suffix and merge:
-
-<GoPlayground>
-
-```go
-package main
-
-import (
-	"fmt"
-	"math/rand"
-)
-
-// A megastore merchant account gets a storm of writes -> one hot shard.
-// Spread the WRITES by appending a random suffix 00..09: one hot key becomes
-// 10 sub-keys that (via hashing) land on different shards.
-func writeKey(account string, hot bool) string {
-	if hot {
-		return fmt.Sprintf("%s#%02d", account, rand.Intn(10))
-	}
-	return account
-}
-
-func main() {
-	counts := map[string]int{}
-	for i := 0; i < 1000; i++ {
-		counts[writeKey("acct_megastore", true)]++
-	}
-	fmt.Printf("1000 writes to one hot account spread across %d sub-keys\n", len(counts))
-	fmt.Println("each sub-key now ~100 writes instead of 1000 hammering a single shard")
-	fmt.Println("tradeoff: a READ of this account must query all 10 sub-keys and merge")
-}
+```text
+$ shardlab load -tag=false -for 5s     # 32 workers; 90% of seat maps are for inception
+HashTag=false: 114040 seat maps in 5s (0 errors), p50 884µs, p99 7.533ms
+  172.21.0.2:6379    slots 0-5460         1209226 commands   27.6%  ███████████
+  172.21.0.3:6379    slots 5461-10922     1540020 commands   35.2%  ██████████████
+  172.21.0.4:6379    slots 10923-16383    1631409 commands   37.2%  ██████████████
+$ shardlab load -tag=true -for 5s     # 32 workers; 90% of seat maps are for inception
+HashTag=true: 502616 seat maps in 5s (0 errors), p50 206µs, p99 1.942ms
+  172.21.0.2:6379    slots 0-5460               1 commands    0.0%  
+  172.21.0.3:6379    slots 5461-10922      452197 commands   89.9%  ███████████████████████████████████
+  172.21.0.4:6379    slots 10923-16383      50603 commands   10.1%  ████
 ```
 
-</GoPlayground>
+**Spread keys** (no tag): the load is shared by all three masters (28%, 35%, 37%), but each seat map is 40 `GET`s over three nodes: about 38 commands per seat map, 114,040 seat maps in 5 s, p99 7.5 ms.
 
-Note the asymmetry: splitting relieves **write** load but not read load (you still read all the pieces), and it only makes sense for the *few* keys that are actually hot — you don't want this bookkeeping on every key. Load also shifts over time (a viral post is hot for two days, then calm), so you need a way to detect hot keys and promote/demote them. Cloud databases automate this (DynamoDB's "adaptive capacity," S3's "heat management").
+**Hash-tagged**: each seat map is one `MGET` to one node. **4.4 times the throughput** (502,616 seat maps), p50 206 µs, p99 1.9 ms. And **90% of the load on one master**, 10% on another, and the third doing nothing: *inception*'s slot is on one node, *dune*'s on another, and there's no third film.
 
-That brings up the operational question: should splitting and moving shards happen **automatically** or with a **human in the loop**?
+### Step 2: what a hot spot means
 
-<Callout kind="warn" title="Automatic rebalancing + automatic failure detection = cascading failure">
+Co-location made each request cheaper and the cluster lopsided. Today the hot node copes, because one MGET is so cheap. But the cluster's capacity for *inception* is now one node's capacity, and adding masters won't help, because the film is one slot and a slot can't be split. That's the fundamental sharding trade-off: **keys you keep together for atomicity or efficiency are keys you can't spread for load**. The usual remedies:
 
-Fully automatic rebalancing is convenient — DynamoDB autoscales shards in minutes. But it's dangerous when combined with automatic failure detection. Picture it: one node gets briefly overloaded and slow. The failure detector concludes it's *dead* and automatically rebalances its shards onto the other nodes — moving a large amount of data across the network. That extra load slows down *those* nodes, so the detector decides *they're* dead too, and rebalances again. Now you have a **cascading failure**: the automation chasing a phantom outage takes the whole cluster down. This is why a human in the loop, though slower, often prevents the worst operational surprises — and why you'd manually pre-rebalance before a known surge (Cyber Monday, a payroll run) rather than letting automation react mid-storm.
+- **Choose the partition key for your hottest access pattern.** The cinema reads whole seat maps constantly: per-film co-location is right, and a film's 40 seats are small.
+- **Split a hot key further** when one partition outgrows a node: per-film-per-showing (`seat:{inception:2026-09-27T20:00}:A7`) spreads a film's showings across slots while keeping each hall together.
+- **Replicate hot partitions for reads**: a Redis Cluster master can have replicas, and read-only commands can go to them (with chapter 20's lag).
 
-</Callout>
-
-## Request Routing
-
-You've split the data and you can rebalance it. Now the question every client faces: *I want account 7 — which machine (which IP and port) do I actually connect to?* This is **request routing**, and unlike stateless service load-balancing (any instance will do), a sharded request can only be served by the node holding that key's shard.
-
-<Define term="Request routing" since="Sharding (Part 2)">
-**Request routing** is the problem of directing a read or write for a given key to the specific node that holds that key's shard. Why it matters: the mapping (key → shard → node) changes as shards split and rebalance, so *something* must track it and keep every router up to date. Get it wrong and requests hit the wrong node — or a node that no longer owns the shard.
-</Define>
-
-There are three places to put the routing knowledge:
-
-<ConceptGrid cols={3}>
-  <ConceptCard label="1. Any node forwards">Client hits any node (round-robin). If that node owns the shard, it answers; otherwise it forwards to the right node and relays the reply. Simple clients, extra hops.</ConceptCard>
-  <ConceptCard label="2. Routing tier">A shard-aware load balancer sits in front. It owns no data — it just looks up key → node and forwards. (MongoDB's `mongos` works this way.)</ConceptCard>
-  <ConceptCard label="3. Shard-aware client">The client itself knows the shard map and connects straight to the right node — no middleman, lowest latency, smartest client.</ConceptCard>
-</ConceptGrid>
-
-All three need the same thing: a **trustworthy, up-to-date map** of shards to nodes. Who keeps it? Most systems use a separate **coordination service** — ZooKeeper or etcd — that holds the authoritative map and **notifies** routers when it changes:
-
-<ExecTimeline
-  title="Routing a write through a coordination service"
-  lanes={[
-    { id: "client", label: "Payments API" },
-    { id: "router", label: "Routing tier" },
-    { id: "zk", label: "ZooKeeper/etcd" },
-    { id: "node", label: "Node holding shard" }
+<CinemaAnim
+  title="Opening night: one film, one shard"
+  kicker="hot spot · live"
+  noDesk
+  rows={2}
+  cols={6}
+  halls={[{ label: "master 1", sub: "(no film)" }, { label: "master 2", sub: "inception" }, { label: "master 3", sub: "dune" }]}
+  customers={[{ id: "a", label: "alice", look: "pink" }, { id: "b", label: "bob" }, { id: "c", label: "carol", look: "pink" }, { id: "d", label: "dan" }, { id: "e", label: "erin", look: "pink" }]}
+  events={[
+    { at: 0, who: "a", to: "lobby" }, { at: 0, who: "b", to: "lobby" }, { at: 0, who: "c", to: "lobby" }, { at: 0, who: "d", to: "lobby" }, { at: 0, who: "e", to: "lobby", note: "Seat keys are hash-tagged by film: all of inception's seats are in slot 6229, on master 2." },
+    { at: 1.0, who: "a", to: "A1@1" }, { at: 1.2, who: "b", to: "A3@1" }, { at: 1.4, who: "c", to: "B2@1" }, { at: 1.6, who: "d", to: "B5@1", note: "Opening night: 9 of every 10 requests are for inception." },
+    { at: 1.8, seat: "A1@1", state: "held", by: "alice" }, { at: 1.9, seat: "A3@1", state: "held", by: "bob" }, { at: 2.0, seat: "B2@1", state: "held", by: "carol" }, { at: 2.1, seat: "B5@1", state: "held", by: "dan" },
+    { at: 2.4, who: "e", to: "A2@2" }, { at: 2.6, seat: "A2@2", state: "held", by: "erin" },
+    { at: 3.2, hall: 1, banner: "89.9% of all commands", beat: "problem", note: "Measured: master 2 processed 89.9% of the commands, master 3 10.1%, master 1 none." },
+    { at: 3.2, hall: 0, banner: "0.0%" }, { at: 3.2, hall: 2, banner: "10.1%" },
+    { at: 4.6, hall: 1, banner: "4.4× the seat maps, one MGET each", beat: "solution", note: "And yet: 502,616 seat maps in 5 s against 114,040 with spread keys, because each one is a single MGET to one node instead of 40 GETs to three." },
+    { at: 5.8, hall: 0, banner: null, beat: "neutral", note: "Keeping a film together buys atomic, cheap seat maps and costs balance. A film is one slot; more masters won't split it." }
   ]}
-  steps={[
-    { lane: "zk", kind: "run", label: "authoritative map", note: "ZooKeeper/etcd holds the source-of-truth: shard 113 lives on node 5. Nodes register themselves here." },
-    { lane: "router", kind: "recv", label: "subscribe to map", note: "The routing tier subscribes. When ownership changes, ZooKeeper pushes the update — the router is never guessing." },
-    { lane: "client", kind: "run", label: "write acct 7", note: "Client sends the write to the routing tier (it doesn't need to know the layout)." },
-    { lane: "router", kind: "run", label: "acct 7 -> shard 113 -> node 5", note: "Router hashes the key to a shard, looks up the shard's node in its cached map, forwards." },
-    { lane: "node", kind: "done", label: "apply write", note: "The one node that owns shard 113 applies the write and replies back up the chain." }
-  ]}
-  caption="The coordination service is the brain. It uses a consensus algorithm (Chapter 23) to stay correct and avoid split-brain — two routers must never believe different nodes own the same shard."
+  caption="What you keep together for speed and atomicity, you can't spread for load. Choose the partition key for your hottest access path."
 />
-
-<Callout kind="note" title="This is why consensus matters — and where we're headed">
-
-Why a whole dedicated service just to store a small map? Because that map *must not* disagree with itself. If two routers think different nodes own shard 113, writes split-brain and you corrupt data. Keeping a tiny piece of state perfectly agreed-upon across machines, even as machines fail, is the **consensus** problem — and it's hard enough to deserve its own chapter. ZooKeeper, etcd, and the built-in Raft in Kafka/TiDB/CockroachDB exist to solve exactly this. We tackle it head-on in **Consistency & Consensus** (Chapter 23). For now: the shard map is sacred, and a consensus system guards it.
-
-</Callout>
-
-## Secondary Indexes
-
-Everything so far assumed you look records up **by their partition key** — "give me account 7." But applications also ask "find all transactions over ₦10,000," or "find all *failed* payments." Those filter by a **secondary** attribute, not the partition key, and secondary indexes don't split as cleanly. Two designs, opposite trade-offs:
-
-<Define term="Local vs global secondary index" since="Sharding (Part 2)">
-A **local (document-partitioned) secondary index** lives *inside each shard* and indexes only that shard's own records. A **global (term-partitioned) secondary index** is a separate index, itself sharded by the *indexed value* rather than the primary key. Why it matters: local indexes make **writes** cheap (one shard updated) but **reads** expensive (you must ask every shard and merge — "scatter/gather"); global indexes flip it — **reads** of one term hit one shard, but **writes** fan out to update many index shards. You're choosing which operation pays.
-</Define>
-
-<ConceptGrid cols={2}>
-  <ConceptCard label="Local (document-partitioned)">Each shard indexes its own rows. Write: touch one shard — cheap. Read "all failed payments": ask **every** shard and combine, because matches are scattered. Prone to tail-latency amplification (the slowest shard sets your latency). Used by MongoDB, Cassandra, Elasticsearch.</ConceptCard>
-  <ConceptCard label="Global (term-partitioned)">One index across all data, sharded by the indexed value (`amount`, `status`). Read one term: hit one shard — cheap. Write one record: update **several** index shards (each field may live elsewhere), often asynchronously, so the index can be briefly stale. Used by CockroachDB, TiDB, DynamoDB's global indexes.</ConceptCard>
-</ConceptGrid>
 
 <QuickCheck
-  question="Meridian shards the ledger by account ID, and needs a fast dashboard query: 'all transactions flagged for fraud review, across all accounts.' Reads must be fast; the flag is rare and written occasionally. Which secondary-index design fits?"
+  question="With hash tags, inception's load sits on one master. Why doesn't adding more masters help it?"
   options={[
-    "Local index — it's always best",
-    "Global (term-partitioned) index on the flag — a read for 'flagged' hits one index shard instead of scatter/gathering across every account shard; the rarer writes paying a fan-out cost is an acceptable trade",
-    "No index; scan every shard each time",
-    "Shard by the fraud flag instead of account ID"
+    "Masters can't be added",
+    "All of inception's keys are in one hash slot, and a slot is the smallest unit the cluster can move: one slot, one node",
+    "The client caches the node",
+    "Redis is single-threaded"
   ]}
   answer={1}
-  explain="The query filters by a non-partition-key attribute and must be read-fast. A global index sharded by the flag value answers 'all flagged' from a single index shard. Writes pay a fan-out to keep the index current, but writes of the rare flag are infrequent — so you spend on the cheap operation to make the frequent read fast. A local index would force every account shard to be queried on every dashboard load."
+  explain="Rebalancing moves slots. A hot slot moves as a whole. To spread a hot partition you must change the key design (per showing, say) so it becomes several slots."
 />
+
+## Rebalancing
+
+*Stop 4 of 6.*
+
+### Step 1: add a node under load
+
+`reshard.sh` writes 10,000 booking keys, starts `shardlab churn` (16 workers holding seats and reading seat maps, both films, for 30 s), adds a fourth master while that runs, and rebalances:
+
+```text
+10000 booking keys written
+== before: 3 masters
+  172.21.0.2:6379     3337 booking keys
+  172.21.0.3:6379     3351 booking keys
+  172.21.0.4:6379     3312 booking keys
+  mod-N placement (slot % N): going from 3 to 4 nodes would move 7508 of 10000 keys (75%)
+== while holds and seat maps run: add rc4 and rebalance
+[OK] New node added correctly.
+   1 >>> Rebalancing across 4 nodes. Total weight = 4.00
+   1 Moving 1365 slots from 172.21.0.2:6379 to 172.21.0.5:6379
+   1 Moving 1365 slots from 172.21.0.4:6379 to 172.21.0.5:6379
+   1 Moving 1366 slots from 172.21.0.3:6379 to 172.21.0.5:6379
+rebalance took 3.1 s
+churn for 30s: 574583 rounds ok, 94 failed (first: CLUSTERDOWN The cluster is down)
+== after: 4 masters
+  172.21.0.2:6379     2502 booking keys
+  172.21.0.3:6379     2524 booking keys
+  172.21.0.4:6379     2500 booking keys
+  172.21.0.5:6379     2474 booking keys
+  mod-N placement (slot % N): going from 3 to 4 nodes would move 7508 of 10000 keys (75%)
+```
+
+The rebalance moved **1,365–1,366 slots from each master** to the new one, in 3.1 s, and afterwards each master holds about 2,500 of the 10,000 keys. Only the keys in the moved slots traveled: **2,474 of 10,000 (25%)**, the minimum possible for going from three nodes to four.
+
+### Step 2: what the clients saw
+
+Of about 574,700 rounds of holds and seat maps, **94 failed**, all with `CLUSTERDOWN The cluster is down`, clustered in the moments when the new node joined and the slot configuration changed. Everything else went through: while a slot migrates, a node answers requests for keys already moved with **ASK** (a one-time redirect, "this key is over there for now"), and go-redis follows it. Resharding is online, but not invisible: clients need retries for transient cluster errors, like chapter 12's retries for a slow Redis.
+
+<QuickCheck
+  question="Resharding from 3 to 4 masters moved 2,474 of 10,000 keys. Why about a quarter?"
+  options={[
+    "Redis moved as few as it could get away with",
+    "The new node needs a quarter of the slots, and only keys in slots that change owner move; the rest stay where they are",
+    "The rebalance was cancelled early",
+    "Keys were evicted"
+  ]}
+  answer={1}
+  explain="Moving whole slots means the data moved is exactly the share the new node takes: 4,096 of 16,384 slots, about 25% of the keys. Stop 5 shows what a naive scheme moves instead."
+/>
+
+## Modulo versus Slots
+
+*Stop 5 of 6.*
+
+### Step 1: the obvious scheme
+
+Why the indirection through 16,384 slots? The obvious scheme is **`hash(key) % N`**: node number = hash modulo the number of nodes. `shardlab where` computes, for the same 10,000 keys, how many would change node if placement were `slot % N` and N went from 3 to 4 (the last line of each part of the output above):
+
+```text
+mod-N placement (slot % N): going from 3 to 4 nodes would move 7508 of 10000 keys (75%)
+```
+
+**75%**, against the 25% the cluster actually moved. With modulo, changing N changes almost every key's remainder, so adding one machine reshuffles nearly all the data, all at once, while you're adding the machine because you're short of capacity. Going from 10 nodes to 11 would move about 91%.
+
+### Step 2: the fix, two ways
+
+Both widely used fixes keep most keys in place when nodes come and go:
+
+- **Fixed slots** (Redis Cluster, Elasticsearch shards, Couchbase vBuckets): hash keys into a fixed, large number of slots that never changes, and move *slots* between nodes. Adding a node takes a fair share of slots from the others.
+- **Consistent hashing** (Dynamo, Cassandra's token ring): place nodes and keys on the same hash ring; each key belongs to the next node clockwise. Adding a node takes over only the arc before it; virtual nodes (many points per node) keep the arcs even.
+
+<QuickCheck
+  question="Why does hash % N move most keys when N changes?"
+  options={[
+    "The hash function changes",
+    "A key's node is its hash's remainder mod N; changing N changes the remainder for most hashes, so most keys get a new node",
+    "Redis rehashes on resize",
+    "It doesn't"
+  ]}
+  answer={1}
+  explain="Measured on the same keys: 75% would move from 3 to 4 nodes by modulo, 25% moved with slots. A fixed slot count turns 'add a node' into 'move a quarter of the slots'."
+/>
+
+## Indexes Across Shards
+
+*Stop 6 of 6.*
+
+### Step 1: "all of Alice's holds"
+
+The seats are partitioned by film. A customer page needs the reverse: every seat *Alice* holds, across all films. Two designs:
+
+- A **local index**, one per partition: `holds:{inception}:alice`, a set on the same shard as the film's seats. Updating it with the hold is atomic. Answering "all Alice's holds" means asking every film's partition: a **scatter-gather** query to every shard, as slow as the slowest shard.
+- A **global index**, partitioned by customer: `holds:{alice}`, one set on whichever shard Alice's slot is on. Answering is one read. But is updating it atomic with the hold?
+
+```text
+$ shardlab index
+MULTI SET seat:{inception}:A7 (slot 6229) + SADD holds:{alice} (slot 749): CROSSSLOT Keys in request don't hash to the same slot
+MULTI SET seat:{inception}:A7 (slot 6229) + SADD holds:{inception}:alice (slot 6229): <nil>
+```
+
+It isn't. `seat:{inception}:A7` is in slot 6229, `holds:{alice}` in slot 749, and a `MULTI` across slots fails with **CROSSSLOT**. The local index, tagged by film, commits with the hold.
+
+### Step 2: living with a global index
+
+A global index updated separately is **eventually consistent** with the data: hold the seat, then add it to the index, and between the two (or if the second fails) the index is wrong. Systems that offer global secondary indexes (DynamoDB's GSIs, Cassandra's materialized views) update them asynchronously and say so. The cinema's options: the local index plus scatter-gather (two films today: cheap), or a global index written after the hold, with the seat data as the source of truth and a periodic repair. What doesn't exist, on a sharded store, is "both, atomically, for free".
+
+<QuickCheck
+  question="Why can't the hold and a per-customer index entry be written in one atomic MULTI on the cluster?"
+  options={[
+    "MULTI is disabled in cluster mode",
+    "The seat key and holds:{alice} are in different hash slots (6229 and 749), so possibly on different nodes; a transaction must stay within one slot",
+    "Sets can't be in transactions",
+    "The index key is too long"
+  ]}
+  answer={1}
+  explain="Measured: CROSSSLOT for the global index, success for holds:{inception}:alice. Atomicity ends at the shard boundary; across it you get eventual consistency or a distributed transaction."
+/>
+
+---
 
 ## Exercises
 
-Build the primitives. Each is a real sharding mechanism in miniature.
+These use the Redis Cluster from this chapter.
 
-<Exercise n={1} title="Detect a hot shard" level="easy">
+<Exercise n={1} title="Choose the partition key" level="easy">
 
-Given a slice of per-shard request counts, write `hotShard(counts []int) (idx int, skewed bool)` returning the busiest shard's index and whether the load is **skewed** — define skewed as the max being more than 2× the average. Why does skew make sharding "less effective"?
+For each access pattern, pick the partition key (hash tag) for the cinema's data and say what it costs: (a) the seat map of one showing; (b) a customer's booking history; (c) nightly sales per film; (d) a customer's loyalty points balance, updated with every booking.
 
 <Solution>
 
-```go
-func hotShard(counts []int) (idx int, skewed bool) {
-	total, max := 0, -1
-	for i, c := range counts {
-		total += c
-		if c > max {
-			max, idx = c, i
-		}
-	}
-	avg := float64(total) / float64(len(counts))
-	return idx, float64(max) > 2*avg
-}
-```
-
-Skew means some shards do far more work than others. In the extreme, all load lands on one shard, so 9 of 10 machines are idle and your throughput is capped by the single busy one — you paid for ten machines and got the capacity of one. The point of sharding is an *even* spread; skew defeats the point.
+(a) **The showing** (`{inception:2026-09-27T20:00}`): one MGET, atomic holds within the hall; a hot showing is one slot. (b) **The customer** (`{alice}`): one read for the history, but writing it atomically with the booking isn't possible (the booking is partitioned by showing), so it's updated after, eventually consistent. (c) Not a key lookup at all: aggregate from bookings asynchronously (a job or a stream into a warehouse). (d) **The customer**: the balance must change atomically, but with the booking in another slot you need an idempotent follow-up write (chapter 13's queue) rather than one transaction.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={2} title="Generalize the mod-N stampede" level="easy">
+<Exercise n={2} title="Split the hot film" level="medium">
 
-Write `fractionMoved(keys, fromN, toN int) float64` returning the fraction of `keys` (numbered `0..keys-1`) that change node when `hash%N` goes from `fromN` to `toN`. Use the key number itself as the "hash." Print it for 3→4 and 100→101.
+Change the hash tag to include the showing time and rerun `shardlab load -tag=true` with six showings of *inception*. How does the per-node distribution change, and what does it cost?
 
 <Solution>
 
-```go
-func fractionMoved(keys, fromN, toN int) float64 {
-	moved := 0
-	for k := 0; k < keys; k++ {
-		if k%fromN != k%toN {
-			moved++
-		}
-	}
-	return float64(moved) / float64(keys)
-}
-
-// 3 -> 4:    ~0.75 (three-quarters move)
-// 100 -> 101: ~0.99 (almost everything moves!)
-```
-
-The bigger the cluster, the *worse* mod-N gets — going 100→101 nodes moves ~99% of keys to relieve 1% more load. That's why mod-N is unusable at scale and why fixed-shard or consistent-hashing schemes exist: they move only the minimal slice the new node should own.
+Six showings are six slots, which land on different masters (by their hash), so the 90% spreads across nodes roughly in proportion to how the six slots fall: with three masters, likely all three get some. Each seat map is still one MGET. The cost: anything that spans showings (a film's total occupancy, "all inception seats Alice holds") becomes a multi-slot operation, handled by scatter-gather or a separate aggregate.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={3} title="Hot-key splitter with read fan-out" level="medium">
+<Exercise n={3} title="Replicas for the hot shard" level="medium">
 
-Implement `splitWrite(key string, fanout int) string` (append `#NN` for a random suffix `0..fanout-1`) and `readKeys(key string, fanout int) []string` returning every sub-key a reader must query. Why must `readKeys` return *all* of them?
+Add a replica to each master (`redis-cli --cluster add-node … --cluster-slave`) and set go-redis's `ReadOnly: true` and `RouteRandomly: true`. What happens to the hot master's load, and what new problem does it bring?
 
 <Solution>
 
-```go
-func splitWrite(key string, fanout int) string {
-	return fmt.Sprintf("%s#%02d", key, rand.Intn(fanout))
-}
-
-func readKeys(key string, fanout int) []string {
-	out := make([]string, fanout)
-	for i := range out {
-		out[i] = fmt.Sprintf("%s#%02d", key, i)
-	}
-	return out
-}
-```
-
-Writes were randomly sprinkled across the `fanout` sub-keys, so the data for the logical key is spread over all of them. A read has no way to know which sub-keys received writes, so it must query every sub-key and merge. That's the cost of splitting a hot key: cheaper writes, more expensive reads. Only worth it for genuinely hot keys.
+Read-only commands (the seat map's MGET) can go to the replicas, so the hot slot's reads are shared by the master and its replica: the hot node's load roughly halves. The new problem is chapter 20's: replica reads are asynchronous, so a customer who just held a seat may read a seat map (from the replica) without their hold. The cinema would read its own holds from the master, or accept a moment of staleness for the public map.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={4} title="Stable shard, unstable node" level="medium">
+<Exercise n={4} title="Measure consistent hashing" level="medium">
 
-Show the fixed-shard guarantee concretely. Write `shardOf(key string, numShards int) int` (FNV hash `% numShards`) and demonstrate that for `numShards = 256` held constant, a key's shard is identical whether the cluster has 3 nodes or 30. Then explain what *does* change when nodes are added.
+Write a consistent-hash ring with 100 virtual nodes per server and place the 10,000 booking keys on 3 servers, then 4. How many keys move? How even is the load with 1, 10 and 100 virtual nodes per server?
 
 <Solution>
 
-```go
-func shardOf(key string, numShards int) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32()) % numShards
-}
-
-// shardOf("acct_7", 256) is the SAME number regardless of node count,
-// because numShards never changes. The key's shard is fixed for life.
-```
-
-What changes when you add nodes is **only the shard→node assignment table** — a small map saying "shard 113 now lives on node 5 instead of node 2." The data inside a shard never gets re-hashed or re-bucketed; whole shards just get reassigned to nodes. That decoupling (keys→shards fixed, shards→nodes flexible) is what makes rebalancing cheap.
+With a ring, adding the fourth server moves only the keys on the arcs it takes over: close to 25%, like the slots. With **one** point per server, the arcs are uneven, so one server can own far more than a third (tens of percent off); with 10 points the imbalance shrinks, and with 100 it's within a few percent. Virtual nodes are to a ring what many small slots are to Redis Cluster: fine-grained units that can be divided evenly.
 
 </Solution>
 
 </Exercise>
 
-<Exercise n={5} title="Local vs global index query cost" level="hard">
+<Exercise n={5} title="A resharding-safe client" level="hard">
 
-Model both index types over `S` shards. For a single-term query (e.g. `status = failed`), write `localCost(S int) int` (shards touched by a **local** index) and `globalCost() int` (shards touched by a **global** index, to fetch the postings list). For a write of one record, give `localWriteCost()` and `globalWriteCost(terms int)`. Summarize who pays what.
+`churn` saw 94 CLUSTERDOWN errors while the fourth node joined. Wrap the cinema's store calls so that transient cluster errors (CLUSTERDOWN, TRYAGAIN, a connection reset during failover) are retried, and prove with `reshard.sh` that no customer request fails. What must not be retried blindly?
 
 <Solution>
 
-```go
-func localCost(S int) int { return S } // read: ask EVERY shard, scatter/gather
-func globalCost() int     { return 1 } // read: one index shard owns the term
-
-func localWriteCost() int           { return 1 }     // write: only the record's own shard
-func globalWriteCost(terms int) int { return terms } // write: one index shard per term
-```
-
-Local indexes push the cost onto **reads** (every shard queried, tail-latency amplification) and keep **writes** cheap (one shard). Global indexes flip it: a single-term read hits one shard, but a write fans out to update one index shard per indexed term, and to stay correct may need a distributed transaction (or accept a briefly stale index). The right choice depends on your read/write ratio: read-heavy filtering → global; write-heavy with rare ad-hoc filters → local.
+Retry with backoff and jitter (chapter 12) on errors whose message starts with CLUSTERDOWN or TRYAGAIN and on network errors, within the request's deadline; go-redis already follows MOVED and ASK. Rerunning `reshard.sh` should show 0 failures. What must not be retried blindly: `Hold` after an ambiguous failure (the SET NX may have applied, as chapter 12 measured), so use the idempotent Hold that recognises its own earlier success, and never retry business answers like "seat taken".
 
 </Solution>
 
 </Exercise>
+
+---
+
+## The Lab
 
 <Lab
-  title="Decouple keys from nodes with fixed shards"
+  title="Find the Slot, Find the Node"
   archetype="build-it"
-  difficulty="scaffolded"
-  points={80}
-  hintCost={12}
-  objective="Prove the central trick of sharding: a fixed shard count makes a key's shard independent of the node count, so growing the cluster moves a minimal slice of data — unlike mod-N, which reshuffles almost everything. Implement modNNode(key, nodes) returning int(h32(key)) % nodes and fixedShard(key, numShards) returning int(h32(key)) % numShards. The self-check harness in main grows the cluster 3->4 and prints ALL CHECKS PASS only when fixedShard moves 0 keys (shard count unchanged) and mod-N reshuffles more than 40% of keys, demonstrating the contrast."
+  difficulty="guided"
+  points={120}
+  hintCost={15}
   verify="self-check"
   expect="ALL CHECKS PASS"
+  objective="Implement the two things every Redis Cluster client computes for each command: the key's hash slot (CRC16/XMODEM of the key, or of its hash tag, modulo 16384) and the node serving that slot (binary search over the cluster's slot ranges). The expected slots were measured with CLUSTER KEYSLOT on this chapter's cluster, including the hash-tag edge cases."
   starter={`package main
 
 import (
 	"fmt"
-	"hash/fnv"
+	"hash/crc32"
+	"sort"
 )
 
-func h32(key string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return h.Sum32()
+// A Redis Cluster splits keys into 16384 hash slots and gives each master
+// a range of slots. You write the two pieces a cluster client needs:
+// which slot a key is in, and which node serves a slot.
+
+// keySlot returns the key's hash slot, as Redis Cluster computes it:
+// CRC16 (the XMODEM variant: polynomial 0x1021, initial value 0) of the
+// key, modulo 16384. If the key contains a '{' followed later by a '}'
+// with at least one character between them, only the characters between
+// the first '{' and the first '}' after it are hashed (the hash tag).
+// It is one of the two functions you edit (you may add helpers).
+func keySlot(key string) int {
+	return int(crc32.ChecksumIEEE([]byte(key)) % 16384)
 }
 
-// modNNode: the naive scheme — node = hash % numberOfNodes.
-// BUG: returns -1 instead of the real mapping.
-func modNNode(key string, nodes int) int {
-	return -1 // TODO: return int(h32(key)) % nodes
+// Range is a run of slots served by one node.
+type Range struct {
+	Start, End int // inclusive
+	Node       string
 }
 
-// fixedShard: hash % numShards, where numShards is a CONSTANT that does NOT
-// change when nodes are added or removed.
-// BUG: returns -1 instead of the real mapping.
-func fixedShard(key string, numShards int) int {
-	return -1 // TODO: return int(h32(key)) % numShards
+// nodeFor returns the node serving slot, given ranges sorted by Start
+// that cover 0–16383. It must use binary search (the harness calls it
+// a million times). It is the other function you edit.
+func nodeFor(ranges []Range, slot int) string {
+	for _, r := range ranges {
+		if slot >= r.Start {
+			return r.Node
+		}
+	}
+	return ""
 }
 
-// ── checks: do not edit. Run to verify your fix. ──
+// ── below this line: do not edit ──
+
+var _ = sort.Search
+
 func main() {
-	const numShards = 512
-	keys := make([]string, 1000)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("acct_%d", i)
-	}
-
-	modMoved, shardMoved := 0, 0
-	for _, k := range keys {
-		if modNNode(k, 3) != modNNode(k, 4) {
-			modMoved++
-		}
-		if fixedShard(k, numShards) != fixedShard(k, numShards) {
-			shardMoved++
-		}
-	}
-
 	allOK := true
-	if shardMoved != 0 {
-		allOK = false
-		fmt.Printf("FAIL: fixedShard moved %d keys with a constant shard count (should be 0)\\n", shardMoved)
+	fail := func(format string, a ...any) { fmt.Printf("FAIL "+format+"\\n", a...); allOK = false }
+
+	// Check 1: slots measured with CLUSTER KEYSLOT on a real Redis 8.10 cluster.
+	for key, want := range map[string]int{
+		"seat:inception:A7":    7008,
+		"seat:{inception}:A1":  6229,
+		"holds:{alice}":        749,
+		"123456789":            12739,
+		"seat:{dune}:D6":       13565,
+		"booking:00042":        6160,
+		"{user1000}.following": 3443,
+		"{user1000}.followers": 3443,
+		"":                     0,
+	} {
+		if got := keySlot(key); got != want {
+			fail("keySlot(%q) = %d, want %d", key, got, want)
+		}
 	}
-	if modMoved < 400 {
-		allOK = false
-		fmt.Printf("FAIL: mod-N should reshuffle >40%% of keys 3->4; only %d moved\\n", modMoved)
+
+	// Check 2: the hash-tag rules' edge cases, also measured on the cluster.
+	for key, want := range map[string]int{
+		"foo{}{bar}":    8363,  // empty first tag: hash the whole key
+		"foo{{bar}}zap": 4015,  // tag is "{bar": first '{', then first '}'
+		"foo{bar}{zap}": 5061,  // only the first tag counts: "bar"
+		"{":             4092,  // no closing brace: whole key
+		"}{x}":          16287, // '{' after the '}': tag "x"
+	} {
+		if got := keySlot(key); got != want {
+			fail("keySlot(%q) = %d, want %d", key, got, want)
+		}
 	}
+
+	// Check 3: routing, on the cluster's layout after adding a fourth master.
+	ranges := []Range{
+		{0, 1364, "rc4"}, {1365, 5460, "rc1"}, {5461, 6826, "rc4"}, {6827, 10922, "rc2"},
+		{10923, 12287, "rc4"}, {12288, 16383, "rc3"},
+	}
+	for slot, want := range map[int]string{0: "rc4", 1364: "rc4", 1365: "rc1", 5460: "rc1", 5461: "rc4", 7008: "rc2", 12287: "rc4", 12288: "rc3", 16383: "rc3"} {
+		if got := nodeFor(ranges, slot); got != want {
+			fail("nodeFor(slot %d) = %q, want %q", slot, got, want)
+		}
+	}
+	counts := map[string]int{}
+	for i := range 1_000_000 {
+		counts[nodeFor(ranges, i%16384)]++
+	}
+	if counts["rc4"] < 247_000 || counts["rc4"] > 253_000 {
+		fail("routing a million slots: rc4 served %d, want about a quarter (it owns 4,096 of the 16,384 slots)", counts["rc4"])
+	}
+
 	if allOK {
-		fmt.Printf("mod-N moved %d/1000 keys; fixed shards moved 0\\nALL CHECKS PASS\\n", modMoved)
+		fmt.Println("ALL CHECKS PASS")
 	}
-}
-`}
-  verifier="main runs two in-process assertions over 1000 account keys: fixedShard (called twice with the same constant) always returns the same value so zero keys move (shard stability), and modNNode reshuffles >40% of keys when the node count changes from 3 to 4 (demonstrating the mod-N stampede). The flag unlocks when the build is clean and stdout ends with ALL CHECKS PASS."
+}`}
+  verifier="Check 1: nine keys whose slots were measured on the cluster, including seat:inception:A7 (7008), seat:{inception}:A1 (6229) and 123456789 (12739, the CRC16/XMODEM check value). Check 2: five hash-tag edge cases (empty tag, nested braces, two tags, no closing brace, a brace before the tag). Check 3: routing on the cluster's layout after the fourth master joined, including every range boundary, and a million lookups that must give the fourth master a quarter of them. Prints ALL CHECKS PASS."
   hints={[
-    "Both functions are one line. modNNode: return int(h32(key)) % nodes. fixedShard: return int(h32(key)) % numShards. The difference is what you take the modulus by — a changeable node count vs a fixed shard count.",
-    "Why fixedShard moves 0: it's called twice with the SAME numShards, so it returns the same value. The lesson is that node count never enters the formula — so adding nodes can't move a key between shards; only whole shards get reassigned to nodes.",
-    "Why mod-N moves most keys: for key number k, k%3 and k%4 disagree for about three-quarters of values. Adding one node to a 3-node cluster therefore relocates ~75% of the data."
+    "CRC16/XMODEM, bit by bit: crc = 0; for each byte: crc ^= byte << 8, then 8 times: if the top bit is set, crc = crc<<1 ^ 0x1021, else crc <<= 1. The check value for '123456789' is 0x31C3 = 12739.",
+    "Hash tag: find the first '{'; then the first '}' after it. Only if there's at least one character between them, hash just those characters. 'foo{}{bar}' has an empty first tag, so the whole key is hashed.",
+    "Routing: sort.Search for the first range whose End >= slot, then check that its Start <= slot. That's O(log n) per lookup instead of a scan."
   ]}
-  flag="GO{fixed_shards_decouple_keys_from_nodes}"
+  flag="GO{keep_together_what_you_change_together}"
 >
 
-This is the heart of sharding made executable. Implement the two mappings and watch the contrast: mod-N detonates on a cluster resize, while a fixed shard count keeps every key exactly where it was. Get PASS and you understand why no production system maps keys to nodes with `% numberOfNodes`.
+These are the functions go-redis's `ClusterClient` runs before every command to pick a node, and the rules `CLUSTER KEYSLOT` applies on the server.
 
 </Lab>
 
----
-
 <Recap>
 
-You can now split a dataset bigger than any single machine — and route, rebalance, and index it:
-
-- **Sharding splits** data so each machine holds a slice (survive *size*); **replication copies** data so each machine holds all of it (survive *failure*). Production does **both** — each shard is replicated. They're independent choices.
-- The **partition key** decides a record's shard. Know it → go straight to one shard. Don't know it → query every shard and merge. It's the hardest decision to undo. Meridian shards the ledger by **account ID**.
-- **Key-range** sharding keeps keys sorted → cheap range scans, but **hot shards** when writes cluster (a timestamp key dumps all writes on "this month"). Fix: put a spreading field first, like `(account_id, timestamp)`.
-- **Hash** sharding spreads load evenly but **destroys ordering** (range scans now hit every shard). Never map keys with `hash % numberOfNodes` — that **mod-N stampede** moves ~75% of data on a 3→4 resize. Use a **fixed shard count** (or consistent hashing) so keys never change shard; rebalance by moving **whole shards**.
-- Don't shard with Go's built-in/`maphash` hash — it's per-process random. Use a stable hash (`hash/fnv`, `crc32`, `crypto/sha256`).
-- Even hashing can't fix a **hot key**; split it with a random suffix (cheaper writes, fan-out reads) — only for the few keys that are truly hot. **Automatic rebalancing + automatic failure detection** risks **cascading failure**; keep a human in the loop.
-- **Request routing** (any-node-forwards / routing tier / shard-aware client) needs an authoritative shard→node map, guarded by a **consensus**-backed coordination service (ZooKeeper, etcd, Raft) — the subject of Chapter 23.
-- **Secondary indexes** must be sharded too: **local** (cheap writes, scatter/gather reads) vs **global** (one-shard reads, fan-out writes). Choose by your read/write ratio.
+- **Slots**: Redis Cluster hashes each key (CRC16) into one of 16,384 slots and gives each master ranges of slots. A node asked about someone else's slot answers MOVED; cluster-aware clients follow and remember.
+- **Multi-key operations** must stay within one slot: the cinema's seat-map MGET failed with CROSSSLOT until **hash tags** (`seat:{inception}:A7`) put a film's seats in one slot (6229). Changing key names on a live system is a migration.
+- **Co-location vs balance**: tagged seat maps were one MGET each, **4.4x** the throughput (502,616 vs 114,040 in 5 s), p99 1.9 ms vs 7.5 ms, and put **90%** of the load on one master on opening night. A slot can't be split; split the key design instead.
+- **Rebalancing** a fourth master in under load moved **25%** of keys (only the slots that changed owner) in 3.1 s; 94 of about 574,700 client operations saw `CLUSTERDOWN` while it joined. Modulo placement would have moved **75%**.
+- **Global indexes** span shards: writing the hold and `holds:{alice}` atomically failed with CROSSSLOT; a film-local index commits with the hold but needs scatter-gather to answer per-customer queries.
 
 </Recap>
 
 <Scoreboard
-  streak={7}
+  streak={6}
   items={[
-    { label: "Quick check — replication vs sharding (full disk)", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — the mod-N stampede and its fix", kind: "quiz", points: 10, done: false },
-    { label: "Quick check — local vs global secondary index", kind: "quiz", points: 10, done: false },
-    { label: "Exercise 1 — detect a hot shard", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 2 — generalize the mod-N stampede", kind: "exercise", points: 10, done: false },
-    { label: "Exercise 3 — hot-key splitter with read fan-out", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 4 — stable shard, unstable node", kind: "exercise", points: 15, done: false },
-    { label: "Exercise 5 — local vs global index query cost", kind: "exercise", points: 20, done: false }
+    { label: "Quick check: MOVED", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: hash tags", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the hot slot", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: a quarter of the keys", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: modulo", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: atomicity ends at the shard", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: choose the partition key", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: split the hot film", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: replicas for the hot shard", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: measure consistent hashing", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: a resharding-safe client", kind: "exercise", points: 20, done: false }
   ]}
-  flag={{ label: "Lab — Fixed-shard router prints PASS", captured: false, points: 80 }}
+  flag={{ label: "Lab: Find the Slot, Find the Node", captured: false, points: 120 }}
 />
-
-Sharding — the data split across machines, the keys pinned to shards, the shards routed to nodes, and the wisdom to never tie your modulus to the node count. You now understand how a thousand-machine database finds *your* account in one hop, and why one celebrity can still set a single shard on fire. The data's split. Next we go down a level — *inside* a single shard — to the storage engine itself: **LSM-trees vs B-trees**, and why your database makes the read/write trade-offs it does. The copies were easy. The splits were clever. The engine is where it gets beautiful. Let's go.
