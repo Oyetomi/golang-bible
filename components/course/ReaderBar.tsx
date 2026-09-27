@@ -2,6 +2,15 @@
 
 import { useEffect, useState } from "react";
 
+/* The reading column scales as a whole: prose, lists, callouts, animation
+   notes and code together. Setting only a font-size moved top-level
+   paragraphs and nothing else, which read as a dead button. 15px is 1×. */
+function applyReaderSize(px: number) {
+  const root = document.documentElement.style;
+  root.setProperty("--reader-font-size", `${px}px`);
+  root.setProperty("--reader-zoom", String(px / 15));
+}
+
 export function ReaderBar({
   wordCount = 1800,
   animCount = 2,
@@ -29,7 +38,7 @@ export function ReaderBar({
     if (savedFont) {
       const sz = Number(savedFont);
       setFontSize(sz);
-      document.documentElement.style.setProperty("--reader-font-size", `${sz}px`);
+      applyReaderSize(sz);
     }
 
     // Keyboard shortcuts: Z for Zen, S for Scratchpad
@@ -74,7 +83,7 @@ export function ReaderBar({
     setFontSize((prev) => {
       const next = Math.min(20, Math.max(13.5, prev + delta));
       localStorage.setItem("gb-font-size", String(next));
-      document.documentElement.style.setProperty("--reader-font-size", `${next}px`);
+      applyReaderSize(next);
       return next;
     });
   };
