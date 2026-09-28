@@ -15,6 +15,7 @@ type Account struct {
 	TenantID string `json:"tenant_id"`
 	OwnerID  string `json:"owner_id"`
 	Balance  int64  `json:"balance"`
+	Memo     string `json:"memo,omitempty"`
 }
 
 type Principal struct {
@@ -30,8 +31,8 @@ type Store struct{ Pool *pgxpool.Pool }
 func (s *Store) AccountByID(ctx context.Context, id int64) (Account, error) {
 	var a Account
 	err := s.Pool.QueryRow(ctx,
-		`SELECT id, tenant_id, owner_id, balance FROM accounts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.TenantID, &a.OwnerID, &a.Balance)
+		`SELECT id, tenant_id, owner_id, balance, memo FROM accounts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.TenantID, &a.OwnerID, &a.Balance, &a.Memo)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -43,9 +44,9 @@ func (s *Store) AccountByID(ctx context.Context, id int64) (Account, error) {
 func (s *Store) AccountFor(ctx context.Context, p Principal, id int64) (Account, error) {
 	var a Account
 	err := s.Pool.QueryRow(ctx,
-		`SELECT id, tenant_id, owner_id, balance FROM accounts
+		`SELECT id, tenant_id, owner_id, balance, memo FROM accounts
 		  WHERE id = $1 AND tenant_id = $2 AND owner_id = $3`, id, p.TenantID, p.UserID,
-	).Scan(&a.ID, &a.TenantID, &a.OwnerID, &a.Balance)
+	).Scan(&a.ID, &a.TenantID, &a.OwnerID, &a.Balance, &a.Memo)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -53,11 +54,11 @@ func (s *Store) AccountFor(ctx context.Context, p Principal, id int64) (Account,
 }
 
 func (s *Store) ListAll(ctx context.Context) ([]Account, error) {
-	return s.list(ctx, `SELECT id, tenant_id, owner_id, balance FROM accounts ORDER BY id`)
+	return s.list(ctx, `SELECT id, tenant_id, owner_id, balance, memo FROM accounts ORDER BY id`)
 }
 
 func (s *Store) ListFor(ctx context.Context, p Principal) ([]Account, error) {
-	return s.list(ctx, `SELECT id, tenant_id, owner_id, balance FROM accounts
+	return s.list(ctx, `SELECT id, tenant_id, owner_id, balance, memo FROM accounts
 	                     WHERE tenant_id = $1 AND owner_id = $2 ORDER BY id`, p.TenantID, p.UserID)
 }
 
@@ -70,7 +71,7 @@ func (s *Store) list(ctx context.Context, q string, args ...any) ([]Account, err
 	var out []Account
 	for rows.Next() {
 		var a Account
-		if err := rows.Scan(&a.ID, &a.TenantID, &a.OwnerID, &a.Balance); err != nil {
+		if err := rows.Scan(&a.ID, &a.TenantID, &a.OwnerID, &a.Balance, &a.Memo); err != nil {
 			return nil, err
 		}
 		out = append(out, a)

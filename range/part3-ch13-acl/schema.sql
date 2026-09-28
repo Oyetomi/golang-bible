@@ -11,7 +11,8 @@ CREATE TABLE users (
 CREATE TABLE accounts (
   id bigint GENERATED ALWAYS AS IDENTITY (START WITH 1001) PRIMARY KEY,
   tenant_id text NOT NULL REFERENCES tenants, owner_id text NOT NULL REFERENCES users,
-  balance bigint NOT NULL DEFAULT 0);
+  balance bigint NOT NULL DEFAULT 0,
+  memo text NOT NULL DEFAULT '');
 CREATE INDEX ON accounts (tenant_id);
 CREATE INDEX ON accounts (owner_id);
 CREATE TABLE grants (resource text NOT NULL, user_id text NOT NULL REFERENCES users, role text NOT NULL, PRIMARY KEY (resource, user_id));
