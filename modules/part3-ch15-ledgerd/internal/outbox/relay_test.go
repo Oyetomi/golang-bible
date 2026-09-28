@@ -59,3 +59,33 @@ func TestAtLeastOnceThenDedup(t *testing.T) {
 		t.Fatal("projection does not match the ledger")
 	}
 }
+
+func TestTwoRelaysDontOverlap(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, "postgres://abbey@127.0.0.1:55432/ledgerd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pool.Exec(ctx, `TRUNCATE outbox, idempotency_keys, postings, transactions, accounts RESTART IDENTITY CASCADE`)
+	pool.Exec(ctx, `INSERT INTO accounts (id,currency,kind) VALUES ('treasury','USD','system'),('a','USD','customer'),('b','USD','customer')`)
+	st := &store.Store{Pool: pool}
+	st.Transfer(ctx, store.TransferReq{Key: "fund", From: "treasury", To: "a", Amount: 1_000_000})
+	for i := 0; i < 400; i++ {
+		st.Transfer(ctx, store.TransferReq{Key: fmt.Sprintf("s%d", i), From: "a", To: "b", Amount: 1})
+	}
+	sk := sink.New()
+	srv := httptest.NewServer(sk.Handler())
+	defer srv.Close()
+	done := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			r := &Relay{Pool: pool, SinkURL: srv.URL, Batch: 100}
+			n, _, _ := r.Once(ctx)
+			done <- n
+		}()
+	}
+	a, b := <-done, <-done
+	rec, dups, distinct, _ := sk.State()
+	t.Logf("two relays started together on 401 unpublished events, batch 100: one sent %d, the other sent %d; consumer saw %d (%d duplicates, %d distinct)", a, b, rec, dups, distinct)
+}

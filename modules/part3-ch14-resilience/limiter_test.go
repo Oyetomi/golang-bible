@@ -41,3 +41,16 @@ func TestPerAccountIsolation(t *testing.T) {
 	}
 	t.Log("account 8's first request: allowed")
 }
+
+func TestNoGoroutinePerBucket(t *testing.T) {
+	before := runtime.NumGoroutine()
+	p := NewPerAccount(10, 5)
+	for i := 0; i < 100_000; i++ {
+		p.Allow(i)
+	}
+	t.Logf("goroutines before: %d, after 100,000 buckets: %d", before, runtime.NumGoroutine())
+	l := p.buckets[1].l
+	t.Logf("a bucket of burst 5 at 10/s: tokens now %.2f", l.Tokens())
+	time.Sleep(300 * time.Millisecond)
+	t.Logf("300 ms later, with no goroutine running for it: tokens %.2f (refilled on demand from the clock)", l.Tokens())
+}
