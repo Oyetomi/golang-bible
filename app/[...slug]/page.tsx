@@ -1,4 +1,5 @@
 import { notFound } from "next/navigation";
+import { MarkRead } from "@/components/nav/MarkRead";
 import { chapters, chapterByHref } from "@/lib/manifest";
 import { renderChapter, chapterExists } from "@/lib/content";
 import { ComingSoon } from "@/components/course/server";
@@ -77,6 +78,7 @@ export default async function ChapterPage({
       <ReaderBar wordCount={stats.words} animCount={stats.anims} />
       <ChapterMeta chapter={chapter} />
       {content}
+      <MarkRead slug={chapter.slug} />
       <ChapterPagination prev={prev} next={next} />
     </article>
   );
