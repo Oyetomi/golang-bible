@@ -18,4 +18,4 @@ go run ./cmd/range            # http://127.0.0.1:8613, list the labs at /labs
 go test -run TestFixLab .     # goes green when the v0 routes stop leaking
 ```
 
-Labs: `bola`, `list`, `tenant`. `run.sh` reproduces every number in the chapter.
+Labs: `bola`, `list`, `tenant`, `window` (a permission change in flight: `go test -run TestFixLabWindow .` is its fix half). `run.sh` reproduces every number in the chapter.

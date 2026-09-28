@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"acl"
 
@@ -23,6 +24,7 @@ type lab struct {
 var labs = []lab{
 	{"bola", "One login, every account", "Logged in as acme-u3, read the memo of account 3999 (it belongs to somebody else). Submit it at /verify?lab=bola&flag=...", "GET /v0/accounts/{id} with header Authorization: acme-u3"},
 	{"list", "The list that lists everything", "Find the memo that belongs to no account you own by listing accounts. Submit it at /verify?lab=list&flag=...", "GET /v0/accounts"},
+	{"window", "The permission change in flight", "As acme-u3, change the email of acme-u4 (locked by the admin) without the admin ever leaving it open for you. Use the range's admin panel (as acme-u1) to open and then lock the field, and watch for a request that succeeds after the lock. Then GET /verify?lab=window.", "PUT /v0/profiles/acme-u4, POST /admin/rules?field=email&editable=true|false as acme-u1; the rule cache lives 5 s"},
 	{"tenant", "Whose tenant is it?", "Make globex account 1005 hold a balance of exactly 1337 cents more than it started with, as acme-u3. Then GET /verify?lab=tenant to check.", "POST /v0/credits {tenant_id, account_id, amount}"},
 }
 
@@ -51,6 +53,11 @@ func main() {
 		}
 	}
 	mux := http.NewServeMux()
+	cache := s.NewRulesCache(5 * time.Second)
+	profiles := s.ProfileRoutes(cache)
+	mux.Handle("/v0/profiles/", profiles)
+	mux.Handle("/v1/profiles/", profiles)
+	mux.Handle("/admin/", profiles)
 	mux.Handle("/", s.Routes())
 	mux.HandleFunc("GET /labs", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(labs)
@@ -63,6 +70,12 @@ func main() {
 			ok = f == "FLAG{bola-sequential-ids}"
 		case "list":
 			ok = f == "FLAG{list-with-no-scope}"
+		case "window":
+			var email string
+			var editable bool
+			pool.QueryRow(ctx, `SELECT email FROM profiles WHERE user_id='acme-u4'`).Scan(&email)
+			pool.QueryRow(ctx, `SELECT editable FROM field_rules WHERE field='email'`).Scan(&editable)
+			ok = !editable && email != "acme-u4@example.com"
 		case "tenant":
 			var start, now int64
 			pool.QueryRow(ctx, `SELECT v FROM lab_state WHERE k='tenant_start'`).Scan(&start)
