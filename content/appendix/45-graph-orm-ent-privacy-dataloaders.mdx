@@ -15,7 +15,7 @@ At **Meridian Bank**, we don't gamble with financial data or security compliance
 
 Following the battle-tested **Openlane architectural pattern**, we combine Facebook's code-generated **`ent`** graph framework, schema mixins, automated row-level **Privacy Policies & Interceptors**, schema-first **`gqlgen`**, and high-performance **batched DataLoaders**. 
 
-No reflection. Zero string-based query vulnerabilities. Automated tenant isolation enforced on every query before SQL touches the wire. And zero N+1 database connection pool starvation. Today, you're learning how world-class Go backend engineers build bulletproof, ultra-high-throughput graph persistence layers.
+No reflection. Queries built from typed code instead of strings, which removes the usual place for SQL injection. Automated tenant isolation enforced on every query before SQL touches the wire. And batching that turns a thousand tiny queries into a handful. Today, you're learning how world-class Go backend engineers build bulletproof, graph persistence layers.
 
 </HeroCard>
 
@@ -54,7 +54,7 @@ Most people think an ORM is a slow way to write SQL. A good one is a typed graph
     },
     {
       from: "Advanced Generics & Data Pipelines (part 1, ch05)",
-      q: "What Go 1.26 feature enables type-safe batching without interface{} boxing?",
+      q: "What Go feature (since 1.18) enables type-safe batching without interface{} boxing?",
       options: [
         "Generic type constraints Loader[K comparable, V any]",
         "Dynamic type assertions at runtime",
@@ -112,16 +112,16 @@ func main() {
       ]
     },
     {
-      caption: "BOTTLENECK: The 20-connection pool is starved. 30 queries stall in wait queues. p99 tail latency spikes to 850ms. Database CPU surges due to query parsing overhead.",
+      caption: "BOTTLENECK (illustrative): with many requests each firing 100 small queries, the 20-connection pool is the limit and queries wait in line. Measured in the program below: 50 concurrent requests took 147–168 ms in total and 80–94 ms at the median.",
       beat: "problem",
       cells: [
         { id: "B1", state: "bad", label: "Resolver Timeout Risk" },
-        { id: "B2", state: "bad", label: "Queue Lag: 600ms" },
+        { id: "B2", state: "bad", label: "Queue Lag" },
         { id: "B3", state: "bad", label: "Connection Churn" }
       ]
     },
     {
-      caption: "DATALOADER SOLUTION: Resolvers submit 50 OrgIDs to the batcher. On tick flush, exactly 1 query executes: SELECT * FROM accounts WHERE org_id IN ($1..$50). Latency drops to 3ms.",
+      caption: "DATALOADER SOLUTION: Resolvers submit 50 OrgIDs to the batcher. On tick flush, exactly 1 query executes: SELECT * FROM accounts WHERE org_id IN ($1..$50). In the measured run below, the same 50 requests finished in 3 ms.",
       beat: "solution",
       cells: [
         { id: "C1", state: "done", label: "50 Keys Aggregated" },
@@ -345,7 +345,7 @@ How does `ent` generate zero-reflection code?
    }
    ```
 5. **Zero-Reflection Row Scanning**: In generated `scanValues` methods, `ent` passes pointers directly to the driver (`&account.ID`, `&account.BalanceCents`, `&account.TenantID`). The `database/sql` driver populates memory offsets directly.
-6. **Go 1.26 GC Impact**: Because struct offsets are fixed at compile time and no `reflect.ValueOf` boxing occurs, zero intermediate `interface{}` descriptors escape to the heap. On Go 1.26, struct instantiations reuse Green Tea GC allocation arenas with near-zero allocation overhead.
+6. **Fewer allocations**: because generated code scans into typed fields, there's no `reflect.Value` boxing per column. (The `database/sql` layer still allocates, and how much you save depends on the query; measure with `-benchmem` rather than assuming.)
 
 </UnderTheHood>
 
@@ -947,9 +947,81 @@ Let's visualize the timeline of a DataLoader batching 4 concurrent GraphQL resol
   caption="The DataLoader collapses hundreds of concurrent resolver requests into a single batched database round-trip."
 />
 
-### Building a Generic, High-Performance DataLoader in Go 1.26
+### Building a Generic DataLoader
 
 In modern Go, we write type-safe generic DataLoaders using `[K comparable, V any]`. 
+
+First, the problem measured. This program resolves 100 transactions' accounts against a fake database with a fixed 0.5 ms round trip and a 20-connection pool, once as N+1 and once batched. The database is simulated (Postgres wasn't available for this run), so read the *shape*, not the milliseconds:
+
+```go noverify title="n1/main.go"
+// Compares resolving 100 transactions' accounts one query at a time (N+1)
+// against one batched query, over a fake database with a fixed round-trip
+// time and a 20-connection pool.
+package main
+
+import (
+	"fmt"
+	"slices"
+	"sync"
+	"time"
+)
+
+const rtt = 500 * time.Microsecond // one network round trip to the database
+
+type db struct{ pool chan struct{}; queries int; mu sync.Mutex }
+
+func newDB(conns int) *db { return &db{pool: make(chan struct{}, conns)} }
+
+// query holds a pooled connection for one round trip.
+func (d *db) query() {
+	d.pool <- struct{}{}
+	time.Sleep(rtt)
+	<-d.pool
+	d.mu.Lock(); d.queries++; d.mu.Unlock()
+}
+
+func main() {
+	for _, requests := range []int{1, 50} {
+		for _, batched := range []bool{false, true} {
+			d := newDB(20)
+			var wg sync.WaitGroup
+			lat := make([]time.Duration, requests)
+			start := time.Now()
+			for r := range requests {
+				wg.Go(func() {
+					t := time.Now()
+					d.query() // the list of 100 transactions
+					if batched {
+						d.query() // one IN (...) query for all 100 accounts
+					} else {
+						var inner sync.WaitGroup
+						for range 100 { // one query per transaction, run by field resolvers
+							inner.Go(d.query)
+						}
+						inner.Wait()
+					}
+					lat[r] = time.Since(t)
+				})
+			}
+			wg.Wait()
+			slices.Sort(lat)
+			name := map[bool]string{false: "N+1   ", true: "batched"}[batched]
+			fmt.Printf("%2d concurrent requests, %s: %4d queries, median %-8v slowest %-8v total %v\n",
+				requests, name, d.queries, lat[len(lat)/2].Round(100*time.Microsecond), lat[len(lat)-1].Round(100*time.Microsecond), time.Since(start).Round(time.Millisecond))
+		}
+	}
+}
+```
+
+```text
+$ go run .
+ 1 concurrent requests, N+1   :  101 queries, median 3.7ms    slowest 3.7ms    total 4ms
+ 1 concurrent requests, batched:    2 queries, median 1.1ms    slowest 1.1ms    total 1ms
+50 concurrent requests, N+1   : 5050 queries, median 93.8ms   slowest 167.7ms  total 168ms
+50 concurrent requests, batched:  100 queries, median 2.3ms    slowest 2.9ms    total 3ms
+```
+
+One request: 101 queries against 2, 3.7 ms against 1.1 ms. Fifty at once: 5,050 queries against 100, and the pool turns that into queueing: 168 ms in total in the run shown (147 ms in another) against 3 ms. The loader below is how you get from the first row to the second.
 
 Key architectural requirements:
 1. **Thread-Safe Key Buffer**: Synchronized via `sync.Mutex`.
