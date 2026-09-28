@@ -68,9 +68,9 @@ func TestReconcile(t *testing.T) {
 		s.Pay(ctx, PayReq{Key: k, From: 1 + i%500, To: 501 + i%400, Amount: amt}, "posted")
 		stmt = append(stmt, Line{k, amt})
 	}
-	stmt[41].Amount += 12                                // the bank moved 12 cents more than we booked
-	stmt = append(stmt[:100], stmt[101:]...)             // the bank has no line for p0100
-	stmt = append(stmt, Line{"p9999", 4242})             // the bank has a payment we never saw
+	stmt[41].Amount += 12                    // the bank moved 12 cents more than we booked
+	stmt = append(stmt[:100], stmt[101:]...) // the bank has no line for p0100
+	stmt = append(stmt, Line{"p9999", 4242}) // the bank has a payment we never saw
 	fs, _ := s.Reconcile(ctx, stmt)
 	for _, f := range fs {
 		t.Logf("finding: %-22s %s ledger=%d bank=%d", f.Kind, f.Key, f.Ledger, f.Bank)
