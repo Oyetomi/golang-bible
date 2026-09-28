@@ -80,6 +80,7 @@ export const mdxComponents = {
   RoundTripAnim: A.RoundTripAnim,
   ShopCacheAnim: A.ShopCacheAnim,
   LockLanesAnim: A.LockLanesAnim,
+  ShutdownAnim: A.ShutdownAnim,
   PlanAnim: A.PlanAnim,
   ReconcileAnim: A.ReconcileAnim,
   BurnAnim: A.BurnAnim,

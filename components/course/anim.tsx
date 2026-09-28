@@ -5315,3 +5315,87 @@ export function LockLanesAnim({ title, frames, caption }: { title: string; frame
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   ShutdownAnim — a server stopping. The door
+   (the listener) closes; each connection shows
+   the commands it has received but not run and
+   the replies it owes; a deadline clock runs.
+   Abrupt stop vs graceful drain vs a stuck client.
+   ════════════════════════════════════════════ */
+
+export type ShutdownConn = {
+  name: string;
+  state: "serving" | "idle" | "closed" | "stuck" | "cut";
+  /** commands received, not yet run */
+  inbox?: number;
+  /** replies written back this frame */
+  replies?: string;
+};
+
+export type ShutdownFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  door: "open" | "closed";
+  signal?: string;
+  clock?: string;
+  conns: ShutdownConn[];
+  meters?: { label: string; value: string; tone?: "bad" | "good" }[];
+};
+
+export function ShutdownAnim({ title, frames, caption }: { title: string; frames: ShutdownFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2400);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="shutdown"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="sdn" key={st.cur}>
+        <div className="sdn-top">
+          <span className={`sdn-door sdn-door-${f.door}`}>{f.door === "open" ? "🚪 accepting" : "⛔ not accepting"}</span>
+          {f.signal && <span className="sdn-signal">{f.signal}</span>}
+          {f.clock && <span className="sdn-clock">⏱ {f.clock}</span>}
+        </div>
+        <div className="sdn-conns">
+          {f.conns.map((c) => (
+            <div key={c.name} className={`sdn-conn sdn-${c.state}`}>
+              <Gopher
+                role="operator"
+                pose={c.state === "serving" ? "carry" : c.state === "stuck" ? "blocked" : c.state === "cut" ? "panic" : c.state === "closed" ? "wave" : "sleep"}
+                state={c.state === "cut" ? "bad" : "active"}
+                size={30}
+                title={c.name}
+              />
+              <span className="sdn-name">{c.name}</span>
+              <span className="sdn-inbox">{c.inbox ? `${c.inbox} commands waiting` : ""}</span>
+              {c.replies && <span className="shc-chip shc-ans">{c.replies}</span>}
+              <span className="sdn-state">{c.state === "cut" ? "cut off" : c.state}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      {f.meters && (
+        <div className="rtp-meters">
+          {f.meters.map((m) => (
+            <span key={m.label} className={`rtp-meter ${m.tone ?? ""}`}>
+              {m.label} <b>{m.value}</b>
+            </span>
+          ))}
+        </div>
+      )}
+    </AnimShell>
+  );
+}

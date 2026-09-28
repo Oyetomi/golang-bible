@@ -1,0 +1,810 @@
+---
+title: "Stopping Cleanly: Shutdown with context"
+part: "redis"
+order: 12
+type: "course"
+description: "What happens to fifty thousand pipelined commands a second when the server is told to stop. Killed by SIGTERM (exit 143), our server left each of 20 clients with 100 INCRs unanswered and no way to know whether they ran. With signal.NotifyContext and a Shutdown(ctx) that stops accepting, wakes idle readers with a read deadline and waits for every handler, the server's own count matched the replies the clients received, 1,876,000 of 1,876,000, and stopped in about a millisecond. A client that never read its replies held shutdown until the 2-second context deadline, and a test found a real bug on the way: replies lost when the last bytes read were half a command."
+prerequisites: ["redis-locks"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 12" title="Stopping Cleanly: Shutdown with context">
+
+Every server is stopped eventually: a new version is deployed, a machine is drained, someone presses Ctrl-C. So far ours simply dies when told to stop, in the middle of whatever it was doing. This lesson measures what that does to the clients, then teaches the server to stop *cleanly*, using the tool Go provides for "stop, and here's how long you've got": `context`.
+
+Three stops:
+
+1. **Pulling the plug.** What SIGTERM does to our server and its clients, measured.
+2. **Shutdown.** Stop accepting, finish what's in hand, wait, with a deadline from a `context`.
+3. **The stuck client, and a bug.** A deadline that fires, and a test that caught lost replies.
+
+</HeroCard>
+
+<Narrator mood="menacing">
+Anyone can start a server. What I watch is how you *stop* one. Twenty clients mid-sentence, and you hang up on all of them without a word? Not in my building.
+</Narrator>
+
+<ChapterTabs tabs={["Pulling the Plug", "Shutdown", "The Stuck Client"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "go.sum" },
+    { path: "store.go" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "resp/resp.go" },
+    { path: "resp/resp_test.go" },
+    { path: "server/server.go", status: "changed", note: "tracks connections; Shutdown(ctx); ErrServerClosed; Commands; flush before closing" },
+    { path: "server/commands.go" },
+    { path: "server/server_test.go" },
+    { path: "server/readlock_test.go" },
+    { path: "server/bench_test.go" },
+    { path: "server/shutdown_test.go", status: "new", note: "every command the server ran must reach the client" },
+    { path: "cmd/kv-server/main.go", status: "changed", note: "signal.NotifyContext, then Shutdown with a -grace deadline" },
+    { path: "cmd/busy/main.go", status: "new", note: "20 clients pipelining INCRs until the server goes away" },
+    { path: "cmd/stuck/main.go", status: "new", note: "a client that sends a million PINGs and never reads" },
+    { path: "cmd/gopipe/main.go" },
+    { path: "cmd/spy/main.go" },
+    { path: "cmd/raw/main.go" },
+    { path: "cmd/talk/main.go" },
+    { path: "cmd/twoclients/main.go" },
+    { path: "cmd/hammer/main.go" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" }
+  ]}
+  run={["go run ./cmd/kv-server", "go run ./cmd/busy   # in a second terminal; then Ctrl-C the server", "go test -race ./server"]}
+>
+
+All the shutdown logic lives in `server/server.go`; `cmd/kv-server` only decides *when* to call it. `cmd/busy` and `cmd/stuck` are the two clients that test it.
+
+</ProjectMap>
+
+## Pulling the Plug
+
+*Stop 1 of 3.*
+
+### Step 1: how a server is told to stop
+
+A program is stopped with a **signal**: a small numbered message the operating system delivers to a process. Two matter here:
+
+- **SIGINT** is what Ctrl-C in a terminal sends.
+- **SIGTERM** is what `kill`, `docker stop` and Kubernetes send when they want a process to end. It means "please stop". If the process is still running some seconds later (10 for Docker, 30 by default for Kubernetes), they send **SIGKILL**, which can't be caught: the process just vanishes.
+
+A Go program that doesn't ask for signals gets Go's default: on SIGINT or SIGTERM it exits immediately, wherever it is. The shell reports that as exit status **143**, which is 128 + 15, SIGTERM's number.
+
+### Step 2: a busy client
+
+To see what "immediately" means for clients, `cmd/busy` opens 20 connections and has each one pipeline `INCR`s, 100 at a time, as fast as it can, until the server goes away:
+
+```go noverify title="kv/cmd/busy/main.go · lines 26–57"
+	endings := map[string]int{} // how each connection ended
+	var wg sync.WaitGroup
+	for range *clients {
+		wg.Go(func() {
+			conn, err := net.Dial("tcp", *addr)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer conn.Close()
+			r := bufio.NewReader(conn)
+			req := strings.Repeat("INCR hits\r\n", *batch)
+			var end string
+			for end == "" {
+				if _, err := io.WriteString(conn, req); err != nil {
+					end = "write: " + short(err)
+					break
+				}
+				sent.Add(int64(*batch))
+				for range *batch {
+					if _, err := r.ReadString('\n'); err != nil {
+						end = "read: " + short(err)
+						break
+					}
+					replies.Add(1)
+				}
+			}
+			mu.Lock()
+			endings[end]++
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+```
+
+Each connection writes a batch of 100 `INCR hits` lines, then reads 100 replies. It counts every command it **sent** and every reply it **got**, and when the connection ends, it records how. A shell script starts lesson 11's server, starts `busy`, and one second later sends the server SIGTERM:
+
+```text
+$ ./stop.sh s11
+kv-server exit status 143
+== client
+sent 969800 INCRs, got 967800 replies: 2000 unanswered
+20 connections ended with read: EOF (the server closed the connection)
+== server
+listening on 127.0.0.1:6391
+```
+
+The server died with status 143 and said nothing. Every client was in the middle of a batch: **2,000 `INCR`s were sent and never answered**, 100 per connection. (In other runs some connections ended with `connection reset by peer` instead of EOF: when a process dies with unread bytes in a socket, the kernel answers with a TCP *reset* rather than a normal close.)
+
+### Step 3: what the client can't know
+
+Here is the real problem. Each client has 100 commands without replies. **Did they run?** Some may have: the server may have run them and died before sending the replies (lesson 10's replies wait in a buffer until the pipeline is done). Others were never read. The client can't tell which. For `INCR`, retrying one that already ran counts it twice; not retrying one that never ran loses it. There's no safe choice, because the server left without saying where it stopped.
+
+<QuickCheck
+  question="Killed mid-pipeline, the server left 100 INCRs unanswered on each connection. Why can't the client just retry them?"
+  options={[
+    "Retrying is always safe",
+    "Some of them may have run before the server died, with only their replies lost, so retrying would count them twice",
+    "The server will answer them after it restarts",
+    "TCP will resend them automatically"
+  ]}
+  answer={1}
+  explain="An unanswered command is ambiguous: it may or may not have run. A clean shutdown's job is to remove that ambiguity."
+/>
+
+## Shutdown
+
+*Stop 2 of 3.*
+
+### Step 1: what "cleanly" means
+
+A clean stop, a **graceful shutdown**, has three steps:
+
+1. **Stop accepting** new connections: close the listener.
+2. **Finish what's in hand**: every command a connection has already received gets run and answered. Then that connection closes.
+3. **Don't wait forever**: if some connection won't finish (a client that stopped reading, say), give up after a deadline and close it anyway.
+
+After that, any command the client didn't get a reply for **did not run**, so it's safe to send again, to this server after its restart or to another one.
+
+<ShutdownAnim
+  title="A graceful shutdown"
+  frames={[
+    { note: "Three clients are connected. Two are pipelining INCRs; one is idle, waiting to send its next command.", door: "open", conns: [{ name: "client 1", state: "serving", inbox: 60 }, { name: "client 2", state: "serving", inbox: 35 }, { name: "client 3", state: "idle" }] },
+    { note: "SIGTERM arrives. Without a handler, Go exits right here: client 1's 60 commands and client 2's 35 are left unanswered, some run and some not. Nobody can tell which.", beat: "problem", door: "open", signal: "SIGTERM", conns: [{ name: "client 1", state: "cut", inbox: 60 }, { name: "client 2", state: "cut", inbox: 35 }, { name: "client 3", state: "cut" }], meters: [{ label: "exit status", value: "143", tone: "bad" }] },
+    { note: "With Shutdown instead: first, close the listener. New clients are refused; the ones already connected carry on.", door: "closed", signal: "SIGTERM → Shutdown", clock: "0 of 5 s", conns: [{ name: "client 1", state: "serving", inbox: 60 }, { name: "client 2", state: "serving", inbox: 35 }, { name: "client 3", state: "idle" }] },
+    { note: "Next, a read deadline of 'now' on every connection. Client 3's handler was blocked waiting for a command: its read fails at once and it closes. Commands already received are still served.", door: "closed", clock: "0 of 5 s", conns: [{ name: "client 1", state: "serving", inbox: 20, replies: "40 replies" }, { name: "client 2", state: "serving", inbox: 0, replies: "35 replies" }, { name: "client 3", state: "closed" }] },
+    { note: "Each handler runs what it received, flushes the replies, then finds nothing more to read and closes its connection.", beat: "solution", door: "closed", clock: "0.001 of 5 s", conns: [{ name: "client 1", state: "closed", replies: "20 replies" }, { name: "client 2", state: "closed" }, { name: "client 3", state: "closed" }] },
+    { note: "Every handler has returned, so Shutdown returns nil and main exits with status 0. Every command that ran was answered; anything unanswered never ran and is safe to retry.", beat: "solution", door: "closed", clock: "done in ~1 ms", conns: [{ name: "client 1", state: "closed" }, { name: "client 2", state: "closed" }, { name: "client 3", state: "closed" }], meters: [{ label: "commands run", value: "= replies sent", tone: "good" }, { label: "exit status", value: "0", tone: "good" }] }
+  ]}
+  caption="The listener closes first, idle readers are woken by a read deadline, busy ones finish, and a context bounds the wait."
+/>
+
+### Step 2: knowing the connections
+
+To wake or close connections, the server has to know which are open. `Server` gets a few new fields:
+
+```go noverify title="kv/server/server.go · lines 21–39"
+type Server struct {
+	shards []*shard
+	seed   maphash.Seed
+
+	// ReadLocks lets GETs on the same shard run at the same time, under a
+	// read lock. Writes still take the lock alone.
+	ReadLocks bool
+
+	commands atomic.Int64 // commands run, for Commands
+
+	mu       sync.Mutex // guards the three fields below
+	listener net.Listener
+	conns    map[net.Conn]struct{}
+	closing  bool
+	handlers sync.WaitGroup // one per open connection
+}
+
+// ErrServerClosed is what Serve returns after Shutdown.
+var ErrServerClosed = errors.New("server closed")
+```
+
+- `conns` is a **set** of open connections: a map whose values carry nothing (`struct{}` takes no memory), used only for its keys.
+- `closing` records that shutdown has begun.
+- `handlers` is a `sync.WaitGroup`, a counter of running goroutines: `Add(1)` when one starts, `Done()` when it ends, and `Wait()` blocks until it's back to zero.
+- `mu` guards `listener`, `conns` and `closing`, because `Serve`, every handler and `Shutdown` all touch them from different goroutines.
+- `ErrServerClosed` is a sentinel error (lesson 4) so the caller can tell "stopped because I asked" from a real failure. `net/http` has the same thing with the same name.
+
+`Serve` records each connection before handing it to a goroutine:
+
+```go noverify title="kv/server/server.go · lines 72–113"
+// Serve accepts connections on l and serves each one in its own
+// goroutine, until Shutdown.
+func (s *Server) Serve(l net.Listener) error {
+	s.mu.Lock()
+	s.listener = l
+	s.mu.Unlock()
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if s.isClosing() {
+				return ErrServerClosed
+			}
+			return err
+		}
+		if !s.track(conn) {
+			conn.Close() // accepted just as Shutdown began
+			continue
+		}
+		go s.handle(conn)
+	}
+}
+
+// track records an open connection, unless the server is shutting down.
+func (s *Server) track(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
+	if s.conns == nil {
+		s.conns = map[net.Conn]struct{}{}
+	}
+	s.conns[conn] = struct{}{}
+	s.handlers.Add(1)
+	return true
+}
+
+func (s *Server) isClosing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing
+}
+```
+
+`track` refuses a connection that arrives after shutdown began, so no new handler can start while `Shutdown` is waiting for the old ones. When `Shutdown` closes the listener, `Accept` returns an error; `Serve` sees `closing` and returns `ErrServerClosed`.
+
+And each handler removes itself when it ends, in a `defer`, so it happens however the loop exits:
+
+```go noverify title="kv/server/server.go · lines 158–167"
+func (s *Server) handle(conn net.Conn) {
+	defer func() {
+		conn.Close()
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		s.handlers.Done()
+	}()
+	r := resp.NewReader(conn)
+	w := bufio.NewWriter(conn)
+```
+
+### Step 3: Shutdown
+
+```go noverify title="kv/server/server.go · lines 115–149"
+// Shutdown stops the server gracefully. It stops accepting connections,
+// then lets every connection finish the commands it has already received
+// and send their replies. If ctx ends first, it closes the connections
+// that are left and returns ctx's error.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.closing = true
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	for conn := range s.conns {
+		// Wake any handler waiting for its client's next command: its read
+		// now fails at once, but bytes already buffered are still served.
+		conn.SetReadDeadline(time.Now())
+	}
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		for conn := range s.conns {
+			conn.Close() // unblocks handlers stuck writing to slow clients
+		}
+		s.mu.Unlock()
+		<-done
+		return ctx.Err()
+	}
+}
+```
+
+Line by line:
+
+- **Close the listener.** No new clients.
+- **`conn.SetReadDeadline(time.Now())`** on every connection. A **deadline** makes a read fail with a timeout error if it hasn't finished by that time; a deadline of *now* makes the next read that actually has to wait for the network fail at once. A handler blocked waiting for its client's next command wakes up and returns. A handler in the middle of a pipeline is unaffected while its reader still has buffered bytes to parse: it finishes those commands first.
+- **Wait for the handlers**, but in a goroutine that closes a channel `done` when `Wait` returns, because `Wait` itself can't be interrupted.
+- **`select`** on two channels: whichever is ready first wins. If `done` closes, every connection finished: return `nil`. If **`ctx.Done()`** closes first, the deadline passed: close the remaining connections by force, wait for their handlers to notice, and return `ctx.Err()`.
+
+`ctx` is a **`context.Context`**: Go's standard way to pass "stop by this time, or when told" into a function. `ctx.Done()` is a channel that closes when the context ends, and `ctx.Err()` says why: `context.DeadlineExceeded` for a deadline, `context.Canceled` for a cancel. `Shutdown` doesn't pick a deadline itself; the caller does.
+
+<QuickCheck
+  question="Why does Shutdown set a read deadline of 'now' instead of closing every connection straight away?"
+  options={[
+    "Closing is slower",
+    "A deadline only stops reads that have to wait for the network, so a connection mid-pipeline still runs and answers what it already received; closing would cut it off",
+    "Deadlines also close the listener",
+    "Go doesn't allow closing a connection from another goroutine"
+  ]}
+  answer={1}
+  explain="Idle handlers wake and return; busy ones finish their buffered commands first. Closing is kept for the deadline case, when finishing has taken too long."
+/>
+
+### Step 4: main listens for the signal
+
+`cmd/kv-server` asks for SIGINT and SIGTERM, and calls `Shutdown` when one arrives:
+
+```go noverify title="kv/cmd/kv-server/main.go · lines 37–54"
+	// ctx ends when the process gets Ctrl-C (SIGINT) or SIGTERM, the signal
+	// docker stop, kill and Kubernetes send.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		if err := srv.Serve(l); !errors.Is(err, server.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("shutting down: %d commands run so far", srv.Commands())
+	start := time.Now()
+	sctx, cancel := context.WithTimeout(context.Background(), *grace)
+	defer cancel()
+	err = srv.Shutdown(sctx)
+	log.Printf("shut down in %v (%v): %d commands run", time.Since(start).Round(time.Millisecond), err, srv.Commands())
+}
+```
+
+**`signal.NotifyContext`** returns a context that is cancelled when the process receives one of the listed signals, and stops Go's default "exit now" for them. `Serve` moves into a goroutine, and `main` blocks on `<-ctx.Done()` until the signal comes. Then it makes a *second* context with **`context.WithTimeout`**, which ends by itself after `-grace` (5 seconds by default), and hands that to `Shutdown`. `defer cancel()` releases the timer if `Shutdown` finishes early.
+
+The same experiment, with this lesson's server:
+
+```text
+$ ./stop.sh s12
+== client
+sent 1878000 INCRs, got 1876000 replies: 2000 unanswered
+15 connections ended with read: EOF (the server closed the connection)
+ 5 connections ended with read: connection reset by peer
+== server
+listening on 127.0.0.1:6391
+shutting down: 1874749 commands run so far
+shut down in 1ms (<nil>): 1876000 commands run
+```
+
+The client sees much the same: 2,000 commands without replies, and connections ending. But now the server speaks up, and its numbers are the point: it ran **1,876,000** commands and the clients received **1,876,000** replies. Every command that ran was answered, so the 2,000 unanswered ones **never ran**, and are safe to send again. It shut down in about a millisecond and exited with status 0. Three more runs:
+
+```text
+== s12 run 1
+== s12 run 2
+== client
+sent 1683000 INCRs, got 1681000 replies: 2000 unanswered
+19 connections ended with read: EOF (the server closed the connection)
+ 1 connections ended with read: connection reset by peer
+== server
+listening on 127.0.0.1:6391
+shutting down: 1679822 commands run so far
+shut down in 1ms (<nil>): 1681000 commands run
+== s12 run 3
+== client
+sent 1882900 INCRs, got 1880900 replies: 2000 unanswered
+ 5 connections ended with read: connection reset by peer
+15 connections ended with read: EOF (the server closed the connection)
+== server
+listening on 127.0.0.1:6391
+shutting down: 1879783 commands run so far
+shut down in 0s (<nil>): 1880900 commands run
+```
+
+(Connections still sometimes end with `connection reset by peer`: each client had its next batch in flight, and closing a socket that holds unread bytes makes the kernel send a reset. The replies had all been delivered before that.)
+
+## The Stuck Client
+
+*Stop 3 of 3.*
+
+### Step 1: a client that never reads
+
+Waiting for every connection to finish assumes every client cooperates. `cmd/stuck` doesn't: it sends a million `PING`s, 6 MB of requests, and never reads a reply:
+
+```go noverify title="kv/cmd/stuck/main.go · lines 14–27"
+func main() {
+	addr := flag.String("addr", "127.0.0.1:6380", "server address")
+	flag.Parse()
+	conn, err := net.Dial("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// 1,000,000 PINGs is 6 MB of requests and 7 MB of replies: far more than
+	// the kernel's socket buffers hold, so the server's writes soon block.
+	req := strings.Repeat("PING\r\n", 1_000_000)
+	go conn.Write([]byte(req))
+	fmt.Println("sent a million PINGs; not reading any replies")
+	time.Sleep(time.Hour)
+}
+```
+
+The server answers `PONG`s until the socket's send buffer in the kernel is full, and then its `Flush` blocks: there's nowhere to put more bytes until the client reads. A handler blocked in a write never gets back to its read, so the read deadline doesn't reach it. Without a limit on the wait, `Shutdown` would wait for this client forever. With `-grace 2s`:
+
+```text
+$ ./stuck.sh
+sent a million PINGs; not reading any replies
+kv-server exit status 0
+listening on 127.0.0.1:6392
+shutting down: 78994 commands run so far
+shut down in 2.002s (context deadline exceeded): 79112 commands run
+```
+
+`Shutdown` gave up after **2.002 seconds** and returned `context deadline exceeded`, having closed the stuck connection by force; the server still exited normally. It ran 118 more commands during those two seconds, whatever fitted into the socket buffers. This is exactly what the context is for: the caller decides how long a clean stop may take, and `Shutdown` enforces it. Keep `-grace` shorter than the time your orchestrator waits before SIGKILL, so the server finishes on its own terms.
+
+### Step 2: the test, and the bug it found
+
+`server/shutdown_test.go` checks the promise directly: a client pipelines 20,000 `INCR`s, the server shuts down mid-pipeline, and the number of replies the client receives must equal the number of commands the server ran:
+
+```go noverify title="kv/server/shutdown_test.go · lines 16–67"
+// Shutdown with an idle client and a client mid-pipeline: the pipeline's
+// replies all arrive, then both connections close, well inside the deadline.
+func TestShutdown(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(kv.New())
+	served := make(chan error, 1)
+	go func() { served <- s.Serve(l) }()
+
+	idle, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	busy, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	fmt.Fprint(busy, strings.Repeat("INCR hits\r\n", 20_000))
+	r := bufio.NewReader(busy)
+	if _, err := r.ReadString('\n'); err != nil { // the server is working on it
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	t.Logf("shut down in %v", time.Since(start))
+	if err := <-served; !errors.Is(err, ErrServerClosed) {
+		t.Errorf("Serve returned %v, want ErrServerClosed", err)
+	}
+
+	got := 1
+	for {
+		if _, err := r.ReadString('\n'); err != nil {
+			break // closed by the server
+		}
+		got++
+	}
+	if int64(got) != s.Commands() {
+		t.Errorf("server ran %d commands, client got %d replies", s.Commands(), got)
+	}
+	if _, err := net.Dial("tcp", l.Addr().String()); err == nil {
+		t.Error("the server still accepts connections after Shutdown")
+	}
+}
+```
+
+The first version of `handle` failed it, some runs and not others:
+
+```text
+--- FAIL: TestShutdown (0.00s)
+    shutdown_test.go:49: shut down in 148.583µs
+    shutdown_test.go:62: server ran 1116 commands, client got 700 replies
+FAIL
+FAIL	kv/server	0.819s
+FAIL
+```
+
+The server ran 1,116 commands; the client got 700 replies. 416 answers were lost. The cause was a line from lesson 10: `handle` only flushes when `r.Buffered() == 0`, that is, when the reader holds no more bytes. But the reader reads the socket in chunks of 4,096 bytes, and `INCR hits\r\n` is 11 bytes, so a chunk often ends in the middle of a command. With half a command buffered, `Buffered()` isn't zero, so no flush; the reader then needs more bytes, the read deadline makes that read fail, and the handler returned, **with the replies to every complete command still sitting in `w`**. (An earlier version of the test used an 8-byte command, which divides 4,096 exactly, so chunks never split one, and it passed every time. The bug only showed up once the test's commands were an awkward size.)
+
+The fix is to flush before returning, however the loop ends:
+
+```go noverify title="kv/server/server.go · lines 168–191"
+	for {
+		args, err := r.ReadCommand()
+		if errors.Is(err, resp.ErrProtocol) {
+			w.WriteString(errorReply(err.Error())) // then hang up, as Redis does
+			w.Flush()
+			return
+		}
+		if err != nil {
+			// The client hung up, or Shutdown woke us. Replies may still be
+			// waiting in w: if the reader held part of a command, we didn't
+			// flush after the last full one. Send them before closing.
+			w.Flush()
+			return
+		}
+		if len(args) > 0 {
+			w.WriteString(s.do(args))
+			s.commands.Add(1)
+		}
+		if r.Buffered() == 0 { // nothing more waiting: send what we have
+			if err := w.Flush(); err != nil {
+				return
+			}
+		}
+	}
+```
+
+After it, the test passed 100 runs out of 100, and under `-race`:
+
+```text
+$ go test -run Shutdown -v ./server
+    shutdown_test.go:49: shut down in 72.333µs
+--- PASS: TestShutdown (0.00s)
+PASS
+ok  	kv/server	(cached)
+```
+
+<UnderTheHood title="How a read deadline wakes a blocked goroutine">
+
+A goroutine blocked in `conn.Read` isn't blocking an OS thread. Go's network poller registers the socket with the kernel (kqueue on macOS, epoll on Linux) and parks the goroutine. `SetReadDeadline` sets a timer inside the runtime tied to that socket. When the timer fires, the runtime marks the socket's read side as timed out and makes the parked goroutine runnable again; its `Read` returns an error that satisfies `errors.Is(err, os.ErrDeadlineExceeded)`. That's why one goroutine can safely interrupt another's read: nothing is killed, the read simply ends with an error, and the handler's own code decides what to do next. `Close` from another goroutine works the same way, with a "use of closed network connection" error instead.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Why didn't the read deadline stop the handler serving cmd/stuck?"
+  options={[
+    "Deadlines don't work on TCP",
+    "The handler was blocked writing replies the client wouldn't read, not reading, and a read deadline only affects reads; the context deadline closed it instead",
+    "The client had set its own deadline",
+    "The handler ignores errors"
+  ]}
+  answer={1}
+  explain="A write blocks when the kernel's send buffer is full. Only closing the connection, which Shutdown does when ctx ends, gets it out."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="A second Ctrl-C" level="easy">
+
+While `Shutdown` waits for a stuck client, pressing Ctrl-C again does nothing, because `signal.NotifyContext` already caught it. Make a second SIGINT or SIGTERM exit at once.
+
+<Solution>
+
+After `<-ctx.Done()`, call `stop()`: it stops the context from catching the signals, so Go's default behaviour returns and a second signal kills the process straight away. This is common in real servers ("press Ctrl-C again to force"). Test it with `cmd/stuck` and a long `-grace`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Idle timeout" level="medium">
+
+Real Redis has a `timeout` setting: close a client that sends nothing for that many seconds. Add `-idle 30s` to `kv-server`, using a read deadline set before each blocking read. Test it with `redis-cli` left idle.
+
+<Solution>
+
+In `handle`, before each `ReadCommand` that will have to wait (when `r.Buffered() == 0`), call `conn.SetReadDeadline(time.Now().Add(idle))`. A read that times out returns an error and the handler closes the connection, flushing first. Careful: `Shutdown` also uses the read deadline; set it only if `closing` is false, under `s.mu`, or `Shutdown`'s "now" could be overwritten by "now + 30 s".
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="docker stop" level="medium">
+
+Build the server into an image (as in Part 4's containers chapter), run it, put `cmd/busy` on it, and run `docker stop`. What exit status does `docker ps -a` show, with and without this lesson's signal handling? What happens with `docker stop -t 1` and `cmd/stuck`?
+
+<Solution>
+
+Without handling, SIGTERM kills it at once: `Exited (143)`. With it: `Exited (0)`, after about a millisecond. With `cmd/stuck` and the default `-grace 5s`, `docker stop -t 1` sends SIGKILL after 1 second, before `Shutdown`'s deadline, so the container ends `Exited (137)` (128 + 9, SIGKILL): the grace period has to be shorter than the orchestrator's. Also check that the server is PID 1 or started with `exec`, or the signal never reaches it (Part 4, Linux chapter).
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Last Orders"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="This small server answers each line with a running count, and its Shutdown is broken three ways: it hangs even with a well-behaved client, it cuts connections off so answered lines never reach the client, and it ignores its context. Fix Shutdown (and handle, if it needs it) so that every line the server answered reaches the client, and a client that never reads can't hold Shutdown past its deadline. It must pass under go run -race too."
+  starter={`package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Server answers every line with a count of the lines it has answered so
+// far: ":1\\r\\n", ":2\\r\\n", and so on.
+type Server struct {
+	answered atomic.Int64
+
+	mu       sync.Mutex
+	listener net.Listener
+	conns    map[net.Conn]struct{}
+	handlers sync.WaitGroup
+}
+
+func (s *Server) Serve(l net.Listener) error {
+	s.mu.Lock()
+	s.listener = l
+	s.conns = map[net.Conn]struct{}{}
+	s.mu.Unlock()
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.conns[conn] = struct{}{}
+		s.handlers.Add(1)
+		s.mu.Unlock()
+		go s.handle(conn)
+	}
+}
+
+func (s *Server) handle(conn net.Conn) {
+	defer func() {
+		conn.Close()
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		s.handlers.Done()
+	}()
+	r := bufio.NewReader(conn)
+	w := bufio.NewWriter(conn)
+	for {
+		if _, err := r.ReadString('\\n'); err != nil {
+			return
+		}
+		fmt.Fprintf(w, ":%d\\r\\n", s.answered.Add(1))
+		if r.Buffered() == 0 {
+			if w.Flush() != nil {
+				return
+			}
+		}
+	}
+}
+
+// Shutdown should stop accepting, let every connection finish the lines it
+// has already received and send their answers, and give up when ctx ends.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listener.Close()
+	for conn := range s.conns {
+		conn.Close()
+	}
+	s.handlers.Wait()
+	return nil
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+
+	// 1. A client mid-pipeline: every line the server answered must reach it.
+	s := &Server{}
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	served := make(chan error, 1)
+	go func() { served <- s.Serve(l) }()
+	c, _ := net.Dial("tcp", l.Addr().String())
+	fmt.Fprint(c, strings.Repeat("go\\n", 20000))
+	r := bufio.NewReader(c)
+	r.ReadString('\\n') // it has started answering
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown(context.Background()) }()
+	got := 1
+	for {
+		if _, err := r.ReadString('\\n'); err != nil {
+			break
+		}
+		got++
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		fail("Shutdown didn't return within 3s with one well-behaved client")
+	}
+	if int64(got) != s.answered.Load() {
+		fail("the server answered %d lines, the client received %d", s.answered.Load(), got)
+	}
+	select {
+	case err := <-served:
+		if err == nil {
+			fail("Serve returned nil after Shutdown")
+		}
+	case <-time.After(time.Second):
+		fail("Serve still running after Shutdown")
+	}
+
+	// 2. A client that never reads: Shutdown must give up when ctx ends.
+	s = &Server{}
+	l, _ = net.Listen("tcp", "127.0.0.1:0")
+	go s.Serve(l)
+	c2, _ := net.Dial("tcp", l.Addr().String())
+	go c2.Write([]byte(strings.Repeat("go\\n", 3_000_000)))
+	time.Sleep(300 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := make(chan error, 1)
+	go func() { res <- s.Shutdown(ctx) }()
+	select {
+	case err := <-res:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			fail("Shutdown with a stuck client returned %v, want context.DeadlineExceeded", err)
+		}
+		if d := time.Since(start); d > 1500*time.Millisecond {
+			fail("Shutdown took %v with a 500ms deadline", d)
+		}
+	case <-time.After(3 * time.Second):
+		fail("Shutdown with a stuck client and a 500ms deadline was still waiting after 3s")
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Pipelines 20,000 lines, shuts down mid-pipeline, and checks the client received exactly as many answers as the server counted, and that Serve returned; then a client that sends 3 million lines and never reads, with a 500 ms deadline: Shutdown must return context.DeadlineExceeded within 1.5 s. Prints ALL CHECKS PASS."
+  hints={[
+    "Shutdown holds s.mu while it calls s.handlers.Wait(), and every handler needs s.mu in its defer to remove itself. Nobody can finish. Unlock before waiting.",
+    "Closing every connection cuts off handlers that have answers buffered. Wake them instead with conn.SetReadDeadline(time.Now()), and wait with a select on a done channel and ctx.Done(); close connections only when ctx ends.",
+    "If a handler's read fails with part of a line buffered, it returns without flushing. Call w.Flush() before returning on a read error."
+  ]}
+  flag="GO{last_orders}"
+>
+
+The third bug is this lesson's own: it only shows when a read ends in the middle of a line, which is why the lab's lines are 3 bytes long.
+
+</Lab>
+
+<Recap>
+
+- **SIGTERM** is how `kill`, Docker and Kubernetes ask a process to stop; Go's default is to exit at once (status **143**). Killed mid-pipeline, our server left 2,000 `INCR`s unanswered, and the clients couldn't know which had run.
+- A **graceful shutdown**: close the listener, wake idle handlers with a **read deadline of now**, let busy ones finish and flush, wait for all of them with a `sync.WaitGroup`, and give up when the **`context`** ends.
+- **`signal.NotifyContext`** turns a signal into a cancelled context; **`context.WithTimeout`** bounds the wait. Measured: the server ran **1,876,000** commands and the clients got **1,876,000** replies; shutdown took about **1 ms**.
+- A client that never reads blocks its handler in a write; the context deadline closed it after **2.002 s**.
+- The test found a real bug: with half a command buffered, `handle` returned without flushing, and lost **416 of 1,116** replies. Flush before returning.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: the ambiguous INCR", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: deadline, not close", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the stuck client", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: a second Ctrl-C", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: idle timeout", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: docker stop", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: Last Orders", captured: false, points: 80 }}
+/>
+
+<Narrator>
+1,876,000 commands run, 1,876,000 replies delivered. Not one client left wondering. And the bug that lost 416 answers? Caught by your test, not by a customer. That's how I like my exits: on time, on my terms, and nobody talking about it afterwards.
+</Narrator>
