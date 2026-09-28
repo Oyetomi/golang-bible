@@ -1,0 +1,722 @@
+---
+title: "Speaking RESP: A Parser, Fuzzed"
+part: "redis"
+order: 9
+type: "course"
+description: "redis-cli doesn't send lines: a spy proxy shows it sends arrays of length-prefixed bulk strings. We write a parser for them over io.Reader, and Go's fuzzer breaks the first version twice within seconds (an empty line, then a 666-trillion-byte length). After the fixes it survives 7.2 million inputs, rejects bad input with Redis's exact errors, and the real redis-cli works against our server."
+prerequisites: ["redis-tcp-server"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 9" title="Speaking RESP: A Parser, Fuzzed">
+
+Our server understands lines of words, which is enough for `nc`. The real `redis-cli`, and every Redis client library, speaks the full protocol. This lesson finds out exactly what they send, writes a parser for it, and then treats that parser the way a server on a network must: as code that strangers will feed any bytes they like.
+
+Four stops:
+
+1. **What redis-cli sends.** A spy in the middle of a real connection.
+2. **A parser over `io.Reader`.** Reading length-prefixed data, and why the parser takes an interface.
+3. **Fuzzing.** Letting Go generate millions of inputs, and the two crashes it found.
+4. **The real client.** `redis-cli` against our server, and bad input rejected the way Redis rejects it.
+
+</HeroCard>
+
+<ChapterTabs tabs={["What redis-cli Sends", "A Parser", "Fuzzing", "The Real Client"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "store.go" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "resp/resp.go", status: "new", note: "package resp: reads commands, as RESP arrays or inline lines, from any io.Reader" },
+    { path: "resp/resp_test.go", status: "new", note: "a unit test and a fuzz test for the reader" },
+    { path: "resp/testdata/fuzz/FuzzReadCommand/19341be7f2b06e4a", status: "new", note: "the first input the fuzzer broke the parser with, kept as a test" },
+    { path: "resp/testdata/fuzz/FuzzReadCommand/b724c9c8d353ad71", status: "new", note: "the second one" },
+    { path: "server/server.go", status: "changed", note: "handle reads with resp.Reader, and hangs up on a protocol error" },
+    { path: "server/commands.go" },
+    { path: "server/server_test.go" },
+    { path: "cmd/kv-server/main.go" },
+    { path: "cmd/spy/main.go", status: "new", note: "a proxy that prints every byte between a client and a server" },
+    { path: "cmd/raw/main.go", status: "new", note: "sends exact bytes, prints the reply and whether the server hung up" },
+    { path: "bad.txt", status: "new", note: "four malformed commands, for cmd/raw" },
+    { path: "cmd/talk/main.go" },
+    { path: "cmd/twoclients/main.go" },
+    { path: "cmd/hammer/main.go" },
+    { path: "session.txt" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" }
+  ]}
+  run={["go test ./resp", "go test -fuzz FuzzReadCommand -fuzztime 60s ./resp", "go run ./cmd/kv-server -addr 0.0.0.0:6380", "redis-cli -p 6380   # in a second terminal"]}
+>
+
+The parser is its own package, `kv/resp`: it knows about bytes and nothing about the store. The server imports it, and so could a client.
+
+</ProjectMap>
+
+## What redis-cli Sends
+
+*Stop 1 of 4.*
+
+### Step 1: a spy in the middle
+
+To see what a real client sends, put a program between it and real Redis that passes every byte along and prints it. That's a **proxy**. For each connection, `cmd/spy` dials the real server and copies bytes both ways:
+
+```go noverify title="kv/cmd/spy/main.go · lines 34–45"
+// relay copies bytes both ways between the client and the server.
+func relay(client net.Conn, target string) {
+	defer client.Close()
+	server, err := net.Dial("tcp", target)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	defer server.Close()
+	go copyShowing(server, client, "client →") // requests
+	copyShowing(client, server, "← server")    // replies
+}
+```
+
+Two copies run at once, one per direction, because a client and a server can each send at any time. The copying is a plain read-then-write loop that prints each chunk on the way:
+
+```go noverify title="kv/cmd/spy/main.go · lines 47–64"
+// copyShowing is io.Copy that also prints each chunk it copies.
+func copyShowing(dst io.Writer, src io.Reader, label string) {
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			out.Lock()
+			fmt.Printf("%s %q\n", label, buf[:n])
+			out.Unlock()
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+```
+
+Notice the parameter types: `dst io.Writer`, `src io.Reader`. `copyShowing` doesn't care that both are network connections; stop 2 is about why that matters.
+
+### Step 2: what went over the wire
+
+With the spy listening on port 6390 and forwarding to Redis 8.10.2, four `redis-cli` commands:
+
+```text
+$ redis-cli SET user:1:name Ada
+OK
+$ redis-cli GET user:1:name
+Ada
+$ redis-cli INCR visits
+1
+$ redis-cli GET nobody
+```
+
+and what the spy saw:
+
+```text
+client → "*3\r\n$3\r\nSET\r\n$11\r\nuser:1:name\r\n$3\r\nAda\r\n"
+← server "+OK\r\n"
+client → "*2\r\n$3\r\nGET\r\n$11\r\nuser:1:name\r\n"
+← server "$3\r\nAda\r\n"
+client → "*2\r\n$4\r\nINCR\r\n$6\r\nvisits\r\n"
+← server ":1\r\n"
+client → "*2\r\n$3\r\nGET\r\n$6\r\nnobody\r\n"
+← server "$-1\r\n"
+```
+
+The replies are the ones our server already sends. The **requests** are different from the lines we've been parsing: `redis-cli` sends each command as an **array**:
+
+- `*3\r\n` says "an array of 3 elements follows";
+- each element is a **bulk string**: `$3\r\nSET\r\n` is "3 bytes: `SET`", `$11\r\nuser:1:name\r\n` is "11 bytes".
+
+Every argument has a length prefix, so an argument can contain spaces, newlines or any bytes at all. Our inline parser splits on spaces, so `SET greeting "hello world"` would reach it as four words. (Redis's own inline parser understands quotes, but even it can't carry a raw newline inside an argument; an array can carry anything.)
+
+<QuickCheck
+  question="How does redis-cli send GET user:1:name?"
+  options={[
+    "GET user:1:name\\r\\n",
+    "*2\\r\\n$3\\r\\nGET\\r\\n$11\\r\\nuser:1:name\\r\\n",
+    "$15\\r\\nGET user:1:name\\r\\n",
+    "+GET user:1:name\\r\\n"
+  ]}
+  answer={1}
+  explain="The spy printed exactly that: an array of two bulk strings, each with its length in bytes."
+/>
+
+## A Parser
+
+*Stop 2 of 4.*
+
+### Step 1: a Reader type over io.Reader
+
+```go noverify title="kv/resp/resp.go · lines 25–32"
+// Reader reads one command at a time from a stream of bytes.
+type Reader struct {
+	br *bufio.Reader
+}
+
+func NewReader(r io.Reader) *Reader {
+	return &Reader{br: bufio.NewReader(r)}
+}
+```
+
+`NewReader` takes an **`io.Reader`**, not a `net.Conn`. `io.Reader` is the smallest interface in Go's standard library that matters: one method, `Read(p []byte) (n int, err error)`, "fill some of this buffer with bytes". Any type with that method **is** an `io.Reader`, without saying so anywhere: a network connection, an open file, a `strings.Reader` over a string in memory, the pipe from lesson 8's lab. So the same parser reads from a real client in the server, from a string in the tests, and from millions of generated strings in the fuzzer.
+
+Inside, it wraps the reader in a **`bufio.Reader`**, which reads from the connection in big chunks and hands them out a line or a few bytes at a time. Without it, reading a line would mean one system call per byte.
+
+<RelationAnim
+  title="Who can be an io.Reader"
+  kicker="interfaces · io.Reader"
+  role="smith"
+  height={60}
+  nodes={[
+    { id: "ir", label: "io.Reader", sub: "Read(p []byte) (int, error)", x: 50, y: 14, kind: "iface" },
+    { id: "tcp", label: "*net.TCPConn", sub: "a client's connection", x: 14, y: 46, kind: "type" },
+    { id: "str", label: "*strings.Reader", sub: "a string in memory", x: 50, y: 46, kind: "type" },
+    { id: "file", label: "*os.File", sub: "a file on disk", x: 86, y: 46, kind: "type" },
+    { id: "br", label: "*bufio.Reader", sub: "wraps one, is one", x: 30, y: 84, kind: "type" },
+    { id: "rr", label: "resp.Reader", sub: "NewReader(r io.Reader)", x: 72, y: 84, kind: "pkg" }
+  ]}
+  edges={[
+    { from: "tcp", to: "ir", label: "has Read", dashed: true },
+    { from: "str", to: "ir", label: "has Read", dashed: true },
+    { from: "file", to: "ir", label: "has Read", dashed: true },
+    { from: "br", to: "ir", dashed: true },
+    { from: "rr", to: "br", label: "reads through" }
+  ]}
+  frames={[
+    { show: ["ir"], hot: ["ir"], at: "ir", say: "one method", note: "io.Reader is an interface: a list of methods. Just one here: Read fills a buffer with some bytes and says how many." },
+    { show: ["ir", "tcp", "tcp>ir"], hot: ["tcp", "tcp>ir"], at: "tcp", say: "Read ✓", note: "A TCP connection has a Read method with exactly that signature, so it is an io.Reader. Nobody wrote 'implements': having the method is enough." },
+    { show: ["ir", "tcp", "tcp>ir", "str", "str>ir", "file", "file>ir"], hot: ["str", "file", "str>ir", "file>ir"], at: "str", say: "Read ✓", note: "So are a strings.Reader over text in memory and an open file. Three unrelated types, one shared method." },
+    { show: ["ir", "tcp", "tcp>ir", "str", "str>ir", "file", "file>ir", "br", "br>ir"], hot: ["br", "br>ir"], at: "br", say: "wraps any of them", note: "bufio.NewReader takes an io.Reader and returns a *bufio.Reader, which has Read too. Wrappers stack: it reads big chunks from underneath and hands out small pieces." },
+    { show: ["ir", "tcp", "tcp>ir", "str", "str>ir", "file", "file>ir", "br", "br>ir", "rr", "rr>br"], hot: ["rr", "rr>br", "tcp", "str"], at: "rr", say: "any io.Reader", beat: "solution", note: "resp.NewReader asks only for an io.Reader. The server passes a connection, the tests a strings.Reader, and the fuzzer millions of generated strings: one parser, tested without a network." }
+  ]}
+  caption="In Go, a type satisfies an interface by having its methods. Accept the smallest interface you need, and every type that fits can use your code."
+/>
+
+### Step 2: reading a command
+
+```go noverify title="kv/resp/resp.go · lines 34–58"
+// ReadCommand returns the next command's words, sent either as an array of
+// bulk strings (what redis-cli sends) or as an inline line.
+func (r *Reader) ReadCommand() ([]string, error) {
+	line, err := r.line()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(line, "*") {
+		return strings.Fields(line), nil // an inline command
+	}
+	n, err := strconv.Atoi(line[1:])
+	if err != nil || n < 0 || n > maxArgs {
+		return nil, protocolError("invalid multibulk length")
+	}
+	// As with bulk lengths, n is a claim: start small and grow.
+	args := make([]string, 0, min(n, 1024))
+	for range n {
+		arg, err := r.bulk()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+	}
+	return args, nil
+}
+```
+
+The first line decides the format: a `*` means an array, anything else is an inline command, handled exactly as before. For an array, the number after `*` says how many bulk strings follow, and `bulk` reads each one. (Two limits appear here that the first version didn't have. Stop 3 is where they came from.)
+
+### Step 3: reading one bulk string
+
+```go noverify title="kv/resp/resp.go · lines 60–86"
+// bulk reads one bulk string: $<length>\r\n<bytes>\r\n.
+func (r *Reader) bulk() (string, error) {
+	line, err := r.line()
+	if err != nil {
+		return "", err
+	}
+	if line == "" {
+		return "", protocolError("expected '$', got an empty line")
+	}
+	if line[0] != '$' {
+		return "", protocolError(fmt.Sprintf("expected '$', got '%c'", line[0]))
+	}
+	n, err := strconv.Atoi(line[1:])
+	if err != nil || n < 0 || n > maxBulk {
+		return "", protocolError("invalid bulk length")
+	}
+	// Don't trust n with memory: grow the buffer only as bytes arrive, so a
+	// client claiming 500 MB and sending 10 bytes costs 10 bytes.
+	var b strings.Builder
+	if _, err := io.CopyN(&b, r.br, int64(n)); err != nil {
+		return "", err
+	}
+	if _, err := r.br.Discard(2); err != nil { // the \r\n after the bytes
+		return "", err
+	}
+	return b.String(), nil
+}
+```
+
+A bulk string is a header line, `$` and a length, then exactly that many bytes, then `\r\n`. The bytes are read by count, not by looking for `\r\n`, which is what makes them binary-safe. `Discard(2)` skips the `\r\n` that follows.
+
+### Step 4: the server uses it
+
+```go noverify title="kv/server/server.go · lines 36–57"
+// handle reads commands, as RESP arrays or inline lines, and writes one
+// reply for each, until the client hangs up or breaks the protocol.
+func (s *Server) handle(conn net.Conn) {
+	defer conn.Close()
+	r := resp.NewReader(conn)
+	for {
+		args, err := r.ReadCommand()
+		if errors.Is(err, resp.ErrProtocol) {
+			io.WriteString(conn, errorReply(err.Error())) // then hang up, as Redis does
+			return
+		}
+		if err != nil {
+			return // the client hung up
+		}
+		if len(args) == 0 {
+			continue
+		}
+		if _, err := io.WriteString(conn, s.do(args)); err != nil {
+			return
+		}
+	}
+}
+```
+
+`handle` now asks `resp.Reader` for each command instead of a line scanner. A **protocol error** gets Redis's treatment: send the message, then hang up, because after a malformed length the server can't know where the next command starts. `errors.Is` from lesson 4 tells a protocol error apart from the client simply going away.
+
+## Fuzzing
+
+*Stop 3 of 4.*
+
+### Step 1: inputs you'd never think of
+
+A parser on a network port reads whatever anyone sends it. Unit tests check the inputs you thought of; the dangerous ones are those you didn't. Go has a **fuzzer** built into `go test`: you describe a property that must hold for **every** input, give it a few examples, and it generates new inputs by mutating them, guided by which code paths each input reaches.
+
+```go noverify title="kv/resp/resp_test.go · lines 33–52"
+// Any bytes at all: the reader must return a command or an error, never
+// panic. And a command it accepts must survive a round trip.
+func FuzzReadCommand(f *testing.F) {
+	f.Add("*2\r\n$3\r\nGET\r\n$11\r\nuser:1:name\r\n")
+	f.Add("PING\r\n")
+	f.Add("*1\r\n$0\r\n\r\n")
+	f.Fuzz(func(t *testing.T, input string) {
+		args, err := NewReader(strings.NewReader(input)).ReadCommand()
+		if err != nil {
+			return
+		}
+		if !strings.HasPrefix(input, "*") {
+			return // inline: spaces aren't preserved, so no round trip
+		}
+		again, err := NewReader(strings.NewReader(encode(args))).ReadCommand()
+		if err != nil || !slices.Equal(again, args) {
+			t.Fatalf("round trip: %q became %q, %v", args, again, err)
+		}
+	})
+}
+```
+
+Two properties: `ReadCommand` must return a command or an error for any bytes at all, never panic; and an array it accepts, encoded again the way `redis-cli` would (`encode`, just above it in the file), must read back the same.
+
+### Step 2: the first version
+
+The first version of `bulk` was the obvious one:
+
+```go noverify title="kv/resp/resp.go · the first version of bulk"
+func (r *Reader) bulk() (string, error) {
+	line, err := r.line()
+	if err != nil {
+		return "", err
+	}
+	if line[0] != '$' {
+		return "", protocolError(fmt.Sprintf("expected '$', got '%c'", line[0]))
+	}
+	n, err := strconv.Atoi(line[1:])
+	if err != nil {
+		return "", protocolError("invalid bulk length")
+	}
+	buf := make([]byte, n+2) // the bytes, then \r\n
+	if _, err := io.ReadFull(r.br, buf); err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+```
+
+It passed the unit test. `go test -fuzz FuzzReadCommand` broke it in under a second, and saved the input that did it:
+
+```text
+--- FAIL: FuzzReadCommand (0.00s)
+    --- FAIL: FuzzReadCommand/19341be7f2b06e4a (0.00s)
+panic: runtime error: index out of range [0] with length 0 [recovered, repanicked]
+
+goroutine 36 [running]:
+testing.tRunner.func1.2({0x1048ba8b8, 0x14ee0528060})
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2123 +0x1a0
+testing.tRunner.func1()
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2126 +0x2c8
+panic({0x1048ba8b8?, 0x14ee0528060?})
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/runtime/panic.go:859 +0x120
+kv/resp.(*Reader).bulk(0x14ee05616d8)
+	/tmp/fz/kv/resp/resp.go:55 +0x184
+kv/resp.(*Reader).ReadCommand(0x14ee05616d8)
+	/tmp/fz/kv/resp/resp.go:42 +0x104
+kv/resp.FuzzReadCommand.func1(0x14ee056e248, {0x14ee05102a8, 0x4})
+	/tmp/fz/kv/resp/resp_test.go:41 +0x12c
+reflect.Value.call({0x1048893f8?, 0x1048c9928?, 0x13?}, {0x1046c4cab, 0x4}, {0x14ee051cc30, 0x2, 0x2?})
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/reflect/value.go:586 +0xa88
+reflect.Value.Call({0x1048893f8?, 0x1048c9928?, 0x1045fffa0?}, {0x14ee051cc30?, 0x1048c61e8?, 0x1048b5930?})
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/reflect/value.go:369 +0x94
+testing.(*F).Fuzz.func1.1(0x14ee056e248?)
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/fuzz.go:341 +0x254
+testing.tRunner(0x14ee056e248, 0x14ee058a000)
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2193 +0xc4
+created by testing.(*F).Fuzz.func1 in goroutine 35
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/fuzz.go:328 +0x4b8
+FAIL	kv/resp	0.661s
+FAIL
+```
+
+The input was `*1\n\n`: an array of one element whose header line is **empty**, so `line[0]` indexes an empty string. On a live server, that panic in the connection's goroutine would have crashed the **whole server**, disconnecting every client, because of 5 bytes from one of them.
+
+### Step 3: the second crash
+
+With an empty-line check added, the fuzzer ran again, and found this within seconds:
+
+```text
+--- FAIL: FuzzReadCommand (0.00s)
+    --- FAIL: FuzzReadCommand/b724c9c8d353ad71 (0.00s)
+panic: runtime error: makeslice: len out of range [recovered, repanicked]
+```
+
+The input was `*1\n$666666666666660\n`: a client **claiming** a 666-terabyte argument. `make([]byte, n+2)` believed it and panicked. A smaller claim is worse: 400 MB wouldn't panic, it would allocate 400 MB, and a few connections doing that at once exhaust the server's memory while sending almost nothing.
+
+The fix is two rules, both visible in the final `bulk` above:
+
+- **Limit the length.** Redis refuses anything over `proto-max-bulk-len`, 512 MB by default, and any negative length. So do we.
+- **Don't allocate on the client's word.** `io.CopyN` into a `strings.Builder` grows the buffer only as bytes actually arrive: a client claiming 500 MB and sending 10 bytes costs 10 bytes. The array count gets the same treatment, a starting capacity of at most 1,024.
+
+### Step 4: clean
+
+Both crashing inputs were saved by the fuzzer into `resp/testdata/fuzz/FuzzReadCommand/`, and from then on every plain `go test` replays them as ordinary test cases:
+
+```text
+=== RUN   FuzzReadCommand
+=== RUN   FuzzReadCommand/seed#0
+=== RUN   FuzzReadCommand/seed#1
+=== RUN   FuzzReadCommand/seed#2
+=== RUN   FuzzReadCommand/19341be7f2b06e4a
+=== RUN   FuzzReadCommand/b724c9c8d353ad71
+--- PASS: FuzzReadCommand (0.00s)
+    --- PASS: FuzzReadCommand/seed#0 (0.00s)
+    --- PASS: FuzzReadCommand/seed#1 (0.00s)
+    --- PASS: FuzzReadCommand/seed#2 (0.00s)
+    --- PASS: FuzzReadCommand/19341be7f2b06e4a (0.00s)
+    --- PASS: FuzzReadCommand/b724c9c8d353ad71 (0.00s)
+PASS
+ok  	kv/resp	0.454s
+```
+
+And a fresh 60-second fuzzing run against the fixed parser:
+
+```text
+fuzz: elapsed: 1m0s, execs: 7210366 (90468/sec), new interesting: 4 (total: 65)
+fuzz: elapsed: 1m1s, execs: 7210366 (0/sec), new interesting: 4 (total: 65)
+PASS
+ok  	kv/resp	61.963s
+```
+
+**7,210,366 inputs**, no failures. That doesn't prove the parser correct, but it's a great deal of evidence the unit tests alone could never have given.
+
+<UnderTheHood title="How Go's fuzzer chooses inputs">
+
+`go test -fuzz` compiles the package with coverage instrumentation: every branch in your code gets a counter. It starts from the seed corpus (the `f.Add` values and anything in `testdata/fuzz`), mutates inputs (flipping bits, inserting bytes, splicing two inputs together, replacing numbers with interesting values like 0, -1 or huge ones), and keeps any mutated input that reaches a branch no earlier input reached ("new interesting" in the output). So it's not random guessing: it climbs into the code, which is why a parser's edge cases fall in seconds. It runs one worker per CPU, and stops at the first failure, minimising the input before saving it.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="The fuzzer found *1\\n$666666666666660\\n. What was the real danger of the first version's make([]byte, n+2), beyond this panic?"
+  options={[
+    "Nothing; the panic was the only problem",
+    "A client could claim a large but valid length and make the server allocate that much memory while sending almost nothing",
+    "It was slow for small values",
+    "It didn't handle Unicode"
+  ]}
+  answer={1}
+  explain="Trusting a length from the network is a memory-exhaustion hole. The fix caps the length at Redis's 512 MB and grows the buffer only as bytes arrive."
+/>
+
+## The Real Client
+
+*Stop 4 of 4.*
+
+### Step 1: redis-cli, pointed at us
+
+Started with `-addr 0.0.0.0:6380` so the `redis-cli` in the container can reach it, our server answered the real client:
+
+```text
+127.0.0.1:6380> PING
+PONG
+127.0.0.1:6380> SET user:1:name Ada
+OK
+127.0.0.1:6380> GET user:1:name
+"Ada"
+127.0.0.1:6380> INCR visits
+(integer) 1
+127.0.0.1:6380> INCR visits
+(integer) 2
+127.0.0.1:6380> GET nobody
+(nil)
+127.0.0.1:6380> DEL user:1:name visits
+(integer) 2
+127.0.0.1:6380> SET greeting Ẹ_káàárọ̀
+OK
+127.0.0.1:6380> GET greeting
+"\xe1\xba\xb8_k\xc3\xa1\xc3\xa0\xc3\xa1r\xe1\xbb\x8d\xcc\x80"
+127.0.0.1:6380> GETT x
+(error) ERR unknown command 'GETT', with args beginning with: 'x' 
+```
+
+`redis-cli` parsed every reply correctly: `(integer)` for `:`, `(nil)` for `$-1`, quotes for bulk strings, `(error)` for `-`. The greeting is Yoruba for good morning, and `redis-cli` printed it as escaped bytes. That's the client's choice, not our bug: real Redis shows it the same way, and `--raw` prints the text:
+
+```text
+real Redis (6379):
+"\xe1\xba\xb8_k\xc3\xa1\xc3\xa0\xc3\xa1r\xe1\xbb\x8d\xcc\x80"
+ours (6380), redis-cli --raw:
+Ẹ_káàárọ̀
+```
+
+### Step 2: bad input, rejected like Redis
+
+`cmd/raw` sends exact bytes and reports the reply and whether the server hung up. The four malformed commands in `bad.txt`, against real Redis:
+
+```text
+sent  "*2\r\n$3\r\nGET\r\n$-3\r\nkey\r\n"
+got   "-ERR Protocol error: invalid bulk length\r\n" (closed: true)
+sent  "*x\r\n"
+got   "-ERR Protocol error: invalid multibulk length\r\n" (closed: true)
+sent  "*1\r\nGET\r\n"
+got   "-ERR Protocol error: expected '$', got 'G'\r\n" (closed: true)
+sent  "*2\r\n$3\r\nGET\r\n$600000000\r\nab"
+got   "-ERR Protocol error: invalid bulk length\r\n" (closed: true)
+```
+
+Against our server, `diff` reports no difference at all: the same four messages, and our server hangs up after each, as Redis does.
+
+<QuickCheck
+  question="Why must the server close the connection after a protocol error, instead of carrying on?"
+  options={[
+    "To punish the client",
+    "After a malformed header it can't know where the next command starts in the byte stream, so anything it read next would be garbage",
+    "Because Go can't recover from errors",
+    "To free memory"
+  ]}
+  answer={1}
+  explain="RESP has no markers to resynchronise on. Redis replies with the error and closes; so does ours."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Fuzz the whole server" level="hard">
+
+Write `FuzzServer` in `server/server_test.go`: send the fuzz input over `net.Pipe` to `handle`, then check the server either closed the connection or still answers `PING`. What does it find?
+
+<Solution>
+
+`client, srv := net.Pipe(); go s.handle(srv); client.Write(input)`; then write `PING\r\n` with a deadline and read. Either the read fails (the server hung up after a protocol error) or the last reply read is `+PONG\r\n`. It exercises `do` with arbitrary arguments too: for example, every command with the wrong number of arguments must reply rather than index past the end of `args`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="A reply parser" level="medium">
+
+Write `ReadReply` for the other direction (`+`, `-`, `:`, `$`, `*` arrays of replies), and use it to replace the 200 ms guesswork in `cmd/talk`.
+
+<Solution>
+
+Switch on the first byte: `+` and `-` return the rest of the line; `:` parses an integer; `$` reads a bulk string exactly as `bulk` does (with `-1` meaning null); `*` reads a count and calls `ReadReply` that many times, recursively. `talk` can then read exactly one reply per command, with no timeout.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="The spy, with io.Copy" level="easy">
+
+`copyShowing` is `io.Copy` plus printing. Rewrite `relay` with `io.Copy` and `io.TeeReader`, without the loop.
+
+<Solution>
+
+`io.Copy(dst, io.TeeReader(src, printer{label}))`, where `printer` is a type with a `Write` method that prints `%q` of what it's given and returns `len(p), nil`. `TeeReader` passes every byte read to the writer too: two small interfaces, `io.Reader` and `io.Writer`, composed instead of a hand-written loop.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Never Trust a Length"
+  archetype="fix-it"
+  difficulty="guided"
+  points={90}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="This ReadCommand works on the happy path and falls over on everything else: it panics on empty lines and negative counts, ignores parse errors, allocates whatever a client claims, and reads a bulk string's bytes but leaves its \r\n behind, which corrupts the next command. Make it return an error wrapping ErrProtocol for every malformed input, never panic, and read back-to-back commands correctly."
+  starter={`package main
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+var ErrProtocol = errors.New("Protocol error")
+
+const maxBulk = 512 * 1024 * 1024 // Redis's proto-max-bulk-len
+
+// ReadCommand reads one command from r: an array of bulk strings
+// (*<count>\\r\\n then $<len>\\r\\n<bytes>\\r\\n for each) or an inline line.
+// Malformed input must return an error wrapping ErrProtocol: never panic,
+// and never allocate memory for bytes the client hasn't sent.
+func ReadCommand(r *bufio.Reader) ([]string, error) {
+	line, err := r.ReadString('\\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimRight(line, "\\r\\n")
+	if line[0] != '*' {
+		return strings.Fields(line), nil
+	}
+	n, _ := strconv.Atoi(line[1:])
+	args := make([]string, n)
+	for i := range args {
+		hdr, err := r.ReadString('\\n')
+		if err != nil {
+			return nil, err
+		}
+		size, _ := strconv.Atoi(strings.TrimRight(hdr, "\\r\\n")[1:])
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		args[i] = string(buf)
+	}
+	return args, nil
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	read := func(input string) (args []string, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("PANIC: %v", p)
+			}
+		}()
+		return ReadCommand(bufio.NewReader(strings.NewReader(input)))
+	}
+
+	// Two commands on one connection: the second must be read correctly too.
+	r := bufio.NewReader(strings.NewReader("*2\\r\\n$3\\r\\nGET\\r\\n$5\\r\\nÀdé\\r\\n*1\\r\\n$4\\r\\nPING\\r\\n"))
+	for _, want := range [][]string{{"GET", "Àdé"}, {"PING"}} {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					fail("pipelined commands: PANIC: %v", p)
+				}
+			}()
+			if got, err := ReadCommand(r); err != nil || !slices.Equal(got, want) {
+				fail("pipelined commands: got %q, %v; want %q", got, err, want)
+			}
+		}()
+	}
+
+	if got, err := read("SET a 1\\r\\n"); err != nil || !slices.Equal(got, []string{"SET", "a", "1"}) {
+		fail("inline SET a 1: got %q, %v", got, err)
+	}
+	if got, err := read("\\r\\n"); err != nil || len(got) != 0 {
+		fail("a blank line should give no words and no error: got %q, %v", got, err)
+	}
+
+	for _, bad := range []string{
+		"*x\\r\\n",                             // count isn't a number
+		"*-5\\r\\n",                            // negative count
+		"*1\\r\\n\\r\\n",                         // empty bulk header
+		"*1\\r\\nGET\\r\\n",                      // no $
+		"*1\\r\\n$-3\\r\\nabc\\r\\n",               // negative length
+		"*1\\r\\n$abc\\r\\nx\\r\\n",                // length isn't a number
+		"*1\\r\\n$600000000\\r\\nonly ten b\\r\\n", // longer than proto-max-bulk-len
+	} {
+		if _, err := read(bad); !errors.Is(err, ErrProtocol) {
+			fail("%q: want an error wrapping ErrProtocol, got %v", bad, err)
+		}
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Reads two pipelined commands (one with a 5-byte Yoruba name), an inline command and a blank line, then eight malformed inputs: a non-number and a negative count, an empty header, a missing $, a negative and a non-number length, and one over proto-max-bulk-len. Any panic is caught and reported as a failure. Prints ALL CHECKS PASS."
+  hints={[
+    "Check the error from strconv.Atoi, and reject n < 0 (and absurdly large n) with an error made by fmt.Errorf using %w and ErrProtocol.",
+    "An empty line has no line[0]: test the first character with strings.HasPrefix instead of indexing.",
+    "Read exactly size bytes with io.CopyN into a strings.Builder, then r.Discard(2) to skip the \\r\\n, or the next ReadCommand starts in the middle of it."
+  ]}
+  flag="GO{never_trust_a_length}"
+>
+
+Every bug in this starter is one a fuzzer finds in seconds. Try it: add a `FuzzReadCommand` to your fixed version and run it for a minute.
+
+</Lab>
+
+<Recap>
+
+- `redis-cli` sends each command as an **array of bulk strings**: `*2\r\n$3\r\nGET\r\n$11\r\nuser:1:name\r\n`. A spy proxy showed exactly that.
+- The parser takes an **`io.Reader`**: any type with a `Read` method is one, so a connection, a string and the fuzzer's inputs all work. `bufio.Reader` wraps one and is one.
+- **Fuzzing** broke the first parser twice in seconds: an empty line (`line[0]` on `""`) and a 666-terabyte length. Both inputs are now permanent test cases.
+- **Never trust a length from the network**: cap it (512 MB, like Redis) and grow buffers only as bytes arrive. After the fixes: 7,210,366 fuzzed inputs, no failures.
+- The real `redis-cli` works against our server, and malformed input gets Redis's exact errors, followed by a hang-up.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: what redis-cli sends", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: trusting a length", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: hanging up", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: fuzz the whole server", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 2: a reply parser", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: the spy, with io.Copy", kind: "exercise", points: 10, done: false }
+  ]}
+  flag={{ label: "Lab: Never Trust a Length", captured: false, points: 90 }}
+/>
