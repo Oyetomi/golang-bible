@@ -13,6 +13,7 @@ import { PostRoomAnim } from "@/components/course/PostRoomAnim";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
 import { ProjectCode } from "@/components/course/ProjectCode";
 import { ProjectMap } from "@/components/course/ProjectMap";
+import { Narrator } from "@/components/course/Narrator";
 import { ProcAnim } from "@/components/course/ProcAnim";
 import { PacketAnim } from "@/components/course/PacketAnim";
 import { EnvelopeAnim, SignAnim } from "@/components/course/CryptoAnim";
@@ -31,6 +32,7 @@ export const mdxComponents = {
   GoPlayground: S.GoPlayground,
   ProjectCode,
   ProjectMap,
+  Narrator,
   // Visual explainers
   ExecTimeline: C.ExecTimeline,
   Scene: C.Scene,
