@@ -4838,3 +4838,103 @@ export function PlanAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   ReconcileAnim — the controller pattern. Watch
+   events arrive from the API server; the work
+   queue keeps one entry per object however many
+   events there were; a worker takes a key and
+   compares the whole desired state with the
+   whole actual state, then writes only what
+   differs. It never sees what the event was.
+   ════════════════════════════════════════════ */
+export type ReconcileRow = { field: string; want: string; have?: string };
+
+export type ReconcileFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** events arriving from the watch in this frame */
+  events?: string[];
+  /** keys waiting in the work queue */
+  queue: string[];
+  /** the key being reconciled, if any */
+  working?: string;
+  rows?: ReconcileRow[];
+  /** what the reconcile wrote, if anything */
+  wrote?: string;
+};
+
+export function ReconcileAnim({
+  title,
+  frames,
+  caption,
+}: {
+  title: string;
+  frames: ReconcileFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="controller · reconcile"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rcl">
+        <div className="rcl-col">
+          <span className="rcl-k">watch events</span>
+          <div className="rcl-events" key={st.cur}>
+            {(f.events ?? []).map((e, i) => (
+              <span key={i} className="rcl-ev" style={{ animationDelay: `${i * 120}ms` }}>
+                {e}
+              </span>
+            ))}
+            {!f.events?.length && <span className="rcl-quiet">quiet</span>}
+          </div>
+        </div>
+        <div className="rcl-col">
+          <span className="rcl-k">work queue</span>
+          <div className="rcl-queue">
+            {f.queue.map((q) => (
+              <span key={q} className="rcl-key">{q}</span>
+            ))}
+            {f.queue.length === 0 && <span className="rcl-quiet">empty</span>}
+          </div>
+        </div>
+        <div className="rcl-col rcl-worker">
+          <div className="rcl-who">
+            <Gopher role="worker" pose={f.working ? (f.wrote ? "carry" : "run") : "idle"} state={f.beat === "problem" ? "warn" : "active"} size={38} />
+            <span className="rcl-k">{f.working ? `Reconcile(${f.working})` : "waiting"}</span>
+          </div>
+          {f.rows && (
+            <div className="rcl-table">
+              <span className="rcl-h">field</span>
+              <span className="rcl-h">desired</span>
+              <span className="rcl-h">actual</span>
+              {f.rows.map((r) => (
+                <Fragment key={r.field}>
+                  <span className="rcl-f">{r.field}</span>
+                  <span className="rcl-v">{r.want}</span>
+                  <span className={`rcl-v ${r.have === undefined ? "rcl-miss" : r.have !== r.want ? "rcl-diff" : "rcl-same"}`}>{r.have ?? "missing"}</span>
+                </Fragment>
+              ))}
+            </div>
+          )}
+          {f.working && <span className={`rcl-wrote ${f.wrote ? "on" : ""}`}>{f.wrote ?? "no write: already matches"}</span>}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
