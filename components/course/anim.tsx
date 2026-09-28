@@ -5875,3 +5875,69 @@ export function IfaceWordsAnim({ title, frames, caption }: { title: string; fram
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   TwoClocksAnim — the two readings inside one
+   time.Time: the wall clock people read, which the
+   OS can step backwards, and the monotonic counter,
+   which only moves forward. Durations taken from
+   each, side by side.
+   ════════════════════════════════════════════ */
+
+export type TwoClocksFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  label: string;
+  wall: string;
+  /** seconds on the monotonic counter since t0 */
+  mono: number;
+  /** the wall clock just jumped */
+  jump?: string;
+  wallDiff?: string;
+  monoDiff?: string;
+};
+
+export function TwoClocksAnim({ title, frames, caption, monoMax = 3.2 }: { title: string; frames: TwoClocksFrame[]; caption?: string; monoMax?: number }) {
+  const st = useStepper(frames.length, 2600);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="two clocks"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="tck" key={st.cur}>
+        <div className="tck-label">{f.label}</div>
+        <div className="tck-dials">
+          <div className={`tck-dial ${f.jump ? "tck-jumped" : ""}`}>
+            <span className="tck-k">wall clock · CLOCK_REALTIME</span>
+            <span className="tck-wall">{f.wall}</span>
+            {f.jump && <span className="tck-jump">{f.jump}</span>}
+          </div>
+          <div className="tck-dial">
+            <span className="tck-k">monotonic · CLOCK_MONOTONIC</span>
+            <span className="tck-mono">m=+{f.mono.toFixed(3)} s</span>
+            <span className="tck-bar"><span style={{ width: `${Math.min(100, (f.mono / monoMax) * 100)}%` }} /></span>
+          </div>
+        </div>
+        {(f.wallDiff || f.monoDiff) && (
+          <div className="rtp-meters">
+            {f.wallDiff && <span className="rtp-meter bad">wall t1 − t0 <b>{f.wallDiff}</b></span>}
+            {f.monoDiff && <span className="rtp-meter good">time.Since(t0) <b>{f.monoDiff}</b></span>}
+          </div>
+        )}
+      </div>
+    </AnimShell>
+  );
+}
