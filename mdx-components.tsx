@@ -79,6 +79,7 @@ export const mdxComponents = {
   LRUAnim: A.LRUAnim,
   RoundTripAnim: A.RoundTripAnim,
   ShopCacheAnim: A.ShopCacheAnim,
+  LockLanesAnim: A.LockLanesAnim,
   PlanAnim: A.PlanAnim,
   ReconcileAnim: A.ReconcileAnim,
   BurnAnim: A.BurnAnim,

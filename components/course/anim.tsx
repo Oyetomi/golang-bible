@@ -5226,3 +5226,92 @@ export function ShopCacheAnim({ title, frames, caption }: { title: string; frame
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   LockLanesAnim — goroutines at locks. Each
+   lane is one lock (one shard): who holds it,
+   whether as a writer (alone) or readers (many
+   at once), and who is queued behind it. Shows
+   one big lock, read locks, sharding, and the
+   read-lock bug where a "read" writes the map.
+   ════════════════════════════════════════════ */
+
+export type LockLane = {
+  name: string;
+  /** who holds the lock and how */
+  mode?: "free" | "write" | "read";
+  holders?: string[];
+  waiting?: string[];
+  /** a problem on this lane (a map written under a read lock) */
+  bad?: string;
+  /** keys this lane owns, shown small */
+  keys?: string;
+};
+
+export type LockLanesFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  lanes: LockLane[];
+  meters?: { label: string; value: string; tone?: "bad" | "good" }[];
+};
+
+export function LockLanesAnim({ title, frames, caption }: { title: string; frames: LockLanesFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2400);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="locks"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="lkl" key={st.cur}>
+        {f.lanes.map((l) => (
+          <div key={l.name} className={`lkl-lane lkl-${l.mode ?? "free"} ${l.bad ? "bad" : ""}`}>
+            <div className="lkl-lock">
+              <span className="lkl-icon">{l.mode === "write" ? "🔒" : l.mode === "read" ? "📖" : "🔓"}</span>
+              <span className="lkl-name">{l.name}</span>
+              {l.keys && <span className="lkl-keys">{l.keys}</span>}
+            </div>
+            <div className="lkl-holders">
+              {(l.holders ?? []).map((h, i) => (
+                <span key={h + i} className="lkl-g">
+                  <Gopher role="worker" pose={l.bad ? "panic" : "carry"} state={l.bad ? "bad" : "active"} size={28} title={h} />
+                  <span className="lkl-cmd">{h}</span>
+                </span>
+              ))}
+            </div>
+            <div className="lkl-queue">
+              {(l.waiting ?? []).map((w, i) => (
+                <span key={w + i} className="lkl-g lkl-wait">
+                  <Gopher role="worker" pose="blocked" state="active" size={22} title={w} />
+                  <span className="lkl-cmd">{w}</span>
+                </span>
+              ))}
+            </div>
+            {l.bad && <span className="lkl-bad">{l.bad}</span>}
+          </div>
+        ))}
+      </div>
+      {f.meters && (
+        <div className="rtp-meters">
+          {f.meters.map((m) => (
+            <span key={m.label} className={`rtp-meter ${m.tone ?? ""}`}>
+              {m.label} <b>{m.value}</b>
+            </span>
+          ))}
+        </div>
+      )}
+    </AnimShell>
+  );
+}
