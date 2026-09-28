@@ -78,6 +78,7 @@ export const mdxComponents = {
   RoundTripAnim: A.RoundTripAnim,
   PlanAnim: A.PlanAnim,
   ReconcileAnim: A.ReconcileAnim,
+  BurnAnim: A.BurnAnim,
   CodeWalk,
   RuntimeStage,
   CinemaAnim,

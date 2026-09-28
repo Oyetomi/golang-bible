@@ -4938,3 +4938,109 @@ export function ReconcileAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   BurnAnim — a multi-window burn-rate alert.
+   Each bar is one period's server-error ratio;
+   a long and a short window slide over the
+   latest bars; the page fires only when both
+   windows' averages exceed the threshold (burn
+   rate × the error budget). The alert light is
+   computed from the bars, never set by hand.
+   ════════════════════════════════════════════ */
+export type BurnFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** error ratio of each period, in percent, oldest first */
+  bars: number[];
+  /** error budget left for the month, in percent */
+  budget: number;
+};
+
+export function BurnAnim({
+  title,
+  slo = 99.9,
+  burn = 14.4,
+  long = 12,
+  short = 1,
+  longLabel = "1 h",
+  shortLabel = "5 min",
+  frames,
+  caption,
+}: {
+  title: string;
+  /** the SLO, in percent */
+  slo?: number;
+  /** the burn-rate multiple that pages */
+  burn?: number;
+  /** window lengths, in bars */
+  long?: number;
+  short?: number;
+  longLabel?: string;
+  shortLabel?: string;
+  frames: BurnFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2000);
+  const f = frames[st.cur] ?? frames[0];
+  const threshold = burn * (100 - slo); // percent
+  const avg = (n: number) => {
+    const w = f.bars.slice(-n);
+    return w.length ? w.reduce((a, b) => a + b, 0) / w.length : 0;
+  };
+  const la = avg(long);
+  const sa = avg(short);
+  const paging = la > threshold && sa > threshold;
+  const top = Math.max(6, ...frames.flatMap((x) => x.bars)) * 1.1;
+  const n = f.bars.length;
+  return (
+    <AnimShell
+      title={title}
+      kicker={`SLO ${slo}% · burn ${burn}×`}
+      note={f.note}
+      beat={f.beat ?? (paging ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="brn">
+        <div className="brn-chart">
+          <div className="brn-thr" style={{ bottom: `${(threshold / top) * 100}%` }}>
+            <span>page above {threshold.toFixed(2)}%</span>
+          </div>
+          <div className="brn-win brn-long" style={{ left: `${((n - Math.min(long, n)) / n) * 100}%`, width: `${(Math.min(long, n) / n) * 100}%` }}>
+            <span>{longLabel}: {la.toFixed(2)}%</span>
+          </div>
+          <div className="brn-win brn-short" style={{ left: `${((n - Math.min(short, n)) / n) * 100}%`, width: `${(Math.min(short, n) / n) * 100}%` }}>
+            <span>{shortLabel}: {sa.toFixed(2)}%</span>
+          </div>
+          <div className="brn-bars">
+            {f.bars.map((b, i) => (
+              <i key={i} className={b > threshold ? "hot" : ""} style={{ height: `${Math.max(1.5, (b / top) * 100)}%` }} />
+            ))}
+          </div>
+        </div>
+        <div className="brn-side">
+          <div className={`brn-light ${paging ? "on" : ""}`}>
+            <Gopher role="medic" pose={paging ? "panic" : "idle"} state={paging ? "bad" : "ok"} size={40} />
+            <span>{paging ? "PAGING" : "quiet"}</span>
+          </div>
+          <div className="brn-budget">
+            <span className="brn-k">budget left</span>
+            <div className="brn-gauge">
+              <div className="brn-fill" style={{ width: `${Math.max(0, f.budget)}%` }} />
+            </div>
+            <span className="brn-n">{f.budget.toFixed(1)}%</span>
+          </div>
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
