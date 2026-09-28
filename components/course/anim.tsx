@@ -5493,3 +5493,89 @@ export function PubSubAnim({ title, frames, caption }: { title: string; frames: 
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   DurabilityAnim — where a write lives on its way
+   to disk: the process's buffer, the kernel's page
+   cache, the disk itself. Shows what kill -9 and a
+   power cut each destroy, when the reply is sent,
+   and fsync (one per connection, or grouped).
+   ════════════════════════════════════════════ */
+
+export type DurabilityFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** commands sitting in each layer */
+  buffer: string[];
+  cache: string[];
+  disk: string[];
+  /** a reply the client has received */
+  reply?: string;
+  /** what just happened to the machine */
+  event?: "kill -9" | "power cut" | "fsync" | "write()";
+  /** layers wiped by the event */
+  lost?: ("buffer" | "cache")[];
+  meters?: { label: string; value: string; tone?: "bad" | "good" }[];
+};
+
+export function DurabilityAnim({ title, frames, caption }: { title: string; frames: DurabilityFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2600);
+  const f = frames[st.cur] ?? frames[0];
+  const layer = (key: "buffer" | "cache" | "disk", label: string, sub: string, items: string[]) => (
+    <div className={`dur-layer dur-${key} ${f.lost?.includes(key as "buffer" | "cache") ? "dur-lost" : ""}`}>
+      <div className="dur-head">
+        <span className="dur-label">{label}</span>
+        <span className="dur-sub">{sub}</span>
+      </div>
+      <div className="dur-items">
+        {items.map((c, i) => (
+          <span key={c + i} className="shc-chip">
+            {c}
+          </span>
+        ))}
+        {f.lost?.includes(key as "buffer" | "cache") && <span className="dur-x">gone</span>}
+      </div>
+    </div>
+  );
+  return (
+    <AnimShell
+      title={title}
+      kicker="durability"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="dur" key={st.cur}>
+        <div className="dur-client">
+          <Gopher role="reader" pose={f.reply ? "happy" : "idle"} state="active" size={40} title="the client" />
+          <span className="shc-name">client</span>
+          {f.reply && <span className="shc-chip shc-ans">{f.reply}</span>}
+        </div>
+        <div className="dur-stack">
+          {f.event && <span className={`dur-event ${f.event === "kill -9" || f.event === "power cut" ? "bad" : ""}`}>{f.event}</span>}
+          {layer("buffer", "kv-server", "bufio.Writer, in the process", f.buffer)}
+          {layer("cache", "kernel", "page cache, in RAM", f.cache)}
+          {layer("disk", "disk", "kv.aof, on the drive", f.disk)}
+        </div>
+      </div>
+      {f.meters && (
+        <div className="rtp-meters">
+          {f.meters.map((m) => (
+            <span key={m.label} className={`rtp-meter ${m.tone ?? ""}`}>
+              {m.label} <b>{m.value}</b>
+            </span>
+          ))}
+        </div>
+      )}
+    </AnimShell>
+  );
+}

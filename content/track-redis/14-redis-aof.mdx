@@ -1,0 +1,788 @@
+---
+title: "Surviving a Crash: The Append-Only File"
+part: "redis"
+order: 14
+type: "course"
+description: "Module 4 begins: our server forgets everything when it stops. Now every write is logged to an append-only file and replayed at start. kill -9 during 2 million INCRs a second lost 2,609 and 976 confirmed INCRs in 2 of 5 runs while replies went out before the log was written; writing the file before replying lost none in 9 runs. fsync, which survives a power cut, measured in Docker against Redis 8.10.2: appendfsync always gave 4,510 SETs a second to Redis's 38,580 until group commit let one fsync cover every waiting connection: 33,160 (and 194,550 against 188,680 pipelined)."
+prerequisites: ["redis-pubsub"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 14" title="Surviving a Crash: The Append-Only File">
+
+Everything our server stores lives in memory. Stop the process, for a deploy or a crash, and every key is gone. That's fine for a cache. It's not fine for anything you'd be upset to lose.
+
+Redis's answer is the **append-only file**, the AOF: every command that changes data is also written to a file, and when the server starts it replays that file to rebuild its data. The idea is simple. The hard part is the promise behind it: when a client is told "OK", is that write really safe? Safe from what? This lesson measures both kinds of crash.
+
+Three stops:
+
+1. **The log.** What goes in the file, and replaying it.
+2. **kill -9.** When the reply is sent matters: the bug that lost confirmed writes, and the rule that fixed it.
+3. **fsync.** Surviving a power cut, what it costs, and the group commit that made ours as fast as Redis.
+
+</HeroCard>
+
+<Narrator>
+Module 4. Durability. Your server has the memory of a goldfish: brilliant for as long as it's awake, and nothing afterwards. Today it learns to keep a diary. And more importantly, it learns never to tell anyone "done" until the diary says so. Lying about that is the one thing I won't forgive.
+</Narrator>
+
+<ChapterTabs tabs={["The Log", "kill -9", "fsync"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "go.sum" },
+    { path: "store.go" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "resp/resp.go" },
+    { path: "resp/resp_test.go" },
+    { path: "server/server.go", status: "changed", note: "an AOF field; handle commits the log before flushing replies" },
+    { path: "server/aof.go", status: "new", note: "the append-only file: Append, Commit (with group commit), everysec, Replay" },
+    { path: "server/commands.go", status: "changed", note: "SET, INCR and DEL log themselves while their shard is locked" },
+    { path: "server/pubsub.go" },
+    { path: "server/server_test.go" },
+    { path: "server/readlock_test.go" },
+    { path: "server/bench_test.go" },
+    { path: "server/shutdown_test.go" },
+    { path: "server/pubsub_test.go" },
+    { path: "server/aof_test.go", status: "new", note: "a confirmed write is already in the file; replay rebuilds the data" },
+    { path: "cmd/kv-server/main.go", status: "changed", note: "-aof and -appendfsync; replays the file at start" },
+    { path: "cmd/acked/main.go", status: "new", note: "20 clients INCR until the server dies, then check what survived" },
+    { path: "cmd/pubtalk/main.go" },
+    { path: "cmd/fanout/main.go" },
+    { path: "cmd/busy/main.go" },
+    { path: "cmd/stuck/main.go" },
+    { path: "cmd/gopipe/main.go" },
+    { path: "cmd/spy/main.go" },
+    { path: "cmd/raw/main.go" },
+    { path: "cmd/talk/main.go" },
+    { path: "cmd/twoclients/main.go" },
+    { path: "cmd/hammer/main.go" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" }
+  ]}
+  run={["go run ./cmd/kv-server -aof kv.aof -appendfsync everysec", "go test -race ./server"]}
+>
+
+The log itself is `server/aof.go`. The rest is three small hooks: commands append to it, `handle` commits it before replying, and `main` replays it at start.
+
+</ProjectMap>
+
+## The Log
+
+*Stop 1 of 3.*
+
+### Step 1: what goes in the file
+
+Only commands that **change** data: `SET`, `INCR` and `DEL`. A `GET` changes nothing, so replaying it would be pointless. And they're written in **RESP**, the exact bytes a client would send, so replaying the file is just reading commands with the parser we already have (lesson 9) and running them. After `SET user:1 ada`, `GET user:1`, `INCR visits` and `DEL user:1 nobody`:
+
+```text
+$ cat kv.aof      # each \r\n written out
+*3\r\n
+$3\r\n
+SET\r\n
+$6\r\n
+user:1\r\n
+$3\r\n
+ada\r\n
+*2\r\n
+$4\r\n
+INCR\r\n
+$6\r\n
+visits\r\n
+*2\r\n
+$3\r\n
+DEL\r\n
+$6\r\n
+user:1\r\n
+```
+
+Three commands, not four: the `GET` isn't there. And the `DEL` names only `user:1`, because deleting `nobody`, which didn't exist, changed nothing. Real Redis 8.10.2 writes its AOF the same way: after the same `SET`, its file held the same bytes, preceded by `SELECT 0` (Redis has 16 numbered databases; we have one). It even records an `EXPIRE` as an absolute time, which is exercise 1.
+
+### Step 2: appending
+
+`server/aof.go` holds the file, and a buffer in front of it:
+
+```go noverify title="kv/server/aof.go · lines 16–30"
+// AOF is the append-only file: every command that changes data is written
+// to it, in RESP, the same bytes a client would send. Replaying the file
+// rebuilds the data after a restart.
+type AOF struct {
+	mu      sync.Mutex
+	f       *os.File
+	w       *bufio.Writer // commands appended since the last Commit
+	policy  string        // when to fsync: "always", "everysec" or "no"
+	written int64         // bytes written to the file so far; guarded by mu
+
+	syncMu sync.Mutex // one fsync at a time
+	synced int64      // bytes known to be on disk; guarded by syncMu
+	stop   chan struct{}
+	done   chan struct{}
+}
+```
+
+Commands are **appended** to the buffer `w`, in memory. Writing them to the file is a separate step, `Commit`, and **when** that happens is the whole lesson. `Append` itself just encodes:
+
+```go noverify title="kv/server/aof.go · lines 59–67"
+// Append adds one command to the buffer. It doesn't touch the file: Commit does.
+func (a *AOF) Append(args []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.w.WriteString("*" + strconv.Itoa(len(args)) + "\r\n")
+	for _, arg := range args {
+		a.w.WriteString(bulk(arg))
+	}
+}
+```
+
+Each write command logs itself in `server/commands.go`, **while its shard's lock is still held**:
+
+```go noverify title="kv/server/commands.go · lines 19–25"
+	case name == "SET" && len(args) == 3:
+		sh := s.shardFor(args[1])
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+		sh.store.Set(args[1], args[2])
+		s.log(args)
+		return simple("OK")
+```
+
+That detail matters. If two clients `INCR` the same key, the one that runs first must be logged first, or replaying the file would apply them in a different order from the one the clients saw. Logging under the lock that ordered them keeps the file in the same order.
+
+### Step 3: replaying
+
+At start, `kv-server` replays the file before accepting any connections:
+
+```go noverify title="kv/cmd/kv-server/main.go · lines 38–49"
+	if *aofPath != "" {
+		start := time.Now()
+		n, err := srv.Replay(*aofPath)
+		if err != nil {
+			log.Fatalf("loading %s: %v", *aofPath, err)
+		}
+		log.Printf("loaded %d commands from %s in %v", n, *aofPath, time.Since(start).Round(time.Millisecond))
+		if srv.AOF, err = server.OpenAOF(*aofPath, *fsync); err != nil {
+			log.Fatal(err)
+		}
+		defer srv.AOF.Close()
+	}
+```
+
+and `Replay` feeds each command through the same `do` that clients use:
+
+```go noverify title="kv/server/aof.go · lines 134–158"
+// Replay runs every command in the file at path against s, and returns how
+// many there were. A missing file is an empty one.
+func (s *Server) Replay(path string) (int, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r := resp.NewReader(f)
+	n := 0
+	for {
+		args, err := r.ReadCommand()
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, fmt.Errorf("command %d: %w", n+1, err)
+		}
+		s.do(args)
+		n++
+	}
+}
+```
+
+`s.AOF` is still `nil` while `Replay` runs, so the replayed commands aren't logged a second time, which would double the file on every restart.
+
+<QuickCheck
+  question="Why does SET log itself while its shard is still locked?"
+  options={[
+    "Logging is faster under a lock",
+    "So two commands on the same key reach the file in the order they actually ran, and replaying gives the same result",
+    "Because the AOF has no lock of its own",
+    "To stop GETs being logged"
+  ]}
+  answer={1}
+  explain="The shard lock decides the order commands on a key run in. Appending under it makes the file's order the same order."
+/>
+
+## kill -9
+
+*Stop 2 of 3.*
+
+### Step 1: two kinds of crash
+
+A write has three places it can be on its way to the disk:
+
+1. **The process's buffer**: our `bufio.Writer`, memory owned by `kv-server`.
+2. **The kernel's page cache**: after a `write` system call, the bytes belong to the operating system, which keeps them in RAM and writes them to the drive when it chooses, usually within seconds.
+3. **The disk.**
+
+That gives two different crashes. **`kill -9`** (SIGKILL; also a panic or an out-of-memory kill) ends the *process*. Its buffer is gone, but the kernel is fine, and it still writes everything in its page cache to the disk. A **power cut** or a kernel crash ends the *machine*: the page cache is gone too. Only what reached the disk survives.
+
+<DurabilityAnim
+  title="Where a write lives, and what each crash takes"
+  frames={[
+    { note: "A client sends INCR hits. The server runs it and appends it to the AOF's buffer, in the process's memory.", buffer: ["INCR hits"], cache: [], disk: [] },
+    { note: "The first version replied straight away, and wrote its buffer to the file only once a second. The client has an OK for a write that exists only in the process.", beat: "problem", buffer: ["INCR hits"], cache: [], disk: [], reply: ":1 (OK)" },
+    { note: "kill -9. The process and its buffer vanish. The client was told the INCR happened; after a restart, it didn't.", beat: "problem", event: "kill -9", buffer: ["INCR hits"], cache: [], disk: [], reply: ":1 (OK)", lost: ["buffer"], meters: [{ label: "confirmed and lost", value: "2,609 in one run", tone: "bad" }] },
+    { note: "The fix: before sending any reply, Commit writes the buffer to the file with write(). Now the bytes belong to the kernel.", beat: "solution", event: "write()", buffer: [], cache: ["INCR hits"], disk: [] },
+    { note: "Only then does the reply go out.", beat: "solution", buffer: [], cache: ["INCR hits"], disk: [], reply: ":1 (OK)" },
+    { note: "kill -9 now: the process is gone, but the kernel still has the bytes and writes them to disk. Replay finds the INCR. Lost: none, in 9 runs.", beat: "solution", event: "kill -9", buffer: [], cache: ["INCR hits"], disk: ["INCR hits"], reply: ":1 (OK)", meters: [{ label: "confirmed and lost", value: "0", tone: "good" }] },
+    { note: "A power cut is worse: the page cache is RAM, and it's gone too. Only fsync, which waits until the drive has the bytes, protects against this.", beat: "problem", event: "power cut", buffer: [], cache: ["INCR hits"], disk: [], reply: ":1 (OK)", lost: ["cache"] },
+    { note: "appendfsync always: fsync before replying, so every confirmed write is on the disk. It's safe against both crashes, and it's slow: stop 3 measures how slow.", beat: "solution", event: "fsync", buffer: [], cache: [], disk: ["INCR hits"], reply: ":1 (OK)" }
+  ]}
+  caption="kill -9 wipes the process's memory; a power cut also wipes the kernel's. write() moves a command out of the first; fsync moves it out of the second."
+/>
+
+### Step 2: the first version
+
+The first version had no `Commit` in `handle`. Replies went out as soon as the commands ran, and the buffer reached the file in two ways: when it filled up (64 KB) and once a second, from the `everysec` goroutine:
+
+```go noverify title="kv/server/aof.go · lines 102–121"
+// everySecond is the "everysec" policy: fsync once a second, in the
+// background, whatever the clients are doing.
+func (a *AOF) everySecond() {
+	defer close(a.done)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.stop:
+			return
+		case <-t.C:
+			if a.policy == "everysec" {
+				a.mu.Lock()
+				a.w.Flush()
+				a.f.Sync()
+				a.mu.Unlock()
+			}
+		}
+	}
+}
+```
+
+It looks durable: a file on disk, fsynced every second. To test it, `cmd/acked` runs 20 clients that pipeline `INCR hits` 100 at a time and count every reply they get, until the server dies:
+
+```go noverify title="kv/cmd/acked/main.go · lines 45–65"
+	var got atomic.Int64
+	var wg sync.WaitGroup
+	req := strings.Repeat("INCR hits\r\n", 100)
+	for range 20 {
+		wg.Go(func() {
+			c, err := net.Dial("tcp", *addr)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer c.Close()
+			r := bufio.NewReader(c)
+			for {
+				if _, err := io.WriteString(c, req); err != nil {
+					return
+				}
+				for range 100 {
+					if _, err := r.ReadString('\n'); err != nil {
+						return
+					}
+					got.Add(1)
+				}
+```
+
+A script starts the server with `-aof`, runs `acked`, and after 1.5 seconds sends `kill -9`. Then it restarts the server from the file and compares `hits` with the number of `INCR`s the clients were **told** had succeeded. Five runs of the first version:
+
+```text
+== run 1
+confirmed 2101700 INCRs in 1.208s before the server died
+loaded 2102218 commands from /tmp/crash.aof in 855ms
+after restart hits = 2102218; confirmed before the crash: 2101700; no confirmed INCR lost
+== run 2
+confirmed 2108300 INCRs in 1.205s before the server died
+loaded 2105691 commands from /tmp/crash.aof in 768ms
+after restart hits = 2105691; confirmed before the crash: 2108300; 2609 confirmed INCRs LOST
+== run 3
+confirmed 2098200 INCRs in 1.21s before the server died
+loaded 2097224 commands from /tmp/crash.aof in 817ms
+after restart hits = 2097224; confirmed before the crash: 2098200; 976 confirmed INCRs LOST
+== run 4
+confirmed 2093600 INCRs in 1.218s before the server died
+loaded 2093604 commands from /tmp/crash.aof in 715ms
+after restart hits = 2093604; confirmed before the crash: 2093600; no confirmed INCR lost
+== run 5
+confirmed 2263700 INCRs in 1.207s before the server died
+loaded 2263817 commands from /tmp/crash.aof in 773ms
+after restart hits = 2263817; confirmed before the crash: 2263700; no confirmed INCR lost
+```
+
+In runs 2 and 3 the clients had been told about **2,609** and **976** `INCR`s that weren't in the file. They were in the 64 KB buffer when the process died. In the other runs the kill happened to land just after the buffer was written. That's the nasty part: the bug loses data *sometimes*, so a test that passes once proves nothing.
+
+### Step 3: write before you reply
+
+The rule is **never confirm a write that isn't in the file yet.** In `handle`, before the replies are flushed:
+
+```go noverify title="kv/server/server.go · lines 219–232"
+		w.WriteString(s.do(args))
+		if r.Buffered() == 0 { // nothing more waiting: send what we have
+			if s.AOF != nil {
+				// The commands these replies confirm must be in the file first.
+				if err := s.AOF.Commit(); err != nil {
+					log.Printf("aof: %v", err)
+					return
+				}
+			}
+			if err := w.Flush(); err != nil {
+				return
+			}
+		}
+	}
+```
+
+`Commit` writes the whole buffer with one `write` call, so a pipeline of 100 `INCR`s costs one system call, not 100 (the same batching as lesson 10's replies). Then the replies go out. Nine runs, three with each fsync policy:
+
+```text
+== always run 1
+confirmed 88700 INCRs in 1.211s before the server died
+loaded 90321 commands from /tmp/crash.aof in 36ms
+after restart hits = 90321; confirmed before the crash: 88700; no confirmed INCR lost
+== always run 2
+confirmed 81900 INCRs in 1.221s before the server died
+loaded 82803 commands from /tmp/crash.aof in 49ms
+after restart hits = 82803; confirmed before the crash: 81900; no confirmed INCR lost
+== always run 3
+confirmed 88300 INCRs in 1.217s before the server died
+loaded 89655 commands from /tmp/crash.aof in 51ms
+after restart hits = 89655; confirmed before the crash: 88300; no confirmed INCR lost
+== everysec run 1
+confirmed 2140000 INCRs in 1.214s before the server died
+loaded 2140801 commands from /tmp/crash.aof in 734ms
+after restart hits = 2140801; confirmed before the crash: 2140000; no confirmed INCR lost
+== everysec run 2
+confirmed 2070700 INCRs in 1.218s before the server died
+loaded 2071517 commands from /tmp/crash.aof in 712ms
+after restart hits = 2071517; confirmed before the crash: 2070700; no confirmed INCR lost
+== everysec run 3
+confirmed 2249200 INCRs in 1.217s before the server died
+loaded 2249941 commands from /tmp/crash.aof in 771ms
+after restart hits = 2249941; confirmed before the crash: 2249200; no confirmed INCR lost
+== no run 1
+confirmed 2000200 INCRs in 1.215s before the server died
+loaded 2001042 commands from /tmp/crash.aof in 687ms
+after restart hits = 2001042; confirmed before the crash: 2000200; no confirmed INCR lost
+== no run 2
+confirmed 2141900 INCRs in 1.214s before the server died
+loaded 2142573 commands from /tmp/crash.aof in 733ms
+after restart hits = 2142573; confirmed before the crash: 2141900; no confirmed INCR lost
+== no run 3
+confirmed 2242400 INCRs in 1.215s before the server died
+loaded 2243513 commands from /tmp/crash.aof in 772ms
+after restart hits = 2243513; confirmed before the crash: 2242400; no confirmed INCR lost
+```
+
+**No confirmed `INCR` lost, in any run.** `hits` is always a little *higher* than the confirmed count: those are `INCR`s that ran and were logged, whose replies were still on their way when the process died. That's lesson 12's ambiguity again, and it's the safe side of it: the server never claims more than it kept.
+
+`server/aof_test.go` checks the rule directly: after each reply arrives, the command must already be in the file.
+
+```go noverify title="kv/server/aof_test.go · lines 15–54"
+// A confirmed write must already be in the file when its reply arrives,
+// so a kill -9 right after the reply can't lose it.
+func TestReplyAfterAOF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kv.aof")
+	aof, err := OpenAOF(path, "no")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aof.Close()
+	s := New(kv.New())
+	s.AOF = aof
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go s.Serve(l)
+
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	for i := range 100 {
+		fmt.Fprintf(c, "SET user:%d ada\r\n", i)
+		if _, err := r.ReadString('\n'); err != nil {
+			t.Fatal(err)
+		}
+		// The reply has arrived: the command must be in the file now.
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fmt.Sprintf("$%d\r\nuser:%d\r\n", len(fmt.Sprint("user:", i)), i)
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("SET user:%d was confirmed but isn't in the AOF (%d bytes)", i, len(b))
+		}
+	}
+}
+```
+
+Against the first version it failed on the very first `SET`:
+
+```text
+    aof_test.go:51: SET user:0 was confirmed but isn't in the AOF (0 bytes)
+FAIL
+FAIL	kv/server	0.661s
+FAIL
+```
+
+<QuickCheck
+  question="After the fix, kill -9 lost no confirmed writes even with appendfsync no, which never calls fsync. How?"
+  options={[
+    "The data was still in the process after it died",
+    "Commit had written it to the kernel with write() before replying, and kill -9 only ends the process: the kernel still writes its page cache to disk",
+    "Replay recovers lost commands from the clients",
+    "Go fsyncs automatically on exit"
+  ]}
+  answer={1}
+  explain="write() hands the bytes to the kernel. Killing the process doesn't touch the kernel's page cache. Only a machine crash does, which is what fsync is for."
+/>
+
+## fsync
+
+*Stop 3 of 3.*
+
+### Step 1: the three policies
+
+**`fsync`** (`f.Sync()` in Go) asks the kernel to write a file's cached bytes to the drive, and waits until the drive says they're stored. It's the only thing that survives a power cut, and it's slow: the drive has to actually do the work. Redis offers three policies, and so does our `-appendfsync` flag:
+
+- **`always`**: fsync before every reply. A confirmed write survives a power cut. Slowest.
+- **`everysec`**: fsync once a second in the background. A power cut can lose up to about a second of confirmed writes. Redis's default.
+- **`no`**: never fsync; the kernel writes to disk when it likes (Linux: usually within 30 seconds). Fastest.
+
+All three survive `kill -9`, as stop 2 measured, because all three `write` before replying.
+
+### Step 2: measured against Redis
+
+The same fair setup as lessons 10 and 11: each server in its own container on one Docker network, and `redis-benchmark` from a third, 50 clients sending `SET` on 10,000 random keys, without pipelining (`-P 1`) and with 16 per round trip (`-P 16`), three runs each. Real Redis ran with `--appendonly yes --appendfsync <policy>`. In thousands of `SET`s a second, the median of three (all runs are in `out/s14-bench-raw.txt`):
+
+| | no AOF | `no` | `everysec` | `always` |
+|---|---|---|---|---|
+| ours, `-P 1` | 129.5 | 105.0 | 94.0 | **4.5** |
+| Redis 8.10.2, `-P 1` | 138.1 | 156.7 | 101.2 | 38.6 |
+| ours, `-P 16` | 531.9 | 378.8 | 387.6 | **31.8** |
+| Redis 8.10.2, `-P 16` | 943.4 | 833.3 | 602.4 | 188.7 |
+
+(Laptop benchmarks wobble. Redis with `no` ranged from 379k to 847k pipelined across its three runs, so read small differences with care.) Logging costs us something, as expected. But look at **`always`**: ours managed **4,500** `SET`s a second, Redis **38,600**. Eight times slower, with the same disk.
+
+### Step 3: one fsync for everyone
+
+The first `Commit` did an fsync per call. With 50 connections, 50 handlers each wanted their own fsync, and since a file's fsyncs happen one at a time, they queued: the 50th client waited for 49 other fsyncs before its own. But an fsync doesn't sync *one caller's bytes*: it syncs **everything written to the file so far**. When the first fsync finishes, many of the waiting handlers' commands were already written before it started, so they're already on disk.
+
+Redis gets this for free: one thread handles all clients, so one pass of its event loop writes everyone's commands and does one fsync for all of them. The same idea in Go is called **group commit**, and databases like PostgreSQL use it too:
+
+```go noverify title="kv/server/aof.go · lines 69–100"
+// Commit writes everything appended so far to the file, so it survives the
+// process being killed, and with "always" also fsyncs it, so it survives
+// the machine losing power. Replies must not be sent before it returns.
+func (a *AOF) Commit() error {
+	a.mu.Lock()
+	if err := a.w.Flush(); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	mine := a.written // everything up to here includes this caller's commands
+	a.mu.Unlock()
+	if a.policy != "always" {
+		return nil
+	}
+
+	// Group commit: while one goroutine fsyncs, others queue here. When a
+	// queued one gets its turn, the fsync that just finished may already
+	// have covered its bytes, and then it has nothing to do.
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	if a.synced >= mine {
+		return nil
+	}
+	a.mu.Lock()
+	upTo := a.written // everyone's bytes written so far: one fsync covers them all
+	a.mu.Unlock()
+	if err := a.f.Sync(); err != nil {
+		return err
+	}
+	a.synced = upTo
+	return nil
+}
+```
+
+- `written` counts bytes written to the file. A tiny wrapper around the file, `countingWriter`, adds to it on every write.
+- Each caller writes its buffer, then notes `mine`: how far the file reached, including its own commands.
+- Callers queue for `syncMu`. When one gets it, if the last fsync already reached past `mine` (`a.synced >= mine`), its commands are on disk and it returns **without an fsync**.
+- Otherwise it fsyncs, but first it notes `upTo`, **everything** written so far, including other handlers' commands that arrived while it waited. When the fsync returns, all of those are safe, and their handlers will skip theirs.
+
+The same benchmark for `always` with group commit:
+
+```text
+kv-always-group P1 run 1: SET: 33512.07 requests per second, p50=1.303 msec
+kv-always-group P1 run 2: SET: 33156.50 requests per second, p50=1.295 msec
+kv-always-group P1 run 3: SET: 29603.31 requests per second, p50=1.375 msec
+kv-always-group P16 run 1: SET: 210084.03 requests per second, p50=3.367 msec
+kv-always-group P16 run 2: SET: 194552.53 requests per second, p50=3.415 msec
+kv-always-group P16 run 3: SET: 194552.53 requests per second, p50=3.303 msec
+```
+
+From **4,500 to 33,200** `SET`s a second without pipelining (Redis: 38,600), and from **31,800 to 194,600** pipelined (Redis: 188,700). Same fsyncs, same drive: they're just shared. On the Mac, where Go's `Sync` uses the stronger `F_FULLFSYNC` (it waits for the drive's own cache too), `cmd/acked` confirmed about 29,000 `INCR`s in 1.2 seconds before group commit and 82,000 to 89,000 after, still with none lost.
+
+<UnderTheHood title="Why fsync is slow, and why F_FULLFSYNC is slower">
+
+A write to a file normally just copies bytes into the kernel's page cache and marks those pages dirty; the kernel's writeback threads send them to the drive later. `fsync` makes the kernel send this file's dirty pages, and its metadata, to the drive **now**, and wait for the drive to acknowledge them. On an SSD that's tens of microseconds to milliseconds, in a VM it goes through the hypervisor's virtual disk too. But drives have caches of their own, and a plain fsync may return once the data is in the *drive's* volatile cache. On macOS, `fsync` promises only that much, so Go's `File.Sync` on darwin calls `fcntl(F_FULLFSYNC)` instead, which asks the drive to flush its cache as well. That's the only way to be sure on a Mac, and it's why every fsync number there is slower than on Linux.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="With group commit, why can a handler return from Commit without calling fsync at all?"
+  options={[
+    "Because appendfsync always skips fsync when busy",
+    "Because an fsync that finished while it waited already covered its bytes: fsync syncs everything written to the file, not one caller's writes",
+    "Because another handler will fsync later",
+    "Because the kernel fsyncs automatically"
+  ]}
+  answer={1}
+  explain="If synced has passed this caller's mine, its commands are on disk. Only callers whose bytes came after the last fsync began need a new one."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Log EXPIRE" level="medium">
+
+Lesson 6's store has expiry, but the server has no `EXPIRE` command yet. Add it, and log it. Why must the AOF store the absolute time a key expires rather than the number of seconds, and what does Redis write? Check with real Redis and `cat` its AOF.
+
+<Solution>
+
+`EXPIRE session 60` replayed an hour later would give the key another 60 seconds, from the replay. Redis logs expiries as absolute times: its AOF contains `PEXPIREAT session <milliseconds since 1970>`, whatever the client sent. Log `PEXPIREAT` with `time.Now().Add(d).UnixMilli()` and implement `PEXPIREAT` for replay; a key whose time has passed is simply expired when it's next read.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Power cut, simulated" level="hard">
+
+`kill -9` can't show `everysec` losing data, because the kernel survives it. Simulate a power cut: in a test, write to the AOF through a wrapper that keeps bytes written but not yet `Sync`ed in a separate slice, and "cut the power" by dropping them. How many confirmed writes do `no`, `everysec` and `always` lose?
+
+<Solution>
+
+Make the file a small interface (`Write`, `Sync`) so the test can substitute a fake whose `Write` appends to an unsynced slice and whose `Sync` moves it to a synced one. Run many `INCR`s through the server with a fake clock (`testing/synctest`) so `everysec`'s ticker fires on schedule, then drop the unsynced slice and replay only the synced bytes. `always` should lose nothing confirmed, `everysec` up to one second's worth, `no` everything since the last `Sync`, which for our `no` is never.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Bigger batches" level="easy">
+
+Run `redis-benchmark -t set -c 50 -P 64` against `-appendfsync always` with group commit. Does throughput keep rising with the pipeline depth? Why does group commit help more the more clients there are?
+
+<Solution>
+
+Measure it. Each fsync covers everything written before it started, so its cost is shared by every command written in the meantime: more clients and deeper pipelines mean more commands per fsync. Throughput rises until something else (parsing, the locks, the network) becomes the limit, and latency rises with it, because every reply waits for the next fsync.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Write It Down First"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="DB logs every Set to an append-only file and replays it when opened. It has three bugs: a Set that has returned can still be lost to a crash, values with spaces or newlines come back wrong after a restart, and every restart makes the file bigger. Fix all three. It must pass under go run -race too."
+  starter={`package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+)
+
+// DB is a key-value store that logs every Set to an append-only file and
+// rebuilds itself from that file when opened.
+type DB struct {
+	mu   sync.Mutex
+	data map[string]string
+	f    *os.File
+	w    *bufio.Writer
+}
+
+// Open replays the file at path (if it exists) and opens it for appending.
+func Open(path string) (*DB, error) {
+	db := &DB{data: map[string]string{}}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	db.f, db.w = f, bufio.NewWriter(f)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		parts := strings.Fields(sc.Text()) // SET key value
+		if len(parts) == 3 {
+			db.Set(parts[1], parts[2])
+		}
+	}
+	return db, sc.Err()
+}
+
+// Set stores value under key. When it returns, the write must be in the
+// file: the caller is about to tell a client it succeeded.
+func (db *DB) Set(key, value string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.data[key] = value
+	fmt.Fprintf(db.w, "SET %s %s\\n", key, value)
+}
+
+func (db *DB) Get(key string) string {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.data[key]
+}
+
+func (db *DB) Close() error {
+	db.w.Flush()
+	return db.f.Close()
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("lab-aof-%d.aof", os.Getpid()))
+	defer os.Remove(path)
+
+	db, err := Open(path)
+	if err != nil {
+		fmt.Println("FAIL", err)
+		return
+	}
+	values := map[string]string{
+		"user:1":   "ada",
+		"greeting": "hello world",
+		"note":     "two\\nlines",
+		"empty":    "",
+	}
+	for k, v := range values {
+		db.Set(k, v)
+		// Set has returned: a kill -9 now must not lose it. Check the file
+		// itself, as a fresh process would see it.
+		if fresh := replayFresh(path); fresh[k] != v {
+			fail("Set(%q) returned, but a restart right now would read %q", k, fresh[k])
+		}
+	}
+	db.Close()
+
+	size1 := fileSize(path)
+	db, err = Open(path)
+	if err != nil {
+		fmt.Println("FAIL", err)
+		return
+	}
+	for k, v := range values {
+		if got := db.Get(k); got != v {
+			fail("after a restart, %s = %q, want %q", k, got, v)
+		}
+	}
+	db.Close()
+	if size2 := fileSize(path); size2 != size1 {
+		fail("opening the database changed the file from %d to %d bytes: replaying must not log again", size1, size2)
+	}
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}
+
+// replayFresh opens the file in a second DB, as a restarted process would,
+// and returns its data.
+func replayFresh(path string) map[string]string {
+	cp := path + ".copy"
+	b, _ := os.ReadFile(path)
+	os.WriteFile(cp, b, 0o644)
+	defer os.Remove(cp)
+	db, err := Open(cp)
+	if err != nil {
+		return nil
+	}
+	defer db.f.Close()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.data
+}
+
+func fileSize(path string) int64 {
+	st, err := os.Stat(path)
+	if err != nil {
+		return -1
+	}
+	return st.Size()
+}`}
+  verifier="After each Set returns, opens a copy of the file in a fresh DB, as a restarted process would, and checks the value is there; Sets 'hello world', 'two\\nlines' and an empty value and checks they survive a restart; checks reopening the database doesn't change the file's size. Prints ALL CHECKS PASS."
+  hints={[
+    "Set writes into a bufio.Writer, which keeps bytes in memory until it's full. Call db.w.Flush() before Set returns: that's the write() that hands them to the kernel.",
+    "\"SET key value\\n\" can't hold a value with a space or a newline, and strings.Fields splits on both. Write each string with its length first, like RESP: $<len>\\n<bytes>\\n, and read exactly that many bytes back.",
+    "Open replays by calling db.Set, which logs every command again. Put replayed values straight into db.data instead."
+  ]}
+  flag="GO{write_it_down_first}"
+>
+
+The three bugs are the three rules of this lesson: write before you confirm, use a format that can hold any value, and don't log a replay.
+
+</Lab>
+
+<Recap>
+
+- The **AOF** logs every command that changes data, in RESP, and the server **replays** it at start. Commands log themselves under their shard's lock, so the file's order is the order they ran.
+- **kill -9** wipes the process's memory, not the kernel's. The first version replied before writing its buffer and lost **2,609** and **976** confirmed `INCR`s in 2 of 5 runs. **Write to the file before replying**: none lost in 9 runs.
+- **fsync** is what survives a power cut. `always` fsyncs before replying, `everysec` once a second, `no` never. Measured in Docker, `always` gave **4,500** `SET`s a second against Redis's **38,600**.
+- **Group commit**: an fsync covers everything written before it, so handlers that were already covered skip theirs. `always` rose to **33,200** (pipelined **194,600**, Redis **188,700**).
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: logging under the lock", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: kill -9 without fsync", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: skipping an fsync", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: log EXPIRE", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2: power cut, simulated", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3: bigger batches", kind: "exercise", points: 10, done: false }
+  ]}
+  flag={{ label: "Lab: Write It Down First", captured: false, points: 80 }}
+/>
+
+<Narrator mood="sincere">
+Two thousand six hundred and nine people were told "done" by the first version, and then it forgot them. Now it forgets no one. And when the careful setting made you eight times slower than Redis, you didn't give up the promise. You found a way to keep it for fifty clients at once. That's the job. That's the whole job.
+</Narrator>

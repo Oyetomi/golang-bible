@@ -82,6 +82,7 @@ export const mdxComponents = {
   LockLanesAnim: A.LockLanesAnim,
   ShutdownAnim: A.ShutdownAnim,
   PubSubAnim: A.PubSubAnim,
+  DurabilityAnim: A.DurabilityAnim,
   PlanAnim: A.PlanAnim,
   ReconcileAnim: A.ReconcileAnim,
   BurnAnim: A.BurnAnim,
