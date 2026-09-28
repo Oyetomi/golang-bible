@@ -5941,3 +5941,64 @@ export function TwoClocksAnim({ title, frames, caption, monoMax = 3.2 }: { title
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   ContextTreeAnim — contexts as the tree they
+   really form: each node knows its parent, its
+   own deadline and its effective one (never later
+   than its parent's). A clock runs; when a node's
+   Done closes, every descendant's closes with it.
+   ════════════════════════════════════════════ */
+
+export type CtxNode = { id: string; parent?: string; label: string; asked?: string; effective?: string };
+
+export type ContextTreeFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  clock: string;
+  /** nodes whose Done channel is closed, with the Err() they report */
+  done?: Record<string, string>;
+};
+
+export function ContextTreeAnim({ title, nodes, frames, caption }: { title: string; nodes: CtxNode[]; frames: ContextTreeFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2600);
+  const f = frames[st.cur] ?? frames[0];
+  const kids = (id?: string) => nodes.filter((n) => n.parent === id);
+  const render = (n: CtxNode): ReactNode => {
+    const err = f.done?.[n.id];
+    return (
+      <li key={n.id} className="ctt-item">
+        <div className={`ctt-node ${err ? "ctt-done" : ""}`}>
+          <span className="ctt-label">{n.label}</span>
+          {n.asked && <span className="ctt-dl">asked {n.asked}</span>}
+          {n.effective && <span className={`ctt-dl ${n.asked && n.effective !== n.asked ? "ctt-cut" : ""}`}>deadline {n.effective}</span>}
+          <span className={`ctt-chan ${err ? "closed" : ""}`}>{err ? `Done closed · ${err}` : "Done open"}</span>
+        </div>
+        {kids(n.id).length > 0 && <ul className="ctt-kids">{kids(n.id).map(render)}</ul>}
+      </li>
+    );
+  };
+  return (
+    <AnimShell
+      title={title}
+      kicker="context tree"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ctt" key={st.cur}>
+        <div className="ctt-clock">⏱ {f.clock}</div>
+        <ul className="ctt-root">{kids(undefined).map(render)}</ul>
+      </div>
+    </AnimShell>
+  );
+}
