@@ -5579,3 +5579,75 @@ export function DurabilityAnim({ title, frames, caption }: { title: string; fram
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   AofTapeAnim — the append-only file as a strip
+   of records. Replay walks it with a cursor; a
+   torn last record is cut off, damage in the
+   middle stops the start, and a rewrite folds
+   many records into one per key.
+   ════════════════════════════════════════════ */
+
+export type AofRecord = {
+  label: string;
+  kind?: "ok" | "torn" | "damaged" | "new" | "replayed";
+};
+
+export type AofTapeFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  file: string;
+  records: AofRecord[];
+  /** index of the record the replay cursor is on */
+  cursor?: number;
+  /** a verdict shown under the strip */
+  verdict?: string;
+  meters?: { label: string; value: string; tone?: "bad" | "good" }[];
+};
+
+export function AofTapeAnim({ title, frames, caption }: { title: string; frames: AofTapeFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2600);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="the file"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="aft" key={st.cur}>
+        <div className="aft-head">
+          <Gopher role="scribe" pose={f.cursor !== undefined ? "carry" : "idle"} state={f.beat === "problem" ? "bad" : "active"} size={36} title="replay" />
+          <span className="aft-file">{f.file}</span>
+        </div>
+        <div className="aft-strip">
+          {f.records.map((r, i) => (
+            <span key={r.label + i} className={`aft-rec aft-${r.kind ?? "ok"} ${f.cursor === i ? "aft-at" : ""}`}>
+              {r.label}
+            </span>
+          ))}
+        </div>
+        {f.verdict && <div className={`aft-verdict ${f.beat === "problem" ? "bad" : f.beat === "solution" ? "good" : ""}`}>{f.verdict}</div>}
+      </div>
+      {f.meters && (
+        <div className="rtp-meters">
+          {f.meters.map((m) => (
+            <span key={m.label} className={`rtp-meter ${m.tone ?? ""}`}>
+              {m.label} <b>{m.value}</b>
+            </span>
+          ))}
+        </div>
+      )}
+    </AnimShell>
+  );
+}

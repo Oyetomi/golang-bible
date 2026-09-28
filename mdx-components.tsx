@@ -83,6 +83,7 @@ export const mdxComponents = {
   ShutdownAnim: A.ShutdownAnim,
   PubSubAnim: A.PubSubAnim,
   DurabilityAnim: A.DurabilityAnim,
+  AofTapeAnim: A.AofTapeAnim,
   PlanAnim: A.PlanAnim,
   ReconcileAnim: A.ReconcileAnim,
   BurnAnim: A.BurnAnim,
