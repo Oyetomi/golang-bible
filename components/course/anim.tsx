@@ -4738,3 +4738,103 @@ export function RoundTripAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   PlanAnim — Terraform's three truths side by
+   side: the configuration (what should exist),
+   the state file (what it last saw) and the real
+   system (what exists). Refresh copies real into
+   state, plan compares config with state, apply
+   changes the real system and records it.
+   ════════════════════════════════════════════ */
+export type PlanRow = {
+  addr: string;
+  config?: string;
+  state?: string;
+  real?: string;
+  op?: "create" | "update" | "replace" | "delete";
+};
+
+export type PlanFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  phase?: "edit" | "refresh" | "plan" | "apply" | "drift";
+  rows: PlanRow[];
+};
+
+const PLAN_SYMBOL: Record<NonNullable<PlanRow["op"]>, string> = {
+  create: "+ create",
+  update: "~ update",
+  replace: "-/+ replace",
+  delete: "- destroy",
+};
+
+export function PlanAnim({
+  title,
+  realLabel = "the real system",
+  frames,
+  caption,
+}: {
+  title: string;
+  realLabel?: string;
+  frames: PlanFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2200);
+  const f = frames[st.cur] ?? frames[0];
+  const ph = f.phase ?? "plan";
+  const cell = (v: string | undefined, other: string | undefined, col: string) => (
+    <span className={`pla-cell ${v === undefined ? "pla-none" : ""} ${other !== undefined && v !== other ? "pla-diff" : ""} pla-col-${col}`}>
+      {v ?? "—"}
+    </span>
+  );
+  const who: Record<string, { at: string; say: string; role: GopherRole }> = {
+    edit: { at: "config", say: "edit .tf", role: "reader" },
+    refresh: { at: "real", say: "Read()", role: "detective" },
+    plan: { at: "plan", say: "compare", role: "architect" },
+    apply: { at: "real", say: "Create/Update/Delete", role: "worker" },
+    drift: { at: "real", say: "changed by hand", role: "hacker" },
+  };
+  const g = who[ph];
+  return (
+    <AnimShell
+      title={title}
+      kicker={`terraform · ${ph}`}
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="pla-scroll">
+        <div className={`pla pla-phase-${ph}`}>
+          <span className="pla-h">resource</span>
+          <span className={`pla-h ${g.at === "config" ? "on" : ""}`}>configuration (.tf)</span>
+          <span className={`pla-h ${ph === "refresh" || ph === "apply" ? "on" : ""}`}>state (.tfstate)</span>
+          <span className={`pla-h ${g.at === "real" ? "on" : ""}`}>{realLabel}</span>
+          <span className={`pla-h ${g.at === "plan" ? "on" : ""}`}>plan</span>
+          {f.rows.map((r) => (
+            <Fragment key={r.addr}>
+              <span className="pla-addr">{r.addr}</span>
+              {cell(r.config, r.state, "config")}
+              {cell(r.state, r.config, "state")}
+              {cell(r.real, r.state, "real")}
+              <span className={`pla-op ${r.op ? `pla-op-${r.op}` : ""}`}>{r.op ? PLAN_SYMBOL[r.op] : ""}</span>
+            </Fragment>
+          ))}
+        </div>
+      </div>
+      <div className="pla-who">
+        <Gopher role={g.role} pose={ph === "drift" ? "run" : ph === "apply" ? "carry" : "idle"} state={f.beat === "problem" ? "warn" : "active"} size={36} />
+        <span className="pla-say">{g.say}</span>
+      </div>
+    </AnimShell>
+  );
+}

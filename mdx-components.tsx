@@ -76,6 +76,7 @@ export const mdxComponents = {
   StreamAnim: A.StreamAnim,
   LRUAnim: A.LRUAnim,
   RoundTripAnim: A.RoundTripAnim,
+  PlanAnim: A.PlanAnim,
   CodeWalk,
   RuntimeStage,
   CinemaAnim,
