@@ -53,7 +53,7 @@ Streaming doesn't have to mean a cluster of JVMs and a team to babysit them. NAT
       options: [
         "Heap allocations cause the operating system kernel to remap virtual memory pages on every packet",
         "Allocations force memory onto the heap, triggering Go runtime GC mark-assist pauses that hijack application goroutines and create multi-millisecond tail latency spikes",
-        "Stack memory is limited to 4 kilobytes across all goroutines in Go 1.26",
+        "A goroutine's stack is fixed at 4 kilobytes and can never grow",
         "Heap allocations disable hardware CPU L1 instruction caches"
       ],
       answer: 1,
@@ -187,7 +187,122 @@ The built-in, Go-native persistence and streaming engine of NATS. Built directly
 
 Core NATS is an ultra-high-speed, in-memory publish/subscribe messaging engine. It behaves like a high-performance network switch for your software services. A publisher sends a message on a subject; if three subscribers are listening, NATS immediately fans the bytes out across their TCP sockets. If nobody is listening, the message evaporates into the ether.
 
-The result? Throughput exceeding **10,000,000 messages per second per node** with p99 latency sitting at **3 to 5 microseconds**. For telemetry, ephemeral price ticks, heartbeats, and live order book quote feeds, Core NATS is unbeatable.
+The result? On this chapter's laptop (an Apple M1, server, publisher and subscriber all on one machine), one publisher sending 128-byte messages to one subscriber delivered **2.7–2.9 million messages a second**, all of them, over two runs; a request and reply had a 64 µs median. Fan-out to many subscribers, bigger messages and a real network all lower that. For telemetry, ephemeral price ticks, heartbeats, and live order book quote feeds, Core NATS is unbeatable.
+
+The measurements come from running the real server (`github.com/nats-io/nats-server/v2` v2.15.0) inside a Go program, so anyone can repeat them. Core NATS throughput:
+
+```go noverify title="natsbench/core.go"
+package main
+
+import (
+	"fmt"
+	"log"
+	"sync/atomic"
+	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+)
+
+func main() {
+	s, _ := server.NewServer(&server.Options{Port: -1, NoLog: true, NoSigs: true})
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		log.Fatal("no")
+	}
+	sub, _ := nats.Connect(s.ClientURL())
+	pub, _ := nats.Connect(s.ClientURL())
+	var got atomic.Int64
+	sub.Subscribe("tick", func(m *nats.Msg) { got.Add(1) })
+	sub.Flush()
+	payload := make([]byte, 128)
+	const n = 3_000_000
+	t := time.Now()
+	for range n {
+		pub.Publish("tick", payload)
+	}
+	pub.Flush()
+	sent := time.Since(t)
+	for got.Load() < n && time.Since(t) < 30*time.Second {
+		time.Sleep(time.Millisecond)
+	}
+	el := time.Since(t)
+	fmt.Printf("core NATS, 1 publisher, 1 subscriber, 128 B: published %.0f msgs/s, delivered %d of %d in %v (%.0f msgs/s)\n", n/sent.Seconds(), got.Load(), n, el.Round(time.Millisecond), float64(got.Load())/el.Seconds())
+}
+```
+
+and latency, JetStream publish rate and memory:
+
+```go noverify title="natsbench/main.go"
+package main
+
+import (
+	"fmt"
+	"log"
+	"runtime"
+	"slices"
+	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+)
+
+func main() {
+	s, err := server.NewServer(&server.Options{Port: -1, JetStream: true, StoreDir: "/tmp/nt/store", NoLog: true, NoSigs: true})
+	if err != nil {
+		log.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		log.Fatal("server not ready")
+	}
+	defer s.Shutdown()
+	nc, _ := nats.Connect(s.ClientURL())
+	js, _ := nc.JetStream()
+	js.AddStream(&nats.StreamConfig{Name: "W", Subjects: []string{"w.*"}, Storage: nats.MemoryStorage})
+
+	// Core NATS request/reply latency
+	nc.Subscribe("echo", func(m *nats.Msg) { m.Respond(m.Data) })
+	payload := make([]byte, 128)
+	lat := make([]time.Duration, 0, 20000)
+	for range 20000 {
+		t := time.Now()
+		nc.Request("echo", payload, time.Second)
+		lat = append(lat, time.Since(t))
+	}
+	slices.Sort(lat)
+	fmt.Printf("core NATS request/reply (127.0.0.1, 128 B): p50 %v  p99 %v\n", lat[len(lat)/2].Round(time.Microsecond), lat[len(lat)*99/100].Round(time.Microsecond))
+
+	// JetStream publish with ack, one at a time, then a burst of async publishes
+	lat = lat[:0]
+	for range 5000 {
+		t := time.Now()
+		js.Publish("w.a", payload)
+		lat = append(lat, time.Since(t))
+	}
+	slices.Sort(lat)
+	fmt.Printf("JetStream publish+ack, memory storage:      p50 %v  p99 %v\n", lat[len(lat)/2].Round(time.Microsecond), lat[len(lat)*99/100].Round(time.Microsecond))
+	t := time.Now()
+	const n = 500000
+	for range n {
+		js.PublishAsync("w.b", payload)
+	}
+	<-js.PublishAsyncComplete()
+	el := time.Since(t)
+	fmt.Printf("JetStream async publish, %d msgs:      %.0f msgs/s\n", n, float64(n)/el.Seconds())
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Printf("this process (server + client + test), heap in use: %.0f MB, sys: %.0f MB\n", float64(ms.HeapInuse)/1e6, float64(ms.Sys)/1e6)
+}
+```
+
+```text
+$ go run .
+core NATS request/reply (127.0.0.1, 128 B): p50 64µs  p99 124µs
+JetStream publish+ack, memory storage:      p50 37µs  p99 64µs
+JetStream async publish, 500000 msgs:      550443 msgs/s
+this process (server + client + test), heap in use: 191 MB, sys: 273 MB
+```
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -247,8 +362,8 @@ JetStream is not a separate application. It is not an external cluster like ZooK
 >
   <p>Here is why high-scale engineering teams choose it:</p>
   <ol className="eli5-list">
-    <li><strong>Single 25MB Go Binary:</strong> No JVM garbage collection pauses, no ZooKeeper, no complex configuration scripts. You run one executable and you have a world-class messaging broker.</li>
-    <li><strong>Sub-Millisecond Speed:</strong> While Kafka messages often wait 5–20 milliseconds in buffer queues, NATS routes and commits messages in 50–300 microseconds in pure Go.</li>
+    <li><strong>Single ~24MB Go Binary:</strong> No JVM, no ZooKeeper, no complex configuration scripts. You run one executable and you have a messaging broker. (The v2.15.0 server binary built for this chapter is 23.9 MB.)</li>
+    <li><strong>Sub-Millisecond Speed:</strong> Measured on one laptop with the client and server on the same machine, a NATS request and reply took about 64 microseconds at the median and 124 at the 99th percentile, and a JetStream publish with acknowledgement about 37 and 64 microseconds (memory storage). A real network and disk add to that.</li>
     <li><strong>Multi-Tool Versatility:</strong> It gives you lightweight pub/sub, durable event streams, and an embedded distributed Key-Value store in a single connection.</li>
   </ol>
 </ELI5>
@@ -259,17 +374,17 @@ Let us put the two titans side by side. Treat this comparison with technical hon
 
 | Architectural Dimension | Apache Kafka | NATS JetStream |
 | :--- | :--- | :--- |
-| **Runtime & Binary** | JVM (Java 21 / Scala), 2GB–16GB RAM minimum | Single static Go binary (under 30MB RAM idle) |
-| **P99 Latency Profile** | 2ms – 50ms (vulnerable to JVM GC pauses) | 5µs – 500µs (predictable Go runtime GC) |
+| **Runtime & Binary** | JVM (Java and Scala) | Single static Go binary (about 24 MB) |
+| **Latency** | Depends heavily on batching and acknowledgement settings; not measured here | Measured on one machine, client and server together: publish and ack p99 of 64 µs (memory storage), request and reply p99 of 124 µs |
 | **External Coordination** | Historical ZooKeeper; KRaft metadata quorum | Multi-Raft embedded in Go server |
 | **Subject / Topic Model** | Rigid topics; expensive partition creation | Dynamic subject hierarchy with token wildcards |
 | **Storage Topology** | Rigid partition-per-disk log structure | Decoupled Streams capturing subject sets |
-| **Consumer Scaling** | Rebalance storms halt consumer groups | Lock-free Durable Pull Consumers with batching |
+| **Consumer Scaling** | Consumers in a group share a topic's partitions, and a rebalance moves them | Durable pull consumers fetch batches, and any number of workers can pull from one consumer |
 | **Deduplication** | Manual Kafka Streams state stores | Built-in sliding `DuplicateWindow` via headers |
-| **Distributed KV** | None (requires external Redis / ZooKeeper) | Native embedded Raft KV buckets |
+| **Distributed KV** | None built in (Kafka has compacted topics, which can serve as a KV log) | KV buckets, built on streams |
 
-<Callout kind="pro" title="Go 1.25+ Container-Aware Scheduling in NATS">
-In Kubernetes environments, legacy Go services often suffered from CPU throttling because the Go runtime defaulted `GOMAXPROCS` to the host node's physical CPU cores rather than the container cgroup quota. Starting in Go 1.25, the runtime natively respects cgroup CPU limits without third-party libraries. A modern NATS JetStream cluster running on Go 1.25+ scales its internal thread pool dynamically to container quotas, preventing thread thrashing.
+<Callout kind="pro" title="Container-aware GOMAXPROCS (Go 1.25+)">
+Since Go 1.25 the runtime sets `GOMAXPROCS` from the container's cgroup CPU limit, so a Go service such as the NATS server, built with a current Go, no longer spawns one scheduler thread per host core inside a small pod.
 </Callout>
 
 ### Writing Production JetStream in Go
@@ -1254,23 +1369,26 @@ func main() {
 
 <UnderTheHood title="JetStream Append-Only Storage, Raft Consensus & Zero-Copy Framing">
 
-Let us peel back the metal and inspect how NATS JetStream achieves 10,000,000+ messages per second with single-digit microsecond latencies while Apache Kafka struggles to break 1,000,000 messages per second on identical hardware.
+Let us inspect how JetStream stores and replicates messages. (On this chapter's laptop, one client publishing asynchronously to a memory-backed stream reached about 550,000 messages per second; the throughput you get depends on message size, storage, acknowledgements and hardware.)
 
 ### 1. The Go-Native Append-Only Storage Engine
 
-JetStream avoids third-party embedded databases like RocksDB or Badger. Foreign C++ engines introduce cgo bridge crossing penalties (roughly 50–100 nanoseconds per call) and obscure memory management outside the Go runtime.
+JetStream avoids third-party embedded databases like RocksDB or Badger. An embedded C++ engine would mean crossing the cgo boundary on each call and managing memory outside the Go runtime.
 
 Instead, JetStream implements a Go-native block storage engine:
-- **Segment Files (`.dat`)**: Messages are written to append-only segment files (typically 128MB chunks). Appends are purely sequential, maximizing NVMe SSD controller parallelism and leveraging the Linux kernel page cache.
-- **Index Files (`.idx`)**: A companion fixed-size binary index maps stream sequence numbers to physical byte offsets in the `.dat` file. Reading sequence `N` is an $O(1)$ arithmetic seek: `offset = N * sizeof(IndexRecord)`.
-- **Zero-Random-Disk I/O**: Compactions and retention prunes simply unlink ancient `.dat` files from the filesystem directory, avoiding expensive B-tree rebalancing or LSM-tree compaction storms.
+- **Block files (`.blk`)**: messages are appended to block files, each growing up to a maximum size (8 MB in nats-server v2.15.0's source: `defaultLargeBlockSize`; smaller for small streams). Appends are sequential and go through the kernel's page cache.
+- **An index file (`index.db`)** per stream, written on a clean shutdown so the server can start without re-scanning every block; after a crash it rebuilds what it needs by reading the blocks.
+- **Retention** removes whole blocks that have aged out or exceeded the limits, rather than compacting a tree.
 
 ```
-/data/jetstream/streams/MERIDIAN_WIRES/
-├── 1.dat        # 128MB raw append-only message frame log
-├── 1.idx        # Binary fixed-stride offset table
-├── 2.dat        # Active append head
-└── 2.idx        # Active index head
+(the real layout after publishing 1,000 messages to a file-backed stream named W, v2.15.0)
+
+jetstream/$G/streams/W/
+├── meta.inf     # the stream's configuration
+├── meta.sum     # a checksum of it
+└── msgs/
+    ├── 1.blk    # the first block of messages
+    └── index.db # written on clean shutdown
 ```
 
 ### 2. Multi-Raft Stream Consensus
@@ -1302,11 +1420,11 @@ When a packet hits the network interface:
 
 ### 4. Why NATS Smokes the JVM
 
-Why does NATS consistently deliver single-digit microsecond latencies while Kafka experiences multi-millisecond spikes?
+Why can a Go message broker answer in tens of microseconds?
 
 1. **Memory Representation**: In the JVM, a simple 24-byte payload wrapped in an `Object` overhead costs 48–64 bytes, fragmented across heap memory. In Go, structs and byte buffers are laid out contiguously in flat memory arrays, maximizing CPU L1/L2 cache prefetching.
-2. **Garbage Collection**: Kafka brokers allocate millions of ephemeral JVM objects, triggering GC Mark-Sweep cycles that pause mutator threads. NATS reuses byte buffer pools (`sync.Pool`) and allocates long-lived streams on the stack or in large contiguous arenas. In Go 1.26 the default **Green Tea GC** cuts GC overhead by a reported 10–40%, which shows up as shorter and less frequent interference. Go publishes no pause-time bound, though: stop-the-world pauses scale with `GOMAXPROCS` and are usually dominated by the time taken to stop running goroutines, so measure your own workload rather than trusting a figure.
-3. **Memory Footprint**: A 3-node NATS JetStream cluster handling 1,000,000 msgs/sec consumes roughly 150MB of RAM total. The equivalent Kafka cluster requires 12GB to 24GB of RAM just to satisfy JVM heap minimums.
+2. **Garbage Collection**: any broker written on a garbage-collected runtime can be tuned to allocate little on the hot path, for example by reusing buffers (`sync.Pool`). The NATS server does reuse buffers. This chapter did not measure a comparison with Kafka, so treat claims about it as unproven; the Green Tea collector (Go 1.26 default) is reported by the Go team to cut GC overhead for small-object-heavy programs by about 10–40%, which could show up as shorter and less frequent interference. Go publishes no pause-time bound, though: stop-the-world pauses scale with `GOMAXPROCS` and are usually dominated by the time taken to stop running goroutines, so measure your own workload rather than trusting a figure.
+3. **Memory Footprint**: measured for this chapter, a single embedded server holding 500,000 128-byte messages in memory storage, plus the client, had **191 MB in use** (273 MB obtained from the OS). Memory storage keeps every message in RAM, so it grows with what you store; file storage keeps most of it on disk.
 
 </UnderTheHood>
 
