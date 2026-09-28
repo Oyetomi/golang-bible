@@ -4315,6 +4315,12 @@ export function RelationAnim({
   const W = 1000;
   const H = height * 10;
   const at = f.at ? byId.get(f.at) : undefined;
+  // the tour order: each box is numbered by the step where the gopher first
+  // visits it, so a reader can follow 1, 2, 3 even in a still frame
+  const order = new Map<string, { n: number; frame: number }>();
+  frames.forEach((fr, k) => {
+    if (fr.at && !order.has(fr.at)) order.set(fr.at, { n: order.size + 1, frame: k });
+  });
   // measure each box, in the SVG's units, so arrows can stop at its border
   const stage = useRef<HTMLDivElement>(null);
   const [sizes, setSizes] = useState<Record<string, { w: number; h: number }>>({});
@@ -4419,6 +4425,14 @@ export function RelationAnim({
             className={`rel-node rel-${n.kind ?? "pkg"} ${visible(n.id) ? "on" : ""} ${f.hot?.includes(n.id) ? "hot" : ""} ${f.bad?.includes(n.id) ? "bad" : ""}`}
             style={{ left: `${n.x}%`, top: `${n.y}%` }}
           >
+            {order.has(n.id) && (
+              <span
+                className={`rel-step ${order.get(n.id)!.frame < st.cur ? "done" : ""} ${f.at === n.id ? "now" : ""} ${order.get(n.id)!.frame > st.cur ? "later" : ""}`}
+                title={`step ${order.get(n.id)!.n}`}
+              >
+                {order.get(n.id)!.n}
+              </span>
+            )}
             <span className="rel-label">{n.label}</span>
             {n.sub && <span className="rel-sub">{n.sub}</span>}
           </div>
