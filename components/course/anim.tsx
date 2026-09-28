@@ -5044,3 +5044,81 @@ export function BurnAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   RolloutAnim — a rolling update seen from the
+   Service. Pods move through starting → ready →
+   draining → gone; the Service only routes to
+   pods in its endpoints; each pod shows what
+   happened to the last request sent to it.
+   ════════════════════════════════════════════ */
+export type RolloutPod = {
+  name: string;
+  version: string;
+  state: "starting" | "ready" | "draining" | "gone";
+  /** is it in the Service's endpoints right now? */
+  routed: boolean;
+  /** what happened to the latest request sent to it */
+  last?: "ok" | "refused" | "cut";
+};
+
+export type RolloutFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  pods: RolloutPod[];
+  /** failed requests so far in this animation (not a measurement) */
+  errors: number;
+};
+
+export function RolloutAnim({
+  title,
+  frames,
+  caption,
+}: {
+  title: string;
+  frames: RolloutFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2100);
+  const f = frames[st.cur] ?? frames[0];
+  const LAST = { ok: "201", refused: "refused", cut: "cut off" } as const;
+  return (
+    <AnimShell
+      title={title}
+      kicker="rolling update"
+      note={f.note}
+      beat={f.beat ?? (f.pods.some((p) => p.last && p.last !== "ok") ? "problem" : "neutral")}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rol">
+        <div className="rol-svc">
+          <Gopher role="pilot" pose="idle" state="active" size={38} />
+          <span className="rol-k">Service ledgerd</span>
+          <span className="rol-counts">
+            errors in this picture: <b className={f.errors ? "rol-bad" : "rol-ok"}>{f.errors}</b>
+          </span>
+        </div>
+        <div className="rol-pods">
+          {f.pods.map((p) => (
+            <div key={p.name} className={`rol-pod rol-${p.state} ${p.routed ? "routed" : ""}`}>
+              <span className="rol-line" aria-hidden />
+              <span className="rol-name">{p.name}</span>
+              <span className="rol-ver">{p.version}</span>
+              <span className="rol-state">{p.state}{p.routed ? " · in endpoints" : ""}</span>
+              {p.last && <span className={`rol-last rol-last-${p.last}`}>{LAST[p.last]}</span>}
+            </div>
+          ))}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
