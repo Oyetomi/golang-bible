@@ -5122,3 +5122,107 @@ export function RolloutAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   ShopCacheAnim — why Redis exists: a shop's
+   product page asked of Postgres (a join over
+   the product's 2,000 reviews, every time) and
+   of Redis (one key holding the finished page).
+   The measured numbers ride in the frames.
+   ════════════════════════════════════════════ */
+
+export type ShopCacheFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** how many shoppers are asking at once */
+  shoppers: number;
+  /** which store the app asks this frame */
+  ask?: "postgres" | "redis" | "both";
+  /** what Postgres is doing */
+  pg?: string;
+  /** what Redis is doing */
+  redis?: string;
+  /** the keys Redis holds right now */
+  keys?: string[];
+  /** the chip carried back to the shopper */
+  answer?: string;
+  /** pages/s or time meters for this frame */
+  meters?: { label: string; value: string; tone?: "bad" | "good" }[];
+};
+
+export function ShopCacheAnim({ title, frames, caption }: { title: string; frames: ShopCacheFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2400);
+  const f = frames[st.cur] ?? frames[0];
+  const pgOn = f.ask === "postgres" || f.ask === "both";
+  const rdOn = f.ask === "redis" || f.ask === "both";
+  return (
+    <AnimShell
+      title={title}
+      kicker="why redis"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="shc" key={st.cur}>
+        <div className="shc-col shc-shoppers">
+          <div className="shc-crowd">
+            {Array.from({ length: Math.min(f.shoppers, 6) }, (_, i) => (
+              <Gopher key={i} role={i % 2 ? "reader" : "operator"} look={i % 3 === 1 ? "pink" : undefined} pose={f.answer ? "happy" : f.beat === "problem" ? "blocked" : "idle"} state="active" size={i === 0 ? 40 : 26} title="a shopper" />
+            ))}
+          </div>
+          <span className="shc-name">{f.shoppers > 1 ? `${f.shoppers} shoppers` : "a shopper"}</span>
+          {f.answer && <span className="shc-chip shc-ans">{f.answer}</span>}
+        </div>
+        <div className="shc-col">
+          <Gopher role="operator" pose={f.ask ? "run" : "idle"} state="active" size={44} title="the shop's Go server" />
+          <span className="shc-name">Go server</span>
+        </div>
+        <div className="shc-stores">
+          <div className={`shc-store ${pgOn ? "on" : ""} ${pgOn && f.beat === "problem" ? "bad" : ""}`}>
+            <div className="shc-head">
+              <Gopher role="librarian" pose={pgOn ? "carry" : "idle"} state={pgOn && f.beat === "problem" ? "bad" : "active"} size={34} title="Postgres" />
+              <span className="shc-title">Postgres <em>on disk, the truth</em></span>
+            </div>
+            {pgOn && <span className="shc-arrow">⟵ query</span>}
+            <span className="shc-doing">{f.pg ?? "products · reviews (2,000,000 rows)"}</span>
+          </div>
+          <div className={`shc-store ${rdOn ? "on good" : ""}`}>
+            <div className="shc-head">
+              <Gopher role="courier" pose={rdOn ? "happy" : "idle"} state="active" size={34} title="Redis" />
+              <span className="shc-title">Redis <em>in memory, a copy</em></span>
+            </div>
+            {rdOn && <span className="shc-arrow">⟵ GET</span>}
+            <span className="shc-doing">{f.redis ?? (f.keys?.length ? "" : "empty")}</span>
+            {f.keys && f.keys.length > 0 && (
+              <div className="shc-keys">
+                {f.keys.map((k) => (
+                  <span key={k} className="shc-chip">
+                    {k}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      {f.meters && (
+        <div className="rtp-meters">
+          {f.meters.map((m) => (
+            <span key={m.label} className={`rtp-meter ${m.tone ?? ""}`}>
+              {m.label} <b>{m.value}</b>
+            </span>
+          ))}
+        </div>
+      )}
+    </AnimShell>
+  );
+}
