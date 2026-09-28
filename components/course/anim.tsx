@@ -23,7 +23,7 @@ import { SPEEDS, speedLabel } from "./client";
    ────────────────────────────────────────────── */
 
 /* shared stepped-playback state with adjustable speed */
-function useStepper(total: number, ms = 1500) {
+export function useStepper(total: number, ms = 1500) {
   const [cur, setCur] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -71,7 +71,7 @@ function useStepper(total: number, ms = 1500) {
 }
 
 /* shared chrome: header controls, narration bar, scrubber dots */
-function AnimShell({
+export function AnimShell({
   title,
   kicker,
   note,

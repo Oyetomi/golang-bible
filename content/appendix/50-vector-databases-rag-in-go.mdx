@@ -14,7 +14,7 @@ Look at them. Thousands of developers frantically copying Python tutorials, pip-
 
 It is adorable. Really, it is.
 
-In my world—at the apex of distributed systems—we do not outsource linear algebra to an interpreted runtime that pauses for garbage collection while calculating vector magnitudes. We allocate contiguous `float32` arrays aligned to 64-byte CPU cache lines. We chew through 1,536-dimensional embeddings with unrolled SIMD loops that saturate memory bandwidth. We traverse Hierarchical Navigable Small World (HNSW) graphs in sub-millisecond time. And when the LLM generates tokens, we flush them over raw HTTP Server-Sent Events before the Python script has even resolved its import statements.
+In my world—at the apex of distributed systems—we keep vectors in contiguous `float32` slices, so a scan walks memory in order. We unroll the dot-product loop so the CPU can overlap its multiplications. We use an HNSW graph when a linear scan is too slow. And when the LLM generates tokens, we flush them to the browser over Server-Sent Events as they arrive.
 
 I do not just use AI. I make it obey the metal.
 
@@ -126,11 +126,11 @@ Before you write a single line of database infrastructure, you must master the g
       ]
     },
     {
-      caption: "Stage 3: Query & Sub-Millisecond Retrieval — User asks 'margin requirements for repo trades'. Query vector executes top-K cosine similarity search across the in-memory index in 1.2ms.",
+      caption: "Stage 3: Query & Retrieval — User asks 'margin requirements for repo trades'. The query vector runs a top-K cosine similarity search across the in-memory index; the timing depends on the index size (see the measured scan below).",
       beat: "problem",
       cells: [
         { id: "B1", state: "active", label: "User Query" },
-        { id: "B2", state: "active", label: "Top-K Search (<2ms)" },
+        { id: "B2", state: "active", label: "Top-K Search" },
         { id: "B3", state: "idle",   label: "Augmented Prompt" },
         { id: "B4", state: "idle",   label: "Token Stream" }
       ]
@@ -246,7 +246,7 @@ func DotProduct4Way(a, b []float32) float32 {
 }
 ```
 
-Notice the line `_ = b[n-1]`. As of Go 1.24 and Go 1.26, this subtle statement informs the Go SSA compiler that slice `b` is at least as long as `a`, permanently eliminating runtime boundary checks (`runtime.panicIndex`) inside the tight numerical loop.
+Notice the line `_ = b[n-1]`. It tells the compiler that `b` is at least as long as `a`, which can let it drop a bounds check inside the loop. Measured on Go 1.27 for a 1,536-float dot product, it made no measurable difference to a scan (18.4–19.4 ms with the hint, 18.9–20.6 ms without, for 10,000 vectors): here the loop's cost is the memory reads and the serial dependency of the running sum, not the checks.
 
 </UnderTheHood>
 
@@ -295,13 +295,111 @@ A **Flat Index** is an exhaustive brute-force search. It keeps every vector in c
 - **Index Build Time:** Instantaneous ($O(1)$ append).
 - **Memory Overhead:** Zero graph pointers or edge lists.
 
-At $N = 10,000$ documents and $D = 1536$, calculating $10,000$ dot products requires $15.36 \times 10^6$ floating-point multiplications. On modern Go with cache-friendly layout, a single CPU core computes this in **1.4 milliseconds**. Across 8 worker goroutines, it completes in **under 250 microseconds**.
+At $N = 10,000$ documents and $D = 1536$, calculating $10,000$ dot products requires $15.36 \times 10^6$ floating-point multiplications. Measured on an Apple M1 (Go 1.27), a plain loop took **18–21 ms** for that scan. Splitting the sum across four accumulators, so the CPU can overlap the multiplies, cut it to **7.3–8.1 ms**, and spreading that over 8 goroutines to **2.2–3.0 ms**. The benchmark is below. So a flat scan of 10,000 vectors is a few milliseconds, not microseconds: fine for one query at a time, and a reason to reach for an index sooner than you might expect.
+
+```go noverify title="vec/vec_test.go"
+package vec
+
+import (
+	"math/rand/v2"
+	"testing"
+)
+
+func dotHint(a, b []float32) float32 {
+	_ = b[len(a)-1] // bounds-check hint from the chapter
+	var s float32
+	for i := range a {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+func dotPlain(a, b []float32) float32 {
+	var s float32
+	for i := range a {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+func dotUnrolled(a, b []float32) float32 {
+	var s0, s1, s2, s3 float32
+	i := 0
+	for ; i+4 <= len(a); i += 4 {
+		s0 += a[i] * b[i]
+		s1 += a[i+1] * b[i+1]
+		s2 += a[i+2] * b[i+2]
+		s3 += a[i+3] * b[i+3]
+	}
+	return s0 + s1 + s2 + s3
+}
+
+func data(n, d int) ([][]float32, []float32) {
+	r := rand.New(rand.NewPCG(1, 2))
+	vs := make([][]float32, n)
+	for i := range vs {
+		v := make([]float32, d)
+		for j := range v {
+			v[j] = r.Float32()
+		}
+		vs[i] = v
+	}
+	return vs, vs[0]
+}
+
+func scan(b *testing.B, f func(a, b []float32) float32) {
+	vs, q := data(10_000, 1536)
+	b.ResetTimer()
+	var sink float32
+	for b.Loop() {
+		for _, v := range vs {
+			sink += f(v, q)
+		}
+	}
+	_ = sink
+}
+
+func BenchmarkScan10kPlain(b *testing.B)    { scan(b, dotPlain) }
+func BenchmarkScan10kHint(b *testing.B)     { scan(b, dotHint) }
+func BenchmarkScan10kUnrolled(b *testing.B) { scan(b, dotUnrolled) }
+
+func BenchmarkScan10kUnrolled8Goroutines(b *testing.B) {
+	vs, q := data(10_000, 1536)
+	const workers = 8
+	b.ResetTimer()
+	for b.Loop() {
+		res := make(chan float32, workers)
+		for w := range workers {
+			go func() {
+				var sink float32
+				for i := w; i < len(vs); i += workers {
+					sink += dotUnrolled(vs[i], q)
+				}
+				res <- sink
+			}()
+		}
+		for range workers {
+			<-res
+		}
+	}
+}
+```
+
+```text
+$ go test -bench . -count 3
+BenchmarkScan10kPlain-8                 	      62	  19209911 ns/op
+BenchmarkScan10kHint-8                  	      64	  18510955 ns/op
+BenchmarkScan10kUnrolled-8              	     163	   7317648 ns/op
+BenchmarkScan10kUnrolled8Goroutines-8   	     548	   2254208 ns/op
+
+(one run shown; the ranges quoted in the text are from three runs each, and a laptop varies by about 10–20% between runs)
+```
 
 For datasets up to 50,000 documents (the size of most corporate knowledge bases, internal wikis, and legal vaults), an in-memory Flat Index is not only simpler—it is often faster than distributed vector databases because it incurs zero network serialization overhead!
 
 ### Approximate Nearest Neighbors: The HNSW Graph
 
-When your dataset scales to 5,000,000 vectors, $O(N)$ linear scans become unsustainable (costing 150ms+ per query and saturating CPU cores). You must trade mathematical certainty for logarithmic speed: $O(\log N)$.
+When your dataset scales to 5,000,000 vectors, $O(N)$ linear scans become unsustainable (at the measured 7 ms per 10,000 vectors, that is about 3.5 seconds per query on one core, or 0.4 s across 8). You must trade mathematical certainty for logarithmic speed: $O(\log N)$.
 
 The undisputed king of graph-based ANN algorithms is **HNSW (Hierarchical Navigable Small World)**, developed by Malkov and Yashunin.
 

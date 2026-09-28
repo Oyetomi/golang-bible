@@ -97,7 +97,7 @@ func main() {
   ]}
   answer={1}
   output={`Sanitized: 411111******1111`}
-  explain={'While attrs[0].Value is correctly updated, the string concatenation (Value[:6] + "******" + Value[12:]) creates a brand-new string on the heap for every single span! At 100,000 spans per second, this creates over 100,000 heap allocations/sec, triggering continuous Go runtime GC Mark Assist. A production custom processor mutates raw byte buffers in-place or utilizes the internal string recycling of pdata.'}
+  explain={'While attrs[0].Value is correctly updated, the string concatenation (Value[:6] + "******" + Value[12:]) creates a brand-new string on the heap for every single span! At 100,000 spans per second, this creates at least 100,000 heap allocations a second, adding garbage collection work. A production custom processor mutates raw byte buffers in-place or utilizes the internal string recycling of pdata.'}
 />
 
 ## The OpenTelemetry Collector Pipeline
@@ -332,7 +332,7 @@ Standard Protobuf (Pointer Spaghetti):
                 ---> [*ScopeSpans] ---> [*Span] ---> [*Attributes Slice] ---> [*KeyValue]
 ```
 
-At 100,000 spans per second, decoding standard Protobuf structures allocates millions of tiny objects on the Go heap every second. The Go runtime Garbage Collector spends all its time tracing object pointers, running mutator Mark Assist, and freezing threads.
+Decoding standard generated Protobuf structs allocates a Go object for every nested message, string and slice, which is a lot of small objects for a large batch of spans, and every one has to be traced by the garbage collector.
 
 The OpenTelemetry project engineered `pdata` to solve this exact bottleneck. `pdata` structs (`ptrace.Traces`, `ptrace.ResourceSpans`, `ptrace.Span`, `pcommon.Map`) are **value wrappers** around flat internal memory buffers. When you pass `ptrace.Span` by value, you are passing a lightweight 16-byte header consisting of an internal pointer to a shared buffer and an index:
 
@@ -357,10 +357,10 @@ The internal map checks if the key already exists in its pre-allocated array. If
 
 The Collector pipeline utilizes an asynchronous fan-in / fan-out execution model. Receivers spawn goroutines that parse incoming network packets (gRPC HTTP/2 streams or HTTP/1.1 POSTs). The receiver calls `processor.ConsumeTraces(ctx, td)`.
 
-If your custom processor launches an unconstrained goroutine per span (`go processSpan(span)`), you will flood the Go runtime scheduler with 100,000 runnable goroutines per second. In Go 1.25+, the runtime automatically sets `GOMAXPROCS` to match container CPU quotas (cgroup limits) via `runtime.SetDefaultGOMAXPROCS`. Spawning hundreds of thousands of goroutines induces devastating context-switch churn.
+If your custom processor launches an unconstrained goroutine per span (`go processSpan(span)`), you will create 100,000 goroutines a second, each with its own stack and scheduling cost, for work that is a few dozen nanoseconds. Since Go 1.25 the runtime sets `GOMAXPROCS` from the container's CPU limit, so the parallelism is bounded, but a goroutine per span is still far more overhead than the work itself.
 
 Instead, a production custom processor executes in one of two ways:
-1. **Synchronous in-place mutation on the caller's goroutine**: Since the receiver already allocated a goroutine to read the connection, mutating `ptrace.Traces` directly on that goroutine requires **zero channel sends, zero synchronization locks, and zero scheduler overhead**.
+1. **Synchronous in-place mutation on the caller's goroutine**: the receiver already has a goroutine reading the connection, so mutating `ptrace.Traces` on it needs no channel sends, no locks and no extra scheduling.
 2. **Fixed worker pool with bounded ring buffers**: For CPU-heavy transformations or cryptographic hashing, the processor dispatches batches into pre-sized channel buffers consumed by a static pool of `runtime.GOMAXPROCS(0)` worker goroutines.
 
 Combined with the **Green Tea GC** default introduced in Go 1.26, keeping `ConsumeTraces` allocation-free attacks the cause rather than the symptom: fewer allocations means less frequent collection and less assist work on the hot path. Note that Go's collector is **not generational** — there is no minor or major cycle — and Go publishes no pause-time guarantee, so treat any specific figure as something to measure on your own pipeline.
@@ -593,11 +593,125 @@ func RedactInPlace(buf []byte) bool {
     }
     return true
 }`}
-  badLabel="Naive Regex (14 allocs/span, 2.4GB/s GC load)"
-  goodLabel="Zero-Alloc ASCII Mutator (0 allocs, 0B GC load)"
+  badLabel="Regex ReplaceAllStringFunc (4 allocs, 64 B per PAN, ~260-320 ns)"
+  goodLabel="In-place byte scan (0 allocs, ~16 ns)"
 />
 
-Go's `regexp` engine uses a backtracking NFA algorithm that allocates state tracking slices and string buffers on every execution. When scanning 100,000 spans per second, calling `ReplaceAllString` generates gigabytes of heap garbage every minute.
+Go's `regexp` engine guarantees linear-time matching (it isn't a backtracking engine), but replacing with a function still allocates: the match slices, the result string and the closure's return value. Measured on an Apple M1 with Go 1.27, on a valid 16-digit card number, `ReplaceAllStringFunc` took **258–322 ns, 64 bytes and 4 allocations**, while the in-place byte scan took **about 16 ns and no allocations**, roughly 17 times faster. At 100,000 spans a second with one such attribute each, that is 400,000 allocations and about 6 MB of garbage a second: worth avoiding on a hot path, but not the gigabytes a minute the diagram might suggest. The benchmark, so you can run it:
+
+```go noverify title="redact/red_test.go"
+package ot
+
+import (
+	"regexp"
+	"testing"
+
+	"go.opentelemetry.io/collector/pdata/ptrace"
+)
+
+func luhn(s string) bool {
+	sum, alt := 0, false
+	for i := len(s) - 1; i >= 0; i-- {
+		d := int(s[i] - '0')
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+func luhnBytes(b []byte) bool {
+	sum, alt := 0, false
+	for i := len(b) - 1; i >= 0; i-- {
+		d := int(b[i] - '0')
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+var panRegex = regexp.MustCompile(`\b\d{16}\b`)
+
+func redactRegex(v string) string {
+	return panRegex.ReplaceAllStringFunc(v, func(m string) string {
+		if luhn(m) {
+			return m[:6] + "******" + m[12:]
+		}
+		return m
+	})
+}
+
+func redactInPlace(buf []byte) bool {
+	if len(buf) != 16 || !luhnBytes(buf) {
+		return false
+	}
+	for i := 6; i < 12; i++ {
+		buf[i] = '*'
+	}
+	return true
+}
+
+const pan = "4111111111111111" // a well-known valid test card number
+
+func BenchmarkRegex(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = redactRegex(pan)
+	}
+}
+
+func BenchmarkInPlace(b *testing.B) {
+	b.ReportAllocs()
+	buf := []byte(pan)
+	for b.Loop() {
+		copy(buf, pan)
+		redactInPlace(buf)
+	}
+}
+
+// The real pdata: does setting an attribute in place allocate?
+func BenchmarkPdataAttrInPlace(b *testing.B) {
+	td := ptrace.NewTraces()
+	span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.Attributes().PutStr("payment.pan", pan)
+	b.ReportAllocs()
+	for b.Loop() {
+		if v, ok := span.Attributes().Get("payment.pan"); ok {
+			v.SetStr("411111******1111")
+		}
+	}
+}
+
+func TestRedacts(t *testing.T) {
+	if got := redactRegex("card " + pan + " ok"); got != "card 411111******1111 ok" {
+		t.Fatalf("regex: %q", got)
+	}
+	buf := []byte(pan)
+	if !redactInPlace(buf) || string(buf) != "411111******1111" {
+		t.Fatalf("in place: %q", buf)
+	}
+}
+```
+
+```text
+$ go test -bench .
+BenchmarkRegex-8              	 4624881	       257.9 ns/op	      64 B/op	       4 allocs/op
+BenchmarkInPlace-8            	76886934	        15.57 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPdataAttrInPlace-8   	84761475	        17.81 ns/op	      16 B/op	       1 allocs/op
+```
+
+Note the last row: with the real `pdata` (v1.68.0), overwriting a string attribute in place with `SetStr` still allocated 16 bytes and once per call, so "zero allocation" holds for the byte scan, not for storing the result back into `pdata`.
 
 To achieve true zero-allocation processing, we operate directly on byte slices or ASCII characters:
 
@@ -1005,7 +1119,7 @@ func main() {
 A custom processor in a banking environment cannot be verified with hand-wavy manual checks. It requires rigorous, automated testing:
 1. **Synthetic Traces Harness**: Programmatically constructing full OTLP trace hierarchies with deterministic attributes.
 2. **Invariant Verification**: Asserting that zero unredacted PANs or CVVs ever emerge from the exporter sink.
-3. **Zero-Allocation Benchmarks**: In Go 1.26, we utilize `for b.Loop()` combined with `b.ReportAllocs()` to enforce that the mutation path generates exactly zero heap allocations.
+3. **Allocation Benchmarks**: Since Go 1.24, `for b.Loop()` combined with `b.ReportAllocs()` lets you enforce that the mutation path generates exactly zero heap allocations.
 
 ### Constructing Synthetic OTLP Traces
 
