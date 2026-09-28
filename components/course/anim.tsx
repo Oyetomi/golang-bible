@@ -5804,3 +5804,74 @@ export function OnionAnim({ title, layers, core, frames, caption }: { title: str
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   IfaceWordsAnim — an interface value as the two
+   machine words it really is, with the addresses
+   read from a running program: word 1 points at
+   the type's method table (itab), word 2 at the
+   data. nil means both words are zero.
+   ════════════════════════════════════════════ */
+
+export type IfaceWordsFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  expr: string;
+  /** the two words as printed */
+  words: [string, string];
+  /** what each word points to, if anything */
+  points?: [string | null, string | null];
+  /** err != nil */
+  check?: boolean;
+  /** what fmt prints for it */
+  printed?: string;
+};
+
+export function IfaceWordsAnim({ title, frames, caption }: { title: string; frames: IfaceWordsFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2800);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="interface words"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="ifw" key={st.cur}>
+        <code className="ifw-expr">{f.expr}</code>
+        <div className="ifw-grid">
+          {(["word 1 · type (itab)", "word 2 · data"] as const).map((label, i) => (
+            <div key={label} className={`ifw-word ${f.words[i] === "0x0" ? "ifw-zero" : "ifw-set"}`}>
+              <span className="ifw-label">{label}</span>
+              <code className="ifw-hex">{f.words[i]}</code>
+              {f.points?.[i] && <span className="ifw-points">→ {f.points[i]}</span>}
+            </div>
+          ))}
+        </div>
+        <div className="ifw-out">
+          {f.check !== undefined && (
+            <span className={`rtp-meter ${f.beat === "problem" ? "bad" : f.beat === "solution" ? "good" : ""}`}>
+              err != nil <b>{String(f.check)}</b>
+            </span>
+          )}
+          {f.printed && (
+            <span className="rtp-meter">
+              fmt prints <b>{f.printed}</b>
+            </span>
+          )}
+          <Gopher role="detective" pose={f.beat === "problem" ? "panic" : f.beat === "solution" ? "happy" : "idle"} state={f.beat === "problem" ? "bad" : "active"} size={34} title="the caller's nil check" />
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
