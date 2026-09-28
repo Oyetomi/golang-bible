@@ -45,6 +45,17 @@ PLAN = [
     ("dijkstra", "07", "### The Algorithm", "before-code", "Edge weights are on the lines. Watch dist improve when a cheaper route (via C) appears."),
     ("lowerbound", "08", "### Lower bound: first occurrence (or insert position)", "before-code", "Duplicates make this tricky. Watch the interval shrink toward the FIRST 3."),
     ("rotatedsearch", "08", "### Search in rotated sorted array", "before-code", "At every step one half is sorted. Watch which one, and how the target decides the side."),
+    ("subsets", "09", "### Generate all subsets (the power set)", "before-code", "The recursion drawn as a tree. Each node is the path at one moment; watch choose, explore, un-choose."),
+    ("permutations", "09", "### All orderings of distinct elements", "before-code", "The used[] array remembers which elements are already in the path. Watch it flip on and off as we backtrack."),
+    ("nqueens", "09", "### N-Queens: the classic", "before-code", "A real 4x4 board. Watch a queen get placed, get blocked, and get lifted when a row has no safe square."),
+    ("coinchange", "10", "### Coin change", "before-code", "Each dp cell tries every coin and looks back at earlier cells (green). Watch why greedy would fail on this input."),
+    ("lis", "10", "### Longest increasing subsequence", "before-code", "For each position, find the earlier smaller value whose chain is longest, and extend it."),
+    ("lcs", "10", "### Longest common subsequence (LCS)", "before-code", "Match: look diagonally and add one. No match: take the better of up or left. Highlights show which cells were read."),
+    ("knapsack", "10", "### 0/1 Knapsack", "before-code", "One row of capacities, swept from high to low. Watch why the backwards direction stops an item being used twice."),
+    ("jump", "11", "### Classic: Jump Game", "before-code", "One number does all the work: the furthest index reachable so far."),
+    ("jumpfail", "11", "### Classic: Jump Game", "before-code", "And an input where the zero traps us: watch reach stop growing."),
+    ("meetingrooms", "11", "### Classic: Meeting Rooms II (minimum rooms)", "before-code", "Starts and ends sorted separately, then swept. Watch a room get reused or a new one opened."),
+    ("singlenumber", "11", "### XOR tricks", "before-code", "Watch the bits: equal pairs cancel to 000, leaving the loner."),
 ]
 
 def block(name, intro):
