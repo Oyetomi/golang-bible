@@ -13,6 +13,9 @@ import { PostRoomAnim } from "@/components/course/PostRoomAnim";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
 import { ProjectCode } from "@/components/course/ProjectCode";
 import { ProjectMap } from "@/components/course/ProjectMap";
+import { ProcAnim } from "@/components/course/ProcAnim";
+import { PacketAnim } from "@/components/course/PacketAnim";
+import { EnvelopeAnim, SignAnim } from "@/components/course/CryptoAnim";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -77,6 +80,9 @@ export const mdxComponents = {
   CinemaAnim,
   BankAnim,
   PostRoomAnim,
+  ProcAnim,
+  PacketAnim,
+  EnvelopeAnim, SignAnim,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
   Gotcha: S.Gotcha,

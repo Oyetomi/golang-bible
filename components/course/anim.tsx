@@ -4383,16 +4383,30 @@ export function RelationAnim({
             let nx = -dy / len, ny = dx / len;
             // mostly-horizontal lines: label above; steep lines: label to the right
             if (steep ? nx < 0 : ny > 0 || (ny === 0 && nx > 0)) { nx = -nx; ny = -ny; }
-            const lx = (sx + tx) / 2 + nx * 14, ly = (sy + ty) / 2 + ny * 18;
+            // steep lines: label beside the line; others: on it, over a halo
+            // that masks the line behind the text, so it can't reach a box
+            const off = steep ? 14 : 0;
+            const lx = (sx + tx) / 2 + nx * off, ly = (sy + ty) / 2 + ny * off;
             const anchor = steep ? "start" : "middle";
             const cls = `rel-edge ${visible(id) ? "on" : ""} ${f.hot?.includes(id) ? "hot" : ""} ${f.bad?.includes(id) ? "bad" : ""} ${e.dashed ? "dashed" : ""}`;
             return (
               <g key={id} className={cls}>
                 <line x1={sx} y1={sy} x2={tx} y2={ty} markerEnd="url(#rel-arrow)" />
                 {e.label && (
-                  <text x={lx} y={ly + 6} textAnchor={anchor}>
-                    {e.label}
-                  </text>
+                  <>
+                    {/* a backing rectangle hides the line behind the whole label, spaces included */}
+                    <rect
+                      className="rel-label-bg"
+                      x={anchor === "start" ? lx - 4 : lx - e.label.length * 5.2 - 6}
+                      y={ly - 12}
+                      width={e.label.length * 10.4 + 12}
+                      height={24}
+                      rx={6}
+                    />
+                    <text x={lx} y={ly + 6} textAnchor={anchor}>
+                      {e.label}
+                    </text>
+                  </>
                 )}
               </g>
             );
