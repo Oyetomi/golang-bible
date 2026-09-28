@@ -48,4 +48,6 @@ func main() {
 	genDecodeWays()
 	genGasStation()
 	genInsertInterval()
+	genLongestUnique()
+	genTopKFreq()
 }

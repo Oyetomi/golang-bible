@@ -65,6 +65,8 @@ PLAN = [
     ("decodeways", "10", "### Decode ways", "before-code", "Each dp cell adds the cell one back and/or two back. Green shows which."),
     ("gasstation", "11", "### Classic: Gas Station", "before-code", "Watch the tank go negative, rule out every start before that point, and restart."),
     ("insertinterval", "11", "### Classic: Insert Interval", "before-code", "Three zones: before, overlapping, after. Watch the new interval absorb what it touches."),
+    ("longestunique", "12", "### The complete loop", "before-code", "The worked interview problem, animated. The light cells are the window; the map is the counts inside it."),
+    ("topkfreq", "12", "### A second pattern demo", "before-code", "Count first, then keep only the k most frequent with a size-k heap."),
 ]
 
 def block(name, intro):
