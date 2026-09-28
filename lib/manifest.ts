@@ -23,7 +23,9 @@ export type Chapter = {
 
 export const chapters = data as Chapter[];
 
-export const PART_ORDER: Part[] = [1, 2, 3, 4, "redis", "appendix"];
+// The Redis track comes straight after Part 1: it needs only Part 1, practises
+// its material as one project, and Part 4 builds on the server it produces.
+export const PART_ORDER: Part[] = [1, "redis", 2, 3, 4, "appendix"];
 
 export const PART_TITLES: Record<string, string> = {
   "1": "The Language",
@@ -39,7 +41,7 @@ export const PART_SUBTITLES: Record<string, string> = {
   "2": "Production-grade engineering",
   "3": "The domain capstone",
   "4": "From process to platform",
-  redis: "A project track: one server, grown lesson by lesson until the real redis-cli talks to it",
+  redis: "The project track after Part 1: one server, grown lesson by lesson until the real redis-cli talks to it",
   appendix: "Optional interview-prep track",
 };
 
