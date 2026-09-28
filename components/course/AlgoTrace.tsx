@@ -51,13 +51,14 @@ function Label({ text }: { text?: string }) {
 }
 
 function ArrayView({ v }: { v: Extract<TraceView, { k: "array" }> }) {
-  const n = v.cells.length;
+  const cellsA = v.cells ?? [];
+  const n = cellsA.length;
   const ptrs = Object.entries(v.ptrs ?? {});
   return (
     <div className="atr-block">
       <Label text={v.label} />
       <div className="atr-arr" style={{ "--n": n } as CSSProperties}>
-        {v.cells.map((c, i) => (
+        {cellsA.map((c, i) => (
           <span key={i} className={`atr-cell ${v.marks?.[i] ? `m-${v.marks[i]}` : ""}`}>
             <i>{i}</i>
             {String(c)}
@@ -128,7 +129,8 @@ function MapView({ v }: { v: Extract<TraceView, { k: "map" }> }) {
 }
 
 function HeapView({ v }: { v: Extract<TraceView, { k: "heap" }> }) {
-  const n = v.cells.length;
+  const cells = v.cells ?? [];
+  const n = cells.length;
   const depth = n === 0 ? 0 : Math.floor(Math.log2(n)) + 1;
   const W = 300;
   const H = Math.max(60, depth * 52 + 16);
@@ -143,13 +145,13 @@ function HeapView({ v }: { v: Extract<TraceView, { k: "heap" }> }) {
     <div className="atr-block">
       <Label text={v.label ?? "heap: tree view + array view (same data)"} />
       <svg className="atr-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="heap as a tree">
-        {v.cells.map((_, i) => {
+        {cells.map((_, i) => {
           if (i === 0) return null;
           const a = pos(Math.floor((i - 1) / 2));
           const b = pos(i);
           return <line key={`e${i}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y} className="atr-edge" />;
         })}
-        {v.cells.map((c, i) => {
+        {cells.map((c, i) => {
           const p = pos(i);
           return (
             <g key={i} className={`atr-node ${v.marks?.[i] ? `m-${v.marks[i]}` : ""}`}>
@@ -165,7 +167,7 @@ function HeapView({ v }: { v: Extract<TraceView, { k: "heap" }> }) {
         })}
       </svg>
       <div className="atr-arr" style={{ "--n": Math.max(n, 1) } as CSSProperties}>
-        {v.cells.map((c, i) => (
+        {cells.map((c, i) => (
           <span key={i} className={`atr-cell ${v.marks?.[i] ? `m-${v.marks[i]}` : ""}`}>
             <i>{i}</i>
             {String(c)}

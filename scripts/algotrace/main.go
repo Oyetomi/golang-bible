@@ -39,4 +39,13 @@ func main() {
 	genJump()
 	genMeetingRooms()
 	genSingleNumber()
+	genTopK()
+	genMergeK()
+	genRunningMedian()
+	genKoko()
+	genCombinationSum()
+	genHouseRobber()
+	genDecodeWays()
+	genGasStation()
+	genInsertInterval()
 }
