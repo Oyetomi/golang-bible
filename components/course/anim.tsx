@@ -5399,3 +5399,97 @@ export function ShutdownAnim({ title, frames, caption }: { title: string; frames
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   PubSubAnim — PUBLISH fanning a message out to
+   every subscriber's queue. Each subscriber has a
+   queue (a Go channel) drained by its writer; one
+   that never reads fills up, and the publisher
+   either waits on it or drops it.
+   ════════════════════════════════════════════ */
+
+export type PubSubSub = {
+  name: string;
+  /** messages waiting in its queue */
+  queued: number;
+  state?: "reading" | "stuck" | "dropped";
+};
+
+export type PubSubFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  channel: string;
+  /** the message being published this frame */
+  msg?: string;
+  /** the publisher is blocked */
+  blocked?: boolean;
+  cap: number;
+  subs: PubSubSub[];
+  meters?: { label: string; value: string; tone?: "bad" | "good" }[];
+};
+
+export function PubSubAnim({ title, frames, caption }: { title: string; frames: PubSubFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2400);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="pub/sub"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="psb" key={st.cur}>
+        <div className="psb-pub">
+          <Gopher role="courier" pose={f.blocked ? "blocked" : f.msg ? "carry" : "idle"} state={f.blocked ? "bad" : "active"} size={42} title="the publisher" />
+          <span className="shc-name">publisher</span>
+          {f.msg && <span className="shc-chip">PUBLISH {f.channel} {f.msg}</span>}
+          {f.blocked && <span className="psb-wait">waiting…</span>}
+        </div>
+        <div className="psb-hub">
+          <span className="psb-ch">#{f.channel}</span>
+        </div>
+        <div className="psb-subs">
+          {f.subs.map((s) => {
+            const pct = Math.min(100, (s.queued / f.cap) * 100);
+            return (
+              <div key={s.name} className={`psb-sub psb-${s.state ?? "reading"}`}>
+                <Gopher
+                  role={s.state === "stuck" ? "worker" : "reader"}
+                  look={s.name.endsWith("2") ? "pink" : undefined}
+                  pose={s.state === "dropped" ? "exit" : s.state === "stuck" ? "sleep" : "happy"}
+                  state="active"
+                  size={26}
+                  title={s.name}
+                />
+                <span className="psb-name">{s.name}</span>
+                <span className="psb-q" title={`${s.queued} of ${f.cap} waiting`}>
+                  <span className={`psb-fill ${pct >= 100 ? "full" : ""}`} style={{ width: `${pct}%` }} />
+                </span>
+                <span className="psb-n">{s.state === "dropped" ? "dropped" : `${s.queued}/${f.cap}`}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {f.meters && (
+        <div className="rtp-meters">
+          {f.meters.map((m) => (
+            <span key={m.label} className={`rtp-meter ${m.tone ?? ""}`}>
+              {m.label} <b>{m.value}</b>
+            </span>
+          ))}
+        </div>
+      )}
+    </AnimShell>
+  );
+}
