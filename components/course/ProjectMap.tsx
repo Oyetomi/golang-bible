@@ -68,6 +68,18 @@ export function ProjectMap({
 }) {
   const out: ReactNode[] = [];
   rows(build(files), 1, out, root);
+  const tree = (
+    <ul className="pm-tree">
+      <li className="pm-row pm-dir pm-root" style={{ paddingLeft: "10px" }}>
+        <span className="pm-icon" aria-hidden>▾</span>
+        <span className="pm-name">{root}/</span>
+      </li>
+      {out}
+    </ul>
+  );
+  // In a big project, lead with what this lesson touches and fold the rest.
+  const touched = files.filter((f) => f.status === "new" || f.status === "changed");
+  const fold = files.length > 10 && touched.length > 0;
   return (
     <figure className="pm">
       <div className="pm-head">
@@ -78,13 +90,25 @@ export function ProjectMap({
           <span className="pm-chip pm-chip-changed">changed</span>
         </span>
       </div>
-      <ul className="pm-tree">
-        <li className="pm-row pm-dir pm-root" style={{ paddingLeft: "10px" }}>
-          <span className="pm-icon" aria-hidden>▾</span>
-          <span className="pm-name">{root}/</span>
-        </li>
-        {out}
-      </ul>
+      {fold ? (
+        <>
+          <ul className="pm-tree pm-touched">
+            {touched.map((f) => (
+              <li key={f.path} className={`pm-row pm-${f.status}`} style={{ paddingLeft: "10px" }}>
+                <span className="pm-name">{root}/{f.path}</span>
+                <span className={`pm-chip pm-chip-${f.status}`}>{f.status}</span>
+                {f.note && <span className="pm-note">{f.note}</span>}
+              </li>
+            ))}
+          </ul>
+          <details className="pm-all">
+            <summary>the whole project: {files.length} files</summary>
+            {tree}
+          </details>
+        </>
+      ) : (
+        tree
+      )}
       {run && run.length > 0 && (
         <div className="pm-run">
           <span className="pm-run-k">run it, from inside {root}/</span>
