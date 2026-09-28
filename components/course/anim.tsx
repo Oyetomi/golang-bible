@@ -5736,3 +5736,71 @@ export function FloatCentsAnim({ title, frames, caption }: { title: string; fram
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   OnionAnim — decorators as nested layers. A call
+   travels inward through each wrapper to the core
+   and its result travels back out; a layer can
+   answer early (a cache hit) and the inner ones
+   never run.
+   ════════════════════════════════════════════ */
+
+export type OnionFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** index of the layer the call is at: 0 = outermost; layers.length = the core */
+  at: number;
+  dir: "in" | "out" | "idle";
+  /** a note per layer for this frame, e.g. "start timer" */
+  says?: Record<number, string>;
+  /** layers skipped this call (the call never reached them) */
+  skipped?: number[];
+  result?: string;
+};
+
+export function OnionAnim({ title, layers, core, frames, caption }: { title: string; layers: string[]; core: string; frames: OnionFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2400);
+  const f = frames[st.cur] ?? frames[0];
+  const all = [...layers, core];
+  const render = (i: number): ReactNode => {
+    const here = f.at === i && f.dir !== "idle";
+    const skipped = f.skipped?.includes(i);
+    return (
+      <div className={`onn-layer ${i === all.length - 1 ? "onn-core" : ""} ${here ? "onn-here" : ""} ${skipped ? "onn-skip" : ""}`}>
+        <div className="onn-head">
+          <span className="onn-name">{all[i]}</span>
+          {here && <span className={`onn-arrow onn-${f.dir}`}>{f.dir === "in" ? "call →" : "← result"}</span>}
+          {f.says?.[i] && <span className="onn-says">{f.says[i]}</span>}
+        </div>
+        {i < all.length - 1 && render(i + 1)}
+      </div>
+    );
+  };
+  return (
+    <AnimShell
+      title={title}
+      kicker="decorators"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="onn" key={st.cur}>
+        <div className="onn-caller">
+          <Gopher role="operator" pose={f.result ? "happy" : f.dir === "in" ? "carry" : "idle"} state="active" size={40} title="the caller" />
+          <span className="shc-name">caller</span>
+          {f.result && <span className="shc-chip shc-ans">{f.result}</span>}
+        </div>
+        <div className="onn-stack">{render(0)}</div>
+      </div>
+    </AnimShell>
+  );
+}
