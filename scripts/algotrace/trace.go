@@ -15,11 +15,11 @@ type M = map[string]any
 // the reader; line() finds a marker substring in it so frames point at the
 // right line even if the listing is edited.
 type Trace struct {
-	Title  string `json:"title"`
-	Code   string `json:"code"`
-	Frames []M    `json:"frames"`
-	Nodes  []M    `json:"nodes,omitempty"`
-	Edges  [][2]string `json:"edges,omitempty"`
+	Title  string  `json:"title"`
+	Code   string  `json:"code"`
+	Frames []M     `json:"frames"`
+	Nodes  []M     `json:"nodes,omitempty"`
+	Edges  [][]any `json:"edges,omitempty"`
 	lines  []string
 }
 

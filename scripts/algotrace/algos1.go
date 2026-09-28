@@ -276,7 +276,7 @@ func bfs(adj map[string][]string, start string) []string {
 		{"id": "A", "x": 40, "y": 85}, {"id": "B", "x": 105, "y": 40}, {"id": "C", "x": 105, "y": 130},
 		{"id": "D", "x": 190, "y": 30}, {"id": "E", "x": 190, "y": 100}, {"id": "F", "x": 265, "y": 65},
 	}
-	t.Edges = [][2]string{{"A", "B"}, {"A", "C"}, {"B", "D"}, {"B", "E"}, {"C", "E"}, {"D", "F"}, {"E", "F"}}
+	t.Edges = [][]any{{"A", "B"}, {"A", "C"}, {"B", "D"}, {"B", "E"}, {"C", "E"}, {"D", "F"}, {"E", "F"}}
 	states := map[string]string{}
 	var queue, order []string
 	var lit []string

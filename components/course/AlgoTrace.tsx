@@ -27,6 +27,7 @@ export type TraceView =
   | { k: "map"; label?: string; entries: [Cell, Cell][]; hot?: Cell }
   | { k: "heap"; label?: string; cells: number[]; marks?: Record<number, Mark> }
   | { k: "graph"; label?: string; states: Record<string, string>; edges?: string[]; at?: string }
+  | { k: "tree"; label?: string; nodes: { id: string; label: Cell; parent?: string; state?: string }[]; edgeLabels?: Record<string, string> }
   | { k: "grid"; label?: string; rows: Cell[]; cols: Cell[]; cells: Cell[][]; hot?: [number, number]; deps?: [number, number][] }
   | { k: "intervals"; label?: string; lo: number; hi: number; rows: { a: number; b: number; label?: string; state?: Mark }[] }
   | { k: "bits"; label?: string; rows: { label: string; value: number; width: number; marks?: Record<number, Mark> }[] }
@@ -42,6 +43,8 @@ export type TraceFrame = {
 };
 
 export type TraceNode = { id: string; x: number; y: number };
+/** [from, to] or [from, to, weight] */
+export type TraceEdge = [string, string] | [string, string, number];
 
 function Label({ text }: { text?: string }) {
   return text ? <div className="atr-label">{text}</div> : null;
@@ -181,7 +184,7 @@ function GraphView({
 }: {
   v: Extract<TraceView, { k: "graph" }>;
   nodes: TraceNode[];
-  edges: [string, string][];
+  edges: TraceEdge[];
 }) {
   const pos = Object.fromEntries(nodes.map((n) => [n.id, n]));
   const lit = new Set(v.edges ?? []);
@@ -189,11 +192,20 @@ function GraphView({
     <div className="atr-block">
       <Label text={v.label} />
       <svg className="atr-svg" viewBox="0 0 300 170" role="img" aria-label="graph">
-        {edges.map(([a, b]) => {
+        {edges.map(([a, b, w]) => {
           const on = lit.has(`${a}-${b}`) || lit.has(`${b}-${a}`);
           const A = pos[a];
           const B = pos[b];
-          return <line key={`${a}${b}`} x1={A.x} y1={A.y} x2={B.x} y2={B.y} className={`atr-edge ${on ? "on" : ""}`} />;
+          return (
+            <g key={`${a}${b}`}>
+              <line x1={A.x} y1={A.y} x2={B.x} y2={B.y} className={`atr-edge ${on ? "on" : ""}`} />
+              {w !== undefined && (
+                <text x={(A.x + B.x) / 2} y={(A.y + B.y) / 2 - 4} className="atr-w" textAnchor="middle">
+                  {w}
+                </text>
+              )}
+            </g>
+          );
         })}
         {nodes.map((n) => (
           <g key={n.id} className={`atr-node gs-${v.states[n.id] ?? "idle"} ${v.at === n.id ? "at" : ""}`}>
@@ -204,6 +216,63 @@ function GraphView({
           </g>
         ))}
       </svg>
+    </div>
+  );
+}
+
+function TreeView({ v }: { v: Extract<TraceView, { k: "tree" }> }) {
+  const nodes = v.nodes ?? [];
+  const kids: Record<string, string[]> = {};
+  const byId: Record<string, (typeof nodes)[number]> = {};
+  const roots: string[] = [];
+  nodes.forEach((n) => {
+    byId[n.id] = n;
+    if (n.parent && nodes.some((m) => m.id === n.parent)) (kids[n.parent] ||= []).push(n.id);
+    else roots.push(n.id);
+  });
+  const pos: Record<string, { x: number; y: number }> = {};
+  let leaf = 0;
+  let maxD = 0;
+  const walk = (id: string, d: number): number => {
+    maxD = Math.max(maxD, d);
+    const ch = kids[id] ?? [];
+    const x = ch.length === 0 ? leaf++ : ch.map((c) => walk(c, d + 1)).reduce((a, b) => a + b, 0) / ch.length;
+    pos[id] = { x, y: d };
+    return x;
+  };
+  roots.forEach((r) => walk(r, 0));
+  const GX = 44;
+  const W = Math.max(leaf, 1) * GX;
+  const H = (maxD + 1) * 48 + 12;
+  const px = (id: string) => pos[id].x * GX + GX / 2;
+  const py = (id: string) => pos[id].y * 48 + 22;
+  return (
+    <div className="atr-block">
+      <Label text={v.label} />
+      <div className="atr-scroll">
+        <svg className="atr-svg" style={{ width: Math.max(W, 120), maxWidth: "none" }} viewBox={`0 0 ${Math.max(W, 120)} ${H}`} role="img" aria-label="tree">
+          {nodes.map((n) =>
+            n.parent && pos[n.parent] ? (
+              <g key={`e${n.id}`}>
+                <line x1={px(n.parent)} y1={py(n.parent)} x2={px(n.id)} y2={py(n.id)} className={`atr-edge ${n.state && n.state !== "idle" ? "on" : ""}`} />
+                {v.edgeLabels?.[n.id] && (
+                  <text x={(px(n.parent) + px(n.id)) / 2 + 6} y={(py(n.parent) + py(n.id)) / 2} className="atr-w">
+                    {v.edgeLabels[n.id]}
+                  </text>
+                )}
+              </g>
+            ) : null
+          )}
+          {nodes.map((n) => (
+            <g key={n.id} className={`atr-node ts-${n.state ?? "idle"}`}>
+              <circle cx={px(n.id)} cy={py(n.id)} r={15} />
+              <text x={px(n.id)} y={py(n.id) + 4} textAnchor="middle">
+                {String(n.label)}
+              </text>
+            </g>
+          ))}
+        </svg>
+      </div>
     </div>
   );
 }
@@ -307,7 +376,7 @@ export function AlgoTrace({
   frames: TraceFrame[];
   /** graph views only: fixed node positions (x 0..300, y 0..170) and edges */
   nodes?: TraceNode[];
-  edges?: [string, string][];
+  edges?: TraceEdge[];
   caption?: string;
 }) {
   const st = useStepper(frames.length, 1800);
@@ -367,6 +436,8 @@ export function AlgoTrace({
                 return <GraphView key={i} v={v} nodes={nodes ?? []} edges={edges ?? []} />;
               case "grid":
                 return <GridView key={i} v={v} />;
+              case "tree":
+                return <TreeView key={i} v={v} />;
               case "intervals":
                 return <IntervalsView key={i} v={v} />;
               case "bits":
