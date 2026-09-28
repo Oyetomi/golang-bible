@@ -5651,3 +5651,88 @@ export function AofTapeAnim({ title, frames, caption }: { title: string; frames:
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   FloatCentsAnim — what a float64 really holds.
+   The price you typed, the 64 bits Go stored, the
+   exact value those bits mean, the multiply, and
+   int() chopping the fraction: a cent vanishes.
+   Then the same price as integer cents.
+   ════════════════════════════════════════════ */
+
+export type FloatCentsFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** the Go expression being evaluated */
+  expr: string;
+  /** the float64's bits, if shown: sign, exponent, mantissa */
+  bits?: [string, string, string];
+  /** the exact decimal value the machine holds */
+  exact?: string;
+  /** what fmt.Println shows */
+  printed?: string;
+  /** the final integer, and whether it's right */
+  result?: { value: string; ok: boolean };
+};
+
+export function FloatCentsAnim({ title, frames, caption }: { title: string; frames: FloatCentsFrame[]; caption?: string }) {
+  const st = useStepper(frames.length, 2800);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="float64"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="flc" key={st.cur}>
+        <div className="flc-left">
+          <Gopher role="banker" pose={f.result ? (f.result.ok ? "happy" : "panic") : "idle"} state={f.result && !f.result.ok ? "bad" : "active"} size={48} title="the till" />
+        </div>
+        <div className="flc-rows">
+          <div className="flc-row">
+            <span className="flc-k">expression</span>
+            <code className="flc-v flc-expr">{f.expr}</code>
+          </div>
+          {f.bits && (
+            <div className="flc-row">
+              <span className="flc-k">64 bits</span>
+              <span className="flc-v flc-bits">
+                <span className="flc-sign" title="sign">{f.bits[0]}</span>
+                <span className="flc-exp" title="exponent">{f.bits[1]}</span>
+                <span className="flc-man" title="mantissa">{f.bits[2]}</span>
+              </span>
+            </div>
+          )}
+          {f.exact && (
+            <div className="flc-row">
+              <span className="flc-k">exactly</span>
+              <code className="flc-v">{f.exact}</code>
+            </div>
+          )}
+          {f.printed && (
+            <div className="flc-row">
+              <span className="flc-k">Println</span>
+              <code className="flc-v">{f.printed}</code>
+            </div>
+          )}
+          {f.result && (
+            <div className={`flc-result ${f.result.ok ? "ok" : "bad"}`}>
+              {f.result.ok ? "✓" : "✗"} {f.result.value}
+            </div>
+          )}
+        </div>
+      </div>
+    </AnimShell>
+  );
+}
