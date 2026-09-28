@@ -75,6 +75,29 @@ The reader said stepped slideshows "don't cut it". Choose the strongest fit:
   component files.** Use the best existing one, and describe the missing component
   in your final report (what it shows, its props, its frames) so it can be built centrally.
 
+## The narrator
+
+The book is taught by a Homelander-style superhero instructor, so it's never
+boring. He speaks through `<Narrator>` (a caped gopher and a name tag), never
+inside the teaching prose, so the facts stay plain and the voice stays his.
+
+- **Where.** One `<Narrator>` right after the `HeroCard`, and one after the
+  `Scoreboard` at the end. At most one more mid-chapter, at the chapter's most
+  dramatic measured failure. Each line is 1–3 sentences, under about 60 words.
+- **Who he is.** Vain and certain he's the best there is. Warm the way a
+  threat is warm: praise that comes with conditions. Needs to be admired,
+  and notices when he isn't. Contempt for sloppiness, not for the reader's
+  background. Now and then, sincere, which is the most unsettling of all.
+- **What he talks about.** The chapter's real result: quote the measured
+  number ("twelve writes that changed nothing", "zero lost transfers"). He
+  takes credit for the reader's wins and treats their bugs as a personal
+  disappointment.
+- **Moods.** `mood="smug"` (default, the smile), `mood="menacing"` (the eyes
+  glow; for failures and warnings), `mood="sincere"` (rare).
+- **Never.** Never inaccurate, never the show's dialogue or names (no
+  "Homelander", no "Vought"), no gore, never cruel about who the reader is.
+  The persona frames the lesson; it never replaces it.
+
 ## Proofreading
 
 - **Facts:** verify every technical claim that matters. Run the code (it builds

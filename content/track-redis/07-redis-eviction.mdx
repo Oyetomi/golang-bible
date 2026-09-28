@@ -1,0 +1,626 @@
+---
+title: "When Memory Runs Out: Eviction"
+part: "redis"
+order: 7
+type: "course"
+description: "A cache with a size limit has to decide what to throw away. We build exact LRU with a map and container/list (84.2% hit rate on skewed traffic), then Redis's own approximation, which keeps no list and compares 5 sampled keys: 83.6%, at 79.8 bytes per key instead of 135.8. Random eviction manages 80.8–80.9%. Real Redis 8.10.2 with a 2 MB limit kept 3,489 of 50,000 keys and evicted the oldest."
+prerequisites: ["redis-ttl"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 7" title="When Memory Runs Out: Eviction">
+
+Expiry removes keys that have a known lifetime. But a cache usually holds keys that never expire, and it's given a fixed amount of memory. When it's full and a new key arrives, something has to go. Which one? Throw away something that's about to be read again and the next read is a **miss**: a trip to the slow database the cache was meant to save.
+
+Redis answers with **eviction policies**, set by `maxmemory-policy`. The most used is **LRU**, least recently used: evict the key that hasn't been touched for the longest. This lesson builds it exactly, measures it against random eviction, and then builds the cheaper approximation Redis actually uses.
+
+Three stops:
+
+1. **A size limit.** What Redis does at `maxmemory`, and how to measure a cache: its hit rate.
+2. **Exact LRU.** A map plus a doubly linked list, so both lookup and "move to front" are constant time.
+3. **Redis's approximation.** No list at all: a timestamp per key and a sample of 5.
+
+</HeroCard>
+
+<Narrator>
+When memory runs out, something has to go. Deciding what is a matter of taste. Mine is excellent. Yours is about to be.
+</Narrator>
+
+<ChapterTabs tabs={["A Size Limit", "Exact LRU", "Sampled LRU"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "store.go" },
+    { path: "lru.go", status: "new", note: "Cache: a size limit and exact LRU eviction, with container/list" },
+    { path: "sampled.go", status: "new", note: "SampledCache: Redis's approximation, a clock per key and a sample of 5" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go", status: "new", note: "LRU evicts the right key; the sampled cache stays within its limit" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go", status: "new", note: "a million skewed reads through four eviction policies" },
+    { path: "cmd/mem/main.go", status: "new", note: "memory per key for each kind of cache" }
+  ]}
+  run={["go test ./...", "go run ./cmd/hitrate", "go run ./cmd/mem"]}
+>
+
+The caches are new types beside `Store`, in their own files in the same `kv` package. `Store` doesn't change in this lesson.
+
+</ProjectMap>
+
+## A Size Limit
+
+*Stop 1 of 3.*
+
+### Step 1: real Redis at its limit
+
+Give Redis 8.10.2 a 2 MB limit and the `allkeys-lru` policy, then write 50,000 keys of 100 bytes each, about 5 MB of values:
+
+```text
+127.0.0.1:6379> CONFIG GET maxmemory-samples
+1) "maxmemory-samples"
+2) "5"
+127.0.0.1:6379> CONFIG SET maxmemory 2mb
+OK
+127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lru
+OK
+$ v=$(head -c 100 /dev/zero | tr "\0" x)   # a 100-byte value
+$ for i in $(seq 0 49999); do echo "SET product:$i $v"; done | redis-cli --pipe
+Last reply received from server.
+errors: 0, replies: 50000
+127.0.0.1:6379> DBSIZE
+(integer) 3489
+127.0.0.1:6379> GET product:0
+(nil)
+127.0.0.1:6379> EXISTS product:49999
+(integer) 1
+```
+
+All 50,000 writes succeeded (`errors: 0`), but only **3,489** keys are left. The first key written, `product:0`, is gone; the last, `product:49999`, is there. Redis made room for each new key by evicting old ones. Note the first line too: `maxmemory-samples` is **5**. Stop 3 explains it.
+
+### Step 2: the measure of a cache
+
+A cache is only as good as how often it has the answer. The **hit rate** is the fraction of reads it serves itself. To compare eviction policies fairly, `cmd/hitrate` replays the same traffic through each one:
+
+```go noverify title="kv/cmd/hitrate/main.go · lines 1–4"
+// hitrate: 1,000,000 reads over 100,000 possible keys, skewed like real
+// traffic (a Zipf distribution: a few keys are read far more than the
+// rest). A miss fetches the value and stores it. Room for 10,000 keys.
+// Exact LRU, Redis-style sampled LRU, and evicting a random key.
+```
+
+A million reads over 100,000 product keys, drawn from a **Zipf distribution**: a few products are read constantly and most rarely, the shape real traffic usually has (a shop's best-sellers, a site's front page). The cache has room for 10,000 keys, a tenth of them. On a miss, the program stores the key, as a real cache would after fetching from the database.
+
+### Step 3: the baseline, random eviction
+
+The simplest policy needs no bookkeeping: when full, evict any key. It's Redis's `allkeys-random`:
+
+```go noverify title="kv/cmd/hitrate/main.go · lines 14–29"
+// randomCache evicts an arbitrary key when full (Redis's allkeys-random).
+type randomCache struct {
+	max  int
+	data map[string]string
+}
+
+func (c *randomCache) Get(k string) (string, bool) { v, ok := c.data[k]; return v, ok }
+func (c *randomCache) Set(k, v string) {
+	if _, ok := c.data[k]; !ok && len(c.data) == c.max {
+		for victim := range c.data { // map order is randomised
+			delete(c.data, victim)
+			break
+		}
+	}
+	c.data[k] = v
+}
+```
+
+`range` over a map starts at a random place, so "the first key the loop sees" is an arbitrary key. Measured: **80.9%** (80.8–80.9% over several runs, since the victims are random). That's already high, because the hot products are read so often that even when one is evicted it's back almost at once. The question is how much a smarter policy adds.
+
+<QuickCheck
+  question="Why can a cache that holds only a tenth of the keys still serve about 80% of reads?"
+  options={[
+    "Because the reads repeat randomly",
+    "Because traffic is skewed: a small set of hot keys gets most of the reads, and those stay cached",
+    "Because the cache compresses values",
+    "Because misses are counted as hits"
+  ]}
+  answer={1}
+  explain="With a Zipf distribution, the most popular keys account for most reads. Even random eviction keeps them most of the time."
+/>
+
+## Exact LRU
+
+*Stop 2 of 3.*
+
+### Step 1: what LRU needs
+
+"Evict the least recently used key" needs two things, and both have to be fast because they happen on every command:
+
+- **Find a key** by name: a map does that.
+- **Keep the keys in order of last use**, so that using a key moves it to the front, and the one to evict is always at the back.
+
+A slice kept in order would make "move to front" cost time proportional to the number of keys. A **doubly linked list** does it in constant time: each element points to the one before and after it, so it can be unlinked and relinked at the front without touching anything else. Go's standard library has one, `container/list`.
+
+### Step 2: a map of pointers into a list
+
+```go noverify title="kv/lru.go · lines 5–21"
+// Cache is a Store with a size limit: at most max keys. When a new key
+// would pass the limit, the least recently used key is evicted, as Redis
+// does with maxmemory-policy allkeys-lru.
+type Cache struct {
+	max       int
+	items     map[string]*list.Element // key -> its node in order
+	order     *list.List               // front: most recently used
+	Evictions int
+}
+
+type item struct {
+	key, value string
+}
+
+func NewCache(max int) *Cache {
+	return &Cache{max: max, items: make(map[string]*list.Element), order: list.New()}
+}
+```
+
+The trick is the map's value type: `*list.Element`, a pointer to the key's node in the list. The map finds the node in one step, and the node can then be moved or removed in one step. The node itself holds an `*item` with the key and value; the key is stored there too so that, when a node falls off the back, we know which map entry to delete.
+
+### Step 3: every use moves to the front
+
+```go noverify title="kv/lru.go · lines 23–30"
+func (c *Cache) Get(key string) (string, bool) {
+	el, ok := c.items[key]
+	if !ok {
+		return "", false
+	}
+	c.order.MoveToFront(el) // reading a key makes it recent
+	return el.Value.(*item).value, true
+}
+```
+
+A read is a use: `MoveToFront` relinks the node at the head of the list. `el.Value` is an `any` (`container/list` predates generics), so getting the item back needs a type assertion, `.(*item)`.
+
+### Step 4: a full cache evicts from the back
+
+```go noverify title="kv/lru.go · lines 32–45"
+func (c *Cache) Set(key, value string) {
+	if el, ok := c.items[key]; ok {
+		el.Value.(*item).value = value
+		c.order.MoveToFront(el)
+		return
+	}
+	if len(c.items) == c.max {
+		oldest := c.order.Back()
+		delete(c.items, oldest.Value.(*item).key)
+		c.order.Remove(oldest)
+		c.Evictions++
+	}
+	c.items[key] = c.order.PushFront(&item{key, value})
+}
+```
+
+Updating a key that's already cached just changes its value and moves it to the front. A **new** key, when the cache is full, first evicts `order.Back()`, the least recently used, from both the map and the list, then pushes the new node on the front. Map and list always hold the same keys.
+
+<LRUAnim
+  title="GET and SET on a 3-key LRU cache"
+  max={3}
+  frames={[
+    { op: "SET a, SET b, SET c", keys: ["c", "b", "a"], note: "Three SETs into an empty cache with room for three. Each new key is pushed on the front, so the order is c, b, a: a is the least recent." },
+    { op: "GET a", keys: ["a", "c", "b"], hot: "a", beat: "solution", note: "A read is a use: MoveToFront relinks a at the head. Now b is the least recently used." },
+    { op: "SET d", keys: ["a", "c", "b"], evict: "b", note: "The cache is full and d is new, so the node at the back, b, is removed from the list and its key deleted from the map." },
+    { op: "SET d", keys: ["d", "a", "c"], hot: "d", note: "Then d goes on the front. Still three keys: the map and the list agree." },
+    { op: "GET b", keys: ["d", "a", "c"], miss: "b", beat: "problem", note: "A GET for b misses. A real cache would now fetch b from the database, and SET it, evicting c." },
+    { op: "SET b", keys: ["d", "a", "c"], evict: "c", note: "c was the least recently used, so it goes." },
+    { op: "SET b", keys: ["b", "d", "a"], hot: "b", note: "b is back, at the front. Every step touched only the ends of the list and one map entry: constant time." }
+  ]}
+  caption="The map finds a key's node in one step; the list keeps the nodes in order of use. Together, every operation is O(1)."
+/>
+
+### Step 5: the test, and the measurement
+
+```go noverify title="kv/lru_test.go · lines 8–25"
+func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	c := NewCache(2)
+	c.Set("a", "1")
+	c.Set("b", "2")
+	c.Get("a")      // a is now more recent than b
+	c.Set("c", "3") // full: evicts b
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("b should have been evicted")
+	}
+	for _, k := range []string{"a", "c"} {
+		if _, ok := c.Get(k); !ok {
+			t.Fatalf("%s should still be there", k)
+		}
+	}
+	if c.Len() != 2 || c.Evictions != 1 {
+		t.Fatalf("Len %d, Evictions %d; want 2, 1", c.Len(), c.Evictions)
+	}
+}
+```
+
+```text
+=== RUN   TestCacheEvictsLeastRecentlyUsed
+--- PASS: TestCacheEvictsLeastRecentlyUsed (0.00s)
+=== RUN   TestSampledCacheStaysWithinLimit
+--- PASS: TestSampledCacheStaysWithinLimit (0.00s)
+PASS
+ok  	kv	0.924s
+```
+
+The first test is the animation's first four steps. And through `cmd/hitrate`, exact LRU against random eviction:
+
+```text
+LRU              hit rate 84.2%
+sampled LRU, 5   hit rate 83.6%
+sampled LRU, 10  hit rate 83.9%
+random eviction  hit rate 80.9%
+```
+
+Exact LRU: **84.2%** against random's **80.9%**. That sounds small, but look at the misses instead: 15.8% against 19.1%, so random eviction sends about **a fifth more** reads to the database. For a database that's the thing under pressure, that's the difference that matters.
+
+<QuickCheck
+  question="Why does the LRU map store *list.Element instead of the value?"
+  options={[
+    "Because the value might be large",
+    "So a lookup lands directly on the key's node, which can then be moved to the front or removed in constant time",
+    "Because container/list requires it",
+    "To save memory"
+  ]}
+  answer={1}
+  explain="Without the pointer, finding a key's position in the list would mean walking it, which takes time proportional to its length."
+/>
+
+## Sampled LRU
+
+*Stop 3 of 3.*
+
+### Step 1: what the list costs
+
+Exact LRU keeps a list node per key. How much memory is that? `cmd/mem` fills each cache with a million keys and measures the heap:
+
+```go noverify title="kv/cmd/mem/main.go · lines 18–41"
+type setter interface{ Set(key, value string) }
+
+func main() {
+	const n = 1_000_000
+	keys := make([]string, n) // made first, so the keys aren't counted below
+	for i := range keys {
+		keys[i] = fmt.Sprintf("product:%d", i)
+	}
+	for _, c := range []struct {
+		name string
+		new  func() setter
+	}{
+		{"exact LRU", func() setter { return kv.NewCache(n) }},
+		{"sampled LRU", func() setter { return kv.NewSampledCache(n, 5) }},
+	} {
+		before := heap()
+		s := c.new()
+		for _, k := range keys {
+			s.Set(k, "value")
+		}
+		fmt.Printf("%-12s %5.1f bytes per key\n", c.name, float64(heap()-before)/n)
+		runtime.KeepAlive(s)
+	}
+}
+```
+
+```text
+exact LRU    135.8 bytes per key
+sampled LRU   79.8 bytes per key
+```
+
+**135.8 bytes per key** for exact LRU, against **79.8** for the sampled cache below: the list's nodes (three pointers and an interface value, 40 bytes rounded up to 48 by the allocator) plus the separate `item` they point to cost about 56 bytes per key. For a store holding a hundred million small keys, that's gigabytes of bookkeeping. This is why Redis doesn't keep a list.
+
+### Step 2: a clock instead of a list
+
+Redis stores, in each key's object, the time it was last used (24 bits of a coarse clock). When it needs to evict, it picks **a few keys at random**, `maxmemory-samples` of them (5 by default, as the `CONFIG GET` showed), and evicts the least recently used **of those**. Our version:
+
+```go noverify title="kv/sampled.go · lines 3–30"
+// SampledCache approximates LRU the way Redis does. There's no list: each
+// entry records when it was last used, and when the cache is full it looks
+// at a few entries and evicts the least recently used of those.
+type SampledCache struct {
+	max, samples int
+	clock        uint64 // counts accesses; stands in for Redis's LRU clock
+	data         map[string]*sampledEntry
+	Evictions    int
+}
+
+type sampledEntry struct {
+	value string
+	used  uint64
+}
+
+func NewSampledCache(max, samples int) *SampledCache {
+	return &SampledCache{max: max, samples: samples, data: make(map[string]*sampledEntry)}
+}
+
+func (c *SampledCache) Get(key string) (string, bool) {
+	e, ok := c.data[key]
+	if !ok {
+		return "", false
+	}
+	c.clock++
+	e.used = c.clock
+	return e.value, true
+}
+```
+
+A global counter, `clock`, stands in for Redis's clock: every use stamps the entry with the next value. No list, no pointers between entries.
+
+### Step 3: evict the oldest of five
+
+```go noverify title="kv/sampled.go · lines 32–52"
+func (c *SampledCache) Set(key, value string) {
+	c.clock++
+	if e, ok := c.data[key]; ok {
+		e.value, e.used = value, c.clock
+		return
+	}
+	if len(c.data) == c.max {
+		victim, oldest, n := "", ^uint64(0), 0
+		for k, e := range c.data { // starts at a random place
+			if e.used < oldest {
+				victim, oldest = k, e.used
+			}
+			if n++; n == c.samples {
+				break
+			}
+		}
+		delete(c.data, victim)
+		c.Evictions++
+	}
+	c.data[key] = &sampledEntry{value: value, used: c.clock}
+}
+```
+
+The eviction loop looks at the first `samples` entries of a `range`, which starts at a random place in the map, remembers the one with the smallest `used` stamp, and deletes it. It won't always find the least recently used key in the whole cache, only the least recent of five. But the key it picks is **old enough**: the chance that all five samples are recent keys is small.
+
+<LRUAnim
+  title="Redis's approximation: sample 5, evict the oldest"
+  max={8}
+  frames={[
+    { op: "SET k9", keys: ["k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"], used: { k1: 12, k2: 3, k3: 15, k4: 9, k5: 14, k6: 1, k7: 11, k8: 16 }, note: "Eight keys, no list. Each one carries the clock value of its last use. k6 (used at 1) is the true least recently used." },
+    { op: "SET k9", keys: ["k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"], used: { k1: 12, k2: 3, k3: 15, k4: 9, k5: 14, k6: 1, k7: 11, k8: 16 }, sample: ["k2", "k3", "k4", "k5", "k7"], note: "The cache is full. range starts at a random place and looks at five keys: k2, k3, k4, k5, k7." },
+    { op: "SET k9", keys: ["k1", "k3", "k4", "k5", "k6", "k7", "k8"], used: { k1: 12, k2: 3, k3: 15, k4: 9, k5: 14, k6: 1, k7: 11, k8: 16 }, evict: "k2", note: "The oldest of the five is k2, used at 3. It's evicted. Not the true oldest, k6, but close: most of the cache is newer than it." },
+    { op: "SET k9", keys: ["k1", "k3", "k4", "k5", "k6", "k7", "k8", "k9"], used: { k1: 12, k3: 15, k4: 9, k5: 14, k6: 1, k7: 11, k8: 16, k9: 17 }, hot: "k9", beat: "solution", note: "k9 goes in, stamped with the clock's next value, 17. No list was touched, because there isn't one." }
+  ]}
+  caption="Sampling gives up the exact answer for a close one, and saves a list node per key."
+/>
+
+### Step 4: how close is close enough?
+
+The hit-rate output above also has the sampled caches: **83.6%** with 5 samples and **83.9%** with 10, against exact LRU's **84.2%**. (Over three runs, 5 samples gave 83.6–83.7%, and the others didn't change.) Sampling gives up about half a percentage point of hit rate, keeps nearly all of LRU's advantage over random eviction, and saves 56 bytes per key. That's the trade Redis makes by default, and `maxmemory-samples` lets you move along it: more samples, closer to exact LRU, more CPU per eviction.
+
+<UnderTheHood title="What Redis stores, and its other policies">
+
+Every Redis value is a `robj` whose header has a 24-bit `lru` field: the last-access time in seconds, wrapping every 194 days, or under the LFU policies a small logarithmic access counter plus a decay time. Since Redis 3.0, eviction also keeps a small **pool** of the best candidates found so far (16 entries), so each round's 5 samples compete with the oldest keys seen in earlier rounds, which gets the result closer to true LRU for the same number of samples. Besides `allkeys-lru` and `allkeys-random` there are `allkeys-lfu` (least frequently used), `volatile-*` versions that only evict keys with an expiry, `volatile-ttl` (the soonest to expire), and the default, `noeviction`, which refuses writes with an error once memory is full.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Measured: sampled LRU with 5 samples got 83.6% against exact LRU's 84.2%. What did it save?"
+  options={[
+    "Nothing; it's just simpler",
+    "About 56 bytes per key (79.8 against 135.8), because there's no list node per key",
+    "CPU on every GET",
+    "It avoids using a map"
+  ]}
+  answer={1}
+  explain="cmd/mem measured 135.8 bytes per key for exact LRU and 79.8 for the sampled cache. The sampled cache still has a map, and it does a little more work per eviction."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="A generic cache" level="medium">
+
+Make the exact LRU cache generic: `Cache[K comparable, V any]`. What does that remove from `Get`?
+
+<Solution>
+
+The item becomes `item[K, V]` and the map `map[K]*list.Element`; `Get` still needs `el.Value.(*item[K, V])`, because `container/list` stores `any`. To remove the assertion, write a small generic doubly linked list of your own (a `node[K, V]` with `prev`, `next`, `key`, `value`), which also avoids boxing each item in an interface and saves some of those 56 bytes.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Hit rate against size" level="easy">
+
+Run `cmd/hitrate` with `room` set to 1,000, 5,000, 20,000 and 50,000 keys. What happens to the gap between LRU and random as the cache grows?
+
+<Solution>
+
+Change the `room` constant and run. Measured, LRU against random: room for 1,000 keys, 66.6% against 61.0%; 5,000, 79.3% against 75.1%; 20,000, 88.7% against 86.4%; 50,000, 93.1% against 92.7%. The gap shrinks from 5.6 points to 0.4 as the cache grows: with room for half the keys, every policy keeps the hot ones. Eviction policy matters most when memory is tight, which is exactly when Redis needs it.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="LFU" level="hard">
+
+Add a `volatile`-free LFU: count reads per key and evict the least frequently used of a sample of 5. Compare its hit rate on the Zipf traffic.
+
+<Solution>
+
+Store a counter in each entry, increment it on `Get`, and evict the smallest counter among the sample. On a stable Zipf distribution, LFU does well because popularity doesn't change; on traffic whose hot set shifts (yesterday's best-seller), plain counts never forget, which is why Redis's LFU counter is logarithmic and decays over time.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="A map and a list that disagree" level="medium">
+
+What goes wrong if `Set` for an existing key pushes a new node instead of moving the old one? Write a test that catches it.
+
+<Solution>
+
+The list gets two nodes for one key while the map points at the newer one. When the old node reaches the back it's evicted, deleting the key from the map even though it was just used, and `order.Len()` drifts above `len(items)`. A test that sets the same key twice in a cache of 2 and then checks `order.Len() == len(items)` catches it; the lab does exactly this.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Least Recently Used, Exactly"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="The starter's cache never moves a key on GET, evicts from the wrong end, and adds a second list node when a key is SET again. Make it a correct LRU cache: every GET and SET makes the key the most recent, a full cache evicts the least recent, and the map and the list always hold exactly the same keys."
+  starter={`package main
+
+import (
+	"container/list"
+	"fmt"
+	"strings"
+)
+
+// Cache holds at most max keys and evicts the least recently used one.
+// Both Get and Set count as a use.
+type Cache struct {
+	max   int
+	items map[string]*list.Element
+	order *list.List // front: most recently used, back: least
+}
+
+type item struct{ key, value string }
+
+func NewCache(max int) *Cache {
+	return &Cache{max: max, items: make(map[string]*list.Element), order: list.New()}
+}
+
+func (c *Cache) Get(key string) (string, bool) {
+	el, ok := c.items[key]
+	if !ok {
+		return "", false
+	}
+	return el.Value.(*item).value, true
+}
+
+func (c *Cache) Set(key, value string) {
+	if len(c.items) == c.max {
+		oldest := c.order.Front()
+		delete(c.items, oldest.Value.(*item).key)
+		c.order.Remove(oldest)
+	}
+	c.items[key] = c.order.PushFront(&item{key, value})
+}
+
+// Keys lists the keys from most to least recently used.
+func (c *Cache) Keys() []string {
+	var ks []string
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		ks = append(ks, el.Value.(*item).key)
+	}
+	return ks
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	order := func(c *Cache) string { return strings.Join(c.Keys(), " ") }
+
+	c := NewCache(3)
+	c.Set("a", "1")
+	c.Set("b", "2")
+	c.Set("c", "3")
+	if got := order(c); got != "c b a" {
+		fail("after SET a b c: order %q, want \\"c b a\\"", got)
+	}
+
+	c.Get("a") // a is now the most recent
+	if got := order(c); got != "a c b" {
+		fail("after GET a: order %q, want \\"a c b\\"", got)
+	}
+
+	c.Set("d", "4") // full: evicts b, the least recently used
+	if _, found := c.Get("b"); found {
+		fail("b should have been evicted")
+	}
+	for _, k := range []string{"a", "c", "d"} {
+		if _, found := c.Get(k); !found {
+			fail("%s was evicted, but b was the least recently used", k)
+		}
+	}
+
+	c = NewCache(2)
+	c.Set("x", "1")
+	c.Set("y", "2")
+	c.Set("x", "10") // updates x: no new key, and x becomes the most recent
+	if v, _ := c.Get("x"); v != "10" {
+		fail("SET on an existing key: Get = %q, want \\"10\\"", v)
+	}
+	if got := order(c); got != "x y" {
+		fail("after updating x: order %q, want \\"x y\\" (one node per key)", got)
+	}
+	c.Set("z", "3") // evicts y
+	if _, found := c.Get("y"); found {
+		fail("updating x should have made y the least recently used")
+	}
+	if _, found := c.Get("x"); !found {
+		fail("x was evicted right after it was updated")
+	}
+	if len(c.items) != 2 || c.order.Len() != 2 {
+		fail("map has %d keys and the list %d nodes; want 2 and 2", len(c.items), c.order.Len())
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Fills a 3-key cache and checks the order, reads a key and checks it moved to the front, adds a fourth key and checks the least recently used one was evicted; then updates a key in a 2-key cache and checks there's still one node per key and the other key is the next evicted. Prints ALL CHECKS PASS."
+  hints={[
+    "Get must call c.order.MoveToFront(el) before returning the value.",
+    "The least recently used node is c.order.Back(), not Front().",
+    "In Set, check c.items for the key first: if it's there, update el.Value.(*item).value, move it to the front and return, without pushing a new node."
+  ]}
+  flag="GO{least_recently_used_exactly}"
+>
+
+Three small bugs, each of which still lets the cache "work" in a demo. Only checks on the exact order catch them.
+
+</Lab>
+
+<Recap>
+
+- A cache with a size limit must **evict**; the measure of a policy is its **hit rate**. Real Redis 8.10.2 at a 2 MB limit kept 3,489 of 50,000 keys and evicted the oldest.
+- **Exact LRU** = a map of `*list.Element` + a doubly linked list: lookup, move-to-front and evict-from-back are all O(1). Measured: **84.2%** against random's **80.8–80.9%**, about a fifth fewer misses.
+- The list costs memory: **135.8** bytes per key against **79.8** without it.
+- **Redis's LRU is sampled**: a clock stamp per key, and evict the oldest of `maxmemory-samples` (5) random keys. Measured: **83.6%** with 5 samples, 83.9% with 10.
+- The trade: a little hit rate for a lot of memory, and `maxmemory-samples` tunes it.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: skewed traffic", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: pointers into the list", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: what sampling saves", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: a generic cache", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2: hit rate against size", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: LFU", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 4: a map and a list that disagree", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: Least Recently Used, Exactly", captured: false, points: 80 }}
+/>
+
+<Narrator>
+Exact LRU: 84.2%. Redis's sampled guess: 83.6%, at 79.8 bytes a key instead of 135.8. Almost as good for barely more than half the price. That's not a compromise. That's judgement.
+</Narrator>

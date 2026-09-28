@@ -12,6 +12,11 @@ import { BankAnim } from "@/components/course/BankAnim";
 import { PostRoomAnim } from "@/components/course/PostRoomAnim";
 import { ELI5, MentalModel } from "@/components/course/ELI5";
 import { ProjectCode } from "@/components/course/ProjectCode";
+import { ProjectMap } from "@/components/course/ProjectMap";
+import { Narrator } from "@/components/course/Narrator";
+import { ProcAnim } from "@/components/course/ProcAnim";
+import { PacketAnim } from "@/components/course/PacketAnim";
+import { EnvelopeAnim, SignAnim } from "@/components/course/CryptoAnim";
 
 /* Single source of truth for the components available inside every chapter's
    MDX. Passed to compileMDX in lib/content.ts, so chapter files reference
@@ -26,6 +31,8 @@ export const mdxComponents = {
   BeforeAfter: S.BeforeAfter,
   GoPlayground: S.GoPlayground,
   ProjectCode,
+  ProjectMap,
+  Narrator,
   // Visual explainers
   ExecTimeline: C.ExecTimeline,
   Scene: C.Scene,
@@ -64,11 +71,36 @@ export const mdxComponents = {
   GoroutineAnim: A.GoroutineAnim,
   RendezvousAnim: A.RendezvousAnim,
   RaceAnim: A.RaceAnim,
+  OdometerAnim: A.OdometerAnim,
+  ErrorChainAnim: A.ErrorChainAnim,
+  ExpiryAnim: A.ExpiryAnim,
+  RelationAnim: A.RelationAnim,
+  StreamAnim: A.StreamAnim,
+  LRUAnim: A.LRUAnim,
+  RoundTripAnim: A.RoundTripAnim,
+  ShopCacheAnim: A.ShopCacheAnim,
+  LockLanesAnim: A.LockLanesAnim,
+  ShutdownAnim: A.ShutdownAnim,
+  PubSubAnim: A.PubSubAnim,
+  DurabilityAnim: A.DurabilityAnim,
+  AofTapeAnim: A.AofTapeAnim,
+  FloatCentsAnim: A.FloatCentsAnim,
+  OnionAnim: A.OnionAnim,
+  IfaceWordsAnim: A.IfaceWordsAnim,
+  TwoClocksAnim: A.TwoClocksAnim,
+  ContextTreeAnim: A.ContextTreeAnim,
+  PlanAnim: A.PlanAnim,
+  ReconcileAnim: A.ReconcileAnim,
+  BurnAnim: A.BurnAnim,
+  RolloutAnim: A.RolloutAnim,
   CodeWalk,
   RuntimeStage,
   CinemaAnim,
   BankAnim,
   PostRoomAnim,
+  ProcAnim,
+  PacketAnim,
+  EnvelopeAnim, SignAnim,
   ConceptGrid: S.ConceptGrid,
   ConceptCard: S.ConceptCard,
   Gotcha: S.Gotcha,

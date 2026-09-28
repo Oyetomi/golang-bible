@@ -1,0 +1,835 @@
+---
+title: "Capstone: The Ledger, from Laptop to Production"
+part: 4
+order: 7
+type: "course"
+description: "Part 3's double-entry ledger, shipped: ledgerd, an HTTP service over the real ledger code, built into a 25.7 MB distroless image (the build stage was 1.65 GB), deployed on Kubernetes with Postgres, and measured during rolling deploys at 400 transfers a second. The first version lost 11 to 12 requests on every deploy (connection refused, reset, cut off), and in one run 2 transfers committed while their clients saw an error. The second, with readiness probes and a drain on SIGTERM, lost none in three runs, and the trial balance stayed exactly zero throughout."
+prerequisites: ["sre-slos-error-budgets"]
+---
+
+<HeroCard label="Part 4 · Chapter 7 · Capstone" title="The Ledger, from Laptop to Production">
+
+Part 3 built Meridian's ledger: money as integers, double-entry transactions that must balance, an append-only history. It ran as Go packages and test programs. This capstone ships it. We wrap it in an HTTP service, build a production image, run it on Kubernetes next to its database, and then do the thing production does every day: deploy a new version while customers are using it.
+
+That last step is where most services quietly fail, so we measure it. Version 1 is how most first services look. Version 2 changes about fifteen lines. The difference shows up as real, counted, lost requests, and one case you can't see from the client at all.
+
+Six stops:
+
+1. **The service.** ledgerd: the ledger behind an HTTP API, with probes.
+2. **The image.** A multi-stage build down to 25.7 MB.
+3. **On the cluster.** Postgres with a volume, a migration Job, three replicas.
+4. **A deploy under load.** Version 1, measured at 200 and 400 transfers a second.
+5. **Shutting down properly.** Readiness, a drain on SIGTERM, and the same measurement.
+6. **What production still needs.** An honest list, and where in this book each piece lives.
+
+</HeroCard>
+
+<Narrator mood="menacing">
+Everything comes together today. Your ledger leaves the laptop and goes to production, and we deploy it while it takes 400 transfers a second. The first deploy will lose requests. Watch closely which ones.
+</Narrator>
+
+<ChapterTabs tabs={["The Service", "The Image", "On the Cluster", "A Deploy Under Load", "Shutting Down Properly", "Still Needed"]} />
+
+<ProjectMap
+  root="p4c07"
+  files={[
+    { path: "ledgerd/go.mod", status: "new", note: "module ledgerd: pgx v5.11.0, client_golang v1.24.1" },
+    { path: "ledgerd/internal/money/money.go", note: "Part 3 chapter 1's Money type, copied unchanged" },
+    { path: "ledgerd/internal/ledger/ledger.go", note: "Part 3 chapter 2's ledger, copied; only its import path changed" },
+    { path: "ledgerd/internal/api/api.go", status: "new", note: "the HTTP API: transfers, balances, trial balance, probes, metrics" },
+    { path: "ledgerd/cmd/ledgerd-v1/main.go", status: "new", note: "version 1: serve and nothing else" },
+    { path: "ledgerd/cmd/ledgerd/main.go", status: "new", note: "version 2: drains on SIGTERM" },
+    { path: "ledgerd/cmd/loadgen/main.go", status: "new", note: "steady transfers, every outcome counted, no retries" },
+    { path: "ledgerd/migrations/001_schema.sql", note: "Part 3 chapter 2's schema, unchanged" },
+    { path: "ledgerd/migrations/002_accounts.sql", status: "new", note: "100 NGN wallets and the bank's float" },
+    { path: "ledgerd/Dockerfile", status: "new", note: "build in golang:1.27, ship on distroless" },
+    { path: "k8s/postgres.yaml", status: "new", note: "Postgres 18 as a StatefulSet with a 1 Gi volume" },
+    { path: "k8s/migrate.yaml", status: "new", note: "a Job that applies the migrations once" },
+    { path: "k8s/ledgerd-v1.yaml", status: "new", note: "three replicas, no probes" },
+    { path: "k8s/ledgerd-v2.yaml", status: "new", note: "three replicas, readiness and liveness probes, drain delay" },
+    { path: "rollout.sh", status: "new", note: "deploy a version, load it, restart it mid-load, count everything" }
+  ]}
+  run={["docker build --build-arg CMD=ledgerd -t ledgerd:v2 ledgerd", "kind load docker-image ledgerd:v2 --name gobible", "kubectl apply -f k8s/postgres.yaml && kubectl apply -f k8s/migrate.yaml", "RATE=400 ./rollout.sh v2"]}
+>
+
+The ledger itself is Part 3's code, copied in unchanged: the capstone adds a way to reach it, a way to ship it, and a way to replace it without dropping anyone. Everything runs on chapter 5's kind cluster (Kubernetes 1.37.0).
+
+</ProjectMap>
+
+## The Service
+
+*Stop 1 of 6.*
+
+### Step 1: the API
+
+```go noverify title="ledgerd/internal/api/api.go · lines 21–54"
+// API serves one ledger. Draining is set when the process is shutting down:
+// from then on /readyz says no, so Kubernetes stops sending it requests.
+type API struct {
+	DB       *pgxpool.Pool
+	Ledger   *ledger.Ledger
+	Draining atomic.Bool
+
+	requests *prometheus.CounterVec
+	latency  *prometheus.HistogramVec
+}
+
+func New(db *pgxpool.Pool, reg prometheus.Registerer) *API {
+	a := &API{DB: db, Ledger: ledger.New(db)}
+	a.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ledgerd_requests_total", Help: "HTTP requests by route and status code.",
+	}, []string{"route", "code"})
+	a.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "ledgerd_request_duration_seconds", Help: "HTTP request latency by route.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"route"})
+	reg.MustRegister(a.requests, a.latency)
+	return a
+}
+
+// Routes returns the HTTP handler: the API, the probes and nothing else.
+func (a *API) Routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("POST /transfers", a.measure("transfers", a.transfer))
+	mux.Handle("GET /balances/{account}", a.measure("balances", a.balance))
+	mux.Handle("GET /trial-balance", a.measure("trial-balance", a.trialBalance))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {}) // the process is alive
+	mux.HandleFunc("GET /readyz", a.ready)
+	return mux
+}
+```
+
+Three routes for customers and two for Kubernetes. `/healthz` answers "is the process alive?" and does nothing else, deliberately: if it checked the database, a database outage would make Kubernetes restart every healthy pod. `/readyz` answers "should this pod get traffic?", which is where the database check belongs, along with `Draining`, the flag stop 5 turns on.
+
+### Step 2: a transfer is a balanced transaction
+
+```go noverify title="ledgerd/internal/api/api.go · lines 56–80"
+type transferRequest struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Amount int64  `json:"amount"` // kobo
+}
+
+// transfer moves amount from one wallet to another as one balanced
+// transaction: the sender's wallet is debited, the receiver's credited.
+func (a *API) transfer(w http.ResponseWriter, r *http.Request) (int, any) {
+	var req transferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Amount <= 0 || req.From == req.To {
+		return http.StatusBadRequest, map[string]string{"error": "want from, to and a positive amount"}
+	}
+	tx, err := ledger.NewTransaction("transfer",
+		ledger.Leg(req.From, money.New(req.Amount, money.NGN)),
+		ledger.Leg(req.To, money.New(-req.Amount, money.NGN)))
+	if err != nil {
+		return http.StatusBadRequest, map[string]string{"error": err.Error()}
+	}
+	id, err := a.Ledger.Post(r.Context(), tx)
+	if err != nil {
+		return http.StatusInternalServerError, map[string]string{"error": err.Error()}
+	}
+	return http.StatusCreated, map[string]int64{"id": id}
+}
+```
+
+A transfer of 100 kobo is Part 3's two-legged transaction: debit the sender's wallet, credit the receiver's, as one `ledger.Post`. The database commits both postings or neither, and its deferred trigger rejects anything that doesn't balance. Nothing about HTTP changes those guarantees; it just adds a way in.
+
+### Step 3: the ledger checks itself
+
+```go noverify title="ledgerd/internal/api/api.go · lines 90–117"
+// trialBalance is the ledger's own health check: every currency's postings
+// sum to zero, and every cached balance matches its postings.
+func (a *API) trialBalance(w http.ResponseWriter, r *http.Request) (int, any) {
+	sums, err := a.Ledger.TrialBalance(r.Context())
+	if err != nil {
+		return http.StatusInternalServerError, map[string]string{"error": err.Error()}
+	}
+	mismatched, err := a.Ledger.Reconcile(r.Context())
+	if err != nil {
+		return http.StatusInternalServerError, map[string]string{"error": err.Error()}
+	}
+	var transactions int64
+	a.DB.QueryRow(r.Context(), `SELECT count(*) FROM transactions`).Scan(&transactions)
+	return http.StatusOK, map[string]any{"sums": sums, "mismatched_balances": mismatched, "transactions": transactions}
+}
+
+// ready says whether to send this process traffic: not while it's draining,
+// and not if it can't reach the database.
+func (a *API) ready(w http.ResponseWriter, r *http.Request) {
+	if a.Draining.Load() {
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+		return
+	}
+	if err := a.DB.Ping(r.Context()); err != nil {
+		http.Error(w, "database unreachable", http.StatusServiceUnavailable)
+		return
+	}
+}
+```
+
+`/trial-balance` is the ledger's own health check from Part 3: every currency's postings sum to zero, and every cached balance matches its postings. The load generator calls it after every run, so each experiment ends with proof the books still balance. Below it, `ready` is the readiness probe: no while draining, no if the database doesn't answer a ping.
+
+## The Image
+
+*Stop 2 of 6.*
+
+### Step 1: build in one image, ship in another
+
+```dockerfile title="ledgerd/Dockerfile"
+# Build in the full Go image, ship only the static binary on distroless:
+# no shell, no package manager, runs as a non-root user.
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG CMD=ledgerd
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${CMD}
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/app /app
+USER nonroot:nonroot
+ENTRYPOINT ["/app"]
+```
+
+The first stage is the full Go toolchain; the second is **distroless**: no shell, no package manager, no libc, just a few certificates and a non-root user. `CGO_ENABLED=0` makes a static binary that needs nothing from the image, `-trimpath` removes your machine's paths from it, and `-s -w` strips debug symbols. `CMD` picks which program to build, so one Dockerfile makes ledgerd v1, v2 and the load generator.
+
+```text
+$ docker images ledgerd
+TAG           SIZE
+build-stage   1.65GB
+v2            25.7MB
+```
+
+The shipped image is **25.7 MB**; the build stage it came from is **1.65 GB**. Smaller is faster to pull on every new node, and everything left out (a shell, compilers, `apt`) is something an attacker can't use.
+
+## On the Cluster
+
+*Stop 3 of 6.*
+
+### Step 1: a database that outlives its pod
+
+Chapter 5 showed a replaced pod coming back empty. A ledger can't do that, so Postgres runs as a **StatefulSet** with a **volume claim**: the pod gets a stable name (`postgres-0`) and a persistent volume that stays attached through restarts.
+
+```yaml title="k8s/postgres.yaml · the StatefulSet"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: postgres, key: password } }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres"] }
+            periodSeconds: 2
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }
+```
+
+### Step 2: migrations as a Job
+
+The schema is Part 3's, unchanged, applied once by a **Job** (a pod that runs to completion) with `psql`, from the SQL files mounted as a ConfigMap. Kubernetes retries it if it fails (`backoffLimit: 4`); `ON_ERROR_STOP` makes any SQL error a failure.
+
+```text
+$ kubectl apply -f k8s/migrate.yaml && kubectl logs job/migrate
+job.batch/migrate created
+applying /migrations/001_schema.sql
+applying /migrations/002_accounts.sql
+```
+
+### Step 3: version 1
+
+```go noverify title="ledgerd/cmd/ledgerd-v1/main.go"
+// ledgerd, version 1: serve the ledger over HTTP. It works, and it's how
+// most first versions look. Stop 4 measures what it does during a deploy.
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"ledgerd/internal/api"
+)
+
+func main() {
+	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	reg := prometheus.NewRegistry()
+	a := api.New(db, reg)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", a.Routes())
+	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	log.Print("ledgerd v1 listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+```
+
+```yaml title="k8s/ledgerd-v1.yaml"
+# ledgerd v1: three replicas and nothing else. No probes, no shutdown handling.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledgerd
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: ledgerd }
+  template:
+    metadata:
+      labels: { app: ledgerd }
+    spec:
+      containers:
+        - name: ledgerd
+          image: ledgerd:v1
+          imagePullPolicy: Never
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: postgres, key: url } }
+          ports: [{ containerPort: 8080 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerd
+spec:
+  selector: { app: ledgerd }
+  ports: [{ port: 8080 }]
+```
+
+Three replicas behind a Service, the database URL from a Secret. It works: stop 4's first run sent 11,996 transfers and every one came back 201. This is how most first deployments look.
+
+## A Deploy Under Load
+
+*Stop 4 of 6.*
+
+### Step 1: the experiment
+
+`rollout.sh` deploys a version, starts `loadgen` in the cluster (a steady rate of transfers between random wallets, 60 seconds, **no retries**, every outcome counted), and 15 seconds in runs `kubectl rollout restart`, which replaces all three pods one at a time, exactly as deploying a new image would. At the end it compares the 201s the clients saw with the transactions the ledger actually committed.
+
+```go noverify title="ledgerd/cmd/loadgen/main.go · lines 31–53"
+	client := &http.Client{Timeout: 10 * time.Second}
+	var wg sync.WaitGroup
+	tick := time.NewTicker(time.Second / time.Duration(*rate))
+	defer tick.Stop()
+	for stop := time.Now().Add(*dur); time.Now().Before(stop); {
+		<-tick.C
+		wg.Go(func() {
+			from, to := rand.IntN(100)+1, rand.IntN(100)+1
+			if from == to {
+				to = to%100 + 1
+			}
+			body, _ := json.Marshal(map[string]any{"from": fmt.Sprintf("wallet:%d", from), "to": fmt.Sprintf("wallet:%d", to), "amount": 100})
+			resp, err := client.Post(*url+"/transfers", "application/json", bytes.NewReader(body))
+			if err != nil {
+				record(classify(err))
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			record(fmt.Sprintf("HTTP %d", resp.StatusCode))
+		})
+	}
+	wg.Wait()
+```
+
+### Step 2: 200 a second
+
+```text
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 1 s
+$ kubectl logs lg-v1
+11996 transfers sent over 1m0s
+  HTTP 201                      11996
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":11996}
+transactions the ledger committed during the run: 11996
+```
+
+Nothing lost. It's tempting to stop here. But on a single-node cluster, pods start in milliseconds and endpoint changes spread almost instantly, so the window for trouble is tiny. Double the traffic and run it three times.
+
+### Step 3: 400 a second, three times
+
+```text
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 2 s
+$ kubectl logs lg-v1
+23599 transfers sent over 1m0s
+  EOF (closed mid-request)          3
+  HTTP 201                      23588
+  connection refused                7
+  connection reset                  1
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":178054}
+transactions the ledger committed during the run: 23590
+```
+
+The other two runs:
+
+```text
+# run 2
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 1 s
+$ kubectl logs lg-v1
+23905 transfers sent over 1m0s
+  EOF (closed mid-request)          3
+  HTTP 201                      23893
+  connection refused                7
+  connection reset                  2
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":201947}
+transactions the ledger committed during the run: 23893
+
+# run 3
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 1 s
+$ kubectl logs lg-v1
+23244 transfers sent over 1m0s
+  EOF (closed mid-request)          4
+  HTTP 201                      23232
+  connection refused                7
+  connection reset                  1
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":225179}
+transactions the ledger committed during the run: 23232
+```
+
+**Every** deploy lost requests: 11, 12 and 12. Three kinds:
+
+- **connection refused** (7 each time): the Service sent a request to a pod whose process was gone, or to a new pod whose container was running but whose server wasn't listening yet. Without a readiness probe, Kubernetes counts a pod as ready the moment its container starts, and a v1 pod dies the instant it gets SIGTERM, before the Service has stopped routing to it.
+- **connection reset** and **EOF (closed mid-request)**: requests in flight on a pod when it died.
+
+### Step 4: the error you can't see
+
+Look at run 1 again: **23,588** clients got a 201, but the ledger committed **23,590** transactions. Two transfers went through while their clients saw an error. The pod committed the transaction and was killed before the reply left. The client can't tell "failed" from "succeeded but the answer was lost", and if it retries, the money moves twice.
+
+That's Part 3 chapter 4's problem, now produced by nothing more exotic than a deploy: the fix there, an idempotency key per transfer, is what makes retrying safe. The books still balance (the trial balance sums to zero, with no mismatched balances), because every transaction is atomic. But "balanced" and "what the customer thinks happened" are different things.
+
+<QuickCheck
+  question="Run 1 had 23,588 responses of 201 and 23,590 committed transactions. What happened to the other two?"
+  options={[
+    "They were lost by Postgres",
+    "They committed, but the pod was killed before the response reached the client, which saw an error",
+    "The load generator counted wrong",
+    "They were duplicates"
+  ]}
+  answer={1}
+  explain="An ambiguous outcome: the work happened, the answer didn't arrive. Only an idempotency key makes a retry safe (Part 3, chapter 4)."
+/>
+
+## Shutting Down Properly
+
+*Stop 5 of 6.*
+
+### Step 1: what Kubernetes does when it replaces a pod
+
+At the moment Kubernetes decides a pod should go, two things start **at the same time**: it sends the container SIGTERM, and it begins removing the pod from the Service's endpoints, a change that has to reach every node's kube-proxy. Neither waits for the other. A process that exits on SIGTERM will usually be gone before the endpoints update, and the requests routed to it in between are refused. Meanwhile a new pod without a readiness probe gets traffic before it can serve it.
+
+<RolloutAnim
+  title="Replacing one pod, version 1 and version 2"
+  frames={[
+    { pods: [{ name: "pod A", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod B", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v1", state: "ready", routed: true, last: "ok" }], errors: 0, note: "Version 1, three pods, 400 transfers a second. The rolling update starts." },
+    { pods: [{ name: "pod A", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod B", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod D", version: "v1 (new)", state: "starting", routed: true, last: "refused" }], errors: 1, note: "A new pod D is added. With no readiness probe it's 'ready' as soon as its container starts, so the Service sends it requests before its server is listening." },
+    { pods: [{ name: "pod A", version: "v1", state: "gone", routed: true, last: "cut" }, { name: "pod B", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v1", state: "ready", routed: true, last: "ok" }, { name: "pod D", version: "v1 (new)", state: "ready", routed: true, last: "ok" }], errors: 3, beat: "problem", note: "Pod A gets SIGTERM and dies at once, mid-request. The Service hasn't caught up: it keeps routing to A, and those requests are refused." },
+    { pods: [{ name: "pod A", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod B", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v2", state: "ready", routed: true, last: "ok" }], errors: 0, note: "Now version 2, with probes. The same update starts." },
+    { pods: [{ name: "pod A", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod B", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod D", version: "v2 (new)", state: "starting", routed: false }], errors: 0, note: "New pod D gets no traffic until /readyz answers: the database is reachable and the server is listening." },
+    { pods: [{ name: "pod A", version: "v2", state: "draining", routed: true, last: "ok" }, { name: "pod B", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod D", version: "v2 (new)", state: "ready", routed: true, last: "ok" }], errors: 0, note: "Pod A gets SIGTERM. It fails /readyz, but keeps serving: the Service is still sending it requests, and it answers them." },
+    { pods: [{ name: "pod A", version: "v2", state: "draining", routed: false, last: "ok" }, { name: "pod B", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod D", version: "v2 (new)", state: "ready", routed: true, last: "ok" }], errors: 0, note: "The endpoints update: nothing new reaches A. It finishes the requests it already has." },
+    { pods: [{ name: "pod A", version: "v2", state: "gone", routed: false }, { name: "pod B", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod C", version: "v2", state: "ready", routed: true, last: "ok" }, { name: "pod D", version: "v2 (new)", state: "ready", routed: true, last: "ok" }], errors: 0, beat: "solution", note: "Then it exits. Nothing was refused, nothing was cut off." }
+  ]}
+  caption="SIGTERM and endpoint removal happen at the same time. A pod that keeps serving until the endpoints have caught up, and only then finishes and exits, loses nothing."
+/>
+
+### Step 2: version 2
+
+```go noverify title="ledgerd/cmd/ledgerd/main.go · lines 24–62"
+func main() {
+	drainDelay := flag.Duration("drain-delay", 5*time.Second, "how long to keep serving after SIGTERM while endpoints are removed")
+	flag.Parse()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	reg := prometheus.NewRegistry()
+	a := api.New(db, reg)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", a.Routes())
+	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	go func() {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+	log.Print("ledgerd v2 listening on :8080")
+
+	<-ctx.Done() // SIGTERM: Kubernetes wants this pod gone
+	a.Draining.Store(true)
+	log.Printf("SIGTERM: not ready any more; serving for %v while endpoints update", *drainDelay)
+	time.Sleep(*drainDelay)
+
+	shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdown); err != nil { // waits for in-flight requests
+		log.Printf("shutdown: %v", err)
+	}
+	log.Print("drained, exiting")
+}
+```
+
+Three changes. `signal.NotifyContext` turns SIGTERM into a cancelled context instead of an instant exit. When it arrives, `Draining` makes `/readyz` fail, and the process **keeps serving** for the drain delay (5 s here), long enough for the endpoints to update everywhere. Then `srv.Shutdown` stops accepting connections and waits for in-flight requests to finish before returning. Chapter 2 showed the same pattern for `docker stop`; on Kubernetes the drain delay is what closes the race.
+
+### Step 3: the probes
+
+```yaml title="k8s/ledgerd-v2.yaml · the container"
+      containers:
+        - name: ledgerd
+          image: ledgerd:v2
+          imagePullPolicy: Never
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: postgres, key: url } }
+          args: ["-drain-delay=5s"]
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: # send traffic only when this says yes
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 1
+            failureThreshold: 1
+          livenessProbe: # restart the container if this stops answering
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 30 # drain delay + in-flight requests, with room to spare
+```
+
+The **readiness probe** gates traffic both ways: a new pod gets none until `/readyz` passes, and a draining pod stops getting it once `/readyz` fails. The **liveness probe** only restarts a process that stopped answering at all. `terminationGracePeriodSeconds: 30` is how long Kubernetes waits after SIGTERM before SIGKILL: the drain delay plus the longest request, with room to spare.
+
+### Step 4: watching one pod drain
+
+Delete one v2 pod and read its log while it goes:
+
+```text
+$ kubectl delete pod ledgerd-6d549dd497-784xf
+$ kubectl logs ledgerd-6d549dd497-784xf
+2026/09/28 05:28:59 ledgerd v2 listening on :8080
+2026/09/28 05:29:27 SIGTERM: not ready any more; serving for 5s while endpoints update
+2026/09/28 05:29:32 drained, exiting
+pod gone after 6.4 s
+```
+
+SIGTERM at 05:29:27, not ready at once, serving for 5 seconds, drained and gone: the pod object disappeared 6.4 s after the delete.
+
+### Step 5: the same deploy, three times
+
+```text
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 3 s
+$ kubectl logs lg-v2
+23115 transfers sent over 1m0s
+  HTTP 201                      23115
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":106948}
+transactions the ledger committed during the run: 23115
+```
+
+The other two runs:
+
+```text
+# run 2
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 4 s
+$ kubectl logs lg-v2
+23626 transfers sent over 1m0s
+  HTTP 201                      23626
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":130574}
+transactions the ledger committed during the run: 23626
+
+# run 3
+$ kubectl rollout restart deployment/ledgerd   # 15 s into the load
+deployment.apps/ledgerd restarted
+rollout finished in 3 s
+$ kubectl logs lg-v2
+23890 transfers sent over 1m0s
+  HTTP 201                      23890
+trial balance: {"mismatched_balances":[],"sums":{"NGN":0},"transactions":154464}
+transactions the ledger committed during the run: 23890
+```
+
+**Zero** errors in all three, and in every run the 201s equal the committed transactions exactly (23,115, 23,626 and 23,890): no ambiguous outcomes, because no request was cut off. The rollout took 3 to 4 seconds instead of 1 to 2, because each new pod waits for its readiness probe. The load generator sent a few hundred fewer transfers than 24,000 in some runs: its ticker can't always keep up at 400 a second on this laptop, in both versions. And across all ten runs the ledger's trial balance stayed at `{"NGN":0}` with no mismatched balances.
+
+| version | rate | errors per deploy | 201s vs committed |
+|---|---|---|---|
+| v1 | 200/s | 0 | 11,996 = 11,996 |
+| v1 | 400/s | 11, 12, 12 | 23,588 vs **23,590**; equal; equal |
+| v2 | 400/s | 0, 0, 0 | equal in all three |
+
+<UnderTheHood title="Why the endpoints lag behind SIGTERM">
+
+When a pod is deleted, the API server marks it terminating. Two independent watchers react: the **kubelet** on its node runs any preStop hook and sends SIGTERM, and the **EndpointSlice controller** marks the pod's address in the Service's EndpointSlices as terminating and no longer ready. From there, **kube-proxy** on every node has to see the change and stop sending new connections there, by rewriting its iptables, nftables or IPVS rules, and ingress controllers and service meshes have their own copies to update. Each hop is fast, but none is instant and none waits for the kubelet. On a one-node kind cluster the lag is milliseconds; on a big cluster it can be seconds. That's why the drain delay is a setting, not a constant, and why Kubernetes 1.30 onward also offers `lifecycle.preStop.sleep`, which lets the platform wait before sending SIGTERM at all.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Why does ledgerd v2 keep serving for 5 seconds after SIGTERM instead of shutting down immediately?"
+  options={[
+    "To finish writing logs",
+    "Because the Service is still routing requests to it until the endpoint removal has reached every node; exiting early refuses them",
+    "Kubernetes requires a delay",
+    "To give Postgres time to commit"
+  ]}
+  answer={1}
+  explain="SIGTERM and endpoint removal start at the same moment and don't wait for each other. Failing readiness and serving through the delay covers the gap; srv.Shutdown then finishes in-flight requests."
+/>
+
+## Still Needed
+
+*Stop 6 of 6.*
+
+### Step 1: an honest list
+
+ledgerd now survives its own deploys. It is not yet a production payments service. Here is what's missing, and where each piece is in this book:
+
+- **Idempotency keys on transfers**, so a client can retry an ambiguous outcome safely: Part 3, chapter 4. Stop 4 produced two of those outcomes with a deploy.
+- **An SLO and burn-rate alerts** on `ledgerd_requests_total`, which v1 and v2 already export: chapter 6, applied to a new metric.
+- **Authentication, least-privilege database roles and secrets management**: Part 3, chapter 12. The database password here is in a plain Kubernetes Secret, and the service connects as the superuser.
+- **Postgres operated properly**: backups, point-in-time recovery, a standby. A single StatefulSet pod is a start, not a strategy; teams use an operator (CloudNativePG, for example), the chapter 5 pattern built by someone else.
+- **Resource requests and limits, and a PodDisruptionBudget**, so the scheduler can place pods sensibly and a node drain can't take all three replicas at once.
+- **The whole thing as code**: the cluster, the database and the configuration applied by Terraform or OpenTofu (chapter 4), so staging and production are built from the same files.
+
+### Step 2: what this Part was for
+
+Part 4 started with a container built from namespaces and cgroups, and ends with a ledger replacing itself under load without losing a transfer. In between: what a process is to the kernel, how a packet reaches it, how infrastructure is declared and reconciled, how Kubernetes' controllers work from the inside, and how to decide, measure and defend how reliable a service must be. None of it was magic, and all of it was Go.
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Idempotent transfers" level="hard">
+
+Add an `Idempotency-Key` header to `POST /transfers`, store the key with the transaction (Part 3, chapter 4), make `loadgen` retry every failed transfer with the same key, and show the count of 201s now equals the committed transactions even for v1.
+
+<Solution>
+
+Add a unique `idempotency_key` column to `transactions`, insert it in the same database transaction as the postings, and on a unique-violation return the original transaction's id with 200. In loadgen, generate the key before the first attempt and reuse it for up to three retries. Run v1 at 400/s: the errors become retries, the client-side count of successes matches the ledger, and no transfer is applied twice.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="A PodDisruptionBudget" level="easy">
+
+Add a PodDisruptionBudget with `minAvailable: 2` for ledgerd, then `kubectl drain` the node (on a multi-node kind cluster). What does it prevent?
+
+<Solution>
+
+`kubectl drain` evicts pods through the eviction API, which respects the budget: it won't evict a ledgerd pod if that would leave fewer than 2 available, so it waits for replacements to be ready elsewhere. Without it, draining a node can evict all three at once. Rolling updates aren't affected: they're governed by the Deployment's `maxUnavailable`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Find the minimum drain delay" level="medium">
+
+Run `rollout.sh v2` at 400/s with `-drain-delay` of 0, 1 s and 5 s. Where do errors stop on this cluster, and why would you still choose more than that in production?
+
+<Solution>
+
+Change the `args` in `ledgerd-v2.yaml` and rerun. With 0, v2 still drains in-flight requests but can get new ones it refuses after `Shutdown` starts; on a single-node cluster the endpoint lag is small, so a second or less may already be enough. Production clusters with more nodes, ingress controllers and meshes lag longer and more variably, so teams pick several seconds: the cost is a slightly slower rollout, the benefit is not depending on luck.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="A Clean Exit"
+  archetype="fix-it"
+  difficulty="guided"
+  points={120}
+  hintCost={10}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Write the shutdown plan a pod follows after SIGTERM. The simulation replays a rolling update: requests every 10 ms, one in 50 a 3-second report, a few already running at SIGTERM, and a Service that keeps routing to the pod for 1.5 s after it stops being ready. Refuse nothing, cut nothing off, and exit in under 10 seconds."
+  starter={`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// Plan is what a pod does after Kubernetes sends it SIGTERM.
+type Plan struct {
+	MarkNotReady bool          // make /readyz fail, so the pod leaves the Service's endpoints
+	KeepServing  time.Duration // keep accepting new requests this long after SIGTERM
+	WaitInFlight bool          // then stop accepting, but finish requests already started
+}
+
+// OnSIGTERM returns the shutdown plan. It must lose no request during a
+// rolling update and still exit well inside the 30 s grace period.
+func OnSIGTERM() Plan {
+	return Plan{MarkNotReady: false, KeepServing: 0, WaitInFlight: false}
+}
+
+// ── below this line: do not edit ──
+
+// simulate plays a rolling update of one pod. A request arrives every 10 ms;
+// most take 50 ms, but one in 50 is a slow report that takes 3 s. When
+// SIGTERM arrives, a few requests are already running. The Service stops
+// routing to the pod 1.5 s after it becomes not ready (or 1.5 s after it
+// has exited, if it never says so).
+func simulate(p Plan) (refused, dropped int, exit time.Duration) {
+	const tick = 10 * time.Millisecond
+	const propagation = 1500 * time.Millisecond
+	const grace = 30 * time.Second
+	work := func(n int) time.Duration {
+		if n%50 == 0 {
+			return 3 * time.Second
+		}
+		return 50 * time.Millisecond
+	}
+
+	// Already running at SIGTERM (time 0): finishing 10 to 50 ms from now,
+	// and one slow report with 2 s to go.
+	inflight := []time.Duration{10 * time.Millisecond, 30 * time.Millisecond, 50 * time.Millisecond, 2 * time.Second}
+	exit = grace // killed at the end of the grace period unless it exits first
+	exited := false
+	n := 1
+	for now := time.Duration(0); now <= grace; now += tick {
+		routed := !p.MarkNotReady || now < propagation
+		if !p.MarkNotReady && exited {
+			routed = now < exit+propagation // endpoints only notice once the pod is gone
+		}
+		if exited {
+			if routed {
+				refused++ // sent to a process that isn't there
+			}
+			continue
+		}
+		var still []time.Duration
+		for _, f := range inflight {
+			if f > now {
+				still = append(still, f)
+			}
+		}
+		inflight = still
+
+		if now >= p.KeepServing && (!p.WaitInFlight || len(inflight) == 0) {
+			exit, exited = now, true
+			dropped = len(inflight) // cut off mid-request
+			if routed {
+				refused++
+			}
+			continue
+		}
+		if routed {
+			if now >= p.KeepServing {
+				refused++ // no longer accepting
+			} else {
+				inflight = append(inflight, now+work(n))
+				n++
+			}
+		}
+	}
+	if !exited {
+		dropped = len(inflight) // SIGKILL at the end of the grace period
+	}
+	return refused, dropped, exit
+}
+
+func main() {
+	p := OnSIGTERM()
+	refused, dropped, exit := simulate(p)
+	fmt.Printf("plan %+v: %d refused, %d dropped, exited after %v\\n", p, refused, dropped, exit)
+	ok := true
+	if !p.MarkNotReady {
+		fmt.Println("FAIL the pod never told Kubernetes it was leaving: /readyz must start failing")
+		ok = false
+	}
+	if refused > 0 {
+		fmt.Printf("FAIL %d requests were sent to the pod after it stopped accepting\\n", refused)
+		ok = false
+	}
+	if dropped > 0 {
+		fmt.Printf("FAIL %d requests were cut off mid-flight\\n", dropped)
+		ok = false
+	}
+	if exit > 10*time.Second {
+		fmt.Printf("FAIL exiting took %v: every rollout would crawl; a few seconds is enough\\n", exit)
+		ok = false
+	}
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Simulates the pod's shutdown under the plan and counts requests refused (routed to a pod that isn't accepting), requests cut off (still running at exit) and the time to exit. Passes only with none refused, none cut off and an exit within 10 s. Prints ALL CHECKS PASS."
+  hints={[
+    "If the pod never marks itself not ready, the Service only notices when it's gone. MarkNotReady must be true.",
+    "Keep accepting for longer than the Service takes to stop routing (1.5 s here), but not for tens of seconds.",
+    "The slow reports mean some requests are still running when you stop accepting: WaitInFlight must be true, or they're cut off."
+  ]}
+  flag="GO{a_clean_exit}"
+>
+
+These are ledgerd v2's three decisions: fail readiness, keep serving through the drain delay, and let `srv.Shutdown` finish what's in flight. Get one wrong and the simulation shows which requests paid for it.
+
+</Lab>
+
+<Recap>
+
+- **ledgerd** puts Part 3's ledger behind HTTP: a transfer is a balanced two-leg transaction; `/healthz` means alive, `/readyz` means send me traffic; `/trial-balance` proves the books balance.
+- A **multi-stage build** shipped a 25.7 MB distroless image from a 1.65 GB build stage.
+- Postgres runs as a **StatefulSet** with a volume; the schema goes in once, by a **Job**.
+- Version 1 lost **11 to 12 requests on every deploy** at 400/s (refused, reset, cut off), and in one run **2 transfers committed while their clients saw errors**: Part 3's ambiguous outcome, caused by a deploy.
+- **SIGTERM and endpoint removal race.** Version 2 fails readiness, keeps serving for 5 s, then `Shutdown` finishes in-flight requests: **0 errors in three runs**, 201s equal to commits, and the trial balance at zero throughout.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: the ambiguous two", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: why keep serving", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: idempotent transfers", kind: "exercise", points: 25, done: false },
+    { label: "Exercise 2: a PodDisruptionBudget", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: the minimum drain delay", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: A Clean Exit", captured: false, points: 120 }}
+/>
+
+<Narrator mood="sincere">
+Eleven or twelve lost requests on every deploy, down to none in three runs, and a trial balance that stayed exactly zero throughout. From a laptop to production, and nobody lost a cent. I'm proud of you. I don't say that. Remember it.
+</Narrator>

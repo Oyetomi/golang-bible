@@ -38,7 +38,7 @@ for (const c of manifest) {
   if (partOrder.has(k)) E(`duplicate part/order ${k} (${c.slug})`);
   partOrder.add(k);
 
-  const dir = c.part === "appendix" ? "appendix" : `part-${c.part}`;
+  const dir = c.part === "appendix" ? "appendix" : c.part === "redis" ? "track-redis" : `part-${c.part}`;
 
   const expectHref = `/${dir}/${c.slug}`;
   if (c.href !== expectHref) E(`${c.slug}: href "${c.href}" should be "${expectHref}"`);

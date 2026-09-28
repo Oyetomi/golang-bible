@@ -1,0 +1,1108 @@
+---
+title: "Infrastructure as Code: Terraform, OpenTofu & a Provider in Go"
+part: 4
+order: 4
+type: "course"
+description: "Infrastructure described in files and reconciled by a tool, built from the inside: a real Terraform/OpenTofu provider in Go, terraform-provider-kv, that manages keys in the Redis-compatible server from the Build Your Own Redis track. OpenTofu 1.12.6 created, updated, replaced, imported and destroyed keys with it; a key changed and another deleted by hand showed up as drift in the next plan; the debug log showed OpenTofu starting the provider as a separate process three times in one plan and talking gRPC to it; the same binary worked under Terraform 1.16.4; and an acceptance test drove real Terraform through create, update, import and destroy in 3.3 s."
+prerequisites: ["cloud-networking"]
+---
+
+<HeroCard label="Part 4 · Chapter 4" title="Infrastructure as Code">
+
+A real system is hundreds of pieces: servers, databases, DNS records, load balancers, queues, the settings inside each. Set them up by hand and you get a system nobody can rebuild, where production drifts away from staging one "quick fix" at a time. **Infrastructure as code** writes the desired system down in files, keeps them in git, and lets a tool make reality match. Terraform is the tool most of the industry uses, and OpenTofu is its open-source fork; both are written in Go, and every resource they manage comes from a **provider**, a Go program.
+
+So in this chapter we don't just use Terraform: we write a provider. It manages keys in the server you built in the Build Your Own Redis track, and it's small enough to read in one sitting, yet it uses the same framework as the AWS and Kubernetes providers.
+
+Six stops:
+
+1. **Desired state.** What "declarative" means, and what problem it solves.
+2. **Plan and apply.** The first run, and the state file it leaves behind.
+3. **Three truths.** Configuration, state and reality, and what happens when someone changes things by hand.
+4. **How providers work.** A separate process, spoken to over gRPC.
+5. **Writing the provider.** Schema, configure, and the four CRUD methods, bit by bit.
+6. **Testing it for real.** An acceptance test that runs Terraform itself.
+
+</HeroCard>
+
+<Narrator mood="menacing">
+Infrastructure as code: you write what you want, and a tool makes it true. Today you write that tool's other half, a provider, in Go. Then someone changes things by hand behind your back. We'll catch them.
+</Narrator>
+
+<ChapterTabs tabs={["Desired State", "Plan & Apply", "Three Truths", "How Providers Work", "Writing the Provider", "Testing It"]} />
+
+<ProjectMap
+  root="p4c04"
+  files={[
+    { path: "terraform-provider-kv/go.mod", status: "new", note: "module terraform-provider-kv: plugin framework v1.19.0, go-redis v9.22.0" },
+    { path: "terraform-provider-kv/main.go", status: "new", note: "serves the provider over the plugin protocol" },
+    { path: "terraform-provider-kv/internal/provider/provider.go", status: "new", note: "the provider block: its schema, and a client for the server" },
+    { path: "terraform-provider-kv/internal/provider/key_resource.go", status: "new", note: "the kv_key resource: schema, Create, Read, Update, Delete, import" },
+    { path: "terraform-provider-kv/internal/provider/key_resource_test.go", status: "new", note: "an acceptance test that runs real Terraform" },
+    { path: "config/main.tf", status: "new", note: "the configuration: two kv_key resources" },
+    { path: "tofurc", status: "new", note: "tells OpenTofu to load our provider from a local folder" },
+    { path: "tofu.sh", status: "new", note: "runs OpenTofu 1.12.6 in a container, with the provider mounted" },
+    { path: "rcli.sh", status: "new", note: "redis-cli, for changing the server behind Terraform's back" },
+    { path: "run.sh", status: "new", note: "the whole lifecycle in this chapter, every output saved" },
+    { path: "bin/kv-server", note: "the Redis track's server, lesson 10, built for Linux" }
+  ]}
+  run={["cd terraform-provider-kv && GOOS=linux go build -o ../bin/terraform-provider-kv .", "./tofu.sh plan", "./tofu.sh apply", "./run.sh"]}
+>
+
+Two things live side by side: the provider, a Go module like any other, and a configuration directory that uses it. Everything runs in containers on one Docker network: our kv server as `kv:6380`, OpenTofu, and `redis-cli`.
+
+</ProjectMap>
+
+## Desired State
+
+*Stop 1 of 6.*
+
+### Step 1: steps against states
+
+There are two ways to tell a computer what you want. **Imperative**: a list of steps. "Create a key called `config:rate_limit` with value 100." Run it twice and you get an error, or two of something; run it after someone changed the key and it doesn't notice. **Declarative**: a description of the end state. "A key called `config:rate_limit` should exist, with value 100." The tool works out the steps: create it if it's missing, change it if it's wrong, do nothing if it's right.
+
+A Terraform configuration is declarative. Here is the one this chapter uses:
+
+```hcl title="config/main.tf"
+terraform {
+  required_providers {
+    kv = {
+      source = "gobible/kv"
+    }
+  }
+}
+
+provider "kv" {
+  address = "kv:6380"
+}
+
+resource "kv_key" "greeting" {
+  name  = "config:greeting"
+  value = "Ẹ káàárọ̀"
+}
+
+resource "kv_key" "rate_limit" {
+  name  = "config:rate_limit"
+  value = "100"
+}
+```
+
+A `terraform` block says which providers the configuration needs (`gobible/kv`: ours). A `provider` block configures one. Each `resource` block declares one thing that should exist: `resource "kv_key" "rate_limit"` is a resource of **type** `kv_key` with the local **name** `rate_limit`, so its **address** is `kv_key.rate_limit`. Nothing here says "create". It says what should be true.
+
+### Step 2: why that matters
+
+Because the file describes an end state, running the tool again is always safe. If nothing changed, it does nothing. Because the file lives in git, every change to the infrastructure is a commit with an author, a review and a way back. And because the same file can be applied again and again, staging and production can be built from the same code. That's the whole promise: infrastructure you can **review**, **reproduce** and **repair**, the way you already treat application code.
+
+<QuickCheck
+  question="What does a declarative configuration describe?"
+  options={[
+    "The commands to run, in order",
+    "The end state that should exist; the tool works out the steps to get there from whatever exists now",
+    "Only the resources to create",
+    "A script that runs once"
+  ]}
+  answer={1}
+  explain="That's why applying the same configuration twice is safe: the second time, reality already matches, so there's nothing to do."
+/>
+
+## Plan & Apply
+
+*Stop 2 of 6.*
+
+### Step 1: plan
+
+`tofu plan` compares the configuration with what exists and prints what it would do, without doing it. Against an empty server:
+
+```text
+
+Warning: Provider development overrides are in effect
+
+The following provider development overrides are set in the CLI
+configuration:
+ - gobible/kv in /plugins
+
+The behavior may therefore not match any released version of the provider and
+applying changes may cause the state to become incompatible with published
+releases.
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+OpenTofu will perform the following actions:
+
+  # kv_key.greeting will be created
+  + resource "kv_key" "greeting" {
+      + name  = "config:greeting"
+      + value = "Ẹ káàárọ̀"
+    }
+
+  # kv_key.rate_limit will be created
+  + resource "kv_key" "rate_limit" {
+      + name  = "config:rate_limit"
+      + value = "100"
+    }
+
+Plan: 2 to add, 0 to change, 0 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Note: You didn't use the -out option to save this plan, so OpenTofu can't
+guarantee to take exactly these actions if you run "tofu apply" now.
+```
+
+The warning at the top appears because we load our provider from a local folder instead of a registry (stop 4 explains how); OpenTofu prints it on every command, and it's left out of the outputs below. Then the plan itself: two `+` resources, "2 to add". Reviewing this before anything changes is the point: in a team, the plan is what gets read in the pull request.
+
+### Step 2: apply
+
+`tofu apply` makes the same plan and, once approved, carries it out:
+
+```text
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+OpenTofu will perform the following actions:
+
+  # kv_key.greeting will be created
+  + resource "kv_key" "greeting" {
+      + name  = "config:greeting"
+      + value = "Ẹ káàárọ̀"
+    }
+
+  # kv_key.rate_limit will be created
+  + resource "kv_key" "rate_limit" {
+      + name  = "config:rate_limit"
+      + value = "100"
+    }
+
+Plan: 2 to add, 0 to change, 0 to destroy.
+kv_key.greeting: Creating...
+kv_key.rate_limit: Creating...
+kv_key.rate_limit: Creation complete after 0s [name=config:rate_limit]
+kv_key.greeting: Creation complete after 0s [name=config:greeting]
+
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+```
+
+```text
+$ redis-cli GET config:greeting
+Ẹ káàárọ̀
+$ redis-cli GET config:rate_limit
+"100"
+```
+
+Both keys are on the server, including the Yoruba greeting. Apply once more with nothing changed:
+
+```text
+
+kv_key.greeting: Refreshing state... [name=config:greeting]
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+
+No changes. Your infrastructure matches the configuration.
+
+OpenTofu has compared your real infrastructure against your configuration and
+found no differences, so no changes are needed.
+
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
+```
+
+"No changes." Before planning, OpenTofu **refreshed** each resource ("Refreshing state...") by asking the provider what the server holds now, found it matched the configuration, and did nothing. That's the declarative promise, measured.
+
+### Step 3: the state file
+
+Where did OpenTofu remember that these two keys are **its** keys? In the **state file**, `terraform.tfstate`, JSON written after every apply. Its header and one of the two resources:
+
+```text
+{
+  "version": 4,
+  "terraform_version": "1.12.6",
+  "serial": 1
+}
+{
+  "mode": "managed",
+  "type": "kv_key",
+  "name": "rate_limit",
+  "provider": "provider[\"registry.opentofu.org/gobible/kv\"]",
+  "instances": [
+    {
+      "schema_version": 0,
+      "attributes": {
+        "name": "config:rate_limit",
+        "value": "100"
+      },
+      "sensitive_attributes": []
+    }
+  ]
+}
+```
+
+State maps each address in the configuration (`kv_key.rate_limit`) to the real thing it manages (the key `config:rate_limit`) and records its attributes as last seen. Without it, the tool couldn't tell "a key I created and should update" from "a key someone else created that I should leave alone", or know what to delete when a resource disappears from the configuration. In a team, state lives in a shared backend (an S3 bucket, a database, Terraform Cloud) with a lock, so two people can't apply at once.
+
+<QuickCheck
+  question="Why does Terraform need a state file at all, when it can ask the provider what exists?"
+  options={[
+    "To make plans faster",
+    "To know which real objects it manages (address → real ID), what it last saw, and what to delete when a resource is removed from the configuration",
+    "Because providers can't read",
+    "To store passwords"
+  ]}
+  answer={1}
+  explain="The provider can read a key, but only state says which keys belong to this configuration and under which address."
+/>
+
+## Three Truths
+
+*Stop 3 of 6.*
+
+### Step 1: config, state, reality
+
+At any moment there are three versions of the truth: the **configuration** (what should exist), the **state** (what Terraform last saw), and the **real system**. Every command moves information between them:
+
+- **refresh** reads reality into state (the provider's `Read`);
+- **plan** compares the configuration with the refreshed state;
+- **apply** changes reality to match the configuration, and records the result in state.
+
+<PlanAnim
+  title="Three truths, one plan"
+  realLabel="the kv server"
+  frames={[
+    { phase: "plan", rows: [{ addr: "kv_key.greeting", config: "config:greeting" }, { addr: "kv_key.rate_limit", config: "100", op: "create" }], note: "First plan: the configuration has two resources, state has none, so both are to be created." },
+    { phase: "apply", rows: [{ addr: "kv_key.greeting", config: "config:greeting", state: "config:greeting", real: "config:greeting" }, { addr: "kv_key.rate_limit", config: "100", state: "100", real: "100" }], beat: "solution", note: "Apply creates both keys on the server and writes what it did into state. All three columns agree." },
+    { phase: "edit", rows: [{ addr: "kv_key.greeting", config: "config:greeting", state: "config:greeting", real: "config:greeting" }, { addr: "kv_key.rate_limit", config: "250", state: "100", real: "100" }], note: "You edit the configuration: rate_limit should be 250." },
+    { phase: "plan", rows: [{ addr: "kv_key.greeting", config: "config:greeting", state: "config:greeting", real: "config:greeting" }, { addr: "kv_key.rate_limit", config: "250", state: "100", real: "100", op: "update" }], note: "Plan compares configuration with state: the value differs, so an in-place update." },
+    { phase: "apply", rows: [{ addr: "kv_key.greeting", config: "config:greeting", state: "config:greeting", real: "config:greeting" }, { addr: "kv_key.rate_limit", config: "250", state: "250", real: "250" }], beat: "solution", note: "Apply sends SET, and state records 250." },
+    { phase: "drift", rows: [{ addr: "kv_key.greeting", config: "config:greeting", state: "config:greeting" }, { addr: "kv_key.rate_limit", config: "250", state: "250", real: "5000" }], beat: "problem", note: "Someone changes rate_limit to 5000 with redis-cli, and deletes the greeting. State still says 250 and the greeting exists: it's out of date." },
+    { phase: "refresh", rows: [{ addr: "kv_key.greeting", config: "config:greeting" }, { addr: "kv_key.rate_limit", config: "250", state: "5000", real: "5000" }], note: "The next plan refreshes first. Read finds 5000, and finds the greeting gone, so it drops it from state." },
+    { phase: "plan", rows: [{ addr: "kv_key.greeting", config: "config:greeting", op: "create" }, { addr: "kv_key.rate_limit", config: "250", state: "5000", real: "5000", op: "update" }], beat: "solution", note: "Now the plan shows the drift: create the greeting again, and set rate_limit back from 5000 to 250." }
+  ]}
+  caption="Refresh reads reality into state; plan compares configuration with state; apply makes reality match and records it."
+/>
+
+### Step 2: changes you make
+
+Change `value = "100"` to `"250"` and plan:
+
+```text
+
+kv_key.greeting: Refreshing state... [name=config:greeting]
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  ~ update in-place (current -> planned)
+
+OpenTofu will perform the following actions:
+
+  # kv_key.rate_limit will be updated in-place
+  ~ resource "kv_key" "rate_limit" {
+        name  = "config:rate_limit"
+      ~ value = "100" -> "250"
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+```
+
+`~` is an **update in place**: the key stays, its value changes. Now change the key's **name**, from `config:greeting` to `config:welcome`:
+
+```text
+
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+kv_key.greeting: Refreshing state... [name=config:greeting]
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+-/+ destroy and then create replacement
+
+OpenTofu will perform the following actions:
+
+  # kv_key.greeting must be replaced
+-/+ resource "kv_key" "greeting" {
+      ~ name  = "config:greeting" -> "config:welcome" # forces replacement
+        # (1 unchanged attribute hidden)
+    }
+
+Plan: 1 to add, 0 to change, 1 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+```
+
+`-/+` is a **replacement**: destroy, then create. A key can't be renamed in place, so the provider marks `name` as "requires replace" (stop 5 shows the line) and the plan says so: `# forces replacement`. After applying:
+
+```text
+$ redis-cli GET config:greeting
+(nil)
+$ redis-cli GET config:welcome
+Ẹ káàárọ̀
+```
+
+The old key is gone and the new one holds the value. On real infrastructure the difference between `~` and `-/+` is the difference between changing a setting and deleting a database, which is why reading the plan matters.
+
+### Step 3: changes someone else makes
+
+Now someone "fixes" things by hand, outside Terraform:
+
+```text
+$ redis-cli SET config:rate_limit 5000   # someone "fixes" it by hand
+OK
+$ redis-cli DEL config:welcome
+(integer) 1
+```
+
+The next plan:
+
+```text
+
+kv_key.greeting: Refreshing state... [name=config:welcome]
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+  ~ update in-place (current -> planned)
+
+OpenTofu will perform the following actions:
+
+  # kv_key.greeting will be created
+  + resource "kv_key" "greeting" {
+      + name  = "config:welcome"
+      + value = "Ẹ káàárọ̀"
+    }
+
+  # kv_key.rate_limit will be updated in-place
+  ~ resource "kv_key" "rate_limit" {
+        name  = "config:rate_limit"
+      ~ value = "5000" -> "250"
+    }
+
+Plan: 1 to add, 1 to change, 0 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+```
+
+This is **drift**, and the plan caught both kinds: a value changed behind Terraform's back (`"5000" -> "250"`, it will set it back) and a resource deleted behind its back (it will create it again). Apply, and the server matches the configuration once more. That's the other half of infrastructure as code: the files aren't just how you build the system, they're how you notice when it has wandered off.
+
+### Step 4: adopting what already exists
+
+A key created by hand, `feature:dark_mode`, isn't Terraform's. Add a resource block for it and plan, and Terraform wants to **create** it, not knowing it's already there:
+
+```text
+
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+kv_key.greeting: Refreshing state... [name=config:welcome]
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+OpenTofu will perform the following actions:
+
+  # kv_key.dark_mode will be created
+  + resource "kv_key" "dark_mode" {
+      + name  = "feature:dark_mode"
+      + value = "on"
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+```
+
+`tofu import` adopts it instead: it records the existing key in state under the address, using the provider's `Read` to fill in its attributes:
+
+```text
+kv_key.dark_mode: Importing from ID "feature:dark_mode"...
+kv_key.dark_mode: Import prepared!
+  Prepared kv_key for import
+kv_key.dark_mode: Refreshing state... [name=feature:dark_mode]
+
+Import successful!
+
+The resources that were imported are shown above. These resources are now in
+your OpenTofu state and will henceforth be managed by OpenTofu.
+```
+
+```text
+
+kv_key.dark_mode: Refreshing state... [name=feature:dark_mode]
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+kv_key.greeting: Refreshing state... [name=config:welcome]
+
+No changes. Your infrastructure matches the configuration.
+
+OpenTofu has compared your real infrastructure against your configuration and
+found no differences, so no changes are needed.
+```
+
+No changes: the key is managed now, without being recreated. This is how teams bring hand-built infrastructure under code one resource at a time.
+
+### Step 5: destroy
+
+```text
+
+kv_key.rate_limit: Refreshing state... [name=config:rate_limit]
+kv_key.greeting: Refreshing state... [name=config:welcome]
+kv_key.dark_mode: Refreshing state... [name=feature:dark_mode]
+
+OpenTofu used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  - destroy
+
+OpenTofu will perform the following actions:
+
+  # kv_key.dark_mode will be destroyed
+  - resource "kv_key" "dark_mode" {
+      - name  = "feature:dark_mode" -> null
+      - value = "on" -> null
+    }
+
+  # kv_key.greeting will be destroyed
+  - resource "kv_key" "greeting" {
+      - name  = "config:welcome" -> null
+      - value = "Ẹ káàárọ̀" -> null
+    }
+
+  # kv_key.rate_limit will be destroyed
+  - resource "kv_key" "rate_limit" {
+      - name  = "config:rate_limit" -> null
+      - value = "250" -> null
+    }
+
+Plan: 0 to add, 0 to change, 3 to destroy.
+kv_key.greeting: Destroying... [name=config:welcome]
+kv_key.rate_limit: Destroying... [name=config:rate_limit]
+kv_key.dark_mode: Destroying... [name=feature:dark_mode]
+kv_key.rate_limit: Destruction complete after 0s
+kv_key.greeting: Destruction complete after 0s
+kv_key.dark_mode: Destruction complete after 0s
+
+Destroy complete! Resources: 3 destroyed.
+```
+
+```text
+$ redis-cli GET config:welcome
+(nil)
+$ redis-cli GET config:rate_limit
+(nil)
+$ redis-cli GET feature:dark_mode
+(nil)
+```
+
+`destroy` removes everything in state, and only that. Any key Terraform doesn't manage would still be there.
+
+<QuickCheck
+  question="Someone deleted a managed key with redis-cli. What does the next plan show, and why?"
+  options={[
+    "Nothing, because state says it exists",
+    "An error",
+    "+ create for that resource: refresh asked the server, Read found the key missing and removed it from state, so plan sees a resource in the configuration that isn't in state",
+    "- destroy for that resource"
+  ]}
+  answer={2}
+  explain="Measured: the plan after the DEL showed kv_key.greeting will be created. Refresh is what keeps state honest."
+/>
+
+## How Providers Work
+
+*Stop 4 of 6.*
+
+### Step 1: a plugin is a separate program
+
+Terraform and OpenTofu know nothing about keys, cloud VMs or DNS. Everything they manage comes from **providers**, and a provider is a separate executable. Run ours directly and it says so:
+
+```text
+$ ./terraform-provider-kv
+This binary is a plugin. These are not meant to be executed directly.
+Please execute the program that consumes these plugins, which will
+load any plugins automatically
+(exit status 1)
+```
+
+The core starts it as a child process, with a "magic cookie" in its environment to prove it's being run by Terraform or OpenTofu. The provider then opens a Unix socket and prints one line on standard output saying where to find it. Started that way by hand:
+
+```text
+$ TF_PLUGIN_MAGIC_COOKIE=d602bf8f… PLUGIN_PROTOCOL_VERSIONS=6 ./terraform-provider-kv
+1|6|unix|/tmp/plugin2446974509|grpc|
+```
+
+`1` is the plugin system's own protocol version, `6` the Terraform plugin protocol version, then the network type, the socket's path and `grpc`. The core connects to that socket and from then on they speak **gRPC**: "what's your schema?", "plan this resource", "apply this change". With `TF_LOG=DEBUG`, one `tofu plan` showed it:
+
+```text
+2026-09-28T01:53:26.448Z [DEBUG] Provider registry.opentofu.org/gobible/kv is overridden to load from /plugins
+ - gobible/kv in /plugins
+2026-09-28T01:53:26.480Z [DEBUG] provider: starting plugin: path=/plugins/terraform-provider-kv args=["/plugins/terraform-provider-kv"]
+2026-09-28T01:53:26.483Z [DEBUG] provider: plugin started: path=/plugins/terraform-provider-kv pid=17
+2026-09-28T01:53:26.483Z [DEBUG] provider: waiting for RPC address: plugin=/plugins/terraform-provider-kv
+2026-09-28T01:53:26.525Z [DEBUG] provider: using plugin: version=6
+2026-09-28T01:53:26.525Z [DEBUG] provider.terraform-provider-kv: plugin address: address=/tmp/plugin739882503 network=unix timestamp=2026-09-28T01:53:26.525Z
+2026-09-28T01:53:26.538Z [INFO]  provider: plugin process exited: plugin=/plugins/terraform-provider-kv id=17
+2026-09-28T01:53:26.538Z [DEBUG] provider: plugin exited
+2026-09-28T01:53:26.543Z [DEBUG] provider: starting plugin: path=/plugins/terraform-provider-kv args=["/plugins/terraform-provider-kv"]
+2026-09-28T01:53:26.544Z [DEBUG] provider: plugin started: path=/plugins/terraform-provider-kv pid=27
+2026-09-28T01:53:26.544Z [DEBUG] provider: waiting for RPC address: plugin=/plugins/terraform-provider-kv
+2026-09-28T01:53:26.585Z [DEBUG] provider.terraform-provider-kv: plugin address: address=/tmp/plugin937202734 network=unix timestamp=2026-09-28T01:53:26.585Z
+2026-09-28T01:53:26.585Z [DEBUG] provider: using plugin: version=6
+2026-09-28T01:53:26.601Z [INFO]  provider: plugin process exited: plugin=/plugins/terraform-provider-kv id=27
+2026-09-28T01:53:26.601Z [DEBUG] provider: plugin exited
+2026-09-28T01:53:26.606Z [DEBUG] provider: starting plugin: path=/plugins/terraform-provider-kv args=["/plugins/terraform-provider-kv"]
+2026-09-28T01:53:26.607Z [DEBUG] provider: plugin started: path=/plugins/terraform-provider-kv pid=37
+2026-09-28T01:53:26.607Z [DEBUG] provider: waiting for RPC address: plugin=/plugins/terraform-provider-kv
+2026-09-28T01:53:26.643Z [DEBUG] provider: using plugin: version=6
+```
+
+`starting plugin`, `plugin started ... pid=17`, `waiting for RPC address`, `plugin address: address=/tmp/plugin739882503 network=unix`, `using plugin: version=6`, and then `plugin process exited`. And then again, with pid 27, and again with pid 37: in **one** plan, OpenTofu started our provider three times. `TF_LOG=TRACE` names each gRPC call, which shows what each process was for (another run, so different pids):
+
+```text
+process 17 started
+  gRPC call: GetProviderSchema
+  gRPC call: GetResourceIdentitySchemas
+process 17 exited
+process 28 started
+  gRPC call: ValidateProviderConfig
+  gRPC call: ValidateResourceConfig
+process 28 exited
+process 38 started
+  gRPC call: ValidateProviderConfig
+  gRPC call: ConfigureProvider
+  gRPC call: ValidateResourceConfig
+  gRPC call: PlanResourceChange
+process 38 exited
+```
+
+The first process was asked only for its schema, the second only to validate the configuration, the third to configure itself and plan. Each process is short-lived, which is why a provider keeps no state of its own between calls: everything it needs arrives in the request.
+
+<RelationAnim
+  title="Who talks to whom during tofu apply"
+  kicker="plugins · gRPC"
+  role="operator"
+  height={62}
+  nodes={[
+    { id: "you", label: "tofu apply", sub: "you", x: 14, y: 12, kind: "tool" },
+    { id: "core", label: "OpenTofu core", sub: "config · state · plan", x: 14, y: 56, kind: "cmd" },
+    { id: "plug", label: "terraform-provider-kv", sub: "a child process", x: 50, y: 88, kind: "type" },
+    { id: "srv", label: "kv server", sub: "kv:6380", x: 86, y: 56, kind: "value" },
+    { id: "state", label: "terraform.tfstate", sub: "JSON", x: 50, y: 20, kind: "file" }
+  ]}
+  edges={[
+    { from: "you", to: "core", label: "reads main.tf" },
+    { from: "core", to: "plug", label: "gRPC" },
+    { from: "plug", to: "srv", label: "SET / GET / DEL" },
+    { from: "core", to: "state", label: "writes" }
+  ]}
+  frames={[
+    { show: ["you", "core", "you>core"], hot: ["core", "you>core"], at: "core", say: "parse", note: "The core reads the configuration and the state. It has no idea what a kv_key is." },
+    { show: ["you", "core", "you>core", "plug", "core>plug"], hot: ["plug", "core>plug"], at: "plug", say: "pid 17", note: "It starts the provider as a child process, which announces a Unix socket. From then on they speak gRPC, protocol version 6." },
+    { show: ["you", "core", "you>core", "plug", "core>plug", "srv", "plug>srv"], hot: ["srv", "plug>srv"], at: "srv", say: "GET", note: "Asked to refresh or apply a kv_key, the provider talks to the real system in its own language: here, RESP, through go-redis." },
+    { show: ["you", "core", "you>core", "plug", "core>plug", "srv", "plug>srv", "state", "core>state"], hot: ["state", "core>state"], at: "state", say: "record", beat: "solution", note: "The provider returns the new attributes over gRPC, and the core writes them to state. Swap the provider and the same core manages AWS, Kubernetes or DNS." }
+  ]}
+  caption="The core is generic; every resource type is a gRPC plugin. That split is why one tool can manage thousands of kinds of infrastructure."
+/>
+
+### Step 2: why this design
+
+Separate processes mean a crashing provider can't take the core down, providers can be written and released independently (there are thousands in the public registry), and in principle in any language that speaks gRPC, though in practice nearly all are Go, using HashiCorp's framework. It's the same plugin system (hashicorp/go-plugin) Vault and Packer use.
+
+## Writing the Provider
+
+*Stop 5 of 6.*
+
+### Step 1: main
+
+```go noverify title="terraform-provider-kv/main.go"
+// terraform-provider-kv lets Terraform and OpenTofu manage keys in a
+// Redis-speaking server: the kv server from the Build Your Own Redis track,
+// or Redis itself.
+package main
+
+import (
+	"context"
+	"log"
+
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+
+	"terraform-provider-kv/internal/provider"
+)
+
+func main() {
+	err := providerserver.Serve(context.Background(), provider.New, providerserver.ServeOpts{
+		Address: "registry.terraform.io/gobible/kv",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`providerserver.Serve` is the whole plugin protocol: the handshake, the socket, gRPC, turning each request into a call on our Go types. The `Address` is the provider's name in a registry; the configuration asks for `gobible/kv`, which OpenTofu expands to `registry.opentofu.org/gobible/kv` (you can see that in the state file above) and Terraform to `registry.terraform.io/gobible/kv`. To load it from a folder while developing, `tofurc` sets a **dev override**:
+
+```hcl title="tofurc"
+provider_installation {
+  dev_overrides {
+    "gobible/kv" = "/plugins"
+  }
+  direct {}
+}
+```
+
+### Step 2: the provider block
+
+```go noverify title="terraform-provider-kv/internal/provider/provider.go · lines 16–35"
+// kvProvider holds nothing: each run of the plugin configures a client.
+type kvProvider struct{}
+
+func New() provider.Provider { return &kvProvider{} }
+
+func (p *kvProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+	resp.TypeName = "kv" // resources are named kv_<something>
+}
+
+// The provider block in a configuration: provider "kv" { address = "..." }
+func (p *kvProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Attributes: map[string]schema.Attribute{
+			"address": schema.StringAttribute{
+				Description: "host:port of a Redis-speaking server.",
+				Required:    true,
+			},
+		},
+	}
+}
+```
+
+`Metadata` names the provider `kv`, which is why resources are called `kv_key`. `Schema` declares what the `provider "kv"` block accepts: one required string, `address`. The framework validates the configuration against it before our code sees anything.
+
+```go noverify title="terraform-provider-kv/internal/provider/provider.go · lines 37–55"
+type providerConfig struct {
+	Address types.String `tfsdk:"address"`
+}
+
+// Configure turns the provider block into a client that every resource
+// receives.
+func (p *kvProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+	var cfg providerConfig
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	client := redis.NewClient(&redis.Options{Addr: cfg.Address.ValueString(), Protocol: 2})
+	if err := client.Ping(ctx).Err(); err != nil {
+		resp.Diagnostics.AddError("cannot reach the kv server", err.Error())
+		return
+	}
+	resp.ResourceData = client
+}
+```
+
+`Configure` reads the block into a Go struct (the `tfsdk` tags map attributes to fields), makes a go-redis client, checks the server answers `PING`, and hands the client to every resource via `resp.ResourceData`. A wrong address fails here, once, with a clear error, instead of in every resource. `Protocol: 2` keeps go-redis from opening with the `HELLO 3` handshake our server doesn't implement (lesson 10 of the Redis track).
+
+### Step 3: the resource's schema
+
+```go noverify title="terraform-provider-kv/internal/provider/key_resource.go · lines 16–49"
+// keyResource manages one key: resource "kv_key" "x" { name = ..., value = ... }
+type keyResource struct {
+	client *redis.Client
+}
+
+func NewKeyResource() resource.Resource { return &keyResource{} }
+
+// keyModel is the resource's data, as Terraform stores it in state.
+type keyModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
+}
+
+func (r *keyResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_key" // kv_key
+}
+
+func (r *keyResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Attributes: map[string]schema.Attribute{
+			"name": schema.StringAttribute{
+				Description: "The key. Changing it means a different key: delete and create.",
+				Required:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"value": schema.StringAttribute{
+				Description: "The value stored under the key.",
+				Required:    true,
+			},
+		},
+	}
+}
+```
+
+`keyModel` is the resource's data as a Go struct: what gets read from the plan and written to state. The schema declares both attributes as required, and gives `name` a **plan modifier**, `RequiresReplace`: that one line is why renaming a key planned as `-/+` in stop 3 rather than `~`.
+
+### Step 4: Create and Read
+
+```go noverify title="terraform-provider-kv/internal/provider/key_resource.go · lines 58–91"
+// Create runs on apply for a key that isn't in state yet: SET it.
+func (r *keyResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var plan keyModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if err := r.client.Set(ctx, plan.Name.ValueString(), plan.Value.ValueString(), 0).Err(); err != nil {
+		resp.Diagnostics.AddError("SET failed", err.Error())
+		return
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// Read runs on every plan: what does the server hold now? A key that has
+// gone is removed from state, so the plan offers to create it again.
+func (r *keyResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var state keyModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	v, err := r.client.Get(ctx, state.Name.ValueString()).Result()
+	if errors.Is(err, redis.Nil) {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	if err != nil {
+		resp.Diagnostics.AddError("GET failed", err.Error())
+		return
+	}
+	state.Value = types.StringValue(v) // whatever is there now, even if someone changed it
+	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
+}
+```
+
+`Create` gets the planned values, sends `SET`, and saves the plan as the new state. `Read` is the one that matters most: it runs on every refresh, and it must report **reality**, not echo state back. A key that's gone makes it call `RemoveResource`, which is how the deleted greeting turned into `+ create` in stop 3; a changed value is written into state as found, which is how `"5000" -> "250"` appeared. A provider whose `Read` just returned the state it was given would never see drift.
+
+### Step 5: Update, Delete and import
+
+```go noverify title="terraform-provider-kv/internal/provider/key_resource.go · lines 93–122"
+// Update runs on apply when the value changed: SET the new one.
+func (r *keyResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan keyModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if err := r.client.Set(ctx, plan.Name.ValueString(), plan.Value.ValueString(), 0).Err(); err != nil {
+		resp.Diagnostics.AddError("SET failed", err.Error())
+		return
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+}
+
+// Delete runs on destroy, or before a replacement: DEL the key.
+func (r *keyResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var state keyModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if err := r.client.Del(ctx, state.Name.ValueString()).Err(); err != nil {
+		resp.Diagnostics.AddError("DEL failed", err.Error())
+	}
+}
+
+// ImportState adopts a key that already exists: tofu import kv_key.x <name>.
+func (r *keyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+}
+```
+
+`Update` runs for `~` changes; `Delete` for destroys, and for the first half of a `-/+`. `ImportState` takes the ID the user typed (`tofu import kv_key.dark_mode feature:dark_mode`) and puts it in the `name` attribute; the framework then calls `Read` to fill in the rest, which is exactly what the import output showed. Build it for the containers with `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../bin/terraform-provider-kv .` (use `amd64` on an Intel machine).
+
+<UnderTheHood title="What the framework does between gRPC and your methods">
+
+The plugin protocol is defined in protocol buffers (`tfplugin6.proto`): RPCs like `GetProviderSchema`, `ValidateResourceConfig`, `PlanResourceChange`, `ApplyResourceChange`, `ReadResource` and `ImportResourceState`, carrying values encoded as msgpack or JSON against the schema. `terraform-plugin-go` implements that gRPC server; `terraform-plugin-framework` sits on top, turning a `PlanResourceChange` into calls to your plan modifiers, an `ApplyResourceChange` into `Create`, `Update` or `Delete` depending on the prior and planned state, and converting between wire values and your `types.String` fields. That's why a provider this small can be a first-class citizen: the protocol work is all in the libraries.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="A provider's Read returned the state it was given instead of asking the server. What breaks?"
+  options={[
+    "Nothing; it's faster",
+    "Drift is never detected: changes and deletions made outside Terraform never show up in a plan",
+    "Create stops working",
+    "Import gets faster"
+  ]}
+  answer={1}
+  explain="Refresh is only as honest as Read. Ours asks the server every time, which is how the hand-made changes showed up."
+/>
+
+## Testing It
+
+*Stop 6 of 6.*
+
+### Step 1: an acceptance test
+
+Unit tests could check the Go methods, but the real question is whether Terraform, the provider and the server work together. HashiCorp's `terraform-plugin-testing` runs the actual Terraform binary against your provider for each step:
+
+```go noverify title="terraform-provider-kv/internal/provider/key_resource_test.go · lines 44–78"
+func TestAccKey(t *testing.T) {
+	addr := os.Getenv("KV_ADDR")
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: map[string]func() (tfprotov6.ProviderServer, error){
+			"kv": providerserver.NewProtocol6WithError(New()),
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: config(addr, "100"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("kv_key.t", "value", "100"),
+					onServer(addr, "acc:limit", "100"),
+				),
+			},
+			{
+				Config: config(addr, "250"),
+				Check:  onServer(addr, "acc:limit", "250"),
+			},
+			{
+				ResourceName:                         "kv_key.t",
+				ImportState:                          true,
+				ImportStateId:                        "acc:limit",
+				ImportStateVerify:                    true,
+				ImportStateVerifyIdentifierAttribute: "name",
+			},
+		},
+		CheckDestroy: func(*terraform.State) error {
+			_, err := redis.NewClient(&redis.Options{Addr: addr, Protocol: 2}).Get(context.Background(), "acc:limit").Result()
+			if !errors.Is(err, redis.Nil) {
+				return fmt.Errorf("acc:limit still there after destroy (%v)", err)
+			}
+			return nil
+		},
+	})
+}
+```
+
+Step 1 applies a configuration with value 100 and checks both the state (`TestCheckResourceAttr`) and the server itself (`onServer`, which asks with go-redis). Step 2 changes it to 250. Step 3 imports the key and verifies the imported state matches. When the test ends, the framework destroys everything and `CheckDestroy` checks the key is really gone. Acceptance tests only run with `TF_ACC=1`, because they touch real systems. Run in a `golang:1.27` container with Terraform 1.16.4's binary and our kv server on the network:
+
+```text
+=== RUN   TestAccKey
+--- PASS: TestAccKey (3.28s)
+PASS
+ok  	terraform-provider-kv/internal/provider	3.290s
+```
+
+Create, update, import and destroy against a real server in 3.3 seconds.
+
+### Step 2: Terraform and OpenTofu
+
+The same binary under HashiCorp Terraform instead of OpenTofu (its dev override uses the full address, `registry.terraform.io/gobible/kv`):
+
+```text
+$ terraform version
+Terraform v1.16.4
+on linux_arm64
+$ terraform apply -auto-approve
+kv_key.greeting: Creating...
+kv_key.rate_limit: Creating...
+kv_key.greeting: Creation complete after 0s [name=config:greeting]
+kv_key.rate_limit: Creation complete after 0s [name=config:rate_limit]
+
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+$ terraform destroy -auto-approve
+
+Destroy complete! Resources: 2 destroyed.
+```
+
+Same provider, same results. OpenTofu forked from Terraform in 2023, when HashiCorp moved Terraform from an open-source licence to the Business Source License; the two have diverged in features since, but both still speak the same plugin protocol, so one provider serves both.
+
+---
+
+## Exercises
+
+<Exercise n={1} title="A time to live" level="medium">
+
+Add an optional `ttl_seconds` attribute to `kv_key`. You'll need `EXPIRE` and `TTL` on the server first (Redis track lesson 8, exercise 2). What should `Read` do with the TTL counting down, so that every plan doesn't show a change?
+
+<Solution>
+
+Store the configured `ttl_seconds` in state as given, and in `Read` only check that the key still has an expiry (TTL greater than 0), not its exact remaining seconds, which change every second. If `Read` wrote the live TTL into state, every plan would show `ttl_seconds` changing: perpetual drift, a classic provider bug.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="A data source" level="easy">
+
+Add a `kv_key` **data source** that reads a key Terraform doesn't manage, so a configuration can use its value elsewhere (`data.kv_key.x.value`).
+
+<Solution>
+
+Implement `datasource.DataSource` with `Metadata`, `Schema` (`name` required, `value` computed), `Configure` and `Read` (`GET`, error if missing), and return it from the provider's `DataSources`. A data source only reads; it never appears in plans as a change.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Plan against a real Redis" level="easy">
+
+Start Redis 8 on the network and point the provider's `address` at it. What changes?
+
+<Solution>
+
+Nothing in the provider: it only uses `SET`, `GET` and `DEL`, which Redis has. You can drop `Protocol: 2` too, because Redis understands `HELLO 3`. That's the benefit of our server speaking the real protocol: the same client code works against both.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Two people, one state" level="medium">
+
+What goes wrong if two people run `tofu apply` at the same time with local state files, and how do remote backends prevent it?
+
+<Solution>
+
+Each has their own `terraform.tfstate`; both plan against their own view, both apply, and each state now misses the other's changes, so the next plan by either person tries to undo the other's work. A remote backend (S3 with a lock, Postgres, Terraform Cloud) keeps one shared state and takes a lock for the whole plan-and-apply, so the second `apply` waits or fails with "state locked".
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="The Plan"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={10}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Write the heart of terraform plan. Given the configuration and the refreshed state, both keyed by resource address, return one action per resource that needs one: create what's missing, update a changed value in place, replace a resource whose name changed, delete what's no longer configured, and sort by address so the same inputs always give the same plan."
+  starter={`package main
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
+
+// Key is one kv_key resource: the key's name and its value.
+type Key struct{ Name, Value string }
+
+// Action is one line of a plan: what to do to the resource at Address.
+type Action struct {
+	Address string // e.g. kv_key.rate_limit
+	Op      string // "create", "update", "replace" or "delete"
+}
+
+// Plan compares the configuration (what should exist) with the state after
+// a refresh (what exists now), both keyed by resource address, and returns
+// what apply must do, sorted by address so the same inputs always give the
+// same plan. A changed Name forces a replacement (the key's identity
+// changed); a changed Value is an in-place update; a resource that is in
+// state but no longer in the configuration is deleted.
+func Plan(config, state map[string]Key) []Action {
+	var plan []Action
+	for addr, want := range config {
+		have, ok := state[addr]
+		switch {
+		case !ok:
+			plan = append(plan, Action{addr, "create"})
+		case want != have:
+			plan = append(plan, Action{addr, "update"})
+		}
+	}
+	return plan
+}
+
+var _ = slices.SortFunc[[]Action] // slices is imported for you to use
+
+// ── below this line: do not edit ──
+
+func show(p []Action) string {
+	var parts []string
+	for _, a := range p {
+		parts = append(parts, a.Op+" "+a.Address)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	check := func(name string, config, state map[string]Key, want string) {
+		for range 20 { // map order is random: the plan must not be
+			if got := show(Plan(config, state)); got != want {
+				fail("%s: got %s, want %s", name, got, want)
+				return
+			}
+		}
+	}
+
+	greeting := Key{"config:greeting", "Ẹ káàárọ̀"}
+	limit := Key{"config:rate_limit", "100"}
+	dark := Key{"feature:dark_mode", "on"}
+
+	check("first apply", map[string]Key{"kv_key.greeting": greeting, "kv_key.rate_limit": limit}, map[string]Key{},
+		"[create kv_key.greeting, create kv_key.rate_limit]")
+	check("nothing changed", map[string]Key{"kv_key.greeting": greeting}, map[string]Key{"kv_key.greeting": greeting},
+		"[]")
+	check("value changed", map[string]Key{"kv_key.rate_limit": {"config:rate_limit", "250"}}, map[string]Key{"kv_key.rate_limit": limit},
+		"[update kv_key.rate_limit]")
+	check("name changed", map[string]Key{"kv_key.greeting": {"config:welcome", greeting.Value}}, map[string]Key{"kv_key.greeting": greeting},
+		"[replace kv_key.greeting]")
+	check("removed from config", map[string]Key{"kv_key.greeting": greeting}, map[string]Key{"kv_key.greeting": greeting, "kv_key.dark_mode": dark},
+		"[delete kv_key.dark_mode]")
+	check("drift: deleted by hand, so refresh dropped it from state", map[string]Key{"kv_key.greeting": greeting, "kv_key.rate_limit": {"config:rate_limit", "250"}}, map[string]Key{"kv_key.rate_limit": {"config:rate_limit", "5000"}},
+		"[create kv_key.greeting, update kv_key.rate_limit]")
+	check("everything at once",
+		map[string]Key{"kv_key.a": {"a", "1"}, "kv_key.b": {"b2", "2"}, "kv_key.c": {"c", "3"}, "kv_key.e": {"e", "5"}},
+		map[string]Key{"kv_key.a": {"a", "1"}, "kv_key.b": {"b", "2"}, "kv_key.c": {"c", "old"}, "kv_key.d": {"d", "4"}},
+		"[replace kv_key.b, update kv_key.c, delete kv_key.d, create kv_key.e]")
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Runs seven scenarios from this chapter (first apply, no change, a new value, a rename, a resource removed from the configuration, drift, and all of them at once), each twenty times to catch map-order randomness. Prints ALL CHECKS PASS."
+  hints={[
+    "A name change must be checked before a value change: it's a replace, even if the value changed too.",
+    "Deletions come from the other direction: loop over state and look for addresses the configuration no longer has.",
+    "Go map iteration order is random. Sort the plan with slices.SortFunc and strings.Compare on Address."
+  ]}
+  flag="GO{the_plan}"
+>
+
+Real Terraform builds a dependency graph first, so resources are planned and applied in an order that respects references between them. With independent resources, as here, sorting by address gives the same result every time.
+
+</Lab>
+
+<Recap>
+
+- **Infrastructure as code** describes the end state in files; the tool works out the steps. Applying twice is safe: the second apply found "No changes".
+- **State** maps each resource address to the real object it manages; without it the tool couldn't update, delete or tell its objects from anyone else's.
+- **Three truths**: refresh reads reality into state, plan compares configuration with state, apply changes reality. A value changed and a key deleted with `redis-cli` both appeared in the next plan as **drift**.
+- `~` updates in place; `-/+` destroys and recreates (our `name` has `RequiresReplace`); `tofu import` adopts what already exists.
+- A **provider** is a separate Go program the core starts and speaks **gRPC** to over a Unix socket: three processes in one plan, protocol version 6.
+- `Read` must report reality: that's the whole of drift detection. An acceptance test ran real Terraform through create, update, import and destroy in 3.3 s, and the same binary worked under OpenTofu 1.12.6 and Terraform 1.16.4.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: declarative", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: why state", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: a deleted key", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: an honest Read", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: a time to live", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2: a data source", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: plan against a real Redis", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 4: two people, one state", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: The Plan", captured: false, points: 100 }}
+/>
+
+<Narrator>
+OpenTofu and Terraform both drove your provider through create, update, import and destroy, and the next plan caught every hand edit. Nothing changes in your world without you knowing now. Get used to that feeling. I have.
+</Narrator>

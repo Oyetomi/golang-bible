@@ -1,0 +1,644 @@
+---
+title: "Keys That Expire"
+part: "redis"
+order: 6
+type: "course"
+description: "EXPIRE and TTL for our store: each entry gets an expiry time, a key is deleted lazily when someone reads it after that time, and a Redis-style sweeper samples 20 keys at a time for the ones nobody reads. Tested with testing/synctest, where ten seconds pass instantly; measured, a million expired sessions held 143.5 MB, the sweeper got that to 128.0 MB, and only rebuilding the map got it to 0.2 MB, because a Go map never shrinks."
+prerequisites: ["redis-errors"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 6" title="Keys That Expire">
+
+Much of what people keep in Redis is meant to disappear: login sessions, one-time codes, rate-limit counters, cached pages. Redis lets you give any key a lifetime with `EXPIRE`, and after that it's gone. This lesson adds that to our store. It sounds like one extra field, and it is, but it raises three real questions: **when** does an expired key actually get deleted, how do you **test** code that waits ten seconds without waiting ten seconds, and does deleting keys give the memory back?
+
+Three stops:
+
+1. **An expiry per key.** `EXPIRE`, `TTL`, and which commands keep or clear an expiry.
+2. **Lazy expiry.** Deleting a key when someone reads it, and testing it with fake time.
+3. **Active expiry.** A sweeper for keys nobody reads, and a map that never shrinks.
+
+</HeroCard>
+
+<Narrator>
+Keys that expire. Easy, right? Delete it when the time's up. Except a million keys nobody reads never get deleted at all, and your memory graph climbs politely forever. Let's fix that.
+</Narrator>
+
+<ChapterTabs tabs={["An Expiry Per Key", "Lazy Expiry", "Active Expiry"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "store.go", status: "changed", note: "entries now carry an expiry; lookup, Expire, TTL, Sweep and Compact" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go", status: "new", note: "expiry tests on synctest's fake clock" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go", status: "new", note: "a million expired sessions: how much memory do they hold?" }
+  ]}
+  run={["go test ./...", "go run ./cmd/leak"]}
+>
+
+The older tests still run on every `go test ./...`: `Set`, `Get` and `INCR` now go through the new `lookup`, and those tests are how we know nothing broke.
+
+</ProjectMap>
+
+## An Expiry Per Key
+
+*Stop 1 of 3.*
+
+### Step 1: what real Redis does
+
+Before writing code, here's the behaviour we're copying, from Redis 8.10.2 in a container:
+
+```text
+127.0.0.1:6379> SET session:ada token
+OK
+127.0.0.1:6379> TTL session:ada
+(integer) -1
+127.0.0.1:6379> EXPIRE session:ada 3
+(integer) 1
+127.0.0.1:6379> TTL session:ada
+(integer) 3
+127.0.0.1:6379> EXPIRE nothing 3
+(integer) 0
+127.0.0.1:6379> TTL nothing
+(integer) -2
+(3 seconds later)
+127.0.0.1:6379> GET session:ada
+(nil)
+127.0.0.1:6379> TTL session:ada
+(integer) -2
+127.0.0.1:6379> SET counter 1 EX 100
+OK
+127.0.0.1:6379> INCR counter
+(integer) 2
+127.0.0.1:6379> TTL counter
+(integer) 100
+127.0.0.1:6379> SET counter 5
+OK
+127.0.0.1:6379> TTL counter
+(integer) -1
+```
+
+Four rules come out of that:
+
+- `TTL` answers in three ways: the seconds left, **−1** for a key that exists but never expires, **−2** for a key that doesn't exist (or has expired).
+- `EXPIRE` on a missing key does nothing and returns 0.
+- After the time is up, the key is simply gone: `GET` says `(nil)`.
+- `INCR` **keeps** the expiry (TTL still 100), but a plain `SET` **clears** it (TTL back to −1). A new value is a new key, as far as expiry is concerned.
+
+### Step 2: one more field
+
+Until now the map held plain strings. Now each key needs a value **and** an expiry time, so the map holds a small struct:
+
+```go noverify title="kv/store.go · lines 17–34"
+// entry is one stored value. A zero expires means it never expires.
+type entry struct {
+	value   string
+	expires time.Time
+}
+
+func (e entry) expired(now time.Time) bool {
+	return !e.expires.IsZero() && !now.Before(e.expires)
+}
+
+// Store holds string values by key, each with an optional expiry.
+type Store struct {
+	data map[string]entry
+}
+
+func New() *Store {
+	return &Store{data: make(map[string]entry)}
+}
+```
+
+`time.Time`'s zero value means "no expiry", which is convenient: `Set` stores `entry{value: value}`, with no expiry, which is exactly Redis's "SET clears the TTL" rule. `expired` uses `!now.Before(e.expires)` so a key is gone **at** its expiry time, not a moment after.
+
+### Step 3: EXPIRE and TTL
+
+```go noverify title="kv/store.go · lines 68–91"
+// Expire makes key disappear after ttl. It reports whether key existed.
+func (s *Store) Expire(key string, ttl time.Duration) bool {
+	e, ok := s.lookup(key)
+	if !ok {
+		return false
+	}
+	e.expires = time.Now().Add(ttl)
+	s.data[key] = e
+	return true
+}
+
+// TTL follows Redis: the time left, -1 for a key with no expiry, -2 for a
+// missing key.
+func (s *Store) TTL(key string) time.Duration {
+	e, ok := s.lookup(key)
+	switch {
+	case !ok:
+		return -2
+	case e.expires.IsZero():
+		return -1
+	default:
+		return time.Until(e.expires)
+	}
+}
+```
+
+`TTL` returns a `time.Duration`, with −1 and −2 standing in for Redis's special answers. (A `Duration` is a count of nanoseconds, so these print as `-1ns` and `-2ns`; when the network lessons send replies, they become the integers `-1` and `-2`.) Both methods go through `lookup`, which is the next stop.
+
+<QuickCheck
+  question="A key has TTL 100. What happens to its expiry after SET key newvalue? And after INCR key?"
+  options={[
+    "Both keep the expiry",
+    "SET clears it (TTL −1), INCR keeps it",
+    "Both clear it",
+    "SET keeps it, INCR clears it"
+  ]}
+  answer={1}
+  explain="Measured on Redis 8.10.2: after INCR, TTL was still 100; after SET, it was −1. Our Set stores a fresh entry; our Incr updates the value of the existing one."
+/>
+
+## Lazy Expiry
+
+*Stop 2 of 3.*
+
+### Step 1: delete it when someone looks
+
+The simplest way to make keys disappear is not to do anything when they expire, and check when someone asks for them. Every read goes through one helper:
+
+```go noverify title="kv/store.go · lines 36–45"
+// lookup returns the live entry for key. An expired entry is deleted on the
+// way: Redis calls this lazy expiry.
+func (s *Store) lookup(key string) (entry, bool) {
+	e, ok := s.data[key]
+	if ok && e.expired(time.Now()) {
+		delete(s.data, key)
+		return entry{}, false
+	}
+	return e, ok
+}
+```
+
+If the entry has expired, `lookup` deletes it and reports it missing. Redis does exactly this, and calls it **lazy expiry** (or passive expiry): every command that touches a key first checks whether it has expired. It costs one time comparison per access, and nobody ever sees an expired value.
+
+### Step 2: testing ten seconds in no time
+
+To test expiry we need time to pass. `time.Sleep(10 * time.Second)` in a test works, but then the test takes ten seconds, and a suite full of those gets slow enough that people stop running it. Go 1.25 added **`testing/synctest`** for exactly this:
+
+```go noverify title="kv/ttl_test.go · lines 10–35"
+// Inside a synctest bubble, time is fake: time.Sleep advances the bubble's
+// clock instantly once every goroutine in it is blocked.
+func TestTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New()
+		s.Set("session:ada", "token")
+		if got := s.TTL("session:ada"); got != -1 {
+			t.Fatalf("TTL of a key without expiry = %v, want -1", got)
+		}
+		s.Expire("session:ada", 10*time.Second)
+
+		time.Sleep(9 * time.Second)
+		if _, ok := s.Get("session:ada"); !ok {
+			t.Fatal("gone after 9 s, want it until 10 s")
+		}
+		if got := s.TTL("session:ada"); got != time.Second {
+			t.Fatalf("TTL after 9 s = %v, want 1s", got)
+		}
+
+		time.Sleep(time.Second)
+		if _, ok := s.Get("session:ada"); ok {
+			t.Fatal("still there at 10 s")
+		}
+		if got := s.TTL("session:ada"); got != -2 {
+			t.Fatalf("TTL of an expired key = %v, want -2", got)
+		}
+```
+
+Inside `synctest.Test`, the code runs in a **bubble** with its own fake clock, starting at midnight UTC on 1 January 2000. `time.Now` reads the bubble's clock, and `time.Sleep` doesn't really sleep: when every goroutine in the bubble is blocked, the clock jumps forward to the next moment something is due. So the test sleeps 9 seconds, checks the key is still there with exactly 1 second left (fake time is exact, so the test can compare with `==`), sleeps one more second, and checks it's gone:
+
+```text
+=== RUN   TestTTL
+--- PASS: TestTTL (0.00s)
+=== RUN   TestSetClearsExpiry
+--- PASS: TestSetClearsExpiry (0.00s)
+=== RUN   TestSweep
+    ttl_test.go:71: removed 1000, 1 entries left
+--- PASS: TestSweep (0.00s)
+PASS
+ok  	kv	0.931s
+```
+
+Ten simulated seconds in `TestTTL`, and the test reports `0.00s`.
+
+<UnderTheHood title="How synctest knows when to move the clock">
+
+A bubble tracks every goroutine started inside it. The runtime knows when each one is **durably blocked**: sleeping, waiting on a channel or `sync.WaitGroup` belonging to the bubble, or on a `sync.Cond`. When all of them are, nothing can happen until some timer fires, so it's safe to advance the clock straight to the earliest timer. A goroutine blocked on real I/O (a network read, a file) isn't durably blocked, because something outside the bubble could wake it, so the clock doesn't move. That's why synctest suits code that waits on time and channels, and the network lessons will need a different approach.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Inside synctest.Test, what does time.Sleep(9 * time.Second) do?"
+  options={[
+    "Sleeps 9 real seconds",
+    "Returns immediately without changing the time",
+    "Advances the bubble's fake clock 9 seconds once every goroutine in the bubble is blocked",
+    "Panics: sleeping isn't allowed in tests"
+  ]}
+  answer={2}
+  explain="The test above slept 10 seconds of fake time and took 0.00s. time.Now inside the bubble sees the jump, so TTL comes out as exactly 1s."
+/>
+
+## Active Expiry
+
+*Stop 3 of 3.*
+
+### Step 1: the keys nobody reads
+
+Lazy expiry has a hole. A session key for a user who never comes back is never read again, so `lookup` never sees it, and it stays in the map forever. To measure how much that costs, `cmd/leak` stores a million session keys with a 1-second TTL, waits for them all to expire, and checks the heap:
+
+```go noverify title="kv/cmd/leak/main.go"
+// leak: 1,000,000 session keys with a 1 s TTL, never read again. How much
+// memory do they hold after they expire, with lazy expiry alone and with
+// a sweeper?
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+
+	"kv"
+)
+
+func heapMB() float64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return float64(m.HeapAlloc) / (1 << 20)
+}
+
+func main() {
+	for _, mode := range []string{"lazy only", "with sweeper", "sweep + Compact"} {
+		sweep := mode != "lazy only"
+		s := kv.New()
+		for i := range 1_000_000 {
+			k := fmt.Sprintf("session:%d", i)
+			s.Set(k, "token-abcdefghijklmnop")
+			s.Expire(k, time.Second)
+		}
+		time.Sleep(1100 * time.Millisecond) // every key has expired
+		removed := 0
+		if sweep {
+			removed = s.Sweep()
+		}
+		if mode == "sweep + Compact" {
+			s.Compact()
+		}
+		fmt.Printf("%-16s entries still in the map: %7d, heap %6.1f MB (sweeper removed %d)\n", mode, s.Len(), heapMB(), removed)
+		runtime.KeepAlive(s)
+	}
+}
+```
+
+The first line of its output is lazy expiry alone:
+
+```text
+lazy only        entries still in the map: 1000000, heap  143.5 MB (sweeper removed 0)
+with sweeper     entries still in the map:       0, heap  128.0 MB (sweeper removed 1000000)
+sweep + Compact  entries still in the map:       0, heap    0.2 MB (sweeper removed 1000000)
+```
+
+**1,000,000 entries still in the map, 143.5 MB**, all of it data no client can ever read. For a cache full of sessions, that's a memory leak.
+
+### Step 2: sample, don't scan
+
+The fix is to go looking for expired keys. Checking every key would take time proportional to the whole store, and Redis serves every client from one thread, so a long scan would stall everyone. Instead Redis **samples**: its expire cycle, which runs ten times a second, picks 20 keys that have an expiry, deletes the expired ones, and goes round again only if more than 10% of the sample had expired. If most keys are live it stops almost at once; if many have expired, it keeps going. Our `Sweep` does the same:
+
+```go noverify title="kv/store.go · lines 111–134"
+// Sweep is the active half of expiry, for keys nobody reads again. Like
+// Redis's expire cycle, it looks at a sample of 20 entries, deletes the
+// expired ones, and goes round again while more than 10% of the sample had
+// expired. It returns how many entries it deleted.
+func (s *Store) Sweep() int {
+	now, total := time.Now(), 0
+	for {
+		seen, expired := 0, 0
+		for k, e := range s.data { // iteration starts at a random place
+			if seen == 20 {
+				break
+			}
+			seen++
+			if e.expired(now) {
+				delete(s.data, k)
+				expired++
+			}
+		}
+		total += expired
+		if expired <= 2 {
+			return total
+		}
+	}
+}
+```
+
+Random sampling comes for free in Go: `range` over a map starts at a random position (lesson 2), so each round looks at a different part of the table. Redis also caps the whole cycle at 25% of its CPU time, which our version leaves out. The test that it removes expired keys and leaves live ones alone:
+
+```go noverify title="kv/ttl_test.go · lines 52–73"
+// Sweep removes expired keys nobody reads, and leaves live keys alone.
+func TestSweep(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New()
+		for i := range 1000 {
+			k := fmt.Sprintf("session:%d", i)
+			s.Set(k, "token")
+			s.Expire(k, time.Second)
+		}
+		s.Set("config", "keep me")
+		time.Sleep(2 * time.Second)
+
+		removed := s.Sweep()
+		if _, ok := s.Get("config"); !ok {
+			t.Fatal("Sweep deleted a key with no expiry")
+		}
+		if removed < 990 {
+			t.Fatalf("Sweep removed %d of 1000 expired keys", removed)
+		}
+		t.Logf("removed %d, %d entries left", removed, s.Len())
+	})
+}
+```
+
+The second line of the leak output: **0 entries left**, the sweeper removed all 1,000,000. But the heap is still **128.0 MB**.
+
+<ExpiryAnim
+  title="A map of sessions, a reader and a sweeper"
+  frames={[
+    { t: 0, slots: [{ k: "session:1", exp: 3 }, { k: "session:2", exp: 3 }, { k: "config", }, { k: "session:3", exp: 3 }, { k: "session:4", exp: 5 }, { k: "otp:9", exp: 3 }, { k: "session:5", exp: 3 }, { k: "rate:ip", exp: 3 }], note: "Eight keys in an eight-slot table. Most have a 3-second TTL; config has none." },
+    { t: 3, slots: [{ k: "session:1", exp: 3 }, { k: "session:2", exp: 3 }, { k: "config", }, { k: "session:3", exp: 3 }, { k: "session:4", exp: 5 }, { k: "otp:9", exp: 3 }, { k: "session:5", exp: 3 }, { k: "rate:ip", exp: 3 }], beat: "problem", note: "At t = 3 six keys have expired, but nothing has happened: they're still in their slots, holding memory." },
+    { t: 3, read: 1, slots: [{ k: "session:1", exp: 3 }, { k: "session:2", exp: 3 }, { k: "config", }, { k: "session:3", exp: 3 }, { k: "session:4", exp: 5 }, { k: "otp:9", exp: 3 }, { k: "session:5", exp: 3 }, { k: "rate:ip", exp: 3 }], note: "A client asks for session:2. lookup sees it has expired..." },
+    { t: 3, slots: [{ k: "session:1", exp: 3 }, null, { k: "config", }, { k: "session:3", exp: 3 }, { k: "session:4", exp: 5 }, { k: "otp:9", exp: 3 }, { k: "session:5", exp: 3 }, { k: "rate:ip", exp: 3 }], note: "...deletes it and answers (nil). That's lazy expiry. The other expired keys are never read, so they stay." },
+    { t: 4, sweep: [3, 4, 5, 6], slots: [{ k: "session:1", exp: 3 }, null, { k: "config", }, { k: "session:3", exp: 3 }, { k: "session:4", exp: 5 }, { k: "otp:9", exp: 3 }, { k: "session:5", exp: 3 }, { k: "rate:ip", exp: 3 }], note: "The sweeper samples a few slots from a random starting place. Three of these four have expired: far more than 10%." },
+    { t: 4, sweep: [7, 0], slots: [{ k: "session:1", exp: 3 }, null, { k: "config", }, null, { k: "session:4", exp: 5 }, null, null, { k: "rate:ip", exp: 3 }], note: "It deletes them, and because so many were expired, it goes round again from another spot." },
+    { t: 4, slots: [null, null, { k: "config", }, null, { k: "session:4", exp: 5 }, null, null, null], beat: "problem", note: "Only live keys remain. But the table still has eight slots: a Go map never shrinks, so the memory for them stays." },
+    { t: 4, slots: [{ k: "config", }, { k: "session:4", exp: 5 }], beat: "solution", note: "Compact copies the two live keys into a new, right-sized map. The old table becomes garbage and the GC frees it." }
+  ]}
+  caption="Lazy expiry catches the keys people read; the sweeper samples for the rest. Neither shrinks the map: only a rebuild does."
+/>
+
+### Step 3: a map never shrinks
+
+A Go map grows its table as keys are added, but it **never shrinks** it when keys are deleted. Deleting frees the key and value (here, the strings), but the table of slots, sized for a million entries, stays allocated as long as the map exists. That's the 128.0 MB: an empty table built for a million keys. It's a deliberate trade-off (shrinking would make deletes slower and could make a map that grows and shrinks repeatedly rebuild itself over and over), and it's still true of the Swiss-table maps Go has used since 1.24.
+
+The only way to give that memory back is to make a new map and let the old one be garbage-collected:
+
+```go noverify title="kv/store.go · lines 136–145"
+// Compact copies the live entries into a new, right-sized map. A Go map
+// never shrinks: deleting keys frees the values but keeps the table, so a
+// store that was once large holds that memory until the map is replaced.
+func (s *Store) Compact() {
+	m := make(map[string]entry, len(s.data))
+	for k, e := range s.data {
+		m[k] = e
+	}
+	s.data = m
+}
+```
+
+The third line of the leak output: after `Compact`, **0.2 MB**. When to call `Compact` is a policy decision: after a sweep that removed most of the store, say, or when `Len` has fallen far below its peak. Real Redis faces the same problem with its own hash tables and solves it the same way: it resizes a table down when it's less than 1/8 full, moving entries to the smaller table a few at a time.
+
+<QuickCheck
+  question="The sweeper deleted all 1,000,000 expired keys, but the heap stayed at 128.0 MB. Why?"
+  options={[
+    "The garbage collector hadn't run yet",
+    "A Go map never shrinks its table; deleting keys frees their data, not the slots",
+    "The sweeper only marks keys as deleted",
+    "time.Time values are never freed"
+  ]}
+  answer={1}
+  explain="heapMB calls runtime.GC first, so it wasn't the GC. Only replacing the map (Compact) freed it: 0.2 MB."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="PERSIST" level="easy">
+
+Add `Persist(key string) bool`, Redis's `PERSIST`: remove a key's expiry, returning true only if the key existed and had one. Write the synctest test first.
+
+<Solution>
+
+`e, ok := s.lookup(key)`; if `!ok || e.expires.IsZero()` return false; otherwise set `e.expires = time.Time{}`, store it and return true. In the test, `Expire` for 1 s, `Persist`, sleep 2 s, and check the key is still there with TTL −1.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="SET with EX" level="easy">
+
+Add `SetEX(key, value string, ttl time.Duration)`, like `SET key value EX seconds`, which sets a value and its expiry in one step.
+
+<Solution>
+
+`s.data[key] = entry{value: value, expires: time.Now().Add(ttl)}`. It matters that it's one step: with `Set` then `Expire`, a crash (or, once the store is shared, another client) between the two could leave a key that never expires.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="When to compact" level="medium">
+
+Track the largest `Len` the store has reached, and make `Sweep` call `Compact` when the live count falls below a quarter of that peak. Measure it with `cmd/leak`.
+
+<Solution>
+
+Add a `peak int` field, updated in `Set` when `len(s.data) > s.peak`. At the end of `Sweep`, if `len(s.data) < s.peak/4`, call `Compact` and set `peak = len(s.data)`. The leak program's second line then drops to about 0.2 MB. The quarter is a guard against thrashing: a store that hovers around one size shouldn't rebuild its map every sweep.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="A sweeper that runs by itself" level="medium">
+
+Start a goroutine that calls `Sweep` ten times a second, like Redis's expire cycle, and stops when a `context` is cancelled. What goes wrong when you run the tests with `-race`?
+
+<Solution>
+
+A `time.Ticker` in a `for`/`select` loop with `ctx.Done()`. With `-race`, the detector reports a data race: the sweeper goroutine deletes from the map while the test goroutine reads it, and Go maps aren't safe for concurrent use. Fixing that needs a lock, which is where Module 3 begins.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Gone on Time"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="This store takes its clock as a field, so the checks can move time by hand. Its reads never look at the expiry, Expire creates keys that don't exist, TTL mixes up −1 and −2, and Set keeps an old expiry. Make it follow Redis: an expired key is missing and is deleted when read, Expire only works on live keys, TTL answers −1 and −2 correctly, and Set clears the expiry."
+  starter={`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type entry struct {
+	value   string
+	expires time.Time // zero: never expires
+}
+
+// Store takes its clock as a field, so a test can move time by hand.
+type Store struct {
+	data map[string]entry
+	now  func() time.Time
+}
+
+func New(now func() time.Time) *Store {
+	return &Store{data: make(map[string]entry), now: now}
+}
+
+// Set stores value and clears any expiry, like Redis's SET.
+func (s *Store) Set(key, value string) {
+	e := s.data[key]
+	e.value = value
+	s.data[key] = e
+}
+
+// Get returns a live value. An expired key is missing (and is deleted).
+func (s *Store) Get(key string) (string, bool) {
+	e, ok := s.data[key]
+	return e.value, ok
+}
+
+// Expire sets key to vanish after ttl, and reports whether key existed.
+// A missing or expired key can't be given an expiry.
+func (s *Store) Expire(key string, ttl time.Duration) bool {
+	e := s.data[key]
+	e.expires = s.now().Add(ttl)
+	s.data[key] = e
+	return true
+}
+
+// TTL is the time left, -1 for a key with no expiry, -2 for a missing
+// (or expired) key.
+func (s *Store) TTL(key string) time.Duration {
+	e, ok := s.data[key]
+	if !ok || e.expires.IsZero() {
+		return -1
+	}
+	return e.expires.Sub(s.now())
+}
+
+// Len counts entries in the map, expired or not.
+func (s *Store) Len() int { return len(s.data) }
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	clock := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	s := New(func() time.Time { return clock })
+
+	s.Set("session:ada", "token")
+	if got := s.TTL("session:ada"); got != -1 {
+		fail("TTL of a key with no expiry = %v, want -1", got)
+	}
+	if got := s.TTL("nothing"); got != -2 {
+		fail("TTL of a missing key = %v, want -2", got)
+	}
+	if s.Expire("nothing", time.Second) {
+		fail("Expire on a missing key returned true")
+	}
+	if _, found := s.Get("nothing"); found {
+		fail("Expire on a missing key created it")
+	}
+	if !s.Expire("session:ada", 10*time.Second) {
+		fail("Expire on an existing key returned false")
+	}
+
+	clock = clock.Add(9 * time.Second)
+	if v, found := s.Get("session:ada"); !found || v != "token" {
+		fail("after 9 s: Get = %q, %v; want the value until 10 s", v, found)
+	}
+	if got := s.TTL("session:ada"); got != time.Second {
+		fail("after 9 s: TTL = %v, want 1s", got)
+	}
+
+	clock = clock.Add(time.Second)
+	if _, found := s.Get("session:ada"); found {
+		fail("at exactly 10 s: the key is still there")
+	}
+	if got := s.TTL("session:ada"); got != -2 {
+		fail("TTL of an expired key = %v, want -2", got)
+	}
+	if s.Len() != 0 {
+		fail("reading an expired key should delete it: Len = %d", s.Len())
+	}
+	if s.Expire("session:ada", time.Hour) {
+		fail("Expire brought an expired key back")
+	}
+
+	s.Set("counter", "1")
+	s.Expire("counter", time.Second)
+	s.Set("counter", "2")
+	clock = clock.Add(5 * time.Second)
+	if v, found := s.Get("counter"); !found || v != "2" {
+		fail("SET must clear the old expiry: Get = %q, %v", v, found)
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Walks a fake clock through a session key's life: TTL −1, then EXPIRE 10 s, then reads at 9 s (present, TTL exactly 1 s) and at 10 s (gone, TTL −2, deleted from the map, and EXPIRE can't bring it back). Also checks EXPIRE on a missing key and that SET clears an old expiry. Prints ALL CHECKS PASS."
+  hints={[
+    "Write one lookup(key) helper that returns the entry and whether it's live, deleting it if s.now() is not before its expiry, and make Get, Expire and TTL use it.",
+    "TTL needs three answers: -2 when lookup says missing, -1 when the expiry is zero, otherwise the time left.",
+    "Set should store a brand-new entry{value: value}, which has a zero expiry, instead of updating the old one."
+  ]}
+  flag="GO{gone_on_time}"
+>
+
+Passing the clock in as a field is the other way to test time. It works everywhere, including code that does network I/O, at the cost of threading `now` through your types; synctest needs no changes to the code but only works inside its bubble.
+
+</Lab>
+
+<Recap>
+
+- Each entry now has an **expiry time**; the zero `time.Time` means none. `SET` clears it, `INCR` keeps it, as measured on Redis 8.10.2.
+- `TTL` answers the time left, **−1** (no expiry) or **−2** (missing or expired).
+- **Lazy expiry**: every read goes through `lookup`, which deletes an expired key and reports it missing.
+- **`testing/synctest`** runs a test with a fake clock: ten seconds of `time.Sleep` took 0.00s.
+- **Active expiry** samples 20 keys at a time and repeats while more than 10% were expired: it removed all 1,000,000 expired sessions.
+- A **Go map never shrinks**: 143.5 MB with lazy expiry alone, 128.0 MB after sweeping, 0.2 MB only after `Compact` rebuilt the map.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: SET vs INCR", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: synctest sleep", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the map that won't shrink", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: PERSIST", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: SET with EX", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: when to compact", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: a sweeper that runs by itself", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: Gone on Time", captured: false, points: 80 }}
+/>
+
+<Narrator mood="menacing">
+143.5 MB of dead sessions. The sweeper got it to 128.0. Only rebuilding the map got it to 0.2, because a Go map never shrinks. Remember that number. It'll save you a very embarrassing incident review.
+</Narrator>

@@ -1,9 +1,11 @@
-import Link from "next/link";
 import { chapters, partGroups } from "@/lib/manifest";
-import { DoneMark, HomeDesk, PartProgress } from "@/components/home/HomeDesk";
+import { HomeDesk } from "@/components/home/HomeDesk";
+import { PartOutline } from "@/components/home/PartOutline";
+import { lessonFacts } from "@/lib/outline";
 
 export default function Home() {
   const groups = partGroups();
+  const facts = lessonFacts();
   const first = chapters.find((c) => c.part === 1 && c.order === 1) ?? chapters[0];
   const firstGroup = groups.find((g) => g.part === first.part);
 
@@ -21,33 +23,25 @@ export default function Home() {
       />
 
       {groups.map((g, gi) => (
-        <section key={g.part} className="hp" style={{ animationDelay: `${120 + gi * 60}ms` }}>
-          <header className="hp-head">
-            <div>
-              <p className="hp-kicker">{g.label}</p>
-              <h2 className="hp-title">{g.title}</h2>
-              <p className="hp-sub">{g.subtitle}.</p>
-            </div>
-            <PartProgress slugs={g.chapters.map((c) => c.slug)} />
-          </header>
-          <ol className="hp-list">
-            {g.chapters.map((c) => (
-              <li key={c.slug}>
-                <Link href={c.href} className="hp-ch">
-                  <span className="hp-num">{c.order}</span>
-                  <span className="hp-text">
-                    <span className="hp-ch-title">
-                      {c.title}
-                      {c.type === "project" && <span className="hp-build">build</span>}
-                    </span>
-                    <span className="hp-desc">{c.description}</span>
-                  </span>
-                  <DoneMark slug={c.slug} />
-                </Link>
-              </li>
-            ))}
-          </ol>
-        </section>
+        <div key={g.part} className="hp" style={{ animationDelay: `${120 + gi * 60}ms` }}>
+          <PartOutline
+            label={g.label}
+            title={g.title}
+            subtitle={g.subtitle}
+            locking={g.part !== "appendix"}
+            collapsed={g.part === "appendix"}
+            lessons={g.chapters.map((c) => ({
+              slug: c.slug,
+              title: c.title,
+              href: c.href,
+              order: c.order,
+              type: c.type,
+              kind: c.kind,
+              module: c.module,
+              ...facts[c.slug],
+            }))}
+          />
+        </div>
       ))}
     </div>
   );

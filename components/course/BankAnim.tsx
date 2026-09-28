@@ -28,7 +28,7 @@ export type BankEvent = {
   who?: string;
   to?: string;
   say?: string | null;
-  mood?: "ok" | "bad" | "wait";
+  mood?: "ok" | "bad" | "wait" | null; // null clears it
   carry?: string | null; // a slip the customer holds ("+1¢", "login")
   /* an account jar */
   account?: string;
@@ -86,7 +86,7 @@ function worldAt(events: BankEvent[], accounts: BankAccount[], t: number) {
         from: moved ? prev?.to ?? null : prev?.from ?? null,
         since: moved ? e.at : prev?.since ?? e.at,
         say: e.say !== undefined ? e.say : prev?.say ?? null,
-        mood: e.mood ?? prev?.mood,
+        mood: e.mood !== undefined ? (e.mood ?? undefined) : prev?.mood,
         carry: e.carry !== undefined ? e.carry : prev?.carry ?? null,
         order: moved ? ++stamp : prev?.order ?? ++stamp,
       });

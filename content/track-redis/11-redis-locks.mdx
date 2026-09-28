@@ -1,0 +1,775 @@
+---
+title: "One Lock Is a Queue: Read Locks and Shards"
+part: "redis"
+order: 11
+type: "course"
+description: "Our server takes one mutex for every command, so its goroutines wait in line. Measured on an M1 with a Go benchmark (90% GET, 10% SET): one lock got slower as CPUs were added, 117 ns per command on 1 CPU and 241 ns on 8. A read lock helped a little (167 ns on 8) and first crashed the race test with 'concurrent map read and map write', because our GET deletes expired keys, which is a write. Splitting the keys across 16 shards, each with its own lock, got it to 52 ns on 4 CPUs. Through redis-benchmark, sharding took pipelined SET from 737k to 1,015k requests a second, against Redis 8.10.2's 1,166k."
+prerequisites: ["redis-pipelining"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 11" title="One Lock Is a Queue: Read Locks and Shards">
+
+Module 3 is about many clients at once. Lesson 8 already gave each connection its own goroutine and put one `sync.Mutex` around the store, so the server is *correct* with many clients. This lesson asks whether it's *fast* with many clients, and the answer is no: one lock means one command at a time, however many CPUs the machine has.
+
+Three stops:
+
+1. **The queue.** What one lock does to many goroutines, measured with a Go benchmark.
+2. **Read locks.** Letting `GET`s share, and the crash that came with it.
+3. **Shards.** Splitting the keys so different keys never wait for each other, measured in Go and against real Redis.
+
+</HeroCard>
+
+<Narrator>
+Fifty clients, eight CPUs, and one lock. Seven of those CPUs spend the day watching the eighth work. I don't pay people to watch. Today, everyone works.
+</Narrator>
+
+<ChapterTabs tabs={["The Queue", "Read Locks", "Shards"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "go.sum" },
+    { path: "store.go", status: "changed", note: "Peek: Get without deleting an expired key, safe under a read lock" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "resp/resp.go" },
+    { path: "resp/resp_test.go" },
+    { path: "server/server.go", status: "changed", note: "shards: several stores, each with its own sync.RWMutex; ReadLocks" },
+    { path: "server/commands.go", status: "changed", note: "each command locks only its key's shard" },
+    { path: "server/server_test.go" },
+    { path: "server/readlock_test.go", status: "new", note: "8 goroutines GET expired keys under read locks" },
+    { path: "server/bench_test.go", status: "new", note: "BenchmarkLocks: one lock, read locks, 16 shards" },
+    { path: "cmd/kv-server/main.go", status: "changed", note: "-shards and -read-locks flags" },
+    { path: "cmd/gopipe/main.go" },
+    { path: "cmd/spy/main.go" },
+    { path: "cmd/raw/main.go" },
+    { path: "cmd/talk/main.go" },
+    { path: "cmd/twoclients/main.go" },
+    { path: "cmd/hammer/main.go" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" }
+  ]}
+  run={["go test -race ./server", "go test -bench Locks -cpu 1,2,4,8 -count 3 ./server", "go run ./cmd/kv-server -shards 16"]}
+>
+
+The store itself gains one method, `Peek`. Everything else happens in the `server` package: the one lock becomes a list of shards, and each command picks its shard.
+
+</ProjectMap>
+
+## The Queue
+
+*Stop 1 of 3.*
+
+### Step 1: where we are
+
+Since lesson 8, every connection has its own goroutine, and every command goes through `do`, which starts like this (lesson 10's `server/commands.go`):
+
+```go noverify title="kv/server/commands.go · lines 12–16"
+// do runs one command and returns its reply, encoded the way Redis
+// encodes it (RESP).
+func (s *Server) do(args []string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+```
+
+`s.mu.Lock()` means: *if another goroutine holds the lock, wait until it lets go.* `kv.Store` is a plain Go map, and a map mustn't be written by one goroutine while another uses it (lesson 8 crashed with `concurrent map writes` without this lock). So the lock is necessary. But it is **one** lock for **every** key and **every** command. Fifty clients means fifty goroutines, and at any moment one of them is inside `do` and the rest are waiting in line, even when they want completely different keys.
+
+### Step 2: a picture of the line
+
+<LockLanesAnim
+  title="Goroutines at the lock"
+  frames={[
+    { note: "One lock guards the whole store. A goroutine runs GET user:1 and holds the lock while it does.", lanes: [{ name: "the store", keys: "every key", mode: "write", holders: ["GET user:1"], waiting: [] }] },
+    { note: "Three more commands arrive, for three different keys. None of them touches user:1, but they all need the same lock, so they wait.", beat: "problem", lanes: [{ name: "the store", keys: "every key", mode: "write", holders: ["GET user:1"], waiting: ["GET cart:9", "SET page:4", "GET user:7"] }] },
+    { note: "Each one runs only after the one before it lets go. Adding CPUs doesn't help: there's still one lock, so still one command at a time.", beat: "problem", lanes: [{ name: "the store", keys: "every key", mode: "write", holders: ["GET cart:9"], waiting: ["SET page:4", "GET user:7"] }], meters: [{ label: "commands running at once", value: "1", tone: "bad" }] },
+    { note: "Read locks (stop 2): GETs only read, so several can hold the lock together. A SET still needs it alone.", lanes: [{ name: "the store", keys: "every key", mode: "read", holders: ["GET user:1", "GET cart:9", "GET user:7"], waiting: ["SET page:4"] }], meters: [{ label: "GETs running at once", value: "3", tone: "good" }] },
+    { note: "The catch: our GET deletes a key it finds expired. Two goroutines both 'reading' under the read lock, both deleting from the map: a write during a read. Go stops the program.", beat: "problem", lanes: [{ name: "the store", keys: "every key", mode: "read", holders: ["GET session:1", "GET session:2"], waiting: [], bad: "fatal error: concurrent map read and map write" }] },
+    { note: "Shards (stop 3): split the keys into 16 stores, each with its own lock. A key's hash picks its shard. Commands on different shards don't wait for each other at all.", beat: "solution", lanes: [{ name: "shard 0", keys: "user:1, page:4…", mode: "write", holders: ["GET user:1"] }, { name: "shard 1", keys: "cart:9…", mode: "write", holders: ["GET cart:9"] }, { name: "shard 2", keys: "user:7…", mode: "write", holders: ["GET user:7"] }, { name: "… shard 15", keys: "", mode: "free" }], meters: [{ label: "commands running at once", value: "up to 16", tone: "good" }] },
+    { note: "Two commands wait only if their keys hash to the same shard: here SET page:4 waits behind GET user:1. With 16 shards, that's rare.", lanes: [{ name: "shard 0", keys: "user:1, page:4…", mode: "write", holders: ["GET user:1"], waiting: ["SET page:4"] }, { name: "shard 1", keys: "cart:9…", mode: "write", holders: ["GET cart:9"] }, { name: "shard 2", keys: "user:7…", mode: "free" }, { name: "… shard 15", keys: "", mode: "free" }] }
+  ]}
+  caption="🔒 held alone, 📖 shared by readers, 🔓 free. Gophers on the right are waiting."
+/>
+
+### Step 3: measuring the line
+
+A picture isn't proof, so we measure. `server/bench_test.go` fills a server with 10,000 keys and then runs commands on it from many goroutines at once: 90% `GET`s and 10% `SET`s on random keys, a typical cache's mix.
+
+```go noverify title="kv/server/bench_test.go · lines 11–45"
+// BenchmarkLocks runs 90% GETs and 10% SETs over 10,000 keys from many
+// goroutines at once, against each way of locking.
+func BenchmarkLocks(b *testing.B) {
+	keys := make([]string, 10_000)
+	for i := range keys {
+		keys[i] = fmt.Sprint("product:", i)
+	}
+	servers := []struct {
+		name string
+		new  func() *Server
+	}{
+		{"one-lock", func() *Server { return New(kv.New()) }},
+		{"read-locks", func() *Server { s := New(kv.New()); s.ReadLocks = true; return s }},
+		{"16-shards", func() *Server { return NewSharded(16) }},
+	}
+	for _, sv := range servers {
+		b.Run(sv.name, func(b *testing.B) {
+			s := sv.new()
+			for _, k := range keys {
+				s.do([]string{"SET", k, "value"})
+			}
+			b.RunParallel(func(pb *testing.PB) {
+				r := rand.New(rand.NewPCG(rand.Uint64(), 0))
+				for pb.Next() {
+					k := keys[r.IntN(len(keys))]
+					if r.IntN(10) == 0 {
+						s.do([]string{"SET", k, "value"})
+					} else {
+						s.do([]string{"GET", k})
+					}
+				}
+			})
+		})
+	}
+}
+```
+
+Three things in it are new:
+
+- `b.Run(sv.name, ...)` runs a **sub-benchmark** for each way of locking, so one command measures all three.
+- `b.RunParallel` starts several goroutines that share the work, one per CPU Go is allowed to use. Each calls `pb.Next()` until the benchmark has enough measurements.
+- Each goroutine has its own random-number generator (`rand.New(rand.NewPCG(...))`), so they don't share, and fight over, one.
+
+It calls `s.do` directly, without the network, so it measures only the locking and the store. `-cpu 1,2,4,8` runs everything with Go allowed 1, 2, 4 and 8 CPUs, and `-count 3` runs each three times. On an M1 (4 fast cores and 4 slower ones):
+
+```text
+$ go test -bench Locks -cpu 1,2,4,8 -count 3 ./server
+goos: darwin
+goarch: arm64
+pkg: kv/server
+cpu: Apple M1
+BenchmarkLocks/one-lock           	 8690049	       118.2 ns/op
+BenchmarkLocks/one-lock           	 9173173	       116.7 ns/op
+BenchmarkLocks/one-lock           	 9467613	       114.4 ns/op
+BenchmarkLocks/one-lock-2         	 8417812	       142.5 ns/op
+BenchmarkLocks/one-lock-2         	 8223331	       143.6 ns/op
+BenchmarkLocks/one-lock-2         	 8191992	       143.4 ns/op
+BenchmarkLocks/one-lock-4         	 5986962	       202.7 ns/op
+BenchmarkLocks/one-lock-4         	 5369368	       230.3 ns/op
+BenchmarkLocks/one-lock-4         	 6124164	       202.8 ns/op
+BenchmarkLocks/one-lock-8         	 4617895	       230.5 ns/op
+BenchmarkLocks/one-lock-8         	 5295009	       246.9 ns/op
+BenchmarkLocks/one-lock-8         	 4858844	       241.2 ns/op
+BenchmarkLocks/read-locks         	10983504	       108.7 ns/op
+BenchmarkLocks/read-locks         	11119875	       111.3 ns/op
+BenchmarkLocks/read-locks         	11297408	       118.6 ns/op
+BenchmarkLocks/read-locks-2       	 8519421	       140.5 ns/op
+BenchmarkLocks/read-locks-2       	 8891437	       135.4 ns/op
+BenchmarkLocks/read-locks-2       	 8898006	       134.5 ns/op
+BenchmarkLocks/read-locks-4       	 7621932	       157.0 ns/op
+BenchmarkLocks/read-locks-4       	 7478630	       159.7 ns/op
+BenchmarkLocks/read-locks-4       	 7597852	       159.8 ns/op
+BenchmarkLocks/read-locks-8       	 7330068	       175.4 ns/op
+BenchmarkLocks/read-locks-8       	 7513557	       161.5 ns/op
+BenchmarkLocks/read-locks-8       	 7273797	       167.0 ns/op
+BenchmarkLocks/16-shards          	 9029886	       131.7 ns/op
+BenchmarkLocks/16-shards          	 7872517	       132.5 ns/op
+BenchmarkLocks/16-shards          	 8607440	       137.0 ns/op
+BenchmarkLocks/16-shards-2        	14262988	        83.15 ns/op
+BenchmarkLocks/16-shards-2        	15983918	        78.30 ns/op
+BenchmarkLocks/16-shards-2        	13521532	        90.66 ns/op
+BenchmarkLocks/16-shards-4        	23925033	        51.81 ns/op
+BenchmarkLocks/16-shards-4        	25442841	        53.39 ns/op
+BenchmarkLocks/16-shards-4        	25622479	        49.81 ns/op
+BenchmarkLocks/16-shards-8        	18181952	        74.45 ns/op
+BenchmarkLocks/16-shards-8        	17900005	        69.69 ns/op
+BenchmarkLocks/16-shards-8        	15027793	        79.70 ns/op
+PASS
+ok  	kv/server	52.130s
+```
+
+The names end in the CPU count (`one-lock-4` is 4 CPUs; no suffix is 1). The number that matters is **ns/op**: nanoseconds per command, averaged over all the goroutines. Lower is better. Taking the middle of each three runs:
+
+| CPUs | one lock | read locks | 16 shards |
+|---|---|---|---|
+| 1 | 117 ns | 111 ns | 133 ns |
+| 2 | 143 ns | 135 ns | 83 ns |
+| 4 | 203 ns | 160 ns | **52 ns** |
+| 8 | 241 ns | 167 ns | 74 ns |
+
+Look at the **one lock** column: with more CPUs, each command got **slower**, from 117 ns to 241 ns. More goroutines didn't do more work; they spent more time fighting over the lock, and handing a lock from one CPU to another costs time of its own. That's the queue, measured.
+
+<UnderTheHood title="Why a contended lock gets slower, not just no faster">
+
+An uncontended `sync.Mutex` is a single atomic compare-and-swap on one word of memory: a few nanoseconds. Contended, it gets expensive. The word holding the lock bounces between the CPUs' caches, because every CPU that tries to take it has to own that cache line. Goroutines that can't get the lock spin briefly, then park: the Go scheduler takes them off their thread until the lock is released, and waking them costs scheduler work. Go's mutex also switches into a *starvation mode* when a waiter has been waiting over 1 ms, handing the lock over strictly in order, which is fair but slower. All of that is overhead that one CPU on its own never pays.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="With one lock, why did each command get slower on 8 CPUs than on 1?"
+  options={[
+    "The map gets slower with more CPUs",
+    "Only one command can hold the lock at a time, and the goroutines waiting for it add the cost of passing the lock between CPUs",
+    "The benchmark does more work on 8 CPUs",
+    "The race detector was on"
+  ]}
+  answer={1}
+  explain="The work per command is the same. What grows is the fight over one lock: cache lines moving between CPUs, goroutines parked and woken."
+/>
+
+## Read Locks
+
+*Stop 2 of 3.*
+
+### Step 1: readers can share
+
+Most commands in a cache are `GET`s, and a `GET` only reads. Two goroutines reading the same map at the same time is safe in Go; only a write alongside anything else is not. `sync.RWMutex` is a lock that knows the difference:
+
+- `Lock()` / `Unlock()` take it **alone**, for writing. No reader and no other writer can hold it at the same time.
+- `RLock()` / `RUnlock()` take it **shared**, for reading. Any number of readers can hold it together; a writer waits until they've all let go.
+
+So the plan: `SET`, `DEL` and `INCR` keep `Lock`; `GET` takes `RLock`.
+
+### Step 2: the crash
+
+The first version did exactly that, calling the store's `Get` under the read lock:
+
+```go noverify title="kv/server/commands.go · the first version"
+		sh.mu.RLock()
+		v, ok = sh.store.Get(args[1])
+		sh.mu.RUnlock()
+```
+
+and a test to check it: 1,000 keys that have all just expired, then 8 goroutines `GET`ting them at once under read locks (`server/readlock_test.go`):
+
+```go noverify title="kv/server/readlock_test.go · lines 12–36"
+// GETs under a read lock, on keys that have just expired: several readers
+// at once, as ReadLocks allows.
+func TestReadLocksWithExpiredKeys(t *testing.T) {
+	store := kv.New()
+	for i := range 1000 {
+		k := fmt.Sprint("session:", i)
+		store.Set(k, "token")
+		store.Expire(k, time.Millisecond)
+	}
+	time.Sleep(5 * time.Millisecond) // every key has expired, none deleted yet
+
+	s := New(store)
+	s.ReadLocks = true
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for i := range 1000 {
+				if got := s.do([]string{"GET", fmt.Sprint("session:", i)}); got != "$-1\r\n" {
+					t.Errorf("GET of an expired key = %q", got)
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+```
+
+`go test -race ./server`:
+
+```text
+==================
+WARNING: DATA RACE
+Read at 0x00c0000929c0 by goroutine 11:
+  runtime.mapaccess1_faststr()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/internal/runtime/maps/runtime_faststr.go:114 +0x4c
+  kv.(*Store).lookup()
+      /tmp/kvrace/kv/store.go:39 +0x74
+  kv.(*Store).Get()
+      /tmp/kvrace/kv/store.go:53 +0x37c
+  kv/server.(*Server).do()
+      /tmp/kvrace/kv/server/commands.go:31 +0x340
+  kv/server.TestReadLocksWithExpiredKeys.func1()
+      /tmp/kvrace/kv/server/readlock_test.go:29 +0xf8
+
+Previous write at 0x00c0000929c0 by goroutine 16:
+  runtime.mapassign_faststr()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/internal/runtime/maps/runtime_faststr.go:261 +0x4dc
+  kv.(*Store).lookup()
+      /tmp/kvrace/kv/store.go:41 +0x158
+  kv.(*Store).Get()
+      /tmp/kvrace/kv/store.go:53 +0x37c
+  kv/server.(*Server).do()
+      /tmp/kvrace/kv/server/commands.go:31 +0x340
+  kv/server.TestReadLocksWithExpiredKeys.func1()
+      /tmp/kvrace/kv/server/readlock_test.go:29 +0xf8
+
+Goroutine 11 (running) created at:
+  sync.(*WaitGroup).Go()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/sync/waitgroup.go:238 +0x6c
+  testing.tRunner()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2193 +0x164
+  testing.(*T).Run.gowrap1()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2258 +0x34
+
+Goroutine 16 (running) created at:
+  sync.(*WaitGroup).Go()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/sync/waitgroup.go:238 +0x6c
+  testing.tRunner()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2193 +0x164
+  testing.(*T).Run.gowrap1()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/testing/testing.go:2258 +0x34
+==================
+fatal error: concurrent map read and map write
+
+goroutine 11 [running]:
+internal/runtime/maps.fatal({0x100f9934d?, 0x100e02c80?})
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/runtime/panic.go:1195 +0x20
+kv.(*Store).lookup(0xc0000020a8, {0xc000313d75, 0xb})
+	/tmp/kvrace/kv/store.go:39 +0x78
+kv.(*Store).Get(...)
+	/tmp/kvrace/kv/store.go:53
+kv/server.(*Server).do(0xc0000929f0, {0xc000480f48, 0x2, 0x2})
+	/tmp/kvrace/kv/server/commands.go:31 +0x380
+kv/server.TestReadLocksWithExpiredKeys.func1()
+	/tmp/kvrace/kv/server/readlock_test.go:29 +0xfc
+sync.(*WaitGroup).Go.func1()
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/sync/waitgroup.go:258 +0x48
+created by sync.(*WaitGroup).Go in goroutine 5
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/sync/waitgroup.go:238 +0x70
+FAIL	kv/server	0.719s
+FAIL
+```
+
+The race detector reported a **write** at `store.go:41` from inside `Get`, then the runtime itself stopped the program: `fatal error: concurrent map read and map write`. Line 41 is in `lookup`, which `Get` calls:
+
+```go noverify title="kv/store.go · lines 36–45"
+// lookup returns the live entry for key. An expired entry is deleted on the
+// way: Redis calls this lazy expiry.
+func (s *Store) lookup(key string) (entry, bool) {
+	e, ok := s.data[key]
+	if ok && e.expired(time.Now()) {
+		delete(s.data, key)
+		return entry{}, false
+	}
+	return e, ok
+}
+```
+
+This is lesson 6's **lazy expiry**: when a read finds a key past its expiry time, it deletes it on the spot. That `delete` is a write to the map. So our `GET` isn't a read at all when the key has expired, and several of them "reading" together under a shared lock were writing the same map at once. The lock was right about what `RLock` allows; we were wrong about what `GET` does.
+
+### Step 3: a read that only reads
+
+The fix is a second way to look a key up, which never deletes. In `store.go`:
+
+```go noverify title="kv/store.go · lines 57–66"
+// Peek is Get without lazy expiry: an expired key reads as missing but is
+// left in the map. It only reads, so it's safe under a read lock; the
+// deletion happens later, in a write or in Sweep.
+func (s *Store) Peek(key string) (string, bool) {
+	e, ok := s.data[key]
+	if !ok || e.expired(time.Now()) {
+		return "", false
+	}
+	return e.value, true
+}
+```
+
+`Peek` answers exactly as `Get` would (an expired key reads as missing) but leaves the expired entry in the map. It gets deleted later by something that holds the lock alone: the next `SET` or `DEL` of that key, or lesson 6's sweeper. The `GET` case now uses `Peek` when read locks are on:
+
+```go noverify title="kv/server/commands.go · lines 25–41"
+	case name == "GET" && len(args) == 2:
+		sh := s.shardFor(args[1])
+		var v string
+		var ok bool
+		if s.ReadLocks {
+			sh.mu.RLock()
+			v, ok = sh.store.Peek(args[1]) // Get would delete an expired key: a write
+			sh.mu.RUnlock()
+		} else {
+			sh.mu.Lock()
+			v, ok = sh.store.Get(args[1])
+			sh.mu.Unlock()
+		}
+		if !ok {
+			return null()
+		}
+		return bulk(v)
+```
+
+With that, the same test passes under `-race`. The benchmark's **read locks** column shows what it bought: on 8 CPUs, 167 ns per command against one lock's 241 ns. Better, but still slower than on 1 CPU. Every `GET` still updates the shared lock's reader count, one word of memory that all CPUs fight over, and the 10% of `SET`s still stop everyone.
+
+<QuickCheck
+  question="Why did GET under a read lock crash?"
+  options={[
+    "RWMutex has a bug",
+    "GET deletes an expired key it finds (lazy expiry), and a delete is a write, which a shared read lock doesn't allow",
+    "Two readers can't read a map at the same time",
+    "The keys were too short"
+  ]}
+  answer={1}
+  explain="Readers may share; writers may not. Lazy expiry hides a write inside a read. Peek reads without deleting, so it's safe to share."
+/>
+
+## Shards
+
+*Stop 3 of 3.*
+
+### Step 1: many small locks
+
+The one lock's real problem is that it covers every key. A `GET user:1` and a `SET page:4` have nothing to do with each other, yet they wait for each other. **Sharding** splits the keys into several stores, **shards**, each with its own lock. A command locks only the shard its key lives in, so commands on different shards run truly at the same time.
+
+`server/server.go` now holds a list of shards instead of one store and one lock:
+
+```go noverify title="kv/server/server.go · lines 15–47"
+// Server serves its keys to many clients at once. The keys are split
+// across shards, each a store with its own lock, so commands on keys in
+// different shards don't wait for each other.
+type Server struct {
+	shards []*shard
+	seed   maphash.Seed
+
+	// ReadLocks lets GETs on the same shard run at the same time, under a
+	// read lock. Writes still take the lock alone.
+	ReadLocks bool
+}
+
+// shard is one store and the lock that protects it: kv.Store isn't safe
+// for concurrent use.
+type shard struct {
+	mu    sync.RWMutex
+	store *kv.Store
+}
+
+// New serves one store behind one lock: every command waits for the one
+// before it, as in lesson 8.
+func New(store *kv.Store) *Server {
+	return &Server{shards: []*shard{{store: store}}, seed: maphash.MakeSeed()}
+}
+
+// NewSharded splits the keys across n stores, each with its own lock.
+func NewSharded(n int) *Server {
+	s := &Server{seed: maphash.MakeSeed()}
+	for range n {
+		s.shards = append(s.shards, &shard{store: kv.New()})
+	}
+	return s
+}
+```
+
+`New` keeps the old behaviour (one shard, one lock) and `NewSharded(n)` makes `n` shards, each a fresh `kv.Store`. Each shard's lock is an `RWMutex`, so read locks work per shard too.
+
+### Step 2: which shard?
+
+A key must always go to the same shard, or a `SET` would put it in one shard and a later `GET` look in another. And keys should spread evenly, or one shard gets all the work. A **hash function** gives both: it turns a string into a number that is always the same for the same string and looks random across different strings.
+
+```go noverify title="kv/server/server.go · lines 49–56"
+// shardFor picks a key's shard by hashing it: the same key always lands
+// on the same shard, and keys spread evenly across them.
+func (s *Server) shardFor(key string) *shard {
+	if len(s.shards) == 1 {
+		return s.shards[0]
+	}
+	return s.shards[maphash.String(s.seed, key)%uint64(len(s.shards))]
+}
+```
+
+`maphash` is the standard library's hash for exactly this (it's what Go's own maps use internally). `maphash.MakeSeed()` picks a random seed once, in `New`, so the same key hashes the same way for the life of the server. `% uint64(len(s.shards))` turns the hash into a shard number from 0 to 15.
+
+### Step 3: each command locks its shard
+
+`do` no longer locks anything at the top. Each command finds its key's shard and locks only that:
+
+```go noverify title="kv/server/commands.go · lines 12–24"
+// do runs one command and returns its reply, encoded the way Redis
+// encodes it (RESP). Each command locks only the shard of the key it uses.
+func (s *Server) do(args []string) string {
+	name := strings.ToUpper(args[0])
+	switch {
+	case name == "PING" && len(args) == 1:
+		return simple("PONG") // touches no key: no lock at all
+	case name == "SET" && len(args) == 3:
+		sh := s.shardFor(args[1])
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+		sh.store.Set(args[1], args[2])
+		return simple("OK")
+```
+
+`PING` touches no key, so it takes no lock at all. `DEL` can name several keys, which may live in different shards, so it locks each key's shard in turn:
+
+```go noverify title="kv/server/commands.go · lines 42–52"
+	case name == "DEL" && len(args) >= 2:
+		n := 0
+		for _, k := range args[1:] { // one key at a time: keys may be in different shards
+			sh := s.shardFor(k)
+			sh.mu.Lock()
+			if sh.store.Del(k) {
+				n++
+			}
+			sh.mu.Unlock()
+		}
+		return integer(int64(n))
+```
+
+That means a `DEL` of two keys isn't one atomic step any more: another client could see the first key gone and the second still there. Real Redis doesn't have this problem, because it runs all commands on one thread (see the note below). For our server it's an honest trade, and a real one: it's why sharded systems usually only promise atomicity for commands on one key.
+
+### Step 4: measured
+
+Back to the table. **16 shards** on 4 CPUs: **52 ns** per command, against 203 ns for one lock: about four times faster, which is what four CPUs working at once should give. On 8 CPUs it's 74 ns: the M1's four extra cores are its slower, power-saving ones, and some goroutines now wait on them. On 1 CPU, sharding is slightly slower (133 ns against 117 ns): hashing the key is extra work, and with one CPU there's no one to run in parallel with.
+
+`cmd/kv-server` gets two flags so the real server can run each way:
+
+```go noverify title="kv/cmd/kv-server/main.go · lines 13–30"
+func main() {
+	addr := flag.String("addr", "127.0.0.1:6380", "address to listen on")
+	shards := flag.Int("shards", 1, "split the keys across this many locked stores")
+	readLocks := flag.Bool("read-locks", false, "let GETs share a read lock")
+	flag.Parse()
+
+	l, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("listening on %s", l.Addr())
+	srv := server.New(kv.New())
+	if *shards > 1 {
+		srv = server.NewSharded(*shards)
+	}
+	srv.ReadLocks = *readLocks
+	log.Fatal(srv.Serve(l))
+}
+```
+
+Then the same fair race as lesson 10: each server in its own container on one Docker network, and `redis-benchmark` from a third, with 50 clients, 16 commands per round trip and random keys (`-n 400000 -c 50 -P 16 -r 10000 -t set,get`), three runs each:
+
+```text
+kv-one       SET  median     737k/s  runs 737k, 686k, 739k
+kv-one       GET  median    1338k/s  runs 1408k, 1338k, 1220k
+kv-rw        SET  median     777k/s  runs 777k, 787k, 749k
+kv-rw        GET  median    1569k/s  runs 1569k, 1538k, 1818k
+kv-sh16      SET  median    1015k/s  runs 1015k, 1047k, 983k
+kv-sh16      GET  median    1521k/s  runs 1504k, 1521k, 1562k
+track-redis  SET  median    1166k/s  runs 1166k, 1105k, 1173k
+track-redis  GET  median    1826k/s  runs 1802k, 1826k, 1843k
+```
+
+| thousand requests/s (median of 3) | SET | GET |
+|---|---|---|
+| one lock (`-shards 1`) | 737 | 1,338 |
+| read locks (`-shards 1 -read-locks`) | 777 | 1,569 |
+| **16 shards** (`-shards 16`) | **1,015** | 1,521 |
+| Redis 8.10.2 | 1,166 | 1,826 |
+
+Sharding took `SET` from 737 to 1,015 thousand a second, now 87% of Redis. `GET` improved less, from 1,338 to about 1,520, because reads were already the cheaper half; through the network, parsing and writing replies now cost more than the lock does. Redis is still ahead, on a single thread for its commands, which is the lesson of this whole module: **locks are a cost, and the best lock is one nobody else wants at the same moment.**
+
+<Callout kind="note" title="How real Redis avoids the lock">
+Redis runs every command on **one thread**. Since only one thread ever touches the data, it needs no lock at all, and multi-key commands like `DEL a b` are atomic for free. It stays fast because each command is tiny and the thread never waits for the network: the operating system tells it which connections have data ready (`epoll` on Linux). Since Redis 6, extra I/O threads can read and write sockets, but commands still run on the one thread. Go's model is the opposite: goroutines are cheap, so we use many, and then have to protect what they share.
+</Callout>
+
+<QuickCheck
+  question="Why must shardFor use the same seed for the life of the server?"
+  options={[
+    "To make hashing faster",
+    "So the same key always lands on the same shard: a new seed would send a GET to a different shard than the SET that stored the key",
+    "Because maphash requires it",
+    "To spread keys evenly"
+  ]}
+  answer={1}
+  explain="The shard is chosen from the hash. Change the seed and the hash of 'user:1' changes, and the key seems to vanish."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="How many shards?" level="easy">
+
+Add `4-shards` and `64-shards` to `BenchmarkLocks` and run it with `-cpu 4`. Does 64 beat 16?
+
+<Solution>
+
+Run it and compare the ns/op. Expect 4 shards to fall between one lock and 16 (with 4 CPUs, two goroutines regularly land on the same shard), and 64 to be close to 16: once collisions are rare, more shards buy almost nothing and cost memory, one store and one lock each. The number of shards only needs to be comfortably larger than the number of CPUs working at once.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Shards and read locks together" level="medium">
+
+The server already allows `NewSharded(16)` with `ReadLocks = true`, but `cmd/kv-server` never builds it. Add it to the benchmark as `16-shards-rw`. Is it faster than plain 16 shards with 90% reads?
+
+<Solution>
+
+Measure it. With 16 shards two `GET`s rarely want the same shard, so letting them share a shard's lock rarely matters, while `RLock` still writes the shared reader count on every call. Don't be surprised if it's no faster, or slower: read locks help when many readers really do meet on one lock.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="An atomic DEL" level="hard">
+
+Make `DEL a b c` atomic across shards: lock every shard involved before deleting anything. Why must the shards always be locked in the same order?
+
+<Solution>
+
+Collect the distinct shard indexes, sort them, lock in that order, delete, unlock. Without a fixed order, one `DEL a b` could lock a's shard and wait for b's while another `DEL b a` holds b's shard and waits for a's: each waits for the other forever, a **deadlock**. Locking in ascending index order means the second one waits for the first shard instead of taking it, so it can never hold one lock the first needs.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Sixteen Locks, No Waiting"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Counters is a sharded map of counters: 16 shards, each with its own RWMutex. It has three bugs. Counters vanish right after they're incremented, Len counts only some of them, and 8 goroutines incrementing together crash it. Fix all three; it must pass under go run -race too."
+  starter={`package main
+
+import (
+	"fmt"
+	"hash/maphash"
+	"sync"
+)
+
+// Counters is a map of named counters, split into shards so that
+// goroutines working on different keys don't wait for each other.
+type Counters struct {
+	shards [16]struct {
+		mu sync.RWMutex
+		m  map[string]int64
+	}
+}
+
+func New() *Counters {
+	c := &Counters{}
+	for i := range c.shards {
+		c.shards[i].m = map[string]int64{}
+	}
+	return c
+}
+
+// shard picks the shard a key lives in. The same key must always map to
+// the same shard.
+func (c *Counters) shard(key string) int {
+	return int(maphash.String(maphash.MakeSeed(), key) % 16)
+}
+
+// Incr adds one to a counter and returns the new value.
+func (c *Counters) Incr(key string) int64 {
+	s := &c.shards[c.shard(key)]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.m[key]++
+	return s.m[key]
+}
+
+// Get returns a counter's value (0 if it was never incremented).
+func (c *Counters) Get(key string) int64 {
+	s := &c.shards[c.shard(key)]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.m[key]
+}
+
+// Len is how many different counters exist, across all shards.
+func (c *Counters) Len() int {
+	return len(c.shards[0].m)
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	defer func() {
+		if p := recover(); p != nil {
+			fmt.Println("FAIL panic:", p)
+		}
+	}()
+
+	c := New()
+	for i := range 100 {
+		c.Incr(fmt.Sprint("page:", i))
+	}
+	for i := range 100 {
+		if got := c.Get(fmt.Sprint("page:", i)); got != 1 {
+			fail("page:%d incremented once, Get says %d", i, got)
+			break
+		}
+	}
+	if n := c.Len(); n != 100 {
+		fail("100 different counters, Len says %d", n)
+	}
+
+	// 8 goroutines, 2,000 increments each, over 10 hot keys.
+	c = New()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for i := range 2000 {
+				c.Incr(fmt.Sprint("hot:", i%10))
+			}
+		})
+	}
+	wg.Wait()
+	var total int64
+	for i := range 10 {
+		total += c.Get(fmt.Sprint("hot:", i))
+	}
+	if total != 16000 {
+		fail("16,000 concurrent increments, the counters add up to %d", total)
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Increments 100 counters once each and reads them back; checks Len is 100; then 8 goroutines do 2,000 increments each over 10 keys and checks the counters add up to 16,000. Prints ALL CHECKS PASS."
+  hints={[
+    "shard calls maphash.MakeSeed() every time. A new seed means a new hash, so the same key goes to a different shard each call. Make the seed once, in New, and keep it in the struct.",
+    "Incr does s.m[key]++: a read, then a write. Under RLock, several goroutines do that to the same map at once. A read-modify-write needs Lock.",
+    "Len looks at shard 0 only. Add up len(m) across all 16 shards, taking each shard's read lock while you read it."
+  ]}
+  flag="GO{one_lock_per_shard}"
+>
+
+All three are the lesson's bugs in miniature: the key must always hash to the same shard, a change needs the lock alone, and a question about all the keys has to visit every shard.
+
+</Lab>
+
+<Recap>
+
+- One `sync.Mutex` around the store makes every command wait for the one before it. Measured with `b.RunParallel`, 90% `GET`: **117 ns per command on 1 CPU, 241 ns on 8**. More CPUs made it slower.
+- `sync.RWMutex` lets readers share. Our first read-locked `GET` crashed with **`concurrent map read and map write`**, because lazy expiry deletes inside `Get`. `Peek` reads without deleting; read locks then gave 167 ns on 8 CPUs.
+- **Sharding** splits keys across 16 stores with a lock each, chosen by `maphash` with one fixed seed: **52 ns** per command on 4 CPUs. Multi-key commands are no longer atomic across shards.
+- Through `redis-benchmark` (`-P 16`): `SET` went from **737k to 1,015k** requests a second, against Redis 8.10.2's 1,166k. Redis needs no locks because it runs commands on one thread.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: why one lock gets slower", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the read-lock crash", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: one seed", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: how many shards", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: shards and read locks", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: an atomic DEL", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab: Sixteen Locks, No Waiting", captured: false, points: 80 }}
+/>
+
+<Narrator>
+241 nanoseconds on eight CPUs, down to 52 on four. A "read" that was secretly a write, caught before it shipped. And `SET` at 87% of the real Redis. You didn't just add locks. You took them away from the places they didn't belong. That's the harder skill.
+</Narrator>

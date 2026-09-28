@@ -5,7 +5,7 @@ export type SearchEntry = {
   id: number;
   chTitle: string;
   href: string;
-  part: number | "appendix";
+  part: number | "redis" | "appendix";
   type: "course" | "project";
   heading: string | null;
   anchor: string;
@@ -22,7 +22,7 @@ export type Hit = {
 export type ChapterGroup = {
   href: string;
   chTitle: string;
-  part: number | "appendix";
+  part: number | "redis" | "appendix";
   type: "course" | "project";
   hits: Hit[];
 };
@@ -117,6 +117,7 @@ export function search(index: SearchEntry[], query: string): ChapterGroup[] {
   return [...byHref.values()].slice(0, 8);
 }
 
-export function partLabel(part: number | "appendix"): string {
+export function partLabel(part: number | "redis" | "appendix"): string {
+  if (part === "redis") return "Project Track";
   return part === "appendix" ? "Appendix" : `Part ${part}`;
 }

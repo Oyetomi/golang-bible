@@ -1,0 +1,765 @@
+---
+title: "Damaged Files and Endless Logs: Replay, Repair, Rewrite"
+part: "redis"
+order: 15
+type: "course"
+description: "The last lesson of the track. A write cut off by a crash left half a command at the end of the AOF: lesson 14's server replayed it silently, appended after the fragment, and on the next restart parsed garbage (10 commands from 4) and lost a confirmed SET. Replay now tracks the offset of the last whole command and truncates a torn tail, as Redis 8.10.2 does ('Truncating the AOF at offset 109'), and refuses to start on damage in the middle, which our old server had loaded as 8 commands of junk. Then the log that never stops growing: 2 million INCRs on one key made a 48,000,000-byte file that REWRITEAOF turned into 36 bytes; 1 million keys went from 72.8 MB to 48.8 MB and replay from 1.2 s to 0.67 s, at the cost of a 173 ms pause for every client."
+prerequisites: ["redis-aof"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 15" title="Damaged Files and Endless Logs: Replay, Repair, Rewrite">
+
+Lesson 14 made writes survive a crash, assuming the file is intact and replaying it is simple. Neither is guaranteed. A crash can land in the middle of a write, and a file on a disk can be damaged. And a log of every command ever run only grows: a counter incremented a million times is a million lines, for one number.
+
+This last lesson makes the log trustworthy and keeps it small.
+
+Three stops:
+
+1. **The torn tail.** Half a command at the end of the file, and the confirmed write it quietly destroyed.
+2. **Damage.** Telling a torn tail from a damaged file, and refusing to start on the second.
+3. **The rewrite.** Folding a million commands into one per key, safely, and what it costs.
+
+</HeroCard>
+
+<Narrator mood="menacing">
+The final lesson. Your server keeps a diary now. Lovely. But diaries get torn, pages get smudged, and a diary that records every breath eventually fills the room. Today I find out whether your server can tell a torn page from a forged one. Most can't. Yours will.
+</Narrator>
+
+<ChapterTabs tabs={["The Torn Tail", "Damage", "The Rewrite"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "go.sum" },
+    { path: "store.go", status: "changed", note: "All: an iterator over every live key, for the rewrite" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "resp/resp.go", status: "changed", note: "ArraysOnly: refuse inline commands, for reading files" },
+    { path: "resp/resp_test.go" },
+    { path: "server/server.go" },
+    { path: "server/aof.go", status: "changed", note: "Replay tracks offsets, truncates a torn tail, refuses damage; Rewrite" },
+    { path: "server/commands.go", status: "changed", note: "REWRITEAOF" },
+    { path: "server/pubsub.go" },
+    { path: "server/server_test.go" },
+    { path: "server/readlock_test.go" },
+    { path: "server/bench_test.go" },
+    { path: "server/shutdown_test.go" },
+    { path: "server/pubsub_test.go" },
+    { path: "server/aof_test.go" },
+    { path: "server/recover_test.go", status: "new", note: "a torn tail, damage in the middle, and a rewrite" },
+    { path: "cmd/kv-server/main.go" },
+    { path: "cmd/fill/main.go", status: "new", note: "a million SETs and a million INCRs, pipelined" },
+    { path: "cmd/pause/main.go", status: "new", note: "GET in a loop, reporting the slowest reply" },
+    { path: "cmd/acked/main.go" },
+    { path: "cmd/pubtalk/main.go" },
+    { path: "cmd/fanout/main.go" },
+    { path: "cmd/busy/main.go" },
+    { path: "cmd/stuck/main.go" },
+    { path: "cmd/gopipe/main.go" },
+    { path: "cmd/spy/main.go" },
+    { path: "cmd/raw/main.go" },
+    { path: "cmd/talk/main.go" },
+    { path: "cmd/twoclients/main.go" },
+    { path: "cmd/hammer/main.go" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" }
+  ]}
+  run={["go run ./cmd/kv-server -aof kv.aof", "go run ./cmd/fill", "redis-cli -p 6380 REWRITEAOF", "go test -race ./server"]}
+>
+
+The changes are almost all in `server/aof.go`: a smarter `Replay` and a new `Rewrite`. The store gains an iterator, and the RESP reader a strict mode.
+
+</ProjectMap>
+
+## The Torn Tail
+
+*Stop 1 of 3.*
+
+### Step 1: half a command
+
+A `write` of 30 bytes isn't guaranteed to reach the disk as one piece. If the power goes, or the disk fills, in the middle of it, the file can end with the first part of a command and not the rest: a **torn** write. A script reproduces one: it runs four commands against lesson 14's server, then cuts the last 5 bytes off the file, so the final `SET user:2 bayo` is incomplete. Then it starts the server, writes one more thing, and restarts:
+
+```text
+$ truncate -s -5 kv.aof     # the end of "SET user:2 bayo" never reached the disk
+$ kv-server -aof kv.aof
+listening on 127.0.0.1:6398
+loaded 3 commands from /tmp/torn.aof in 0s
+> GET visits
+  "$1\r\n2\r\n"
+> GET user:2
+  "$-1\r\n"
+> SET user:3 chioma
+  "+OK\r\n"
+$ kv-server -aof kv.aof     # restart
+listening on 127.0.0.1:6398
+loaded 10 commands from /tmp/torn.aof in 0s
+> GET visits
+  "$1\r\n2\r\n"
+> GET user:3
+  "$-1\r\n"
+```
+
+The first start looks fine: `loaded 3 commands`, `visits` is 2, the incomplete `SET user:2` simply didn't happen. Then `SET user:3 chioma` got `+OK`. After the restart, the server loaded **10 commands** from a file that held 5, and `user:3` is **gone**: a confirmed write, lost, with no error anywhere.
+
+### Step 2: what went wrong
+
+Lesson 14's `Replay` read commands until an error, and treated running out of file as the normal end. So when the file ended halfway through `SET user:2`, it stopped quietly, and the half-command **stayed in the file**. The server then opened the file for appending and wrote `SET user:3 chioma` *after the fragment*. On the next start, the parser read the fragment's `$4`, took the start of the next command as the rest of that argument, and from there it was out of step: it read the rest of `SET user:3`'s bytes as if they were separate commands, the "10 commands", and `SET user:3` itself never happened.
+
+<AofTapeAnim
+  title="A torn tail, before and after the fix"
+  frames={[
+    { note: "Four commands were written; the last one, SET user:2 bayo, only partly reached the disk.", file: "kv.aof", records: [{ label: "SET user:1 ada" }, { label: "INCR visits" }, { label: "INCR visits" }, { label: "SET user:2 b…", kind: "torn" }] },
+    { note: "Lesson 14's Replay runs the three whole commands, hits the end of the file inside the fourth, and stops without a word. The fragment stays in the file.", file: "kv.aof", cursor: 3, records: [{ label: "SET user:1 ada", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "SET user:2 b…", kind: "torn" }], verdict: "loaded 3 commands" },
+    { note: "SET user:3 chioma is confirmed and appended: right after the fragment.", beat: "problem", file: "kv.aof", records: [{ label: "SET user:1 ada" }, { label: "INCR visits" }, { label: "INCR visits" }, { label: "SET user:2 b…", kind: "torn" }, { label: "SET user:3 chioma", kind: "new" }] },
+    { note: "Next restart: the fragment's '$4' swallows the first bytes of SET user:3, and the parser reads the rest as nonsense. 10 'commands' from 5; user:3 is lost.", beat: "problem", file: "kv.aof", cursor: 3, records: [{ label: "SET user:1 ada", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "SET user:2 b*3$3", kind: "damaged" }, { label: "SET $6 …", kind: "damaged" }, { label: "user:3 …", kind: "damaged" }], verdict: "loaded 10 commands; GET user:3 → (nil)", meters: [{ label: "confirmed writes lost", value: "1", tone: "bad" }] },
+    { note: "The fix: Replay knows the offset just after the last whole command. At the end of the file it compares: if bytes are left over, it's a torn tail, and Replay cuts the file back to that offset.", beat: "solution", file: "kv.aof", cursor: 2, records: [{ label: "SET user:1 ada", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }], verdict: "ends with 30 bytes of an incomplete command: truncating it at offset 86" },
+    { note: "Now SET user:3 is appended after a whole command, and the next restart replays it.", beat: "solution", file: "kv.aof", records: [{ label: "SET user:1 ada", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "INCR visits", kind: "replayed" }, { label: "SET user:3 chioma", kind: "replayed" }], verdict: "loaded 4 commands; GET user:3 → chioma", meters: [{ label: "confirmed writes lost", value: "0", tone: "good" }] }
+  ]}
+  caption="Leaving half a command in the file is worse than losing it: everything appended after it is misread."
+/>
+
+### Step 3: what Redis does
+
+The same experiment with real Redis 8.10.2: four commands, the last 5 bytes cut off its AOF, restart. Its log:
+
+```text
+* Done loading RDB, keys loaded: 0, keys expired: 0.
+* DB loaded from base file appendonly.aof.1.base.rdb: 0.001 seconds
+# !!! Warning: short read while loading the AOF file appendonly.aof.1.incr.aof!!!
+# !!! Truncating the AOF appendonly.aof.1.incr.aof at offset 109 !!!
+# AOF appendonlydir/appendonly.aof.1.incr.aof loaded anyway because aof-load-truncated is enabled
+* DB loaded from incr file appendonly.aof.1.incr.aof: 0.000 seconds
+* DB loaded from append only file: 0.002 seconds
+* Opening AOF incr file appendonly.aof.1.incr.aof on server start
+```
+
+`short read`, then **`Truncating the AOF … at offset 109`**, and it starts, because the setting `aof-load-truncated` is on by default. That's the rule: a file that ends inside a command was being written when something stopped; the command was never confirmed (lesson 14: replies wait for the write), so cutting it off loses nothing a client was promised.
+
+### Step 4: knowing where you are
+
+To truncate at the right place, `Replay` must know the **offset** in the file just after each complete command. The parser reads through a `bufio.Reader`, which reads ahead in chunks, so the position in the file isn't the position in the parse. Two numbers give it: how many bytes have been read **from the file**, and how many of those the `bufio.Reader` still holds unparsed. A small wrapper counts the first:
+
+```go noverify title="kv/server/aof.go · lines 244–255"
+// countingReader counts the bytes read through it, so Replay knows the
+// offset of each command.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	k, err := c.r.Read(p)
+	c.n += int64(k)
+	return k, err
+}
+```
+
+and `Replay` subtracts the second after each command:
+
+```go noverify title="kv/server/aof.go · lines 200–242"
+// Replay runs every command in the file at path against s, and returns how
+// many there were. A missing file is an empty one.
+//
+// If the file ends partway through a command, the tail of a write that
+// never fully reached the disk, Replay cuts it off and carries on, as
+// Redis does. Damage anywhere else is an error: the server must not start
+// on a file it can't trust.
+func (s *Server) Replay(path string) (int, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	cr := &countingReader{r: f}
+	r := resp.NewReader(cr)
+	r.ArraysOnly = true
+	var good int64 // the offset just after the last complete command
+	n := 0
+	for {
+		args, err := r.ReadCommand()
+		if err == nil {
+			s.do(args)
+			n++
+			good = cr.n - int64(r.Buffered())
+			continue
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if good == st.Size() {
+				return n, nil // ended cleanly, after a whole command
+			}
+			log.Printf("aof: %s ends with %d bytes of an incomplete command: truncating it at offset %d", path, st.Size()-good, good)
+			return n, os.Truncate(path, good)
+		}
+		return n, fmt.Errorf("bad file format at offset %d, command %d: %w", good, n+1, err)
+	}
+}
+```
+
+- After each whole command, `good` becomes `cr.n - r.Buffered()`: bytes read from the file, minus the ones still waiting in the buffer.
+- At the end of the file (`io.EOF`, or `io.ErrUnexpectedEOF` in the middle of a bulk string), if `good` is the file's size, the file ended cleanly. If not, the bytes after `good` are a torn command: log it and **`os.Truncate`** the file to `good`.
+- Any other error is damage, which is stop 2.
+
+The same script against this lesson's server:
+
+```text
+$ truncate -s -5 kv.aof     # the end of "SET user:2 bayo" never reached the disk
+$ kv-server -aof kv.aof
+listening on 127.0.0.1:6398
+aof: /tmp/torn.aof ends with 30 bytes of an incomplete command: truncating it at offset 86
+loaded 3 commands from /tmp/torn.aof in 0s
+> GET visits
+  "$1\r\n2\r\n"
+> GET user:2
+  "$-1\r\n"
+> SET user:3 chioma
+  "+OK\r\n"
+$ kv-server -aof kv.aof     # restart
+listening on 127.0.0.1:6398
+loaded 4 commands from /tmp/torn.aof in 0s
+> GET visits
+  "$1\r\n2\r\n"
+> GET user:3
+  "$6\r\nchioma\r\n"
+```
+
+The fragment was cut off at offset 86, `SET user:3` went after a whole command, and it survived the restart.
+
+<QuickCheck
+  question="Why is it safe to throw away the torn command at the end of the file?"
+  options={[
+    "Because it's usually a GET",
+    "Because replies wait until the command is written to the file (lesson 14), so a command that was never completely written was never confirmed to anyone",
+    "Because Redis does it",
+    "Because clients always retry"
+  ]}
+  answer={1}
+  explain="Write-before-reply means the file always contains every confirmed command in full. A partial one at the end is one nobody was told about."
+/>
+
+## Damage
+
+*Stop 2 of 3.*
+
+### Step 1: a bad byte in the middle
+
+A torn tail is expected damage, at the one place a crash can cause it. Damage in the **middle** of the file is something else: a disk error, a bad copy, someone editing the file. Changing one byte, the `2` in the `*2` that starts the first `INCR`, to `x`, then also the `*` to `y`, and starting lesson 14's server each time:
+
+```text
+$ printf x | dd of=kv.aof bs=1 seek=35 conv=notrunc     # "*2" at the start of the first INCR becomes "*x"
+$ kv-server -aof kv.aof
+listening on 127.0.0.1:6398
+loading /tmp/bad.aof: bad file format at offset 34, command 2: Protocol error: invalid multibulk length
+exit status 1
+$ printf y | dd of=kv.aof bs=1 seek=34 conv=notrunc     # and the "*" becomes "y": "yx"
+$ kv-server -aof kv.aof
+listening on 127.0.0.1:6398
+loading /tmp/bad.aof: bad file format at offset 34, command 2: Protocol error: expected '*', got "yx"
+exit status 1
+```
+
+That's this lesson's server, which refuses both, naming the offset. Lesson 14's refused the first (`*x` isn't a number) but **started** on the second, reporting `loaded 8 commands`. The line `yx` doesn't start with `*`, so the parser took it for an **inline command**, the plain-text form people type into `redis-cli` (lesson 9), and ran the rest of the damaged file as a string of junk commands.
+
+### Step 2: two rules for files
+
+Real Redis refuses too. With the same kind of damage in the middle of its file:
+
+```text
+* DB loaded from base file appendonly.aof.1.base.rdb: 0.001 seconds
+# Bad file format reading the append only file appendonlydir/appendonly.aof.1.incr.aof at offset 57.          make a backup of your AOF file, then use ./redis-check-aof --fix <filename.manifest>.          Alternatively you can set the 'aof-load-corrupt-tail-max-size' configuration option to 87 and restart the server.
+* <search> LOAD end ok=false
+```
+
+It won't start: **`Bad file format … at offset 57`**, and it suggests `redis-check-aof --fix` (a separate tool that truncates at the damage, after you've made a backup). The reasoning: a server that starts on a damaged file has *some* of its data, silently, and every write after that builds on it. Stopping is louder, and correct.
+
+So `Replay` follows two rules:
+
+1. **Damage is an error.** Anything that isn't a clean end or a torn tail stops the server, with the offset.
+2. **A file only holds arrays.** Our server never writes inline commands to the AOF, so one there means damage. The RESP reader gets a strict mode:
+
+```go noverify title="kv/resp/resp.go · lines 25–50"
+// Reader reads one command at a time from a stream of bytes.
+type Reader struct {
+	br *bufio.Reader
+
+	// ArraysOnly refuses inline commands. A client may type them; a file
+	// written by the server never contains them, so one there means damage.
+	ArraysOnly bool
+}
+
+func NewReader(r io.Reader) *Reader {
+	return &Reader{br: bufio.NewReader(r)}
+}
+
+// ReadCommand returns the next command's words, sent either as an array of
+// bulk strings (what redis-cli sends) or as an inline line.
+func (r *Reader) ReadCommand() ([]string, error) {
+	line, err := r.line()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(line, "*") {
+		if r.ArraysOnly {
+			return nil, protocolError("expected '*', got " + strconv.Quote(line))
+		}
+		return strings.Fields(line), nil // an inline command
+	}
+```
+
+and `Replay` turns it on (`r.ArraysOnly = true`). Clients can still type inline commands; files can't contain them.
+
+`server/recover_test.go` pins down both stops: a torn tail followed by a write must survive two restarts, and a file damaged in the middle must fail to replay. Against lesson 14's server:
+
+```text
+--- FAIL: TestTornTail (0.02s)
+    recover_test.go:47: after two restarts, GET user:3 = "$-1\r\n", want "$6\r\nchioma\r\n"
+--- FAIL: TestCorruptionRefused (0.01s)
+    recover_test.go:60: replayed 7 commands from a damaged file without an error
+FAIL
+FAIL	kv/server	0.671s
+```
+
+<QuickCheck
+  question="The AOF ends cleanly, but a byte in the middle is damaged. What should the server do?"
+  options={[
+    "Skip the damaged command and load the rest",
+    "Truncate the file at the damage and start",
+    "Refuse to start, reporting the offset, so a person can decide how to repair it",
+    "Start with an empty store"
+  ]}
+  answer={2}
+  explain="Unlike a torn tail, damage in the middle means commands after it might be missing or misread. Starting would silently serve wrong data; Redis refuses too, and points to redis-check-aof."
+/>
+
+## The Rewrite
+
+*Stop 3 of 3.*
+
+### Step 1: the log that never shrinks
+
+The AOF records every write, forever. After 2 million `INCR hits`, the file holds 2 million commands, 48 MB, and replaying it at every start runs all 2 million again, to arrive at one number. What the data *is* now fits in one command: `SET hits 2000000`.
+
+A **rewrite** replaces the log with the shortest file that rebuilds the same data: one `SET` per key. The store needs a way to visit every key, so it gets an iterator, using Go's `iter` package (a function that calls `yield` for each item, which a `for … range` loop can walk):
+
+```go noverify title="kv/store.go · lines 159–173"
+// All yields every key that hasn't expired, with its value, in no
+// particular order. The store must not change while it runs.
+func (s *Store) All() iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		now := time.Now()
+		for k, e := range s.data {
+			if e.expired(now) {
+				continue
+			}
+			if !yield(k, e.value) {
+				return
+			}
+		}
+	}
+}
+```
+
+### Step 2: rewriting safely
+
+```go noverify title="kv/server/aof.go · lines 137–198"
+// Rewrite replaces the AOF with the shortest file that rebuilds the same
+// data: one SET per key. It stops every command while it runs (it holds
+// every shard's lock), and returns how many keys it wrote.
+//
+// The new file is written beside the old one, fsynced, and renamed over
+// it. A crash at any moment leaves either the whole old file or the whole
+// new one, never a mixture.
+func (s *Server) Rewrite() (int, error) {
+	a := s.AOF
+	if a == nil {
+		return 0, errors.New("no AOF")
+	}
+	for _, sh := range s.shards { // the same order commands would, one by one
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+	}
+	a.syncMu.Lock() // Commit takes syncMu before mu; so do we
+	defer a.syncMu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	tmp, err := os.Create(a.path + ".rewrite")
+	if err != nil {
+		return 0, err
+	}
+	defer os.Remove(tmp.Name()) // does nothing once it has been renamed
+	w := bufio.NewWriterSize(tmp, 64<<10)
+	keys := 0
+	for _, sh := range s.shards {
+		for k, v := range sh.store.All() {
+			w.WriteString("*3\r\n" + bulk("SET") + bulk(k) + bulk(v))
+			keys++
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return 0, err
+	}
+	if err := tmp.Sync(); err != nil { // the new file is on disk...
+		return 0, err
+	}
+	tmp.Close()
+	if err := os.Rename(tmp.Name(), a.path); err != nil { // ...before it replaces the old one
+		return 0, err
+	}
+	if dir, err := os.Open(filepath.Dir(a.path)); err == nil {
+		dir.Sync() // and the rename itself is on disk
+		dir.Close()
+	}
+
+	// Carry on appending to the new file.
+	a.f.Close()
+	if a.f, err = os.OpenFile(a.path, os.O_WRONLY|os.O_APPEND, 0o644); err != nil {
+		return 0, err
+	}
+	st, err := a.f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	a.w.Reset(countingWriter{a})
+	a.written, a.synced = st.Size(), st.Size()
+	return keys, nil
+}
+```
+
+Three safety points:
+
+- **Nothing changes while it runs.** It takes every shard's lock, then the AOF's locks, in the same order commands take them, so it can't deadlock with a command. Every command waits until it's done: that pause is measured below.
+- **Write beside, then rename.** The new file is written as `kv.aof.rewrite`, **fsynced**, and only then **renamed** over `kv.aof`. A rename within one directory is atomic: at every moment, `kv.aof` is either the whole old file or the whole new one. A crash halfway through the rewrite leaves the old file untouched. Then the directory itself is fsynced, so the rename survives a power cut too.
+- **Carry on.** The AOF reopens the new file for appending and resets its counters, so the next `Commit` appends after the `SET`s.
+
+`REWRITEAOF` in `do` runs it and logs how long it took. (Real Redis calls this `BGREWRITEAOF` and does it in the background; more on that below.)
+
+### Step 3: measured
+
+`cmd/fill` sends pipelined commands on one connection; `cmd/pause` asks `GET hits` in a loop and reports its slowest reply, to see what the rewrite does to clients. First, one key incremented 2 million times:
+
+```text
+$ go run ./cmd/fill -keys 0 -incrs 2000000
+sent 0 SETs and 2000000 INCRs
+$ ls -l kv.aof
+48000000 bytes
+$ kv-server -aof kv.aof
+loaded 2000000 commands from /tmp/big.aof in 749ms
+$ go run ./cmd/pause -for 3s &   # meanwhile
+$ redis-cli -p 6380 REWRITEAOF
+"+OK\r\n"
+129625 GETs; the slowest took 8ms
+aof rewritten: 1 keys in 8ms
+$ ls -l kv.aof
+36 bytes
+$ kv-server -aof kv.aof
+loaded 1 commands from /tmp/big.aof in 0s
+> GET hits
+  "$7\r\n2000000\r\n"
+> GET user:1
+  "$-1\r\n"
+```
+
+**48,000,000 bytes became 36**: `SET hits 2000000`, in RESP. Then a more ordinary mix, a million distinct keys plus a million `INCR`s:
+
+```text
+$ go run ./cmd/fill 
+sent 1000000 SETs and 1000000 INCRs
+$ ls -l kv.aof
+72757780 bytes
+$ kv-server -aof kv.aof
+loaded 2000000 commands from /tmp/big.aof in 1.205s
+$ go run ./cmd/pause -for 3s &   # meanwhile
+$ redis-cli -p 6380 REWRITEAOF
+"+OK\r\n"
+118535 GETs; the slowest took 173ms
+aof rewritten: 1000001 keys in 173ms
+$ ls -l kv.aof
+48757816 bytes
+$ kv-server -aof kv.aof
+loaded 1000001 commands from /tmp/big.aof in 673ms
+> GET hits
+  "$7\r\n1000000\r\n"
+> GET user:1
+  "$6\r\nname-1\r\n"
+```
+
+| | before | after |
+|---|---|---|
+| file | 72,757,780 bytes | 48,757,816 bytes |
+| commands replayed at start | 2,000,000 | 1,000,001 |
+| replay time | 1.205 s | 0.673 s |
+
+The million `SET`s can't be folded (each key is different), so the file shrank by a third, and replay nearly halved. The data came back exactly: `hits` is `1000000` and `user:1` is still `name-1`.
+
+The price is the pause: the rewrite held every lock for **173 ms**, and `cmd/pause`'s slowest `GET` took **173 ms**. Every client waited that long. For a million keys that may be acceptable at 3 a.m.; for ten million, it would be seconds.
+
+<Callout kind="note" title="How Redis rewrites without stopping">
+Redis's `BGREWRITEAOF` calls **`fork`**: the operating system makes a copy of the whole Redis process, sharing memory pages copy-on-write, so the copy costs little until either side changes a page. The child writes the snapshot of the data as it was at the fork, while the parent keeps serving clients. Since Redis 7 the AOF is **several files** listed in a manifest: a *base* file (the snapshot) and *incremental* files for writes since. You saw them in stop 1's log: `appendonly.aof.1.base.rdb` and `appendonly.aof.1.incr.aof`. When the child finishes, a new base plus a fresh incremental file replace the old ones, atomically, by rewriting the manifest. Go programs can't `fork` safely (other goroutines' threads don't come along), which is why ours stops the world instead; a Go design without a pause would snapshot each shard in turn while logging new writes to a second file.
+</Callout>
+
+<UnderTheHood title="Why rename is atomic, and why the directory needs an fsync">
+
+A directory is a table from names to files (inodes). `rename(old, new)` changes one entry in that table so `new` points to the file `old` pointed to, and the file `new` used to name is released once nobody has it open. The kernel does this under the directory's lock, so any process looking up `kv.aof` finds either the old file or the new one, never a half-written mix. But the directory's table is data too, cached in memory like any other. After a power cut, the rename could be lost even though the new file's bytes were fsynced, leaving the old name pointing at the old file. That's usually harmless (the old file is complete), but to make the rewrite itself durable, `Rewrite` opens the directory and fsyncs it as well.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Why does Rewrite write a separate file and rename it, instead of truncating kv.aof and writing the SETs into it?"
+  options={[
+    "Renaming is faster than writing",
+    "So that a crash, or anyone reading, at any moment finds either the whole old file or the whole new one; truncating first would leave a moment where the data exists in neither",
+    "Because the old file is still open",
+    "Because Go can't truncate files"
+  ]}
+  answer={1}
+  explain="Write-then-rename is the standard way to replace a file atomically. Between truncate and the end of the writing, a crash would lose everything."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Rewrite automatically" level="medium">
+
+Redis rewrites on its own when the AOF has doubled since the last rewrite and is at least 64 MB (`auto-aof-rewrite-percentage 100`, `auto-aof-rewrite-min-size 64mb`). Add the same rule to our server: check after each `Commit`, and run the rewrite in its own goroutine so the triggering client isn't the one who waits.
+
+<Solution>
+
+Keep the size after the last rewrite in the AOF (`a.base`). After `Commit`, if `a.written >= 2*a.base` and `a.written >= 64<<20`, start `go s.Rewrite()`, guarded by an `atomic.Bool` so only one runs at a time. The client whose `Commit` noticed doesn't wait, but every client still pauses while the rewrite holds the locks; measure it with `cmd/fill` and `cmd/pause`.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="redis-check-aof, in Go" level="medium">
+
+Write `cmd/check-aof`: read an AOF, report the offset of the first damage (or a torn tail), and with `-fix`, truncate the file there after copying it to `kv.aof.bak`.
+
+<Solution>
+
+Reuse `Replay`'s loop with a `do` that does nothing: keep `good`, and on the first error print `good` and the error. With `-fix`, copy the file first, then `os.Truncate(path, good)`. Try it on the damaged file from stop 2: it should report offset 34 and, fixed, keep only `SET user:1 ada`. That's what `redis-check-aof --fix` does, and why Redis asks you to back up first: everything after the damage is thrown away.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="A rewrite without the long pause" level="hard">
+
+Make the rewrite pause each shard only while it copies that shard. While shard 3 is copied, shards 0–2 and 4–15 keep serving. Where do writes to already-copied shards go, and how does the new file end up complete?
+
+<Solution>
+
+Open a second buffer for writes during the rewrite. For each shard in turn: lock it, copy its keys to the new file, unlock it. A write to a shard that's already been copied must reach the new file too, so while the rewrite runs, `log` appends to both the old AOF (so a crash mid-rewrite loses nothing) and the second buffer. When every shard is copied, lock the AOF briefly, append the second buffer to the new file, fsync, rename, and switch. That's Redis's pre-7.0 design, "the rewrite buffer", done per shard. Measure the longest pause with `cmd/pause` again: it should be about 1/16 of the stop-the-world version's.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Trust, but Check"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Load reads a log of length-prefixed records and Compact replaces it with one record per key. Load silently stops at a torn last record and leaves it in the file, so the next record appended after it is lost; it also loads a file damaged in the middle without complaint. Compact overwrites the log in place, so a reader can find it half-written. Fix all three. It must pass under go run -race too."
+  starter={`package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+// The log is a list of records, each a key and a value written as
+// "$<len>\\n<bytes>\\n" (the format from lesson 14's lab).
+
+// Load reads every complete record in the log at path. If the file ends
+// partway through a record (a write that never fully reached the disk),
+// Load must cut that tail off the file and return the rest. Damage anywhere
+// else must be an error.
+func Load(path string) (map[string]string, error) {
+	data := map[string]string{}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	for {
+		key, err1 := readBulk(r)
+		value, err2 := readBulk(r)
+		if err1 != nil || err2 != nil {
+			return data, nil
+		}
+		data[key] = value
+	}
+}
+
+func readBulk(r *bufio.Reader) (string, error) {
+	var n int
+	if _, err := fmt.Fscanf(r, "$%d\\n", &n); err != nil {
+		return "", err
+	}
+	b := make([]byte, n+1)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return "", err
+	}
+	return string(b[:n]), nil
+}
+
+func record(key, value string) string {
+	return fmt.Sprintf("$%d\\n%s\\n$%d\\n%s\\n", len(key), key, len(value), value)
+}
+
+// Compact replaces the log at path with one record per key in data. A
+// crash, or anyone reading the file, at any moment must see either the
+// whole old file or the whole new one.
+func Compact(path string, data map[string]string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(f)
+	for k, v := range data {
+		w.WriteString(record(k, v))
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	dir, _ := os.MkdirTemp("", "lab-recover")
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "kv.log")
+
+	// 1. A torn tail.
+	two := record("user:1", "ada") + record("visits", "2")
+	os.WriteFile(path, []byte(two+record("user:2", "bayo")[:9]), 0o644)
+	data, err := Load(path)
+	if err != nil || len(data) != 2 {
+		fail("a log with a torn last record: Load returned %d keys and %v, want 2 keys and no error", len(data), err)
+	}
+	if st, _ := os.Stat(path); st.Size() != int64(len(two)) {
+		fail("the torn tail is still in the file (%d bytes, want %d): the next record would be appended after it", st.Size(), len(two))
+	}
+	af, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	af.WriteString(record("user:3", "chioma"))
+	af.Close()
+	if data, err = Load(path); err != nil || data["user:3"] != "chioma" || len(data) != 3 {
+		fail("after appending user:3, Load returned %v, %v", data, err)
+	}
+
+	// 2. Damage in the middle.
+	os.WriteFile(path, []byte("$6\\nuser:1\\n$3\\nada\\nx6\\nvisits\\n$1\\n2\\n"), 0o644)
+	if data, err := Load(path); err == nil {
+		fail("a log damaged in the middle loaded without an error (%d keys)", len(data))
+	}
+
+	// 3. Compacting while someone reads.
+	old, next := map[string]string{}, map[string]string{}
+	for i := range 100_000 {
+		old[fmt.Sprint("k", i)] = "old"
+		next[fmt.Sprint("k", i)] = "new"
+	}
+	if err := Compact(path, old); err != nil {
+		fail("Compact: %v", err)
+	}
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	bad := ""
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			d, err := Load(path)
+			if err != nil || len(d) != 100_000 {
+				bad = fmt.Sprintf("a reader saw %d of 100,000 keys (error: %v) while Compact ran", len(d), err)
+				return
+			}
+		}
+	})
+	for range 5 {
+		Compact(path, next)
+		Compact(path, old)
+	}
+	close(stop)
+	wg.Wait()
+	if bad != "" {
+		fail("%s", bad)
+	}
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Loads a log whose last record is torn and checks Load returns the 2 whole records, the file is cut back to exactly their size, and a record appended afterwards loads; loads a log damaged in the middle and expects an error; then compacts a 100,000-key log ten times while another goroutine keeps loading it, expecting every load to see all 100,000 keys. Prints ALL CHECKS PASS."
+  hints={[
+    "Track the offset after the last whole record. With bytes.NewReader and bufio on top of it, that's len(b) - br.Len() - r.Buffered(): what bufio has taken from the bytes, minus what it's still holding.",
+    "When reading a record fails: io.EOF or io.ErrUnexpectedEOF means the file ends inside a record, so os.Truncate(path, good) and return what you have. Any other error (a line that doesn't match \"$%d\") is damage: return it.",
+    "Compact: os.CreateTemp in the same directory, write, Sync, Close, then os.Rename it over path. Readers then see the old file or the new one, never a half-written one."
+  ]}
+  flag="GO{trust_but_check}"
+>
+
+The offset in hint 1 is the one detail people get wrong, including the first draft of this lab's own solution: `len(b) - r.Buffered()` looks right and isn't, because `bufio` hasn't read the whole file yet.
+
+</Lab>
+
+<Recap>
+
+- A crash mid-write can leave a **torn** command at the end of the AOF. Lesson 14's server replayed around it silently, appended after it, and on the next restart misread the file (**10 commands from 5**) and lost a confirmed `SET`.
+- `Replay` now tracks the **offset after each whole command** (bytes read from the file minus what `bufio` still holds). A clean end is fine; a torn tail is **truncated**, as Redis does (`Truncating the AOF … at offset 109`).
+- **Damage in the middle is an error**: the server refuses to start and names the offset, as Redis does. Lesson 14's server had loaded a damaged file as **8** junk commands, because the parser accepted inline commands; files are now arrays-only.
+- **`REWRITEAOF`** writes one `SET` per key to a new file, fsyncs it, and **renames** it over the old one. 2 million `INCR`s: **48,000,000 bytes → 36**. A million keys: 72.8 MB → 48.8 MB, replay **1.2 s → 0.67 s**, and every client paused **173 ms** while it ran. Redis avoids the pause with `fork`.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: why a torn tail can go", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: damage in the middle", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: write, then rename", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: rewrite automatically", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2: redis-check-aof in Go", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: a rewrite without the long pause", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab: Trust, but Check", captured: false, points: 100 }}
+/>
+
+<Narrator mood="sincere">
+Fifteen lessons ago you had a map in a struct. Now you have a server the real redis-cli can't tell from the real thing: it speaks RESP byte for byte, survives a fuzzer, pipelines, shards its locks, stops cleanly, pushes messages, keeps a diary that survives kill -9, repairs a torn page and refuses a forged one. I told you on day one you'd know what's inside Redis. I don't make promises I can't keep. Neither, now, does your server.
+</Narrator>

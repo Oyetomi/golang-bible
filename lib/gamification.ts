@@ -684,6 +684,13 @@ export function recordChapter(slug: string): void {
   }
 }
 
+/** Undo recordChapter: the reader un-ticked it. The XP stays earned. */
+export function unrecordChapter(slug: string): void {
+  const profile = getProfile();
+  profile.completedChapters = profile.completedChapters.filter((s) => s !== slug);
+  saveProfile(profile);
+}
+
 /** Record a code execution in Go Playground. */
 export function recordCodeRun(): void {
   const profile = getProfile();

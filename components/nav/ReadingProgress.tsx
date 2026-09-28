@@ -1,9 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 
+/* The thin progress bar under the header. It only shows position: a
+   chapter is marked read with the MarkRead button at its end, not by
+   scrolling there. */
 export function ReadingProgress() {
   const [progress, setProgress] = useState(0);
+  const pathname = usePathname();
 
   useEffect(() => {
     const handleScroll = () => {
@@ -17,7 +22,7 @@ export function ReadingProgress() {
     window.addEventListener("scroll", handleScroll, { passive: true });
     handleScroll();
     return () => window.removeEventListener("scroll", handleScroll);
-  }, []);
+  }, [pathname]);
 
   return (
     <div className="gb-reading-progress-track" aria-hidden="true">

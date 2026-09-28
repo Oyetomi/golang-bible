@@ -1,0 +1,1411 @@
+---
+title: "Linux for Backend Engineers: Processes, Signals & File Descriptors"
+part: 4
+order: 2
+type: "course"
+description: "What a Go service is to the Linux kernel, measured in Docker on Go 1.27: os/exec starts a child with a vfork-style clone and execve, and a child nobody Waits for stays a zombie; one unclosed response body per failed request took a quote service to 1,024 of 1,024 file descriptors in 1,250 requests, and one line brought it back to 9; docker stop cut an in-flight request (exit 143) until signal.NotifyContext and Shutdown let it finish (exit 0 in 3.0 s), while a shell entrypoint without exec made every stop take 10.7 s and end in SIGKILL (137); a 60 MiB cache was OOM-killed in a 100 MiB container until GOMEMLIMIT kept it at 89 MiB; and a systemd unit with Restart= and sandboxing took systemd-analyze security from 9.6 UNSAFE to 1.2 OK."
+prerequisites: ["containers-from-scratch"]
+---
+
+<HeroCard label="Part 4 · Chapter 2" title="Linux for Backend Engineers">
+
+In chapter 1 you built a container and learned that it's just a process with walls around it. This chapter is about the process itself: what your Go service **is** to the Linux kernel, and the handful of kernel mechanisms that decide whether it starts, keeps running, stops cleanly, or dies at 3 a.m. with a number nobody understands.
+
+Every incident in this chapter is one you'll meet in production: a service that stops answering with `too many open files`, a deploy that takes ten seconds longer than it should and drops requests, a pod that restarts with exit code 137. We'll cause each one on purpose, in Docker, with a real Go service, measure it, and fix it.
+
+Five stops. If you get lost, come back here:
+
+1. **Processes.** How a Go program starts another program, what a PID and a parent are, zombies, and exit codes.
+2. **File descriptors.** Everything the service has open is a number in one table, and the table has a limit.
+3. **Signals.** How `docker stop`, Kubernetes and systemd ask a service to stop, and how to stop well.
+4. **Memory limits.** The cgroup's hard limit, the OOM killer, and telling Go's garbage collector about it.
+5. **systemd.** Running the same service on a plain Linux server, restarted when it crashes and locked down.
+
+</HeroCard>
+
+<Narrator>
+Your Go service thinks it's special. To the kernel, it's a process with a number, some file descriptors and a signal handler it probably got wrong. Today you see it the way the kernel does.
+</Narrator>
+
+<ChapterTabs tabs={["Processes", "File Descriptors", "Signals", "Memory Limits", "systemd"]} />
+
+<SpacedRecall
+  role={"kernel"}
+  items={[
+    {
+      from: "Containers from Scratch (part 4, ch01)",
+      q: "What is a container, to the Linux kernel?",
+      options: ["A small virtual machine", "An ordinary process, restricted by namespaces (what it sees) and cgroups (what it uses)", "A special kind of file", "A Docker daemon thread"],
+      answer: 1,
+      tie: "This chapter looks at that ordinary process from the inside: its PID, its file table, the signals it receives, and the cgroup that limits its memory."
+    },
+    {
+      from: "Context (part 1)",
+      q: "What does cancelling a context.Context do to the goroutines that were given it?",
+      options: ["Kills them", "Nothing by itself: their ctx.Done() channel closes, and well-written code notices and returns", "Pauses them", "Panics them"],
+      answer: 1,
+      tie: "Stop 3 turns a signal from the kernel into exactly this: a context that is cancelled when the service is asked to stop."
+    },
+  ]}
+/>
+
+<RelationAnim
+  title="What the kernel keeps for one Go service"
+  kicker="mental model"
+  role="kernel"
+  height={62}
+  nodes={[
+    { id: "parent", label: "parent", sub: "docker · systemd · your shell", x: 16, y: 16, kind: "cmd" },
+    { id: "proc", label: "api", sub: "PID 140 · one process", x: 50, y: 44, kind: "value" },
+    { id: "fds", label: "fd table", sub: "0 1 2 files sockets pipes", x: 16, y: 82, kind: "type" },
+    { id: "sig", label: "signals", sub: "SIGTERM · SIGKILL · SIGQUIT", x: 84, y: 16, kind: "iface" },
+    { id: "cg", label: "cgroup", sub: "memory.max · pids.max", x: 84, y: 82, kind: "pkg" },
+    { id: "exit", label: "exit status", sub: "0 · 1 · 2 · 137 · 143", x: 50, y: 12, kind: "file" }
+  ]}
+  edges={[
+    { from: "parent", to: "proc", label: "starts (fork + exec)" },
+    { from: "proc", to: "fds", label: "opens" },
+    { from: "sig", to: "proc", label: "delivered to" },
+    { from: "cg", to: "proc", label: "limits" },
+    { from: "proc", to: "exit", label: "ends with" },
+    { from: "exit", to: "parent", label: "Wait()", dashed: true }
+  ]}
+  frames={[
+    { note: "Your Go service is one process. The kernel knows it by a number, its PID, and keeps a record of it for as long as it lives.", show: ["proc"], at: "proc", say: "PID 140" },
+    { note: "Something started it: your shell, Docker, or systemd. That's its parent. A process always has one.", show: ["proc", "parent", "parent>proc"], hot: ["parent>proc"], at: "parent" },
+    { note: "Every file, socket and pipe it opens is an entry in its file descriptor table, a small number like 7. The table has a size limit. (Stop 2.)", show: ["proc", "parent", "parent>proc", "fds", "proc>fds"], hot: ["fds", "proc>fds"], at: "fds" },
+    { note: "Other processes and the kernel talk to it with signals: stop, stop now, dump your goroutines. (Stop 3.)", show: ["proc", "parent", "parent>proc", "fds", "proc>fds", "sig", "sig>proc"], hot: ["sig", "sig>proc"], at: "sig" },
+    { note: "Its cgroup caps how much memory it may use. Past the cap, the kernel kills it. (Stop 4.)", show: ["proc", "parent", "parent>proc", "fds", "proc>fds", "sig", "sig>proc", "cg", "cg>proc"], hot: ["cg", "cg>proc"], at: "cg", beat: "problem" },
+    { note: "When it ends, it leaves an exit status, and its parent must collect it with wait. The number tells you how it died: 143 was SIGTERM, 137 was SIGKILL. (Stops 1 and 3.)", hot: ["exit", "proc>exit", "exit>parent"], at: "exit", beat: "solution" }
+  ]}
+  caption="One process, five relationships. Each stop of this chapter is one of these arrows."
+/>
+
+## The project
+
+Everything runs from one Go 1.27 module, `svc`. The star is `api`, Meridian's quote service: `GET /quote?cur=EUR` asks an upstream service, `rates`, for a currency rate and passes the answer on. The other programs are tools for looking at it.
+
+<ProjectMap
+  root="svc"
+  files={[
+    { path: "go.mod", status: "new", note: "module svc, go 1.27" },
+    { path: "cmd/api/main.go", status: "new", note: "the quote service: the program this chapter operates" },
+    { path: "cmd/rates/main.go", status: "new", note: "the upstream it calls; -delay makes it slow" },
+    { path: "cmd/spawn/main.go", status: "new", note: "stop 1: starts children and watches them in /proc" },
+    { path: "cmd/fds/main.go", status: "new", note: "stop 2: prints its own file descriptor table" },
+    { path: "cmd/load/main.go", status: "new", note: "stop 2: sends requests, counts api's open fds" },
+    { path: "cmd/cache/main.go", status: "new", note: "stop 4: a 60 MiB cache under a memory limit" },
+    { path: "deploy/start.sh", status: "new", note: "stop 3: an entrypoint script, the usual way" },
+    { path: "deploy/start-exec.sh", status: "new", note: "stop 3: the same script, with exec" },
+    { path: "deploy/api.service", status: "new", note: "stop 5: the systemd unit" },
+    { path: "deploy/api-plain.service", status: "new", note: "stop 5: a first-try unit, for comparison" },
+    { path: "deploy/rates.service", status: "new", note: "stop 5: the upstream, as a unit" }
+  ]}
+  run={[
+    "GOOS=linux CGO_ENABLED=0 go build -o bin/ ./cmd/...",
+    "docker run --rm -v $PWD/bin:/bin2 golang:1.27 /bin2/spawn"
+  ]}
+>
+
+Most of these programs read `/proc` or `/sys/fs/cgroup`, which exist only on Linux, so on a Mac you cross-compile with `GOOS=linux` (add `GOARCH=amd64` or `arm64` to match your Docker) and run the binaries inside a container. Every output in this chapter came from exactly that, on Docker Desktop with Linux 6.12.
+
+</ProjectMap>
+
+---
+
+## Processes
+
+*Stop 1 of 5.*
+
+### Step 1: a process is a running program, with a number
+
+When you run `api`, the kernel creates a **process**: the program's code loaded into memory, plus everything the kernel keeps about it while it runs. It names the process with a number, the **PID** (process ID), and remembers which process started it, the **parent** (its PID is the **PPID**).
+
+The kernel publishes what it knows about every process as files under `/proc/<pid>/`. Nothing there is on disk: reading those files asks the kernel. Here's `rates`, running in a container, seen through them:
+
+```text
+$ grep -E '^(Name|State|PPid|Threads|VmRSS)' /proc/8/status
+Name:	rates
+State:	S (sleeping)
+PPid:	7
+VmRSS:	    8528 kB
+Threads:	5
+$ readlink /proc/8/exe
+/bin2/rates
+$ tr '\0' ' ' < /proc/8/cmdline
+/bin2/rates -addr 127.0.0.1:9090 
+$ ls /proc/8/task
+10 11 12 13 8 
+```
+
+Four things worth noticing:
+
+- **`State: S (sleeping)`**. An idle server spends nearly all its time asleep, waiting for a connection. `R` means running on a CPU right now.
+- **`Threads: 5`**, and `/proc/8/task` lists five IDs. One Go program is one process, but the Go runtime runs it on several OS threads (goroutines are spread across them). Each thread has its own ID, and the first one's ID is the PID.
+- **`exe`** is a link to the binary that's running and **`cmdline`** holds its arguments, separated by zero bytes, which is why we pipe it through `tr`.
+- **`PPid: 7`**: the shell that started it.
+
+`ps`, `top` and `htop` are just programs that read these files. When a server misbehaves and you have nothing else, `/proc/<pid>/` has the answers.
+
+### Step 2: starting another program, the way os/exec does
+
+A Go service starts other programs more often than you'd think: a backup job calls `pg_dump`, a report service calls `wkhtmltopdf`, a CI runner calls `git`. In Go that's `os/exec`. `cmd/spawn` starts a child, looks at it through `/proc/<pid>/stat`, and then does the one thing people forget:
+
+```go noverify title="svc/cmd/spawn/main.go · lines 28–46"
+func main() {
+	fmt.Printf("spawn: pid %d, parent %d\n", os.Getpid(), os.Getppid())
+
+	cmd := exec.Command("sleep", "1")
+	if err := cmd.Start(); err != nil {
+		panic(err)
+	}
+	pid := cmd.Process.Pid
+	time.Sleep(100 * time.Millisecond) // let it get going
+	st, ppid := stat(pid)
+	fmt.Printf("child %d started:        state %s, parent %s\n", pid, st, ppid)
+
+	time.Sleep(2 * time.Second) // sleep 1 has exited by now
+	st, _ = stat(pid)
+	fmt.Printf("child %d exited, no Wait: state %s\n", pid, st)
+
+	err := cmd.Wait()
+	st, _ = stat(pid)
+	fmt.Printf("child %d after Wait:      state %s, err %v, exit code %d\n", pid, st, err, cmd.ProcessState.ExitCode())
+```
+
+`cmd.Start` returns as soon as the child is running; it doesn't wait for it to finish. `stat` (lines 15–26 of the same file) reads the state letter and the parent's PID from `/proc/<pid>/stat`. Run in a container:
+
+```text
+spawn: pid 7, parent 1
+child 13 started:        state S, parent 7
+child 13 exited, no Wait: state Z
+child 13 after Wait:      state gone, err <nil>, exit code 0
+child 14 sent SIGTERM:    err signal: terminated, exit code -1, signal 15, a shell reports 143
+```
+
+Line by line:
+
+1. `spawn` is PID 7. Its parent is PID 1, the container's init (we ran it with `docker run --init`, more on that in stop 3).
+2. The child, PID 13, is sleeping, and its parent is 7: `spawn` itself.
+3. After two seconds, `sleep 1` has finished. But the process isn't gone: its state is **`Z`, a zombie.**
+4. Only after `cmd.Wait()` does it disappear from `/proc`.
+
+<Define term="zombie">
+A **zombie** is a process that has finished but whose parent hasn't collected its exit status yet. The kernel frees almost everything it held (its memory, its open files), but keeps its PID and a small record with its exit status, because the parent might still ask for it. The parent collects it with the `wait` family of system calls; in Go, `cmd.Wait()`. That's called **reaping**. A zombie can't be killed, because it's already dead: the only fix is for its parent to reap it, or to die itself.
+</Define>
+
+A zombie costs only a PID. But PIDs are limited (the kernel's `pid_max`, and a container's `pids.max` from chapter 1), so a service that starts children in a loop and never calls `Wait` slowly uses them all up, and then nothing on the machine can start a process. The rule: **every `cmd.Start()` needs a `cmd.Wait()`**. `cmd.Run()` and `cmd.Output()` call both for you.
+
+<ProcAnim
+  title="spawn starts sleep, and forgets to wait for it"
+  frames={[
+    { code: "docker run --init golang:1.27 /bin2/spawn", note: "The container's init is PID 1. It starts spawn, PID 7. Both are asleep, waiting.", say: "Two processes. 1 is 7's parent.", procs: [{ pid: "1", name: "docker-init" }, { pid: "7", name: "spawn", parent: "1", hot: true }] },
+    { code: "cmd.Start()  →  clone(CLONE_VM|CLONE_VFORK)", note: "cmd.Start asks the kernel for a new process. It begins as a copy of spawn, sharing its memory, and spawn pauses until the copy has done one thing.", say: "PID 13: a copy of spawn, for a moment.", procs: [{ pid: "1", name: "docker-init" }, { pid: "7", name: "spawn", parent: "1" }, { pid: "13", name: "spawn (copy)", parent: "7", state: "R", hot: true }] },
+    { code: 'execve("/usr/bin/sleep", ["sleep", "1"])', note: "That one thing: execve. The kernel throws the copied program away and loads /usr/bin/sleep into PID 13. Same PID, same parent, new program.", say: "13 is sleep now.", procs: [{ pid: "1", name: "docker-init" }, { pid: "7", name: "spawn", parent: "1" }, { pid: "13", name: "sleep 1", parent: "7", state: "S", hot: true }] },
+    { note: "One second later sleep exits with status 0. The kernel frees its memory but keeps its PID and its exit status, for its parent to collect. Nobody collects it.", beat: "problem", say: "13 is a zombie until 7 asks.", procs: [{ pid: "1", name: "docker-init" }, { pid: "7", name: "spawn", parent: "1" }, { pid: "13", name: "sleep 1", parent: "7", state: "Z", bad: true }] },
+    { code: "cmd.Wait()  →  waitid(P_PIDFD, ...)", note: "cmd.Wait asks the kernel for the child's exit status. The kernel hands it over and deletes the last trace of PID 13. Reaped.", beat: "solution", say: "Status 0, handed over. PID 13 is free.", procs: [{ pid: "1", name: "docker-init" }, { pid: "7", name: "spawn", parent: "1", hot: true }, { pid: "13", name: "sleep 1", parent: "7", state: "gone" }], exit: "cmd.Wait() = nil, exit code 0" },
+    { code: "cmd.Process.Signal(syscall.SIGTERM)", note: "A second child, sleep 60, gets SIGTERM. sleep has no handler, so the default action runs: the kernel ends it. It never called exit, so it has no exit code of its own.", say: "Killed by signal 15.", sig: { sig: "SIGTERM", from: "spawn", to: "14", result: "killed" }, procs: [{ pid: "1", name: "docker-init" }, { pid: "7", name: "spawn", parent: "1" }, { pid: "14", name: "sleep 60", parent: "7", state: "gone", bad: true }], exit: "err: signal: terminated · ExitCode() -1 · a shell reports 128+15 = 143" }
+  ]}
+  caption="A process is created as a copy (clone), becomes another program (execve), and after it ends stays a zombie until its parent calls wait."
+/>
+
+### Step 3: fork, exec, and why Go doesn't have fork
+
+On Unix, starting a program has always been two steps. **fork** makes a copy of the calling process; **exec** replaces the copy's program with a new one. The split is deliberate: between the two, the child can set itself up (redirect its output to a file, change directory, drop privileges) with ordinary code, before the new program starts.
+
+Go can't offer a plain `fork`. A Go program is several threads, and `fork` copies only the thread that called it, into a child whose other threads (the ones running the garbage collector and the scheduler, maybe holding locks) have vanished. So Go only does fork and exec *together*, in `os/exec`, with nothing but careful, lock-free code between them. `strace` shows how, on Go 1.27 (the `CLONE_THREAD` lines, which are the runtime starting its own threads, and `SIGURG`, the signal Go uses to preempt goroutines, are filtered out):
+
+```text
+71    execve("/bin2/spawn", ["/bin2/spawn"], 0xffffe7f75c00 /* 7 vars */) = 0
+71    waitid(P_PIDFD, 9, 0x1344911a2818, WEXITED, NULL) = -1 ECHILD (No child processes)
+71    clone(child_stack=NULL, flags=CLONE_VM|CLONE_PIDFD|CLONE_VFORK, parent_tid=[10]) = 76
+71    waitid(P_PIDFD, 10, {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=76, si_uid=0, si_status=0, si_utime=0, si_stime=0}, WEXITED|__WCLONE, NULL) = 0
+71    clone(child_stack=NULL, flags=CLONE_VM|CLONE_PIDFD|CLONE_VFORK|SIGCHLD <unfinished ...>
+77    execve("/usr/bin/sleep", ["sleep", "1"], 0x134491100100 /* 7 vars */ <unfinished ...>
+71    <... clone resumed>, parent_tid=[11]) = 77
+77    <... execve resumed>)             = 0
+71    --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=77, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---
+75    waitid(P_PIDFD, 11, {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=77, si_uid=0, si_status=0, si_utime=0, si_stime=0}, WEXITED, {ru_utime={tv_sec=0, tv_usec=1198}, ru_stime={tv_sec=0, tv_usec=914}, ...}) = 0
+75    clone(child_stack=NULL, flags=CLONE_VM|CLONE_PIDFD|CLONE_VFORK|SIGCHLD <unfinished ...>
+78    execve("/usr/bin/sleep", ["sleep", "60"], 0x1344911001c0 /* 7 vars */ <unfinished ...>
+75    <... clone resumed>, parent_tid=[11]) = 78
+78    <... execve resumed>)             = 0
+78    --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER, si_pid=71, si_uid=0} ---
+71    waitid(P_PIDFD, 11,  <unfinished ...>
+78    +++ killed by SIGTERM +++
+71    <... waitid resumed>{si_signo=SIGCHLD, si_code=CLD_KILLED, si_pid=78, si_uid=0, si_status=SIGTERM, si_utime=0, si_stime=0}, WEXITED, {ru_utime={tv_sec=0, tv_usec=0}, ru_stime={tv_sec=0, tv_usec=2250}, ...}) = 0
+72    --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_KILLED, si_pid=78, si_uid=0, si_status=SIGTERM, si_utime=0, si_stime=0} ---
+```
+
+- The first `clone` with `CLONE_PIDFD|CLONE_VFORK`, which becomes PID 76 and exits at once, is Go checking that this kernel supports pidfds.
+- For the real child: **`clone(CLONE_VM|CLONE_VFORK)`** is the fork, in its cheap form. `CLONE_VM` means the child shares the parent's memory instead of copying it; `CLONE_VFORK` means the parent is paused until the child calls `execve`. Copying a service's memory just to throw it away would be slow, and with a big heap, very slow.
+- **`execve("/usr/bin/sleep", ...)`** in PID 77 is the exec.
+- **`waitid(P_PIDFD, 11, ...)`** is `cmd.Wait()`: it waits on a **pidfd**, a file descriptor that refers to the child. Since Go 1.23, os/exec uses pidfds where the kernel has them, so a signal or `Wait` can never hit a different process that happens to reuse the PID.
+- For the second child you can see the kill: `SIGTERM`, `killed by SIGTERM`, and `waitid` returning `CLD_KILLED` with `si_status=SIGTERM`.
+
+<UnderTheHood title="Exit status versus killed by a signal">
+
+A process ends one of two ways. Either it calls `exit(n)` itself (Go's `os.Exit(n)`, or returning from `main`, which is `exit(0)`), or a signal kills it. `wait` tells the parent which, and the number: `CLD_EXITED` with a status, or `CLD_KILLED` with a signal. In Go it's `cmd.ProcessState.Sys().(syscall.WaitStatus)`, with `Exited()`, `ExitStatus()`, `Signaled()` and `Signal()`.
+
+Shells, Docker and Kubernetes squeeze both into one number: an exit status stays itself (0 to 255), and death by signal N is reported as **128 + N**. That's where the famous numbers come from:
+
+| Number | Meaning | Usually |
+|---|---|---|
+| 0 | exited 0 | success |
+| 1 | exited 1 | the program reported an error (Go's `log.Fatal`) |
+| 2 | exited 2 | a Go panic, or a Go program dumping its goroutines on SIGQUIT |
+| 137 | 128 + 9, SIGKILL | the OOM killer, or a stop that ran out of time |
+| 143 | 128 + 15, SIGTERM | stopped with the default action: no handler |
+
+Go's `ExitCode()` returns −1 for a process killed by a signal, since it has no exit code. You build the lab's `exitCode` function from exactly this.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="A Go service starts a helper with cmd.Start() and never calls cmd.Wait(). The helper finishes. What's left?"
+  options={[
+    "Nothing: the kernel cleans up finished processes",
+    "A zombie: the helper's PID and exit status stay until the parent collects them with wait",
+    "A running helper that never exits",
+    "An orphan, adopted by PID 1"
+  ]}
+  answer={1}
+  explain="Measured above: after sleep 1 exited, /proc showed it in state Z until cmd.Wait() ran. It isn't an orphan, because its parent is still alive; it just hasn't asked."
+/>
+
+---
+
+## File Descriptors
+
+*Stop 2 of 5.*
+
+### Step 1: everything is a number in one table
+
+When a process opens a file, the kernel doesn't hand back the file. It adds an entry to the process's **file descriptor table** and hands back the entry's index, a small integer: the **file descriptor**, or fd. Every later `read`, `write` and `close` names the file by that number.
+
+"Everything is a file" is the Unix slogan, and it's really about this table: a network connection, a listening socket, a pipe to a child process, a timer, even the Go runtime's network poller each get an fd, and all of them count against the same limit. `cmd/fds` opens one file, one TCP listener and one pipe, then prints its own table from `/proc/self/fd`, where each entry is a link to what the fd refers to:
+
+```go noverify title="svc/cmd/fds/main.go · lines 15–37"
+func main() {
+	f, _ := os.Open("/etc/hostname")
+	ln, _ := net.Listen("tcp", "127.0.0.1:8080")
+	r, w, _ := os.Pipe()
+	defer f.Close()
+	defer ln.Close()
+	defer r.Close()
+	defer w.Close()
+
+	ents, _ := os.ReadDir("/proc/self/fd")
+	var fds []int
+	for _, e := range ents {
+		n, _ := strconv.Atoi(e.Name())
+		fds = append(fds, n)
+	}
+	sort.Ints(fds)
+	for _, n := range fds {
+		target, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(n))
+		if err != nil {
+			continue // the directory we were reading, already closed
+		}
+		fmt.Printf("fd %2d -> %s\n", n, target)
+	}
+```
+
+```text
+$ ulimit -n
+1048576
+$ fds
+fd  0 -> /dev/null
+fd  1 -> pipe:[18337]
+fd  2 -> pipe:[18338]
+fd  3 -> /sys/fs/cgroup/cpu.max
+fd  4 -> /etc/hostname
+fd  5 -> anon_inode:[eventpoll]
+fd  6 -> anon_inode:[eventfd]
+fd  7 -> socket:[21584]
+fd  8 -> pipe:[21588]
+fd  9 -> pipe:[21588]
+RLIMIT_NOFILE: soft 1048576, hard 1048576
+```
+
+That's more than the four things we opened. Reading the table:
+
+| fd | what | who opened it |
+|---|---|---|
+| 0, 1, 2 | stdin, stdout, stderr | inherited from the parent: every process starts with these three |
+| 3 | `/sys/fs/cgroup/cpu.max` | the Go runtime: since Go 1.25 it keeps the cgroup's CPU limit open, to re-read it and adjust GOMAXPROCS (chapter 1) |
+| 4 | `/etc/hostname` | our `os.Open` |
+| 5 | `eventpoll` | the Go runtime's network poller (epoll): one fd that watches all the others |
+| 6 | `eventfd` | the runtime's way to wake the poller |
+| 7 | `socket` | our TCP listener |
+| 8, 9 | `pipe` | the two ends of our `os.Pipe` |
+
+The kernel always hands out the **lowest free number**, which is why the numbers are packed together, and why a closed fd's number is reused by the next open.
+
+### Step 2: the limit, and what Go does about it
+
+The table has a maximum size per process, the resource limit **`RLIMIT_NOFILE`** (`ulimit -n` in a shell). Each limit has two values: the **soft** limit, which is what's enforced, and the **hard** limit, the ceiling a process may raise its own soft limit to. Opening one more file than the soft limit fails with `EMFILE`, which Go prints as **`too many open files`**.
+
+Docker's default is generous: 1,048,576, the first line of the output above. But plenty of places set a soft limit of 1024, a number that dates from the `select` system call, which can't handle fd numbers of 1024 or more. Here's a container started with soft 1024, hard 4096:
+
+```text
+$ ulimit -Sn; ulimit -Hn
+1024
+4096
+$ fds | tail -1
+RLIMIT_NOFILE: soft 4095, hard 4096
+```
+
+The shell says 1024, but the Go program sees **4095**. Go raises its own soft limit at startup, since Go 1.19, because Go never uses `select`, and a limit of 1024 is easy to hit (gofmt walking a big tree in parallel did). It sets it to one below the hard limit, not equal to it, so that it can tell if someone changes the limit from outside, and it puts the old limit back for programs it starts with os/exec, which might use `select`.
+
+So for a Go service **the hard limit is the one that matters**. Set it where the service is started: `docker run --ulimit nofile=N:N`, `LimitNOFILE=` in a systemd unit (stop 5), or the container runtime's defaults in Kubernetes.
+
+### Step 3: the leak
+
+Now the incident. Here's `api`'s handler as it was first written. It calls `rates` and passes the answer on; if `rates` answers with an error, it returns 502:
+
+```go noverify title="svc/cmd/api/main.go · lines 18–33"
+func quote(ratesURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cur := r.URL.Query().Get("cur")
+		resp, err := client.Get(ratesURL + "/rate?cur=" + url.QueryEscape(cur))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "rates: "+resp.Status, http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(w, resp.Body)
+	}
+}
+```
+
+It works. Every test passes. It has a leak you can't see by reading the happy path: when `rates` answers anything but 200, the function returns at line 28, and the `defer resp.Body.Close()` on line 30 has not run yet, so it never will. The response body is never closed.
+
+An unclosed body means the TCP connection to `rates` is never given back: the HTTP client can't reuse it for the next request (someone might still read it) and can't close it either. So it stays open, holding an fd, forever. Each request for a currency `rates` doesn't know costs one fd.
+
+`cmd/load` sends requests one at a time and every 250 counts the entries in `/proc/<api pid>/fd`:
+
+```go noverify title="svc/cmd/load/main.go · lines 32–47"
+	client := &http.Client{Timeout: 2 * time.Second}
+	seen := map[string]int{}
+	for i := 1; i <= *n; i++ {
+		resp, err := client.Get(target)
+		switch {
+		case err != nil:
+			seen["error: "+errKind(err)]++
+		default:
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			seen[resp.Status]++
+		}
+		if i%*every == 0 {
+			fmt.Printf("%5d requests  api fds %4d  %s\n", i, openFDs(*pid), summary(seen))
+		}
+	}
+```
+
+We run `rates`, `api` and `load` in one container with the fd limit set to 1024, soft and hard, and ask for the unknown currency `XYZ` 1,500 times:
+
+```text
+  250 requests  api fds  258  250 × 502 Bad Gateway
+  500 requests  api fds  508  500 × 502 Bad Gateway
+  750 requests  api fds  758  750 × 502 Bad Gateway
+ 1000 requests  api fds 1008  1000 × 502 Bad Gateway
+ 1250 requests  api fds 1024  1250 × 502 Bad Gateway
+ 1500 requests  api fds 1024  1500 × 502 Bad Gateway
+$ grep 'open files' /proc/9/limits
+Max open files            1024                 1024                 files     
+$ ls -l /proc/9/fd | awk 'NR>1 {print $NF}' | sed 's/:\[.*//' | sort | uniq -c | sort -rn
+   1017 socket
+      2 anon_inode
+      1 pipe
+      1 /tmp/api.log
+      1 /sys/fs/cgroup/cpu.max
+      1 /dev/null
+$ curl 'http://127.0.0.1:8080/quote?cur=EUR'
+Get "http://127.0.0.1:9090/rate?cur=EUR": dial tcp 127.0.0.1:9090: socket: too many open files
+  (HTTP 502)
+$ grep 'Accept error' api.log | head -1
+http: Accept error: accept tcp [::]:8080: accept4: too many open files; retrying in 5ms
+```
+
+The count climbs **exactly one fd per request**: 258 after 250, 508 after 500, 1,008 after 1,000 (8 fds are the service's own: the three standard ones, the runtime's four, the listener). At 1,024 it stops climbing, because the table is full, and then everything fails:
+
+- the fd listing says why: **1,017 of the 1,024 are sockets**;
+- a **good** request, for EUR, fails too: `api` can't open a socket to reach `rates`: `socket: too many open files`;
+- `api` can't even accept new connections: `accept4: too many open files`. Go's HTTP server retries accept with a growing delay, so the process looks alive while turning everyone away.
+
+A leak on an error path takes down the whole service, not just the requests that hit the error. In production it creeps: an upstream has a bad hour, 404s pile up, and the service falls over hours later, on a request that did nothing wrong.
+
+<ProcAnim
+  title="api's fd table, one leaked connection per request"
+  frames={[
+    { code: "curl 'http://127.0.0.1:8080/quote?cur=EUR'", note: "api after one good request, as ls -l /proc/<pid>/fd listed it: stdin, stdout, stderr (our log file), the runtime's cgroup file, the listener, the poller and its wake-up fd, and one idle keep-alive connection to rates, ready for reuse.", say: "8 of 1,024 in use.", procs: [{ pid: "8", name: "api", hot: true }, { pid: "7", name: "rates" }], fds: { title: "/proc/8/fd", rows: [{ fd: 0, what: "/dev/null", kind: "std" }, { fd: 1, what: "pipe", kind: "std" }, { fd: 2, what: "/tmp/api.log", kind: "std" }, { fd: 3, what: "/sys/fs/cgroup/cpu.max", kind: "rt" }, { fd: 4, what: "socket: listening on :8080", kind: "sock" }, { fd: 6, what: "anon_inode:[eventpoll]", kind: "rt" }, { fd: 7, what: "anon_inode:[eventfd]", kind: "rt" }, { fd: 8, what: "socket: api → rates, idle, reusable", kind: "sock" }], open: 8, limit: 1024 } },
+    { code: "curl 'http://127.0.0.1:8080/quote?cur=XYZ'   # twice", note: "rates answers 404 for XYZ. The first request reuses fd 8 and returns 502 before its defer resp.Body.Close() line: fd 8 can never be reused or closed. The second has to dial a new connection, fd 9, and leaks that one too.", beat: "problem", say: "8 and 9 are stuck for good.", procs: [{ pid: "8", name: "api", bad: true }, { pid: "7", name: "rates" }], fds: { title: "/proc/8/fd", rows: [{ fd: "0-7", what: "the service's own seven", kind: "std" }, { fd: 8, what: "socket: api → rates, body never closed", kind: "leak" }, { fd: 9, what: "socket: api → rates, body never closed", kind: "leak" }], open: 9, limit: 1024 } },
+    { code: "load -n 1500 'http://127.0.0.1:8080/quote?cur=XYZ'", note: "Measured: 258 open fds after 250 requests, 508 after 500, 1,008 after 1,000. Exactly one per request.", beat: "problem", say: "1,008 in use.", procs: [{ pid: "8", name: "api", bad: true }, { pid: "7", name: "rates" }], fds: { title: "/proc/8/fd", rows: [{ fd: "0-7", what: "the service's own, and load's connection", kind: "std" }, { fd: "8+", what: "1,000 sockets to rates, never closed", kind: "more" }], open: 1008, limit: 1024 } },
+    { code: "curl 'http://127.0.0.1:8080/quote?cur=EUR'", note: "At 1,024 the table is full. A good request fails: api can't open a socket to rates (socket: too many open files), and can't accept new clients either (accept4: EMFILE).", beat: "problem", say: "EMFILE. No more numbers to give out.", procs: [{ pid: "8", name: "api", bad: true }, { pid: "7", name: "rates" }], fds: { title: "/proc/8/fd", rows: [{ fd: "0-7", what: "the service's own", kind: "std" }, { fd: "8+", what: "1,017 sockets: the rest of the table", kind: "more" }], open: 1024, limit: 1024 }, exit: "HTTP 502 · dial tcp 127.0.0.1:9090: socket: too many open files" },
+    { code: "defer resp.Body.Close()   // right after the err check", note: "The fix: close the body on every path. The connection goes back to the client's pool and the next request reuses it. During 1,500 bad requests: 9 open fds, every time load counted.", beat: "solution", say: "9 of 1,024, after 1,500 requests.", procs: [{ pid: "8", name: "api", hot: true }, { pid: "7", name: "rates" }], fds: { title: "/proc/8/fd", rows: [{ fd: "0-7", what: "the service's own, and load's connection", kind: "std" }, { fd: 8, what: "socket: api → rates, reused every time", kind: "sock" }], open: 9, limit: 1024 } }
+  ]}
+  caption="The fd table is per process and has a hard size. A leak on an error path fills it, and then the good requests fail too."
+/>
+
+### Step 4: the fix, and measuring it
+
+Move the `defer` to the first moment you have a body, right after the error check:
+
+```go noverify title="svc/cmd/api/main.go · lines 18–33"
+func quote(ratesURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cur := r.URL.Query().Get("cur")
+		resp, err := client.Get(ratesURL + "/rate?cur=" + url.QueryEscape(cur))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close() // on every path, the error ones too
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "rates: "+resp.Status, http.StatusBadGateway)
+			return
+		}
+		io.Copy(w, resp.Body)
+	}
+}
+```
+
+The same 1,500 requests:
+
+```text
+  250 requests  api fds    9  250 × 502 Bad Gateway
+  500 requests  api fds    9  500 × 502 Bad Gateway
+  750 requests  api fds    9  750 × 502 Bad Gateway
+ 1000 requests  api fds    9  1000 × 502 Bad Gateway
+ 1250 requests  api fds    9  1250 × 502 Bad Gateway
+ 1500 requests  api fds    9  1500 × 502 Bad Gateway
+$ grep 'open files' /proc/8/limits
+Max open files            1024                 1024                 files     
+$ ls -l /proc/8/fd | awk 'NR>1 {print $NF}' | sed 's/:\[.*//' | sort | uniq -c | sort -rn
+      2 socket
+      2 anon_inode
+      1 pipe
+      1 /tmp/api.log
+      1 /sys/fs/cgroup/cpu.max
+      1 /dev/null
+$ curl 'http://127.0.0.1:8080/quote?cur=EUR'
+{"cur":"EUR","rate":0.9214}
+  (HTTP 200)
+$ grep 'Accept error' api.log | head -1
+```
+
+**9 open fds from start to finish**, 2 of them sockets: the one from `load` and the one to `rates`, reused for every request. The good request works.
+
+The general rule: **once a function has a resource, the very next line is its `defer Close()`**. Anything in between is a path that can return without it. The `bodyclose` linter (in `golangci-lint`) catches the HTTP case.
+
+<Callout kind="pro" title="Watching fds in production">
+
+You don't need a load test to see this. `ls /proc/<pid>/fd | wc -l` is the count; `grep 'open files' /proc/<pid>/limits` is the limit. Go's Prometheus client exports both as `process_open_fds` and `process_max_fds`, so an alert on their ratio (say, above 80%) warns you hours before the service falls over. Raising the limit hides a leak for a while; it never fixes one.
+
+</Callout>
+
+<QuickCheck
+  question="The quote service leaked one socket per failed upstream request and hit its limit of 1,024 fds. What happened to requests for currencies the upstream DID know?"
+  options={[
+    "They kept working: only the failing path leaked",
+    "They failed too: the process had no free fds, so it couldn't open a connection to rates or accept new clients",
+    "They were slower but succeeded",
+    "The kernel closed the oldest sockets to make room"
+  ]}
+  answer={1}
+  explain="Measured: after 1,250 bad requests, a request for EUR got 502 with socket: too many open files, and the server logged accept4: too many open files. The limit is per process, so one leaky path takes everything down."
+/>
+
+---
+
+## Signals
+
+*Stop 3 of 5.*
+
+### Step 1: how you ask a process to stop
+
+A **signal** is a small notification the kernel delivers to a process: a number, nothing else. Some come from the kernel itself (a segmentation fault is `SIGSEGV`), most come from other processes through the `kill` system call. For operating services, five matter:
+
+| Signal | Number | Who sends it | Default action |
+|---|---|---|---|
+| `SIGTERM` | 15 | `docker stop`, Kubernetes, `systemctl stop`, `kill` | end the process |
+| `SIGINT` | 2 | Ctrl-C in a terminal | end the process |
+| `SIGKILL` | 9 | the OOM killer, and anyone out of patience | end the process; **can't be caught, blocked or ignored** |
+| `SIGQUIT` | 3 | `Ctrl-\` in a terminal | end the process (Go: after printing every goroutine's stack) |
+| `SIGHUP` | 1 | a closed terminal; by convention, "reload your config" | end the process |
+
+A process can install a **handler** for any signal except `SIGKILL` (and `SIGSTOP`), and then the signal runs the handler instead of the default action. That's the entire protocol for stopping a service politely: the orchestrator sends **SIGTERM**, which the service may handle, waits a **grace period** (10 s for `docker stop`, 30 s in Kubernetes, 90 s by default in systemd), and if the process is still there, sends **SIGKILL**, which it may not.
+
+### Step 2: what happens to a request in flight
+
+The test: `rates` runs with `-delay 3s`, so every quote takes 3 seconds. We start a request, and half a second later run `docker stop` on the `api` container, timing it. First, `api` as it was in stop 2, with no signal handling:
+
+```text
+== api without NotifyContext, PID 1
+docker stop took 0.4 s, exit code 143
+the request in flight: curl exit 52 (the connection was closed with no answer)
+logs:
+  2026/09/28 00:11:32 INFO listening addr=:8080 pid=1 nofile=1048576
+== api with NotifyContext + Shutdown, PID 1
+docker stop took 3.0 s, exit code 0
+the request in flight: HTTP 200 {"cur":"EUR","rate":0.9214}
+logs:
+  2026/09/28 00:11:35 INFO listening addr=:8080 pid=1 nofile=1048576
+  2026/09/28 00:11:37 INFO shutting down cause="terminated signal received"
+  2026/09/28 00:11:39 INFO stopped cleanly
+== api with NotifyContext + Shutdown, docker stop -t 1
+docker stop took 1.3 s, exit code 137
+the request in flight: curl exit 52 (the connection was closed with no answer)
+logs:
+  2026/09/28 00:11:40 INFO listening addr=:8080 pid=1 nofile=1048576
+  2026/09/28 00:11:42 INFO shutting down cause="terminated signal received"
+```
+
+Three results, one per run:
+
+1. **No handler**: `docker stop` took 0.4 s and the exit code is **143**, which is 128 + 15: killed by SIGTERM. The request in flight got nothing: curl's exit 52 means the server closed the connection without a reply. The Go runtime does install a handler for SIGTERM at startup (it has to, to support `signal.Notify`), but when your code hasn't asked for the signal, the handler restores the default action and sends the signal again, so the process dies of it, exactly as a C program would.
+2. **With a handler** (the code is in step 3): `docker stop` took 3.0 s, the time the request needed to finish. It got its **HTTP 200**, and the exit code is **0**. The log shows why: `shutting down`, then two seconds later `stopped cleanly`.
+3. **With a handler, but `docker stop -t 1`**: a 1-second grace period for a 3-second request. The service started shutting down, and Docker sent SIGKILL at 1.3 s: exit code **137**, and the request was cut off anyway. The grace period is a contract. Your drain time must fit inside it.
+
+(Chapter 1 reported a Go program with no handler exiting with status 2 on SIGTERM. On this machine, Go 1.27 on Linux 6.12, it died of the signal, 143, both as PID 1 and not. Either way the request is lost, and "143 or 2 in the dashboards" is the symptom to look for.)
+
+### Step 3: graceful shutdown in Go
+
+Here's the final `main`. First, turn the signal into a context:
+
+```go noverify title="svc/cmd/api/main.go · lines 49–52"
+	// ctx is cancelled by the first SIGTERM (docker stop, kubectl delete,
+	// systemctl stop) or SIGINT (Ctrl-C).
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+```
+
+`signal.NotifyContext` returns a context that is cancelled when SIGTERM or SIGINT arrives. Asking for the signals is what switches off the default action: from now on SIGTERM means "cancel `ctx`" instead of "die". Since Go 1.26, `context.Cause(ctx)` says which signal it was, which is where the log's `cause="terminated signal received"` comes from.
+
+Next, start the server in its own goroutine, so `main` is free to wait for either of two things:
+
+```go noverify title="svc/cmd/api/main.go · lines 54–67"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /quote", quote(*ratesURL))
+	srv := &http.Server{Addr: *addr, Handler: mux}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+
+	select {
+	case err := <-errc: // the server failed on its own, e.g. the port is taken
+		slog.Error("serve", "err", err)
+		os.Exit(1)
+	case <-ctx.Done():
+	}
+	stop() // from here on, a second signal kills the process the default way
+	slog.Info("shutting down", "cause", context.Cause(ctx))
+```
+
+The `select` waits for the server to fail on its own (the port is taken: exit 1, loudly) or for the signal. Then `stop()` un-registers the signals. That's deliberate: if shutdown hangs, a second Ctrl-C or SIGTERM gets the default action again and kills the process, instead of being swallowed.
+
+Last, the shutdown itself:
+
+```go noverify title="svc/cmd/api/main.go · lines 69–80"
+	sctx, cancel := context.WithTimeout(context.Background(), *grace)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err != nil {
+		slog.Error("shutdown", "err", err) // the grace period ran out
+		os.Exit(1)
+	}
+	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("serve", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("stopped cleanly")
+}
+```
+
+`srv.Shutdown` closes the listener, so new connections are refused, closes idle keep-alive connections, and waits for requests in flight to finish. It gives up when its context does: `-grace 8s` by default, deliberately shorter than Docker's 10 s, so the service gives up on its own and logs it, rather than being SIGKILLed mid-sentence. If it finishes, `ListenAndServe` has returned `http.ErrServerClosed`, which is the normal case, and `main` returns: exit 0.
+
+<Callout kind="note" title="Kubernetes adds one more step">
+
+In Kubernetes, SIGTERM and "stop sending traffic to this pod" happen at the same time, and the second takes a moment to reach every load balancer. For a second or two after SIGTERM, new requests can still arrive. The usual answer is a `preStop` hook that sleeps a few seconds before SIGTERM is sent, or a readiness endpoint that starts failing as soon as `ctx` is cancelled while the server keeps serving a few more seconds. Either way: `terminationGracePeriodSeconds` must be longer than the sleep plus your `Shutdown` timeout.
+
+</Callout>
+
+### Step 4: PID 1, and the shell in the middle
+
+In a container, the first process is **PID 1** of its PID namespace, and the kernel treats PID 1 specially: **a signal whose action is the default is not delivered to it at all**. Only signals PID 1 has a handler for get through. (That's why a PID 1 that crashes can't take its container down by accident, and also why so many containers ignore `docker stop`.) Our Go `api` is fine as PID 1 because it has a handler.
+
+But containers often don't run the service directly. They run a script:
+
+```sh title="svc/deploy/start.sh"
+#!/bin/sh
+# A typical container entrypoint: some setup, then start the service.
+echo "start.sh: preparing config"
+/bin2/api -rates http://p4c02-rates:9090
+```
+
+The shell runs the script, starts `api` as its child, and waits. Now the shell is PID 1, and `api` is PID 6 or 7. Three runs of the same test:
+
+```text
+== start.sh without exec
+docker stop took 10.7 s, exit code 137
+the request in flight: HTTP 200 {"cur":"EUR","rate":0.9214}
+logs:
+  start.sh: preparing config
+  2026/09/28 00:11:44 INFO listening addr=:8080 pid=6 nofile=1048576
+== start.sh without exec, --init
+docker stop took 0.6 s, exit code 143
+the request in flight: curl exit 52 (the connection was closed with no answer)
+logs:
+  start.sh: preparing config
+  2026/09/28 00:11:57 INFO listening addr=:8080 pid=7 nofile=1048576
+== start.sh with exec
+docker stop took 3.0 s, exit code 0
+the request in flight: HTTP 200 {"cur":"EUR","rate":0.9214}
+logs:
+  start.sh: preparing config
+  2026/09/28 00:11:59 INFO listening addr=:8080 pid=1 nofile=1048576
+  2026/09/28 00:12:01 INFO shutting down cause="terminated signal received"
+  2026/09/28 00:12:04 INFO stopped cleanly
+```
+
+- **`start.sh` as it is**: `docker stop` took **10.7 seconds** and ended in **137**. The shell, as PID 1 with no handler for SIGTERM, never received it; it certainly didn't pass it on to `api`, which never logged `shutting down`. Docker waited its 10 seconds and SIGKILLed everything. The request happened to finish because it only needed 3 s; one that needed 11 would have been cut off. And every deploy of this service now takes 10 seconds longer per container than it should.
+- **`--init`**: Docker makes its small init program (tini) PID 1, and it forwards signals to its child. But its child is the shell, not `api`. The shell, no longer PID 1, dies of the SIGTERM at once; tini sees its only child exit and exits too; the kernel kills the rest of the container. **0.6 s, 143, and the request cut off.** `--init` fixes zombies and signal forwarding, but it can't fix a shell that doesn't pass signals on.
+- **`exec`**: one word fixes it. `exec /bin2/api ...` makes the shell *replace itself* with `api` (it's the `execve` from stop 1, without the clone), so `api` is PID 1, handles SIGTERM itself: **3.0 s, exit 0, HTTP 200.**
+
+```sh title="svc/deploy/start-exec.sh"
+#!/bin/sh
+# The same entrypoint, but the shell replaces itself with the service.
+echo "start.sh: preparing config"
+exec /bin2/api -rates http://p4c02-rates:9090
+```
+
+Rules for container entrypoints: use the **exec form** in the Dockerfile (`ENTRYPOINT ["/api"]`, not `ENTRYPOINT /api`, which wraps it in `sh -c`), and **end every entrypoint script with `exec`**. If your service starts child processes of its own, also run it with `--init` (or tini) so someone reaps the zombies from stop 1.
+
+<ProcAnim
+  title="docker stop, four ways"
+  frames={[
+    { code: "docker stop api   # api as PID 1, no signal.Notify", note: "SIGTERM arrives. Go's runtime has a handler, but our code never asked for the signal, so the runtime lets the default action run: the process dies. The request in flight gets no answer.", beat: "problem", say: "Default action: terminate.", sig: { sig: "SIGTERM", from: "docker stop", to: "1", result: "killed" }, procs: [{ pid: "1", name: "api", tag: "no handler", state: "gone", bad: true }], exit: "0.4 s · exit code 143 · the request: no reply (curl 52)" },
+    { code: "docker stop api   # api with NotifyContext + Shutdown", note: "Now the signal cancels ctx. api stops accepting, lets the 3-second request finish, and returns from main.", beat: "solution", say: "Handler registered: I'll tell api.", sig: { sig: "SIGTERM", from: "docker stop", to: "1", result: "caught" }, procs: [{ pid: "1", name: "api", tag: "NotifyContext", state: "R", hot: true }], exit: "3.0 s · exit code 0 · the request: HTTP 200" },
+    { code: "docker stop api   # ENTRYPOINT start.sh, no exec", note: "The shell is PID 1 and has no SIGTERM handler, so the kernel doesn't deliver the signal at all. api never hears it. Ten seconds later Docker sends SIGKILL, which PID 1 can't refuse.", beat: "problem", say: "PID 1, no handler: not delivered.", sig: { sig: "SIGTERM", from: "docker stop", to: "1", result: "ignored" }, procs: [{ pid: "1", name: "sh start.sh", tag: "PID 1", state: "S", bad: true }, { pid: "6", name: "api", parent: "1", state: "S" }], exit: "10.7 s · SIGKILL · exit code 137" },
+    { code: "docker stop --init api   # still no exec", note: "tini is PID 1 and forwards SIGTERM to its child, the shell. The shell dies of it, tini exits, and the kernel kills api with the rest of the container. The request is cut off.", beat: "problem", say: "sh dies, then everyone does.", sig: { sig: "SIGTERM", from: "tini", to: "6", result: "killed" }, procs: [{ pid: "1", name: "docker-init", tag: "tini" }, { pid: "6", name: "sh start.sh", parent: "1", state: "gone", bad: true }, { pid: "7", name: "api", parent: "6", state: "gone", bad: true }], exit: "0.6 s · exit code 143 · the request: no reply" },
+    { code: "exec /bin2/api -rates http://p4c02-rates:9090", note: "With exec, the shell turns into api: same PID 1, new program. api has a handler, gets the SIGTERM, drains and exits 0.", beat: "solution", say: "PID 1 is api, and api has a handler.", sig: { sig: "SIGTERM", from: "docker stop", to: "1", result: "caught" }, procs: [{ pid: "1", name: "api", tag: "exec'd by start.sh", state: "R", hot: true }], exit: "3.0 s · exit code 0 · the request: HTTP 200" }
+  ]}
+  caption="SIGTERM must reach the process that can drain, and that process must handle it. PID 1 gets only the signals it has handlers for."
+/>
+
+### Step 5: SIGKILL, and SIGQUIT for when it's stuck
+
+**SIGKILL** is the one signal nothing can intercept: no handler runs, no `defer` runs, buffers aren't flushed, the kernel just removes the process. That's why it's the last resort after a grace period, and why the OOM killer uses it. If your service needs to do something before it dies (flush a batch, release a lock), it has to do it on SIGTERM, because there may be nothing after.
+
+**SIGQUIT** is Go's gift to operators. When a service is stuck (no errors, no progress, CPU at zero), send it SIGQUIT and the Go runtime prints the stack of **every goroutine** to stderr, then exits with status 2:
+
+```text
+exit code 2
+$ docker logs api 2>&1 | grep -A6 '^goroutine 1 '
+goroutine 1 gp=0x75132dab81e0 m=nil [select]:
+runtime.gopark(0x75132dc13e68?, 0x2?, 0x88?, 0x3b?, 0x75132dc13cf4?)
+	runtime/proc.go:474 +0xb8 fp=0x75132dc13b50 sp=0x75132dc13b30 pc=0x90378
+runtime.selectgo(0x75132dc13e68, 0x75132dc13cf0, 0x75132db2c040?, 0x0, 0x2?, 0x1)
+	runtime/select.go:351 +0x838 fp=0x75132dc13c90 sp=0x75132dc13b50 pc=0x6d348
+main.main()
+	svc/cmd/api/main.go:60 +0x410 fp=0x75132dc13ea0 sp=0x75132dc13c90 pc=0x28b230
+$ docker logs api 2>&1 | grep -c '^goroutine '
+12
+```
+
+Our `api`, idle, had 12 goroutines; `main` was sitting in the `select` at line 60, waiting for a signal, exactly as designed. In a real hang, the dump shows every goroutine blocked on the same mutex or channel, and usually which line took it. (It kills the process, so do it to one replica, not all of them.)
+
+<QuickCheck
+  question="A container's ENTRYPOINT is a shell script whose last line is /app/server (no exec). The Go server handles SIGTERM correctly. What does docker stop do?"
+  options={[
+    "The server shuts down gracefully and exits 0",
+    "The shell, as PID 1 without a handler, never gets SIGTERM, so nothing happens until Docker sends SIGKILL after 10 s: exit 137",
+    "The shell forwards SIGTERM to the server",
+    "Docker sends SIGTERM straight to the server, bypassing the shell"
+  ]}
+  answer={1}
+  explain="Measured: 10.7 s and exit code 137, and api never logged shutting down. Docker signals PID 1 only. Adding exec made it 3.0 s and exit 0."
+/>
+
+---
+
+## Memory Limits
+
+*Stop 4 of 5.*
+
+### Step 1: the cgroup's hard limit
+
+Chapter 1 showed that a container's memory limit is a number in its cgroup's `memory.max` file, and that a group that goes over it has a process killed by the kernel's **OOM killer**, with SIGKILL. Here's what that means for a Go service, measured.
+
+`cmd/cache` behaves like a service with an in-memory cache: it builds a **60 MiB** cache that it keeps, then serves 400,000 "requests", each building a 16 KiB response and throwing it away. It prints the Go heap and the cgroup's own count of the container's memory, `memory.current`:
+
+```go noverify title="svc/cmd/cache/main.go · lines 47–64"
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Printf("cache built       heap %5.1f MiB  GCs %4d  cgroup memory.current %5.1f MiB\n",
+		float64(ms.HeapAlloc)/(1<<20), ms.NumGC, cgroupMiB("memory.current"))
+	start := time.Now()
+	for i := 1; i <= *requests; i++ {
+		resp := make([]byte, 16<<10) // one response, garbage right after
+		copy(resp, template)
+		sink = resp
+		if i%50_000 == 0 {
+			runtime.ReadMemStats(&ms)
+			fmt.Printf("%6d responses  heap %5.1f MiB  GCs %4d  cgroup memory.current %5.1f MiB\n",
+				i, float64(ms.HeapAlloc)/(1<<20), ms.NumGC, cgroupMiB("memory.current"))
+		}
+	}
+	runtime.ReadMemStats(&ms)
+	fmt.Printf("done in %v: %d GCs, cgroup memory.peak %.1f MiB of memory.max %.0f MiB\n",
+		time.Since(start).Round(time.Millisecond), ms.NumGC, cgroupMiB("memory.peak"), cgroupMiB("memory.max"))
+```
+
+First with plenty of room (a 1 GiB limit), to see how much it uses when nothing stops it:
+
+```text
+$ docker run -m 1g --memory-swap 1g golang:1.27 cache
+cache built       heap  61.6 MiB  GCs    4  cgroup memory.current  68.9 MiB
+ 50000 responses  heap 142.0 MiB  GCs   15  cgroup memory.current 162.5 MiB
+100000 responses  heap 129.6 MiB  GCs   28  cgroup memory.current 169.1 MiB
+150000 responses  heap 113.8 MiB  GCs   40  cgroup memory.current 160.1 MiB
+200000 responses  heap 115.7 MiB  GCs   52  cgroup memory.current 161.8 MiB
+250000 responses  heap 100.3 MiB  GCs   64  cgroup memory.current 164.6 MiB
+300000 responses  heap 103.9 MiB  GCs   77  cgroup memory.current 171.7 MiB
+350000 responses  heap 117.2 MiB  GCs   89  cgroup memory.current 165.3 MiB
+400000 responses  heap 125.9 MiB  GCs  102  cgroup memory.current 174.6 MiB
+done in 672ms: 102 GCs, cgroup memory.peak 175.7 MiB of memory.max 1024 MiB
+exit code 0, OOMKilled false
+$ docker run -m 100m --memory-swap 100m golang:1.27 cache
+cache built       heap  61.6 MiB  GCs    4  cgroup memory.current  68.7 MiB
+exit code 137, OOMKilled true
+$ docker run -m 100m --memory-swap 100m -e GOMEMLIMIT=90MiB golang:1.27 cache
+cache built       heap  61.6 MiB  GCs    4  cgroup memory.current  68.6 MiB
+ 50000 responses  heap  81.2 MiB  GCs   57  cgroup memory.current  90.0 MiB
+100000 responses  heap  79.0 MiB  GCs  111  cgroup memory.current  87.9 MiB
+150000 responses  heap  79.3 MiB  GCs  166  cgroup memory.current  88.4 MiB
+200000 responses  heap  79.9 MiB  GCs  221  cgroup memory.current  88.9 MiB
+250000 responses  heap  73.7 MiB  GCs  276  cgroup memory.current  89.3 MiB
+300000 responses  heap  74.8 MiB  GCs  331  cgroup memory.current  89.4 MiB
+350000 responses  heap  76.3 MiB  GCs  386  cgroup memory.current  88.5 MiB
+400000 responses  heap  79.0 MiB  GCs  441  cgroup memory.current  88.5 MiB
+done in 1.19s: 442 GCs, cgroup memory.peak 100.0 MiB of memory.max 100 MiB
+exit code 0, OOMKilled false
+$ docker run -m 100m --memory-swap 100m -e GOMEMLIMIT=80MiB golang:1.27 cache
+cache built       heap  61.6 MiB  GCs    4  cgroup memory.current  68.9 MiB
+ 50000 responses  heap  67.6 MiB  GCs  104  cgroup memory.current  78.7 MiB
+100000 responses  heap  70.2 MiB  GCs  220  cgroup memory.current  77.0 MiB
+150000 responses  heap  70.3 MiB  GCs  336  cgroup memory.current  77.4 MiB
+200000 responses  heap  68.9 MiB  GCs  451  cgroup memory.current  76.6 MiB
+250000 responses  heap  71.2 MiB  GCs  567  cgroup memory.current  78.6 MiB
+300000 responses  heap  68.0 MiB  GCs  682  cgroup memory.current  77.3 MiB
+350000 responses  heap  70.3 MiB  GCs  798  cgroup memory.current  77.4 MiB
+400000 responses  heap  70.2 MiB  GCs  914  cgroup memory.current  76.8 MiB
+done in 2.577s: 914 GCs, cgroup memory.peak 100.0 MiB of memory.max 100 MiB
+exit code 0, OOMKilled false
+$ docker run -m 100m --memory-swap 100m -e GOMEMLIMIT=50MiB golang:1.27 cache
+cache built       heap  61.6 MiB  GCs   11  cgroup memory.current  69.1 MiB
+ 50000 responses  heap  66.0 MiB  GCs  291  cgroup memory.current  76.9 MiB
+100000 responses  heap  68.1 MiB  GCs  572  cgroup memory.current  81.2 MiB
+150000 responses  heap  66.3 MiB  GCs  879  cgroup memory.current  79.0 MiB
+200000 responses  heap  63.7 MiB  GCs 1158  cgroup memory.current  76.6 MiB
+250000 responses  heap  66.1 MiB  GCs 1480  cgroup memory.current  78.9 MiB
+300000 responses  heap  66.0 MiB  GCs 1825  cgroup memory.current  79.3 MiB
+350000 responses  heap  65.8 MiB  GCs 2131  cgroup memory.current  79.0 MiB
+400000 responses  heap  72.9 MiB  GCs 2433  cgroup memory.current  78.7 MiB
+done in 5.207s: 2433 GCs, cgroup memory.peak 94.7 MiB of memory.max 100 MiB
+exit code 0, OOMKilled false
+```
+
+Five runs, top to bottom.
+
+**1 GiB limit.** The live data is 60 MiB, yet the container peaked at **175.7 MiB**. That's how Go's garbage collector works by default: with `GOGC=100`, it lets the heap grow to twice the live data before collecting (60 MiB live, so a target of about 120 MiB of heap), and the runtime's own overhead and freed memory it hasn't returned to the kernel yet come on top. The GC made only 102 collections.
+
+**100 MiB limit.** The same program in a 100 MiB container. The cache fits, 68.7 MiB after it's built. But once requests start, the heap heads for its target of 120 MiB, crosses 100, and the kernel kills it: **exit code 137, `OOMKilled true`**. It never printed its first progress line. Nothing in the program is wrong: it never had more than 60 MiB of data it needed. It died of garbage it would have collected a moment later.
+
+<Define term="GOMEMLIMIT">
+**GOMEMLIMIT** (Go 1.19+) is a **soft memory limit** for the Go runtime: the total memory it may map (heap, stacks, runtime structures). As the total approaches it, the GC collects more often, whatever `GOGC` says. It's soft because the runtime won't crash to respect it: if the live data alone doesn't fit, it goes over rather than collecting forever. Set it with the environment variable (`GOMEMLIMIT=90MiB`) or `debug.SetMemoryLimit`.
+</Define>
+
+### Step 2: telling the GC about the limit
+
+The Go runtime doesn't read `memory.max` (it does read `cpu.max`, for GOMAXPROCS, but not the memory limit). So you tell it, with `GOMEMLIMIT`, a little below the container's limit, leaving room for what the runtime doesn't count: the binary's own code, the kernel's page cache for files it reads, thread stacks.
+
+**`GOMEMLIMIT=90MiB`** in the same 100 MiB container: `memory.current` held at **88 to 90 MiB** for all 400,000 requests, and the program finished. The price is in the GC count: **442 collections** instead of 102, because the GC runs whenever the heap nears the limit instead of when it has doubled. It took 1.19 s against 0.67 s without a limit. Memory traded for CPU, which is the right trade when the alternative is being killed.
+
+**`GOMEMLIMIT=80MiB`**: more headroom (77 to 79 MiB), more collections, **914**, and 2.58 s.
+
+**`GOMEMLIMIT=50MiB`**, set *below* the 60 MiB of live data. The limit can't be met, and the runtime knows it: it went over (the heap stayed at 63 to 73 MiB) and kept working, with **2,433 collections** and 5.21 s. The GC caps itself at roughly half the CPU in this state, so the service slows down instead of spinning forever. A soft limit that's too low turns an OOM kill into a slow service: better, but you'll see it in latency.
+
+(Two runs report `memory.peak` 100.0 MiB although `memory.current` never went past about 90. At the limit, the kernel first reclaims memory it can take back, such as cached pages of the binary, and only kills if that fails. Those runs brushed the limit and were saved by reclaim.)
+
+<ProcAnim
+  title="A 60 MiB cache in a 100 MiB container"
+  kicker="cgroup memory · live"
+  frames={[
+    { code: "docker run -m 1g cache", note: "With room to spare, the cache is 61.6 MiB of heap after it's built, and the container uses 68.9 MiB.", say: "60 MiB of data. Fine so far.", procs: [{ pid: "1", name: "cache", state: "R", hot: true }], mem: { title: "memory.current, 1 GiB limit (scale: 200 MiB)", used: 69, max: 200, heap: 62 } },
+    { code: "400,000 requests × 16 KiB of garbage", note: "Then requests start. With GOGC=100 the GC lets the heap reach twice the live data before collecting. The container peaks at 175.7 MiB: nearly three times the data it needs.", beat: "problem", say: "Peak 175.7 MiB, for 60 MiB of data.", procs: [{ pid: "1", name: "cache", state: "R" }], mem: { title: "memory.current, 1 GiB limit (scale: 200 MiB)", used: 176, max: 200, heap: 126 } },
+    { code: "docker run -m 100m cache", note: "In a 100 MiB container the cache fits: 68.7 MiB. The GC's target, about 120 MiB of heap, does not.", say: "memory.max is 100 MiB.", procs: [{ pid: "1", name: "cache", state: "R" }], mem: { used: 69, max: 100, heap: 62 } },
+    { note: "The heap grows toward its target. At 100 MiB the kernel can't reclaim enough, and the OOM killer sends SIGKILL. Not one request line was printed.", beat: "problem", say: "Over memory.max: SIGKILL.", sig: { sig: "SIGKILL", from: "OOM killer", to: "1", result: "killed" }, procs: [{ pid: "1", name: "cache", state: "gone", bad: true }], mem: { used: 100, max: 100, killed: true }, exit: "exit code 137 · OOMKilled true" },
+    { code: "docker run -m 100m -e GOMEMLIMIT=90MiB cache", note: "With GOMEMLIMIT=90MiB the GC collects whenever the total nears 90 MiB. memory.current held at 88 to 90 MiB for all 400,000 requests: 442 GCs instead of 102.", beat: "solution", say: "Collected in time, 442 times.", procs: [{ pid: "1", name: "cache", state: "R", hot: true }], mem: { used: 89, max: 100, soft: 90, heap: 79 }, exit: "exit code 0 · 1.19 s" },
+    { code: "docker run -m 100m -e GOMEMLIMIT=50MiB cache", note: "A limit below the live data can't be met. The runtime goes over it (heap 63 to 73 MiB) rather than collect forever, and caps the GC at about half the CPU: 2,433 GCs and 5.21 s. Slower, not dead.", say: "Soft limit: over it, but alive.", procs: [{ pid: "1", name: "cache", state: "R" }], mem: { used: 79, max: 100, soft: 50, heap: 73 }, exit: "exit code 0 · 5.21 s" }
+  ]}
+  caption="The cgroup's limit is hard: past it, SIGKILL. GOMEMLIMIT is the Go runtime's soft limit: set it a little below, and the GC works harder instead of the process dying."
+/>
+
+<Gotcha>
+
+**GOMEMLIMIT doesn't cover everything the container is charged for.** It counts memory the Go runtime maps. The cgroup also counts the page cache of files the service reads and writes, memory used by cgo libraries, and, if your service shells out, its children. The 90% rule (a 512 MiB container gets `GOMEMLIMIT=460MiB`) is a starting point; watch `memory.current` (or `container_memory_working_set_bytes` in Kubernetes) against the limit, and lower it if the gap is too thin.
+
+</Gotcha>
+
+<QuickCheck
+  question="A service's live data is 300 MiB. It runs in a 512 MiB container with default GC settings and is OOM-killed under load. What does GOMEMLIMIT=460MiB change?"
+  options={[
+    "Nothing: the GC already respects the container limit",
+    "The GC collects more often as total memory nears 460 MiB, instead of letting the heap reach about twice the live data, so it stays under 512",
+    "It makes the kernel's limit 460 MiB",
+    "It stops the service allocating past 460 MiB, returning errors"
+  ]}
+  answer={1}
+  explain="Measured on the cache: default settings reached 175.7 MiB for 60 MiB of data and were killed in 100 MiB; GOMEMLIMIT=90MiB held it at 88 to 90 MiB, with 442 GCs instead of 102. The Go runtime doesn't read memory.max, and GOMEMLIMIT never makes allocations fail."
+/>
+
+---
+
+## systemd
+
+*Stop 5 of 5.*
+
+### Step 1: who starts the service when there's no Docker?
+
+On a plain Linux server (a VM, bare metal, the machine under your Kubernetes nodes) the process that starts services is **systemd**, which is PID 1 of the whole machine. It does for a service what Docker and Kubernetes do for a container: starts it at boot, restarts it when it crashes, stops it with SIGTERM then SIGKILL, collects its logs, and puts it in its own cgroup. You describe the service in a **unit file**.
+
+The minimum, what most people write the first time:
+
+```ini title="svc/deploy/api-plain.service"
+[Unit]
+Description=Meridian quote API (first try)
+
+[Service]
+ExecStart=/usr/local/bin/api -rates http://127.0.0.1:9090
+
+[Install]
+WantedBy=multi-user.target
+```
+
+It works. It runs `api` as root, with access to the whole filesystem and every capability, never restarts it, and gives it no memory limit. Here's the unit this chapter uses, in three parts. First, what to run and when:
+
+```ini title="svc/deploy/api.service · lines 1–18"
+[Unit]
+Description=Meridian quote API
+Wants=rates.service
+After=rates.service
+# If it has been restarted 5 times within 60 s, stop trying.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/api -addr :8080 -rates http://127.0.0.1:9090 -grace 8s
+
+# Crash? Start it again, 2 s later.
+Restart=on-failure
+RestartSec=2s
+
+# systemctl stop sends SIGTERM, waits this long, then sends SIGKILL.
+TimeoutStopSec=10s
+```
+
+- **`Type=exec`**: the service counts as started once the binary has been exec'd. (`Type=simple` counts it before, so a typo in the path looks like a successful start.)
+- **`Restart=on-failure`**: if it exits with a non-zero status or is killed by a signal, start it again after **`RestartSec=2s`**. The two `StartLimit` lines stop a service that crashes on startup from being restarted in a tight loop forever; they belong in `[Unit]`, which is the next step's story.
+- **`TimeoutStopSec=10s`**: how `systemctl stop` works is exactly `docker stop`: SIGTERM, wait this long, SIGKILL. `api`'s own `-grace 8s` fits inside it.
+
+Then its resources, the things stops 2 and 4 were about:
+
+```ini title="svc/deploy/api.service · lines 20–23"
+# Resources: a cgroup memory limit, the GC told about it, and room for fds.
+MemoryMax=256M
+Environment=GOMEMLIMIT=230MiB
+LimitNOFILE=65536
+```
+
+systemd puts every service in its own cgroup, so **`MemoryMax=`** is `memory.max` for this service, **`GOMEMLIMIT`** is set to 90% of it, and **`LimitNOFILE=`** sets the fd limit, soft and hard.
+
+Then the sandbox:
+
+```ini title="svc/deploy/api.service · lines 25–50"
+# Sandboxing: a throwaway user, a read-only system, no privileges.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+```
+
+Each line takes away something `api` doesn't need. **`DynamicUser=yes`** runs it as a user that systemd creates when it starts and deletes when it stops, so it owns nothing on the machine. **`ProtectSystem=strict`** mounts the whole filesystem read-only for it. **`CapabilityBoundingSet=`** (empty) drops every root capability. **`SystemCallFilter=`** installs a seccomp filter that allows the system calls ordinary services use and kills the process on anything else, such as loading a kernel module. **`RestrictAddressFamilies=`** allows IPv4, IPv6 and Unix sockets, and nothing more exotic. If an attacker finds a bug in `api`, this is the difference between owning the process and owning the server.
+
+### Step 2: check the unit before you trust it
+
+`systemd-analyze verify` reads a unit the way systemd will. The first draft of this unit had the two `StartLimit` lines under `[Service]`:
+
+```text
+$ systemd-analyze verify api.service   # the first draft
+/tmp/api.service:13: Unknown key 'StartLimitIntervalSec' in section [Service], ignoring.
+$ systemd-analyze verify api.service   # fixed
+(exit status 0)
+```
+
+systemd doesn't refuse a unit with an unknown key: it logs a warning and **ignores the line**. The restart limit would silently not exist. Moved to `[Unit]`, verify is silent and exits 0.
+
+`systemd-analyze security` scores how exposed a service is, from 0 (locked down) to 10:
+
+```text
+$ systemd-analyze security api-plain.service | tail -1
+→ Overall exposure level for api-plain.service: 9.6 UNSAFE :-{
+$ systemd-analyze security api.service | tail -1
+→ Overall exposure level for api.service: 1.2 OK :-)
+$ systemd-analyze security api-plain.service | grep -E "User=|NoNewPrivileges|ProtectSystem|CapabilityBoundingSet=~CAP_SYS_ADMIN"
+✗ User=/DynamicUser=                                          Service runs as root user                                                    0.4
+✗ NoNewPrivileges=                                            Service processes may acquire new privileges                                 0.2
+✗ ProtectSystem=                                              Service has full access to the OS file hierarchy                             0.2
+✗ CapabilityBoundingSet=~CAP_SYS_ADMIN                        Service has administrator privileges                                         0.3
+```
+
+The first-try unit scores **9.6 UNSAFE**; ours, **1.2 OK**. The per-line report says exactly what each missing setting would have allowed.
+
+### Step 3: running it for real
+
+All of this ran on a real systemd: a Debian container with systemd as its PID 1 (`sysd/Dockerfile` in the chapter's scratch files, run with `--privileged` so systemd can manage cgroups). Start `rates` and `api`, then look:
+
+```text
+$ systemctl status api
+● api.service - Meridian quote API
+     Loaded: loaded (/etc/systemd/system/api.service; disabled; preset: enabled)
+     Active: active (running) since Mon 2026-09-28 00:12:29 UTC; 1s ago
+ Invocation: 6626cb5efcf949a8be64e38eaf9afd60
+   Main PID: 140 (api)
+      Tasks: 7 (limit: 9520)
+     Memory: 4.7M (max: 256M, available: 251.2M, peak: 5.6M)
+        CPU: 19ms
+     CGroup: /system.slice/api.service
+             └─140 /usr/local/bin/api -addr :8080 -rates http://127.0.0.1:9090 -grace 8s
+$ ps -o user,pid,ppid,cmd -p 140
+USER         PID    PPID CMD
+api          140       1 /usr/local/bin/api -addr :8080 -rates http://127.0.0.1:9090 -grace 8s
+$ grep -E "^(Uid|CapBnd|NoNewPrivs|Seccomp):" /proc/140/status
+Uid:	62104	62104	62104	62104
+CapBnd:	0000000000000000
+NoNewPrivs:	1
+Seccomp:	2
+$ grep "open files" /proc/140/limits
+Max open files            65536                65536                files     
+$ curl localhost:8080/quote?cur=NGN
+{"cur":"NGN","rate":1532.40}
+$ systemctl kill -s SIGKILL api; sleep 3
+$ systemctl show -p MainPID -p NRestarts api
+MainPID=160
+NRestarts=1
+$ systemctl stop api   # while a 3-second request is in flight
+the request in flight got: {"cur":"EUR","rate":0.9214}
+ (HTTP 200)
+$ systemctl show -p Result -p ExecMainStatus api
+Result=success
+ExecMainStatus=0
+$ journalctl -u api -o short-precise
+00:12:29.461940 systemd[1]: Starting api.service - Meridian quote API...
+00:12:29.478634 systemd[1]: Started api.service - Meridian quote API.
+00:12:29.480384 api[140]: 2026/09/28 00:12:29 INFO listening addr=:8080 pid=140 nofile=65536
+00:12:30.545303 systemd[1]: api.service: Sent signal SIGKILL to main process 140 (api) on client request.
+00:12:30.545342 systemd[1]: api.service: Killed unit cgroup with SIGKILL on client request.
+00:12:30.546200 systemd[1]: api.service: Main process exited, code=killed, status=9/KILL
+00:12:30.546267 systemd[1]: api.service: Failed with result 'signal'.
+00:12:32.778241 systemd[1]: api.service: Scheduled restart job, restart counter is at 1.
+00:12:32.781334 systemd[1]: Starting api.service - Meridian quote API...
+00:12:32.840938 systemd[1]: Started api.service - Meridian quote API.
+00:12:32.842588 api[160]: 2026/09/28 00:12:32 INFO listening addr=:8080 pid=160 nofile=65536
+00:12:34.667064 systemd[1]: Stopping api.service - Meridian quote API...
+00:12:34.667505 api[160]: 2026/09/28 00:12:34 INFO shutting down cause="terminated signal received"
+00:12:37.310951 api[160]: 2026/09/28 00:12:37 INFO stopped cleanly
+00:12:37.313600 systemd[1]: api.service: Deactivated successfully.
+00:12:37.314038 systemd[1]: Stopped api.service - Meridian quote API.
+```
+
+Everything the unit asked for, checked from the outside:
+
+- **`USER api`, `Uid: 62104`**: the dynamic user. **`CapBnd: 0000000000000000`**: no capabilities at all. **`NoNewPrivs: 1`** and **`Seccomp: 2`**, a filter in force.
+- **`Max open files 65536 65536`**: `LimitNOFILE`. And `api`'s own log line says `nofile=65536`.
+- **`Memory: ... (max: 256M ...)`** in `systemctl status`: `MemoryMax` is the cgroup limit.
+- **`systemctl kill -s SIGKILL`**, a crash as far as systemd can tell: it logged `code=killed, status=9/KILL`, waited `RestartSec`, and started a new process, PID 160, 2.2 s later. `NRestarts=1`.
+- **`systemctl stop`** with a 3-second request in flight: systemd sent SIGTERM, `api` logged `shutting down`, the request got its **HTTP 200**, and `api` logged `stopped cleanly` 2.6 s later. `Result=success`, `ExecMainStatus=0`: a clean stop, not a failure.
+
+The journal lines from `api[160]` are its stderr: systemd collects a service's output for you, with timestamps, and `journalctl -u api` reads it back. That's why `api` logs with `slog` to stderr and doesn't manage log files.
+
+<RelationAnim
+  title="systemd, a unit, and the process it runs"
+  kicker="mental model"
+  role="kernel"
+  height={60}
+  nodes={[
+    { id: "sd", label: "systemd", sub: "PID 1 of the machine", x: 16, y: 18, kind: "tool" },
+    { id: "unit", label: "api.service", sub: "the unit file", x: 50, y: 18, kind: "file" },
+    { id: "cg", label: "cgroup", sub: "system.slice/api.service", x: 84, y: 18, kind: "pkg" },
+    { id: "proc", label: "api", sub: "PID 160 · user api", x: 50, y: 70, kind: "value" },
+    { id: "jr", label: "journal", sub: "journalctl -u api", x: 16, y: 70, kind: "type" },
+    { id: "lim", label: "sandbox", sub: "seccomp · no caps · read-only /", x: 84, y: 70, kind: "iface" }
+  ]}
+  edges={[
+    { from: "sd", to: "unit", label: "reads" },
+    { from: "unit", to: "cg", label: "MemoryMax" },
+    { from: "sd", to: "proc", label: "starts, restarts, stops" },
+    { from: "cg", to: "proc", label: "contains" },
+    { from: "lim", to: "proc", label: "wraps" },
+    { from: "proc", to: "jr", label: "stderr" }
+  ]}
+  frames={[
+    { note: "systemd reads api.service when you run daemon-reload.", show: ["sd", "unit", "sd>unit"], at: "sd", say: "daemon-reload" },
+    { note: "systemctl start: it makes a cgroup for the service and writes MemoryMax into it, the same memory.max file as a container's.", show: ["sd", "unit", "sd>unit", "cg", "unit>cg"], hot: ["cg", "unit>cg"], at: "cg" },
+    { note: "It starts api inside that cgroup, as a throwaway user, with the sandbox around it, and keeps its stderr in the journal.", show: ["sd", "unit", "sd>unit", "cg", "unit>cg", "proc", "sd>proc", "cg>proc", "lim", "lim>proc", "jr", "proc>jr"], hot: ["proc", "sd>proc"], at: "proc", beat: "solution" },
+    { note: "SIGKILL from outside: the process dies with status 9/KILL. Restart=on-failure: 2.2 s later there's a new api, PID 160.", hot: ["sd>proc"], bad: ["proc"], at: "proc", say: "restart counter is at 1", beat: "problem" },
+    { note: "systemctl stop: SIGTERM, up to TimeoutStopSec for the drain, then SIGKILL if needed. api finished its request and exited 0 in 2.6 s.", hot: ["sd>proc", "proc>jr"], at: "jr", say: "Deactivated successfully", beat: "solution" }
+  ]}
+  caption="A unit file is to systemd what a Dockerfile plus docker run flags are to Docker: what to run, its limits, and how to stop it."
+/>
+
+<QuickCheck
+  question="systemd-analyze verify prints: Unknown key 'StartLimitIntervalSec' in section [Service], ignoring. What does systemd do with the unit?"
+  options={[
+    "Refuses to start it",
+    "Starts it, silently without that setting",
+    "Moves the key to the right section itself",
+    "Starts it with the default value and a warning on every start"
+  ]}
+  answer={1}
+  explain="systemd logs the warning once, when it loads the unit, and ignores the line: the service runs without the restart limit you thought you had. That's why verify belongs in CI for unit files."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Log your limits at startup" level="easy">
+
+`api` logs its `nofile` limit when it starts. Extend it to log the cgroup's memory limit too (`/sys/fs/cgroup/memory.max`, which holds a number of bytes or the word `max`) and the `GOMEMLIMIT` the runtime is actually using. Then warn if `GOMEMLIMIT` is unset or higher than the cgroup limit.
+
+<Solution>
+
+Read the file with `os.ReadFile`, trim it, and treat `max` as no limit. `debug.SetMemoryLimit(-1)` returns the current limit without changing it (a negative argument means "just report"); with no `GOMEMLIMIT` it's `math.MaxInt64`. Log both with `slog.Info`, and `slog.Warn` if the runtime's limit is `math.MaxInt64` or larger than the cgroup's. On a Mac or any machine without the file, skip the check instead of failing: the service has to start there too.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Fail readiness before you stop" level="medium">
+
+Add `GET /healthz` to `api`: 200 while serving, 503 from the moment `ctx` is cancelled. Then, before calling `srv.Shutdown`, keep serving for a configurable `-drain-delay` (say 5 s) so a load balancer has time to notice the 503 and stop sending traffic. Test it with a loop of curls during `docker stop`.
+
+<Solution>
+
+Keep an `atomic.Bool` named `stopping`. The health handler returns 503 when it's set. After `<-ctx.Done()`: `stopping.Store(true)`, `time.Sleep(*drainDelay)`, then `Shutdown` as before. The grace period must now cover both: 5 s of delay plus up to 8 s of shutdown is 13 s, so `docker stop -t 15`, `TimeoutStopSec=15s`, or `terminationGracePeriodSeconds: 15`. During the delay, requests still get answers, which is the point: the orchestrator's view of the pod catches up while nothing is refused.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Type=notify" level="medium">
+
+With `Type=exec`, systemd considers `api` started as soon as the binary runs, before it's listening. With `Type=notify`, the service tells systemd when it's ready, by sending the datagram `READY=1` to the Unix socket named in the `NOTIFY_SOCKET` environment variable. Implement it with the standard library only, and send it after `net.Listen` succeeds.
+
+<Solution>
+
+Split `ListenAndServe` into `ln, err := net.Listen("tcp", *addr)` and `go srv.Serve(ln)`, so you know the port is open. Then: read `os.Getenv("NOTIFY_SOCKET")`; if it's empty, you aren't under systemd, so do nothing. If it starts with `@`, replace that with a zero byte (an abstract socket). `net.DialUnix("unixgram", nil, &net.UnixAddr{Name: name, Net: "unixgram"})`, write `READY=1`, close. On shutdown, send `STOPPING=1` the same way. In the unit, change `Type=exec` to `Type=notify`: systemd creates the socket and sets `NOTIFY_SOCKET` itself. `systemctl start api` then waits until the datagram arrives.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="A Go PID 1 that reaps" level="hard">
+
+Stop 1 showed that a process nobody waits for stays a zombie, and chapter 1 that a Go PID 1 doesn't reap orphans. Write the reaping loop yourself: on `SIGCHLD`, call `syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)` until it returns 0. Then start a child with `os/exec` and call `cmd.Wait()`. What goes wrong, and what does that tell you about using tini?
+
+<Solution>
+
+The loop reaps *every* child, including the one os/exec started, so `cmd.Wait()` finds its child already reaped and fails with `ECHILD` ("no child processes"), and its exit status is gone. A reaper and os/exec fight over the same children. You could track which PIDs are yours, but the simple, robust answer is the one tini gives: a tiny separate PID 1 that reaps orphans and forwards signals, with your Go service as its only child, so the service's own `Wait` calls are left alone. That's `docker run --init`, or tini in the image's `ENTRYPOINT`.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Last Orders"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={10}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Fix this service's process plumbing. readRate leaks a file descriptor whenever a rate file is bad. exitCode reports -1 for a process killed by a signal instead of 128 plus the signal. Shutdown returns at once instead of waiting for requests in flight, Handle keeps accepting requests after shutdown began, and a stuck request must not hold Shutdown past its deadline. And shutdownContext ignores SIGTERM, which is what docker stop, Kubernetes and systemd send: the last check sends the program SIGTERM for real."
+  starter={`package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// readRate reads a rate file: one line holding a number. A file that
+// doesn't hold a number is an error. Every file it opens, it must close.
+func readRate(path string) (float64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 64)
+	n, _ := f.Read(buf)
+	rate, err := strconv.ParseFloat(strings.TrimSpace(string(buf[:n])), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	f.Close()
+	return rate, nil
+}
+
+// exitCode is what a shell, Docker or Kubernetes reports for a process
+// that ended with status ws: its own exit status if it exited, or 128
+// plus the signal's number if a signal killed it.
+func exitCode(ws syscall.WaitStatus) int {
+	return ws.ExitStatus()
+}
+
+// shutdownContext is cancelled when the process is asked to stop: by
+// SIGTERM (docker stop, kubectl delete, systemctl stop) or SIGINT (Ctrl-C).
+func shutdownContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt)
+}
+
+var ErrClosed = errors.New("server is shutting down")
+
+// Server runs requests, like http.Server does, and can shut down the same
+// way: stop taking new requests, then wait for the ones in flight.
+type Server struct {
+	mu       sync.Mutex
+	closed   bool
+	inflight sync.WaitGroup
+}
+
+// Handle runs fn as one request. Once Shutdown has begun it refuses new
+// requests with ErrClosed.
+func (s *Server) Handle(fn func()) error {
+	s.inflight.Add(1)
+	defer s.inflight.Done()
+	fn()
+	return nil
+}
+
+// Shutdown stops new requests and waits for the ones in flight to finish.
+// If ctx ends first, it gives up and returns ctx.Err().
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+
+// ── below this line: do not edit ──
+
+// openFDs counts this process's open file descriptors: /proc/self/fd on
+// Linux, /dev/fd on macOS.
+func openFDs() int {
+	for _, dir := range []string{"/proc/self/fd", "/dev/fd"} {
+		if ents, err := os.ReadDir(dir); err == nil {
+			return len(ents)
+		}
+	}
+	return -1
+}
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+
+	// 1. No file descriptor leaks, on the error path either.
+	dir, _ := os.MkdirTemp("", "rates")
+	defer os.RemoveAll(dir)
+	for i := range 200 {
+		body := "0.9214\\n"
+		if i%2 == 1 {
+			body = "n/a\\n" // half the files are bad
+		}
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("r%03d", i)), []byte(body), 0o644)
+	}
+	runtime.GC()
+	before := openFDs()
+	good, bad := 0, 0
+	for i := range 200 {
+		if _, err := readRate(filepath.Join(dir, fmt.Sprintf("r%03d", i))); err != nil {
+			bad++
+		} else {
+			good++
+		}
+	}
+	if good != 100 || bad != 100 {
+		fail("readRate: %d good and %d bad files, want 100 and 100", good, bad)
+	}
+	if leaked := openFDs() - before; leaked != 0 {
+		fail("readRate leaked %d file descriptors reading 200 files", leaked)
+	}
+
+	// 2. Exit codes, the way a shell reports them. On Linux and macOS a
+	// wait status holds an exit status in bits 8-15, or a signal in bits 0-6.
+	for _, c := range []struct {
+		ws   syscall.WaitStatus
+		want int
+		what string
+	}{
+		{0 << 8, 0, "exited 0"},
+		{1 << 8, 1, "exited 1"},
+		{2 << 8, 2, "exited 2 (a Go panic)"},
+		{syscall.WaitStatus(syscall.SIGTERM), 143, "killed by SIGTERM"},
+		{syscall.WaitStatus(syscall.SIGKILL), 137, "killed by SIGKILL (the OOM killer)"},
+	} {
+		if got := exitCode(c.ws); got != c.want {
+			fail("exitCode(%s) = %d, want %d", c.what, got, c.want)
+		}
+	}
+
+	// 3. Shutdown waits for the request in flight, refuses new ones...
+	s := &Server{}
+	started, finished := make(chan struct{}), make(chan struct{})
+	go s.Handle(func() {
+		close(started)
+		time.Sleep(300 * time.Millisecond)
+		close(finished)
+	})
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := s.Shutdown(ctx)
+	cancel()
+	select {
+	case <-finished:
+		if err != nil {
+			fail("Shutdown returned %v after the request finished, want nil", err)
+		}
+	default:
+		fail("Shutdown returned while a request was still in flight")
+	}
+	ran := false
+	if err := s.Handle(func() { ran = true }); !errors.Is(err, ErrClosed) || ran {
+		fail("Handle after Shutdown: err %v, ran %v; want ErrClosed and not run", err, ran)
+	}
+
+	// ...and gives up when its deadline passes.
+	s = &Server{}
+	release := make(chan struct{})
+	started = make(chan struct{})
+	go s.Handle(func() { close(started); <-release })
+	<-started
+	ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+	t0 := time.Now()
+	err = s.Shutdown(ctx)
+	cancel()
+	close(release)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(t0) > time.Second {
+		fail("Shutdown with a stuck request: %v after %v; want context.DeadlineExceeded after 200ms", err, time.Since(t0).Round(time.Millisecond))
+	}
+
+	// 4. SIGTERM, for real: the process signals itself, as docker stop would.
+	sctx, stop := shutdownContext()
+	defer stop()
+	fmt.Println("sending SIGTERM to myself (if the program dies here, SIGTERM isn't handled)")
+	syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	select {
+	case <-sctx.Done():
+		if c := context.Cause(sctx); c == nil || !strings.Contains(c.Error(), "terminated") {
+			fail("the shutdown context's cause is %v, want the SIGTERM", c)
+		}
+	case <-time.After(2 * time.Second):
+		fail("SIGTERM didn't cancel the shutdown context")
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Reads 200 rate files, half of them bad, and counts the process's open file descriptors before and after (/proc/self/fd on Linux, /dev/fd on macOS): none may leak. Checks exitCode against wait statuses for exits 0, 1 and 2 and deaths by SIGTERM (143) and SIGKILL (137). Starts a 300 ms request and shuts down: Shutdown must wait for it and then refuse new requests; with a request that never ends, Shutdown must give up with context.DeadlineExceeded at its 200 ms deadline. Last, sends itself SIGTERM: the shutdown context must be cancelled, with the signal as its cause. Prints ALL CHECKS PASS."
+  hints={[
+    "In readRate, put defer f.Close() on the line right after the error check for os.Open, and delete the Close at the end, the same fix as api's resp.Body.",
+    "exitCode: if ws.Signaled(), return 128 + int(ws.Signal()); otherwise ws.ExitStatus(). shutdownContext: add syscall.SIGTERM to NotifyContext.",
+    "Handle: under s.mu, return ErrClosed if s.closed, else s.inflight.Add(1), then unlock and run. Shutdown: set closed under the lock, then wait for s.inflight.Wait() in a goroutine that closes a channel, and select on that channel and ctx.Done()."
+  ]}
+  flag="GO{last_orders}"
+>
+
+`Server` is a small `http.Server`: `Handle` is a request arriving, `Shutdown` is `srv.Shutdown`. Adding to the WaitGroup under the same lock that `Shutdown` takes is what makes it safe: a request can't slip in after `Shutdown` has started waiting. Run the fixed program with `GOMAXPROCS=1 go run -race .` too.
+
+</Lab>
+
+<Recap>
+
+- **Processes**: `/proc/<pid>/` is the kernel's view of every process: state, parent, threads (a Go process had 5), binary, arguments. `os/exec` starts a child with a vfork-style `clone` then `execve`, and waits on a pidfd. A child nobody waits for stays a **zombie** (state `Z`) until `cmd.Wait()`. Death by signal N is reported as **128 + N**: 143 for SIGTERM, 137 for SIGKILL.
+- **File descriptors**: files, sockets, pipes and the runtime's poller share one table per process. Go raises its soft `RLIMIT_NOFILE` to the hard limit minus one, so the hard limit is what counts. One unclosed response body per failed request took `api` to **1,024 of 1,024** fds in 1,250 requests, and then good requests failed too; `defer resp.Body.Close()` straight after the error check kept it at **9**.
+- **Signals**: `docker stop`, Kubernetes and `systemctl stop` send SIGTERM, wait, then SIGKILL. With no handler, `api` died at once (**143**) and cut off the request in flight; with `signal.NotifyContext` and `srv.Shutdown`, it finished the request and exited **0** in 3.0 s. PID 1 only gets signals it handles: a shell entrypoint without `exec` made stop take **10.7 s** and end in **137**. SIGQUIT dumps every goroutine.
+- **Memory limits**: 60 MiB of cache peaked at **175.7 MiB** with default GC settings and was **OOM-killed (137)** in a 100 MiB container; `GOMEMLIMIT=90MiB` held it at **88 to 90 MiB** with 442 GCs instead of 102. Too low a GOMEMLIMIT slows the service rather than killing it.
+- **systemd**: a unit with `Restart=on-failure`, `TimeoutStopSec`, `MemoryMax`, `GOMEMLIMIT`, `LimitNOFILE` and a sandbox. `systemd-analyze verify` caught a key in the wrong section; `security` went from **9.6 UNSAFE** to **1.2 OK**. Killed, it was back in 2.2 s; stopped, it drained and exited 0.
+
+</Recap>
+
+<Scoreboard
+  streak={2}
+  items={[
+    { label: "Quick check: the unreaped child", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: one leak, every request", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the shell in the middle", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: what GOMEMLIMIT changes", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the ignored key", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: log your limits", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: fail readiness before you stop", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: Type=notify", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: a Go PID 1 that reaps", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab: Last Orders", captured: false, points: 100 }}
+/>
+
+<Narrator>
+1,024 of 1,024 file descriptors, gone, from one unclosed body, and back to 9 with one line. A `docker stop` that now finishes what it started, and a cache that stopped getting OOM-killed. The kernel respects you now. Took it long enough.
+</Narrator>

@@ -1,0 +1,731 @@
+---
+title: "Publish and Subscribe: Channels All the Way Down"
+part: "redis"
+order: 13
+type: "course"
+description: "Redis's messaging, PUBLISH and SUBSCRIBE, built on Go channels: a subscriber's connection gets a queue and a writer goroutine of its own, so messages can arrive while it waits for its next command. Our server's bytes matched Redis 8.10.2's for a whole subscribe, publish, ping and unsubscribe conversation. Then one subscriber that never reads: when PUBLISH waited for room in its queue, the publisher froze after 17,286 to 19,471 messages and ten healthy subscribers got nothing more; with a select that drops a full subscriber instead, publishing carried on (46,404 to 48,989 messages in 3 s) and every healthy subscriber got every message."
+prerequisites: ["redis-shutdown"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 13" title="Publish and Subscribe: Channels All the Way Down">
+
+Redis isn't only a store. It's also a **message bus**: a client can `SUBSCRIBE` to a named channel, and every message any other client `PUBLISH`es to that channel is pushed to it the moment it's sent. Chat rooms, live price feeds and "tell every server to clear its cache" are built on it.
+
+It's also the first thing in our server where one client's command sends data to *other* clients' connections, which makes it the perfect place for Go's own channels. And for one of the classic concurrency failures: one slow client holding everyone else up.
+
+Three stops:
+
+1. **What pub/sub is.** The conversation with real Redis, byte by byte.
+2. **Building it.** A queue and a writer goroutine per subscriber, and matching Redis exactly.
+3. **The subscriber that never reads.** Wait for it, and everyone waits. Drop it, and nobody does.
+
+</HeroCard>
+
+<Narrator>
+Until today, your server only ever answered the person who asked. Now it speaks to crowds. Crowds are wonderful. Until one person in the crowd stops listening, and you find out whether you keep talking to everyone else or stand there waiting for them. I never wait.
+</Narrator>
+
+<ChapterTabs tabs={["What Pub/Sub Is", "Building It", "The Subscriber That Never Reads"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "go.sum" },
+    { path: "store.go" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "resp/resp.go" },
+    { path: "resp/resp_test.go" },
+    { path: "server/server.go", status: "changed", note: "the subscriber registry; handle hands a subscribed connection to its writer goroutine" },
+    { path: "server/pubsub.go", status: "new", note: "subscriber, publish, SUBSCRIBE/UNSUBSCRIBE, dropping a subscriber that can't keep up" },
+    { path: "server/commands.go", status: "changed", note: "PUBLISH" },
+    { path: "server/server_test.go" },
+    { path: "server/readlock_test.go" },
+    { path: "server/bench_test.go" },
+    { path: "server/shutdown_test.go" },
+    { path: "server/pubsub_test.go", status: "new", note: "Redis's exact bytes; a stuck subscriber must not stop PUBLISH" },
+    { path: "cmd/kv-server/main.go" },
+    { path: "cmd/pubtalk/main.go", status: "new", note: "a subscriber and a publisher taking turns, printing every byte" },
+    { path: "cmd/fanout/main.go", status: "new", note: "one publisher, 10 readers and one subscriber that never reads" },
+    { path: "cmd/busy/main.go" },
+    { path: "cmd/stuck/main.go" },
+    { path: "cmd/gopipe/main.go" },
+    { path: "cmd/spy/main.go" },
+    { path: "cmd/raw/main.go" },
+    { path: "cmd/talk/main.go" },
+    { path: "cmd/twoclients/main.go" },
+    { path: "cmd/hammer/main.go" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" }
+  ]}
+  run={["go run ./cmd/kv-server", "redis-cli -p 6380 SUBSCRIBE news   # in a second terminal", "redis-cli -p 6380 PUBLISH news hello   # in a third", "go run ./cmd/fanout"]}
+>
+
+Everything about pub/sub lives in the new `server/pubsub.go`. `server.go` changes only where a connection switches into subscribed mode.
+
+</ProjectMap>
+
+## What Pub/Sub Is
+
+*Stop 1 of 3.*
+
+### Step 1: a conversation with real Redis
+
+**Publish/subscribe** is a way of sending messages where the sender doesn't know who receives them. A **publisher** sends a message to a named **channel**; every client **subscribed** to that channel gets a copy; the publisher only learns how many that was. Nothing is stored: a message published when nobody is subscribed is gone.
+
+To see exactly what Redis sends, `cmd/pubtalk` opens two connections to real Redis 8.10.2, one subscriber and one publisher, sends commands on each in turn, and prints every byte each one receives:
+
+```text
+$ go run ./cmd/pubtalk -addr 127.0.0.1:6399
+sub> SUBSCRIBE news sport
+  sub got "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n*3\r\n$9\r\nsubscribe\r\n$5\r\nsport\r\n:2\r\n"
+pub> PUBLISH news hello
+  sub got "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n"
+  pub got ":1\r\n"
+pub> PUBLISH weather sunny
+  pub got ":0\r\n"
+sub> GET x
+  sub got "-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"
+sub> PING
+  sub got "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+pub> PUBLISH sport goal
+  sub got "*3\r\n$7\r\nmessage\r\n$5\r\nsport\r\n$4\r\ngoal\r\n"
+  pub got ":1\r\n"
+sub> UNSUBSCRIBE news
+  sub got "*3\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n:1\r\n"
+pub> PUBLISH news anyone?
+  pub got ":0\r\n"
+sub> UNSUBSCRIBE
+  sub got "*3\r\n$11\r\nunsubscribe\r\n$5\r\nsport\r\n:0\r\n"
+sub> GET x
+  sub got "$-1\r\n"
+```
+
+Reading it from the top:
+
+- **`SUBSCRIBE news sport`** gets one reply *per channel*: a three-element array `subscribe`, the channel name, and how many channels this connection is now subscribed to (1, then 2).
+- **`PUBLISH news hello`** from the other connection: the publisher gets `:1` (one subscriber received it), and the subscriber gets a message it never asked for, a three-element array `message`, `news`, `hello`. That's the key thing: Redis **pushes** data to a client that's just sitting there.
+- **`PUBLISH weather sunny`**: `:0`. Nobody is subscribed to `weather`, so the message is simply gone.
+- **`GET x`** on the subscriber is refused: a subscribed connection is in **subscribed mode**, where only the subscribe commands, `PING`, `QUIT` and `RESET` work. (The error mentions `PSUBSCRIBE`, patterns, and `SSUBSCRIBE`, sharded channels, which we won't build.)
+- **`PING`** in subscribed mode answers with an array, `pong` and an empty string, not the usual `+PONG`: it has to look like the other things arriving on that connection.
+- **`UNSUBSCRIBE news`**, then a message to `news` reaches nobody (`:0`), then **`UNSUBSCRIBE`** with no names leaves every channel. At a count of 0 the connection is back to normal, and `GET x` works (`$-1`, no such key).
+
+<QuickCheck
+  question="A client PUBLISHes to a channel nobody is subscribed to. What happens to the message?"
+  options={[
+    "Redis keeps it until someone subscribes",
+    "It's gone: PUBLISH replies :0 and nothing is stored",
+    "PUBLISH returns an error",
+    "It's saved as a key with the channel's name"
+  ]}
+  answer={1}
+  explain="Pub/sub delivers to whoever is listening at that moment. For messages that wait, Redis has streams (Part 3's messaging chapter)."
+/>
+
+## Building It
+
+*Stop 2 of 3.*
+
+### Step 1: the problem with pushing
+
+Until now, each connection's goroutine did everything in a loop: read a command, write the reply. A subscriber breaks that. Its goroutine sits in `ReadCommand`, waiting for the client's next command, which may never come. Meanwhile a `PUBLISH` on *another* connection's goroutine needs to send it a message.
+
+Two goroutines could both write to the subscriber's socket, but then their bytes could interleave, a message landing in the middle of a reply. And the publisher's goroutine would be doing a network write to someone else's client, at that client's speed.
+
+The Go answer is the proverb: *don't communicate by sharing memory; share memory by communicating.* Give each subscriber:
+
+- a **queue**, a buffered Go **channel** of strings, where anyone may put a reply or a message, and
+- one **writer goroutine**, the only code that ever writes to that socket, which takes things off the queue in order and sends them.
+
+The publisher only puts a message in a queue, which takes nanoseconds. What happens when a queue is full is stop 3.
+
+<PubSubAnim
+  title="One message, fanned out"
+  frames={[
+    { note: "Three clients have subscribed to #prices. Each has a queue (a buffered channel, 1,024 long) and a writer goroutine that empties it into its socket.", channel: "prices", cap: 1024, subs: [{ name: "sub 1", queued: 0 }, { name: "sub 2", queued: 0 }, { name: "sub 3", queued: 0 }] },
+    { note: "PUBLISH prices 101: the server puts the message on each subscriber's queue. No network writes happen in the publisher's goroutine.", channel: "prices", msg: "101", cap: 1024, subs: [{ name: "sub 1", queued: 1 }, { name: "sub 2", queued: 1 }, { name: "sub 3", queued: 1 }], meters: [{ label: "PUBLISH replies", value: ":3" }] },
+    { note: "Each writer goroutine takes the message off its queue and writes it to its client. The queues are empty again.", beat: "solution", channel: "prices", cap: 1024, subs: [{ name: "sub 1", queued: 0 }, { name: "sub 2", queued: 0 }, { name: "sub 3", queued: 0 }] },
+    { note: "Sub 3 stops reading. Its socket's buffers in the kernel fill, its writer blocks, and its queue starts to grow. The others keep up.", channel: "prices", msg: "…", cap: 1024, subs: [{ name: "sub 1", queued: 0 }, { name: "sub 2", queued: 1 }, { name: "sub 3", queued: 600, state: "stuck" }] },
+    { note: "Its queue is full. The first version of PUBLISH waits for room, holding the pub/sub lock. The publisher freezes, and so does every other subscriber's feed.", beat: "problem", channel: "prices", msg: "…", blocked: true, cap: 1024, subs: [{ name: "sub 1", queued: 0 }, { name: "sub 2", queued: 0 }, { name: "sub 3", queued: 1024, state: "stuck" }], meters: [{ label: "messages published", value: "stops at ~17,000–19,000", tone: "bad" }] },
+    { note: "The fix: a select with a default. If the queue is full, don't wait: drop that subscriber, closing its queue and its connection. Publishing carries on.", beat: "solution", channel: "prices", msg: "…", cap: 1024, subs: [{ name: "sub 1", queued: 0 }, { name: "sub 2", queued: 0 }, { name: "sub 3", queued: 1024, state: "dropped" }], meters: [{ label: "messages published", value: "~46,000–49,000 in 3 s", tone: "good" }] }
+  ]}
+  caption="The publisher only ever touches queues. Each subscriber's socket has exactly one writer."
+/>
+
+### Step 2: the subscriber
+
+In `server/pubsub.go`:
+
+```go noverify title="kv/server/pubsub.go · lines 11–23"
+// subscriberBuffer is how many replies and messages a subscriber may have
+// waiting to be written before we decide it can't keep up and drop it.
+const subscriberBuffer = 1024
+
+// subscriber is a connection that has run SUBSCRIBE. From then on its
+// replies and its messages all go through out, in order, to one writer
+// goroutine, so a publisher never writes to a client's socket itself.
+type subscriber struct {
+	conn     net.Conn
+	out      chan string
+	channels map[string]bool // guarded by Server.psMu
+	closed   bool            // out is closed; guarded by Server.psMu
+}
+```
+
+- `out` is the queue: `chan string`, made with a buffer of `subscriberBuffer` (1,024) so a publisher can put that many things in it without anyone taking them out.
+- `channels` is the set of channel names this connection is subscribed to, for the count in each reply and for cleaning up.
+- `closed` records that `out` has been closed, because sending on a closed channel **panics** in Go, and so does closing it twice.
+
+The server keeps the other direction, from a channel name to its subscribers, in `server/server.go`, guarded by its own lock:
+
+```go noverify title="kv/server/server.go · lines 32–33"
+	psMu sync.Mutex                          // guards subs and every subscriber's channels
+	subs map[string]map[*subscriber]struct{} // channel name → its subscribers
+```
+
+### Step 3: switching into subscribed mode
+
+`handle` changes in one place. When a connection sends its first `SUBSCRIBE`, it gets a subscriber and a writer goroutine, and from then on every command goes to `subscribed` instead of `do`:
+
+```go noverify title="kv/server/server.go · lines 199–216"
+		if len(args) == 0 {
+			continue
+		}
+		s.commands.Add(1)
+		if sub == nil && strings.EqualFold(args[0], "SUBSCRIBE") {
+			// From now on a second goroutine writes to this connection, so
+			// messages can arrive while we wait for the client's next command.
+			w.Flush()
+			sub = &subscriber{conn: conn, out: make(chan string, subscriberBuffer), channels: map[string]bool{}}
+			written = make(chan struct{})
+			go writeLoop(sub, w, written)
+		}
+		if sub != nil {
+			s.subscribed(sub, args)
+			continue
+		}
+		w.WriteString(s.do(args))
+		if r.Buffered() == 0 { // nothing more waiting: send what we have
+```
+
+`w.Flush()` first sends anything this goroutine still had buffered: after this, `w` belongs to the writer goroutine, and exactly one goroutine may use a `bufio.Writer`. The writer is short:
+
+```go noverify title="kv/server/pubsub.go · lines 155–166"
+// writeLoop is a subscriber's only writer: it sends everything queued on
+// out, flushing when the queue is empty, until out is closed.
+func writeLoop(sub *subscriber, w *bufio.Writer, done chan<- struct{}) {
+	defer close(done)
+	for frame := range sub.out {
+		w.WriteString(frame)
+		if len(sub.out) == 0 {
+			w.Flush() // an error means the connection is gone; keep draining
+		}
+	}
+	w.Flush()
+}
+```
+
+`for frame := range sub.out` takes things off the queue in order, waiting when it's empty, and **ends when the channel is closed** and drained: that's how the writer learns to stop. It flushes when the queue is empty, the same rule as lesson 10's pipelining, so a burst of messages goes out in one write. If a flush fails the client is gone, but it keeps draining so nobody sending to `out` is ever surprised.
+
+### Step 4: SUBSCRIBE, UNSUBSCRIBE and friends
+
+`subscribed` runs a command from a subscribed connection:
+
+```go noverify title="kv/server/pubsub.go · lines 43–93"
+// subscribed runs one command from a connection in subscribed mode, and
+// sends its reply the same way messages are sent.
+func (s *Server) subscribed(sub *subscriber, args []string) {
+	name := strings.ToUpper(args[0])
+	switch {
+	case name == "SUBSCRIBE" && len(args) >= 2:
+		for _, ch := range args[1:] {
+			s.psMu.Lock()
+			if !sub.channels[ch] {
+				sub.channels[ch] = true
+				if s.subs[ch] == nil {
+					s.subs[ch] = map[*subscriber]struct{}{}
+				}
+				s.subs[ch][sub] = struct{}{}
+			}
+			s.sendLocked(sub, "*3\r\n"+bulk("subscribe")+bulk(ch)+integer(int64(len(sub.channels))))
+			s.psMu.Unlock()
+		}
+	case name == "UNSUBSCRIBE":
+		s.psMu.Lock()
+		chans := args[1:]
+		if len(chans) == 0 { // no names: every channel it's in
+			for ch := range sub.channels {
+				chans = append(chans, ch)
+			}
+			sort.Strings(chans)
+		}
+		if len(chans) == 0 {
+			s.sendLocked(sub, "*3\r\n"+bulk("unsubscribe")+null()+integer(0))
+		}
+		for _, ch := range chans {
+			delete(sub.channels, ch)
+			delete(s.subs[ch], sub)
+			if len(s.subs[ch]) == 0 {
+				delete(s.subs, ch)
+			}
+			s.sendLocked(sub, "*3\r\n"+bulk("unsubscribe")+bulk(ch)+integer(int64(len(sub.channels))))
+		}
+		s.psMu.Unlock()
+	case s.inChannels(sub) && name == "PING":
+		arg := ""
+		if len(args) > 1 {
+			arg = args[1]
+		}
+		s.send(sub, "*2\r\n"+bulk("pong")+bulk(arg))
+	case s.inChannels(sub):
+		s.send(sub, errorReply("Can't execute '"+strings.ToLower(args[0])+"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"))
+	default: // subscribed to nothing any more: an ordinary command
+		s.send(sub, s.do(args))
+	}
+}
+```
+
+Each reply is built with the same `bulk` and `integer` helpers `do` uses, then **queued** with `send`, never written directly, so replies and messages reach the client in the order they happened. `UNSUBSCRIBE` with no names leaves every channel, in sorted order so the replies are predictable. Once the connection is in no channels, `default` passes the command to the ordinary `do`, as Redis does.
+
+### Step 5: PUBLISH, and checking it against Redis
+
+`PUBLISH` is one more case in `do`:
+
+```go noverify title="kv/server/commands.go · lines 65–66"
+	case name == "PUBLISH" && len(args) == 3:
+		return integer(int64(s.publish(args[1], args[2])))
+```
+
+and `publish` puts the message on each subscriber's queue (stop 3 explains the `select`):
+
+```go noverify title="kv/server/pubsub.go · lines 25–41"
+// publish queues msg for every subscriber of channel and returns how many
+// there were. It never waits: a subscriber whose queue is full is dropped.
+func (s *Server) publish(channel, msg string) int {
+	frame := "*3\r\n" + bulk("message") + bulk(channel) + bulk(msg)
+	s.psMu.Lock()
+	defer s.psMu.Unlock()
+	n := 0
+	for sub := range s.subs[channel] {
+		n++
+		select {
+		case sub.out <- frame:
+		default: // its queue is full: it isn't reading
+			s.dropLocked(sub)
+		}
+	}
+	return n
+}
+```
+
+The same `cmd/pubtalk` conversation against our server, compared with Redis's:
+
+```text
+$ go run ./cmd/pubtalk > ours.txt
+$ diff redis.txt ours.txt && echo IDENTICAL
+IDENTICAL
+```
+
+Every byte the same, including the error text and the `pong` array. `server/pubsub_test.go` pins that conversation down as a test with Redis's bytes, and the real `redis-cli` works too: `redis-cli -p 6380 SUBSCRIBE news` in one terminal prints each `PUBLISH news …` from another as it arrives.
+
+<QuickCheck
+  question="Why does each subscriber get its own writer goroutine, instead of PUBLISH writing to the subscribers' sockets directly?"
+  options={[
+    "Goroutines are faster than sockets",
+    "So only one goroutine ever writes to a socket (replies and messages can't interleave), and a publisher never waits on another client's network",
+    "Because channels can't be shared",
+    "Redis requires it"
+  ]}
+  answer={1}
+  explain="The queue decouples the publisher from the subscriber's speed, and one writer per socket keeps every frame whole and in order."
+/>
+
+## The Subscriber That Never Reads
+
+*Stop 3 of 3.*
+
+### Step 1: the first version
+
+The first version of `publish` put each message on each queue with a plain send:
+
+```go noverify title="kv/server/pubsub.go · the first version"
+	for sub := range s.subs[channel] {
+		n++
+		sub.out <- frame // wait for room in its queue
+	}
+```
+
+A send on a buffered channel waits when the buffer is full. That's harmless while every subscriber reads. `cmd/fanout` tests what happens when one doesn't: 10 subscribers that read everything, one that subscribes and never reads again, and a publisher sending `PUBLISH prices <n>` one at a time for 3 seconds.
+
+```go noverify title="kv/cmd/fanout/main.go · lines 59–73"
+	pr := bufio.NewReader(pub)
+	var published int
+	var slowest time.Duration
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		start := time.Now()
+		fmt.Fprintf(pub, "PUBLISH prices %d\r\n", published)
+		pub.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := pr.ReadString('\n'); err != nil {
+			fmt.Printf("PUBLISH %d got no reply in 2 s: %v\n", published, err)
+			break
+		}
+		slowest = max(slowest, time.Since(start))
+		published++
+	}
+```
+
+The publisher waits up to 2 seconds for each reply. Three runs against the first version:
+
+```text
+== kv13naive run 1
+PUBLISH 17286 got no reply in 2 s: read tcp 127.0.0.1:55212->127.0.0.1:6394: i/o timeout
+published 17286 messages in 3 s; slowest PUBLISH took 5.603ms
+each of 10 readers got 17286 messages on average
+== kv13naive run 2
+PUBLISH 19471 got no reply in 2 s: read tcp 127.0.0.1:55225->127.0.0.1:6394: i/o timeout
+published 19471 messages in 3 s; slowest PUBLISH took 4.423ms
+each of 10 readers got 19471 messages on average
+== kv13naive run 3
+PUBLISH 17918 got no reply in 2 s: read tcp 127.0.0.1:55239->127.0.0.1:6394: i/o timeout
+published 17918 messages in 3 s; slowest PUBLISH took 397µs
+each of 10 readers got 17918 messages on average
+== kv13 run 1
+published 46404 messages in 3 s; slowest PUBLISH took 5.835ms
+each of 10 readers got 46404 messages on average
+dropped subscriber 127.0.0.1:55251: 1024 replies and messages waiting, not reading
+== kv13 run 2
+published 48989 messages in 3 s; slowest PUBLISH took 4.356ms
+each of 10 readers got 48989 messages on average
+dropped subscriber 127.0.0.1:55264: 1024 replies and messages waiting, not reading
+== kv13 run 3
+published 46646 messages in 3 s; slowest PUBLISH took 6.856ms
+each of 10 readers got 46646 messages on average
+dropped subscriber 127.0.0.1:55278: 1024 replies and messages waiting, not reading
+```
+
+The first three runs are the first version. After about a second, the publisher got **no reply** and stopped, at 17,286, 19,471 and 17,918 messages, and the ten healthy subscribers got nothing after that either. The stuck subscriber's queue filled (its writer was blocked, because the kernel's socket buffers were full), so `sub.out <- frame` waited. And it waited *while holding `s.psMu`*, so every other `PUBLISH`, `SUBSCRIBE` and `UNSUBSCRIBE` on the server waited behind it. One client that stopped reading froze pub/sub for everyone.
+
+### Step 2: never wait
+
+The fix is a **`select` with a `default`**:
+
+```go noverify title="kv/server/pubsub.go · lines 32–38"
+	for sub := range s.subs[channel] {
+		n++
+		select {
+		case sub.out <- frame:
+		default: // its queue is full: it isn't reading
+			s.dropLocked(sub)
+		}
+```
+
+A `select` runs the first case that's ready; `default` runs if none is. So `case sub.out <- frame` happens only if there's room *right now*, and otherwise the subscriber is **dropped**: removed from every channel, its queue closed and its connection closed.
+
+```go noverify title="kv/server/pubsub.go · lines 119–135"
+// dropLocked removes sub from every channel, closes its queue (which ends
+// its writer) and its connection (which ends its reader).
+func (s *Server) dropLocked(sub *subscriber) {
+	if sub.closed {
+		return
+	}
+	for ch := range sub.channels {
+		delete(s.subs[ch], sub)
+		if len(s.subs[ch]) == 0 {
+			delete(s.subs, ch)
+		}
+	}
+	log.Printf("dropped subscriber %s: %d replies and messages waiting, not reading", sub.conn.RemoteAddr(), len(sub.out))
+	sub.closed = true
+	close(sub.out)
+	sub.conn.Close()
+}
+```
+
+The order matters. The log line reads `len(sub.out)` before the close. `close(sub.out)` ends the writer's `range` once it has drained what's left; `sub.conn.Close()` makes the blocked writer's `Write` fail at once, and makes the connection's reader goroutine get an error and return. Every step runs with `s.psMu` held, so no publisher can send on `out` after it's closed.
+
+The last three runs above are this version: the stuck subscriber was dropped with its **1,024** queued messages, publishing never stopped (**46,404 to 48,989** messages in 3 seconds), and every healthy subscriber got **every** message. Without the stuck subscriber at all, the numbers are the same:
+
+```text
+published 48175 messages in 3 s; slowest PUBLISH took 10.932ms
+each of 10 readers got 48175 messages on average
+published 47429 messages in 3 s; slowest PUBLISH took 5.817ms
+each of 10 readers got 47429 messages on average
+published 46372 messages in 3 s; slowest PUBLISH took 2.955ms
+each of 10 readers got 46372 messages on average
+```
+
+The test in `server/pubsub_test.go` makes this permanent: a subscriber that never reads, 20,000 pipelined `PUBLISH`es, and every one must get a reply within 10 seconds while a reading subscriber gets all 20,000 messages. Against the first version it failed:
+
+```text
+    pubsub_test.go:100: PUBLISH 14336: no reply: read tcp 127.0.0.1:55354->127.0.0.1:55351: i/o timeout
+FAIL
+FAIL	kv/server	10.701s
+FAIL
+```
+
+<Callout kind="note" title="What real Redis does">
+Redis has the same rule, with a bigger and more careful limit: `client-output-buffer-limit pubsub 32mb 8mb 60`. A pub/sub client is disconnected when its unsent output reaches 32 MB, or stays above 8 MB for 60 seconds. It's measured in bytes, not messages, and it has a *soft* limit so a short burst doesn't cost a client its connection. Our 1,024-message queue is the simplest version of the same idea: **a server can't let one slow client decide how fast everyone else goes.** (The same `cmd/fanout` against Redis in Docker published 5,315 messages in 3 s: every `PUBLISH` there crosses Docker's network, so its numbers measure the round trip, not Redis.)
+</Callout>
+
+<UnderTheHood title="Channels, select and the runtime">
+
+A buffered channel is a small struct in the runtime (`hchan`): a ring buffer of the element type, a lock, and two queues of waiting goroutines, senders and receivers. A send that finds room copies the value into the ring and returns. A send that finds the buffer full parks the sending goroutine on the channel's send queue until a receiver makes room, which is what froze the first version's publisher. A `select` with a `default` checks each case once, in a random order, without parking: if none is ready it takes `default` and moves on. `close` wakes every parked receiver (they get the zero value and `ok == false`, which is how `range` ends) and makes any later send panic, which is why every send and the close here happen under `psMu`.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Why did one stuck subscriber freeze PUBLISH for every client, not just its own messages?"
+  options={[
+    "Because all subscribers share one queue",
+    "Because the blocked send happened while holding psMu, so every other PUBLISH, SUBSCRIBE and UNSUBSCRIBE waited for the lock",
+    "Because Redis only allows one publisher",
+    "Because the kernel stops all sockets when one is full"
+  ]}
+  answer={1}
+  explain="Waiting while holding a lock turns one slow party into everyone's problem. The select with a default never waits, so the lock is always released quickly."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="Counting subscribers" level="easy">
+
+Redis has `PUBSUB NUMSUB channel…`, which replies with each channel's name and its number of subscribers. Implement it, checking the reply's shape against real Redis with `cmd/raw` first.
+
+<Solution>
+
+Against Redis, `PUBSUB NUMSUB news weather` with one subscriber to `news` replies with a flat array of four: `news`, `1`, `weather`, `0` (names as bulk strings, counts as integers). Under `s.psMu`, reply `len(s.subs[ch])` for each name; a missing map entry has length 0, so unknown channels need no special case.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="A soft limit" level="medium">
+
+Dropping a subscriber the moment its queue is full is harsh on a client that was only briefly slow. Add Redis's idea of a soft limit: drop a subscriber if its queue stays more than three-quarters full for more than 5 seconds, as well as when it's full.
+
+<Solution>
+
+Give `subscriber` a `slowSince time.Time`. In `publish`, after a successful send, if `len(sub.out) > cap(sub.out)*3/4`, set `slowSince` if it's zero, and drop the subscriber if `time.Since(sub.slowSince) > 5*time.Second`; otherwise reset `slowSince` to zero. Test it with `synctest` (lesson 6), where 5 seconds pass instantly, and a subscriber that reads slowly on purpose.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Shutdown with subscribers" level="medium">
+
+Run `redis-cli -p 6380 SUBSCRIBE news` and then Ctrl-C the server. Does lesson 12's `Shutdown` still finish at once? Trace why, through `handle`'s error path and `leave`.
+
+<Solution>
+
+It does. The read deadline wakes the subscriber's reader goroutine; its `ReadCommand` fails, so `handle` calls `leave`, which removes it from its channels and closes `out`. The writer goroutine sends anything still queued, sees the channel closed, and closes `written`; `handle` has been waiting on `<-written`, so it returns, and `Shutdown`'s `WaitGroup` reaches zero. A subscriber whose writer is blocked on a stuck socket is covered by the context deadline, exactly like lesson 12's stuck client.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Nobody Waits"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Hub fans each published message out to every subscriber's buffered channel. A subscriber that never reads freezes Publish, and unsubscribing while messages are being published can panic with 'send on closed channel'. Fix Publish so it never waits (drop a subscriber whose buffer is full, closing its channel) and Unsubscribe so it can't race with Publish. It must pass under go run -race too."
+  starter={`package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Hub delivers every published message to every subscriber, through a
+// buffered channel per subscriber.
+type Hub struct {
+	mu   sync.Mutex
+	subs map[chan string]struct{}
+}
+
+func NewHub() *Hub { return &Hub{subs: map[chan string]struct{}{}} }
+
+// Subscribe returns a channel that receives every message published from
+// now on. It is closed when the subscriber is unsubscribed or dropped.
+func (h *Hub) Subscribe() chan string {
+	ch := make(chan string, 256)
+	h.mu.Lock()
+	h.subs[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+// Unsubscribe stops deliveries to ch and closes it.
+func (h *Hub) Unsubscribe(ch chan string) {
+	close(ch)
+	h.mu.Lock()
+	delete(h.subs, ch)
+	h.mu.Unlock()
+}
+
+// Publish delivers msg to every subscriber and returns how many there
+// were. It must never wait for a slow subscriber: one whose buffer is
+// full is dropped (removed, and its channel closed).
+func (h *Hub) Publish(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subs {
+		ch <- msg
+	}
+	return len(h.subs)
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	defer func() {
+		if p := recover(); p != nil {
+			fmt.Println("FAIL panic:", p)
+		}
+	}()
+
+	// 1. A reader and a subscriber that never reads.
+	h := NewHub()
+	reader := h.Subscribe()
+	stuck := h.Subscribe()
+	got := make(chan int)
+	go func() {
+		n := 0
+		for range reader {
+			n++
+		}
+		got <- n
+	}()
+	done := make(chan struct{})
+	go func() {
+		for i := range 10_000 {
+			h.Publish(fmt.Sprint("tick ", i))
+			if i%100 == 99 {
+				time.Sleep(time.Millisecond) // a pause, so a reader can keep up
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		fail("10,000 PUBLISHes didn't finish in 2 s: a subscriber that never reads is holding them up")
+		fmt.Println("FAIL (stopping here)")
+		return
+	}
+	h.Unsubscribe(reader)
+	if n := <-got; n != 10_000 {
+		fail("the reading subscriber got %d of 10,000 messages", n)
+	}
+	select {
+	case open := <-drain(stuck):
+		if open {
+			fail("the stuck subscriber's channel was never closed")
+		}
+	case <-time.After(time.Second):
+		fail("the stuck subscriber's channel was never closed")
+	}
+
+	// 2. Unsubscribing while messages are being published.
+	h = NewHub()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 20_000 {
+			h.Publish("x")
+		}
+	})
+	for range 200 {
+		ch := h.Subscribe()
+		go func() {
+			for range ch {
+			}
+		}()
+		h.Unsubscribe(ch)
+	}
+	wg.Wait()
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}
+
+// drain reads everything waiting in ch and then reports whether ch is still
+// open, by returning a channel that gets one value.
+func drain(ch chan string) <-chan bool {
+	res := make(chan bool, 1)
+	go func() {
+		for {
+			select {
+			case _, open := <-ch:
+				if !open {
+					res <- false
+					return
+				}
+			default:
+				res <- true
+				return
+			}
+		}
+	}()
+	return res
+}`}
+  verifier="Publishes 10,000 messages with a reading subscriber and one that never reads: they must finish within 2 s, the reader must get all 10,000, and the stuck subscriber's channel must be closed; then subscribes and unsubscribes 200 times while 20,000 messages are published. Prints ALL CHECKS PASS."
+  hints={[
+    "In Publish, replace ch <- msg with a select: case ch <- msg delivers if there's room; default means the buffer is full, so delete it from h.subs and close it.",
+    "Unsubscribe closes the channel before taking the lock, so Publish can send on it in between: panic. Do the delete and the close together, under h.mu.",
+    "A subscriber may already have been dropped by Publish when Unsubscribe is called for it. Only close the channel if it's still in h.subs, or you'll close it twice, which also panics."
+  ]}
+  flag="GO{nobody_waits}"
+>
+
+Fixing only Publish isn't enough: the second check then panics with `send on closed channel`, which is the lab's second lesson. Every send and every close of the same channel have to agree on one lock.
+
+</Lab>
+
+<Recap>
+
+- **Pub/sub**: `SUBSCRIBE` puts a connection in subscribed mode; `PUBLISH` pushes a `message` array to every subscriber and replies with how many; nothing is stored. Our server's bytes matched **Redis 8.10.2's** for a whole conversation.
+- Each subscriber gets a **queue** (a buffered Go channel) and **one writer goroutine**, the only code that writes to its socket. `range` over the channel ends when it's closed.
+- A plain send on a full queue **waits**, and the first version waited while holding the pub/sub lock: one subscriber that never read froze the publisher at **17,286–19,471** messages and starved ten healthy subscribers.
+- **`select` with `default`** never waits: a full subscriber is dropped (its 1,024 queued messages with it), publishing carried on at **46,404–48,989** messages in 3 s, and every healthy subscriber got every one. Redis does the same with `client-output-buffer-limit`.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: a message nobody hears", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: one writer per socket", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: waiting under a lock", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: PUBSUB NUMSUB", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: a soft limit", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: shutdown with subscribers", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: Nobody Waits", captured: false, points: 80 }}
+/>
+
+<Narrator mood="menacing">
+One client stopped listening, and in the first version the whole room stood still for it. Seventeen thousand messages, then silence, for everyone. Now? It's dropped, 1,024 messages and all, and the other ten never even notice. Loyalty is lovely. But the show goes on.
+</Narrator>

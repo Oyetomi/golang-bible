@@ -1,0 +1,1879 @@
+---
+title: "Cloud Networking: A Packet's Journey from DNS to Pod"
+part: 4
+order: 3
+type: "course"
+description: "One HTTP request followed from the client to a Go process in a container, every hop built or captured for real in a privileged Linux container. DNS: a Go authoritative server with miekg/dns; Go's resolver sent 200 queries for 100 lookups and caches nothing, a Kubernetes-style ndots:5 search list made it 800, a dnsmasq cache made it 2, and a changed record stayed stale for 19.7 s. TCP: the handshake in tcpdump; over a 20 ms round trip reused connections took 25.0 ms against 44.4 ms, and Go's default of 2 idle connections per host made a server accept 465 connections instead of 20. Load balancing: an httputil.ReverseProxy round robin, layer 4 against layer 7 (16,518 to 0 against 6,054 each), health checks cutting 27,928 failures to 4,819, a counter race that caused 110 false 503s, and a drain on SIGTERM that took in-flight failures from 15 to 0. Then a VPC from namespaces, bridges, routes and MASQUERADE, a Kubernetes Service as DNAT rules, and the whole journey in one capture."
+prerequisites: ["linux-for-backend-engineers"]
+---
+
+<HeroCard label="Part 4 · Chapter 3" title="Cloud Networking: A Packet's Journey from DNS to Pod">
+
+Someone types `http://shop.internal/` and presses Enter. A few milliseconds later, a Go handler in a container on some machine runs, and the page comes back. In between, the request passed through half a dozen systems, each of which can be slow, wrong or down: a DNS server, a TCP connection, a load balancer, a router, a NAT gateway, a bridge, a network namespace. When a request fails at 3 a.m., "the network" isn't an answer. You need to know **which hop**, and to know that, you need to know what each hop does.
+
+In this chapter we follow one request, hop by hop, and **build or watch every hop for real**. We write an authoritative DNS server and a load balancer in Go, capture the TCP handshake with `tcpdump`, and build a small cloud network (two subnets, a router, a NAT gateway and a Kubernetes-style Service) out of the same Linux pieces AWS, GCP and Kubernetes use underneath. Every number in the chapter was measured, and every output was pasted from a real run.
+
+Five stops, in the order the request meets them. If you get lost, come back here:
+
+1. **DNS.** How `shop.internal` becomes an IP address, what Go's resolver actually sends, and why an answer can be stale.
+2. **TCP.** The handshake, what a new connection costs, and how Go's connection pool saves (or wastes) it.
+3. **The load balancer.** One address in front of many servers: round robin, health checks, layer 4 against layer 7, and what happens to requests when a server dies.
+4. **The private network.** A VPC built from namespaces, a bridge and routes, and the NAT that lets a private subnet reach the internet.
+5. **Into the pod.** How a packet crosses the bridge into a container, how a Kubernetes Service is a few NAT rules, and the whole journey in one capture.
+
+</HeroCard>
+
+<Narrator mood="menacing">
+You type a URL. Somewhere, a pod answers. In between: DNS, a load balancer, NAT, iptables and a kernel rewriting addresses you never see. Today you see all of it. Nothing on the wire hides from me, and soon nothing will hide from you.
+</Narrator>
+
+<ChapterTabs tabs={["DNS", "TCP", "The Load Balancer", "The Private Network", "Into the Pod"]} />
+
+<SpacedRecall
+  role={"captain"}
+  items={[
+    {
+      from: "Containers from Scratch (part 4, ch01)",
+      q: "What does a new network namespace give a process?",
+      options: ["A faster network card", "Its own private network stack: its own interfaces, addresses, routes and ports, starting with only a loopback that is down", "A copy of the host's interfaces", "A firewall"],
+      answer: 1,
+      tie: "Stop 4 uses one network namespace per 'machine', and wires them together."
+    },
+    {
+      from: "Containers from Scratch (part 4, ch01), Exercise 3",
+      q: "How does a container in its own network namespace reach the outside world?",
+      options: ["It can't", "Through a veth pair (a virtual cable) whose other end is on a bridge in the host, plus NAT", "Through the host's loopback", "Through a Unix socket"],
+      answer: 1,
+      tie: "Chapter 1 named the plumbing. Stop 4 builds it, one ip command at a time."
+    },
+  ]}
+/>
+
+Here is the whole trip on one map, before we slow down and take it hop by hop. It's drawn from the capture at the end of the chapter: these are the real addresses, and each step is a packet that `tcpdump` saw.
+
+<PacketAnim
+  title="GET http://shop.internal/, hop by hop"
+  kicker="the whole journey"
+  height={56}
+  hops={[
+    { id: "client", label: "client", sub: "10.10.0.100", x: 10, y: 30, kind: "client", role: "reader" },
+    { id: "dns", label: "DNS server", sub: "10.10.0.1:53", x: 10, y: 80, kind: "dns", role: "librarian" },
+    { id: "lb", label: "load balancer", sub: "10.10.0.2:80", x: 36, y: 30, kind: "lb", role: "pilot" },
+    { id: "router", label: "router", sub: "10.10.0.1 · 10.10.1.1", x: 58, y: 55, kind: "router" },
+    { id: "bridge", label: "br-priv", sub: "bridge", x: 78, y: 55, kind: "bridge" },
+    { id: "pod", label: "web-1 pod", sub: "10.10.1.10:8080", x: 88, y: 20, kind: "pod", role: "operator" }
+  ]}
+  zones={[
+    { id: "pub", label: "public subnet 10.10.0.0/24", x: 1, y: 6, w: 46, h: 90, kind: "public" },
+    { id: "priv", label: "private subnet 10.10.1.0/24", x: 68, y: 6, w: 31, h: 90, kind: "private" }
+  ]}
+  links={[
+    { from: "client", to: "dns" },
+    { from: "client", to: "lb" },
+    { from: "lb", to: "router" },
+    { from: "router", to: "bridge" },
+    { from: "bridge", to: "pod", label: "veth" }
+  ]}
+  frames={[
+    { from: "client", to: "dns", tag: "A?", note: "Stop 1. The client doesn't know where shop.internal is. It asks the DNS server in /etc/resolv.conf, for an IPv4 (A) and an IPv6 (AAAA) address at once.", pkt: { src: "10.10.0.100:43529", dst: "10.10.0.1:53", proto: "UDP · DNS query", body: "A? shop.internal." }, dump: "00:17:06.741422 veth-client  IP 10.10.0.100.43529 > 10.10.0.1.53: 25672+ [1au] A? shop.internal. (42)" },
+    { from: "dns", to: "client", tag: "10.10.0.2", beat: "solution", note: "An authoritative answer: 10.10.0.2, the load balancer's address. Valid for 30 seconds.", pkt: { src: "10.10.0.1:53", dst: "10.10.0.100:43529", proto: "UDP · DNS answer", body: "A 10.10.0.2 (TTL 30)" }, dump: "00:17:06.743433 veth-client  IP 10.10.0.1.53 > 10.10.0.100.43529: 25672*- 1/0/0 A 10.10.0.2 (60)" },
+    { from: "client", to: "lb", tag: "SYN", note: "Stop 2. Before any HTTP, a TCP handshake: SYN, SYN-ACK, ACK. One round trip.", pkt: { src: "10.10.0.100:51182", dst: "10.10.0.2:80", proto: "TCP · SYN" }, dump: "00:17:06.743744 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [S], seq 3892753623, win 64240, options [mss 1460,sackOK,TS val 425115277 ecr 0,nop,wscale 7], length 0" },
+    { from: "client", to: "lb", tag: "GET /", note: "The request itself, on the new connection: 94 bytes.", pkt: { src: "10.10.0.100:51182", dst: "10.10.0.2:80", proto: "TCP · data", body: "GET / HTTP/1.1, Host: shop.internal" }, dump: "00:17:06.744532 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [P.], seq 1:95, ack 1, win 502, options [nop,nop,TS val 425115278 ecr 4052542315], length 94: HTTP: GET / HTTP/1.1" },
+    { to: "lb", tag: "GET /", at: "lb", say: "web-1's turn", note: "Stop 3. The layer-7 balancer reads the request, picks the next healthy backend, and opens its own connection to it. The client's connection ends here.", pkt: { src: "10.10.0.2", dst: "10.10.1.10:8080", proto: "HTTP (a new request)", body: "GET / + X-Forwarded-For: 10.10.0.100" } },
+    { from: "lb", to: "router", tag: "SYN", note: "Stop 4. 10.10.1.10 is in another subnet, so the packet goes to the default gateway: the router.", pkt: { src: "10.10.0.2:54504", dst: "10.10.1.10:8080", proto: "TCP · SYN" } },
+    { from: "router", to: "bridge", tag: "SYN", note: "The router forwards it onto the private subnet's bridge, after an ARP lookup for 10.10.1.10's MAC address.", pkt: { src: "10.10.0.2:54504", dst: "10.10.1.10:8080", proto: "TCP · SYN" } },
+    { from: "bridge", to: "pod", tag: "SYN", note: "Stop 5. The bridge sends it down app1's veth cable, into the pod's network namespace, where web-1 is listening.", pkt: { src: "10.10.0.2:54504", dst: "10.10.1.10:8080", proto: "TCP · SYN" }, dump: "00:17:06.747288 veth-app1  IP 10.10.0.2.54504 > 10.10.1.10.8080: Flags [S], seq 1008262328, win 64240, options [mss 1460,sackOK,TS val 184397059 ecr 0,nop,wscale 7], length 0" },
+    { from: "bridge", to: "pod", tag: "GET /", note: "Handshake done, the proxied request arrives: 184 bytes now, with the balancer's X-Forwarded headers.", pkt: { src: "10.10.0.2:54504", dst: "10.10.1.10:8080", proto: "TCP · data", body: "GET / HTTP/1.1 (184 bytes)" }, dump: "00:17:06.747766 veth-app1  IP 10.10.0.2.54504 > 10.10.1.10.8080: Flags [P.], seq 1:185, ack 1, win 502, options [nop,nop,TS val 184397060 ecr 971981084], length 184: HTTP: GET / HTTP/1.1" },
+    { from: "pod", to: "lb", tag: "200 OK", note: "web-1's Go handler runs and answers. The response retraces the path to the balancer.", pkt: { src: "10.10.1.10:8080", dst: "10.10.0.2:54504", proto: "TCP · data", body: "HTTP/1.1 200 OK, hello from web-1" }, dump: "00:17:06.748369 veth-app1  IP 10.10.1.10.8080 > 10.10.0.2.54504: Flags [P.], seq 1:153, ack 185, win 508, options [nop,nop,TS val 971981085 ecr 184397060], length 152: HTTP: HTTP/1.1 200 OK" },
+    { from: "lb", to: "client", tag: "200 OK", beat: "solution", note: "And the balancer relays it to the client. 13 ms for this first request, most of it spent setting things up: the next one, on warm connections, took 1.8 ms.", pkt: { src: "10.10.0.2:80", dst: "10.10.0.100:51182", proto: "TCP · data", body: "HTTP/1.1 200 OK, hello from web-1" }, dump: "00:17:06.750811 veth-client  IP 10.10.0.2.80 > 10.10.0.100.51182: Flags [P.], seq 1:153, ack 95, win 509, options [nop,nop,TS val 4052542322 ecr 425115278], length 152: HTTP: HTTP/1.1 200 OK" }
+  ]}
+  caption="One request: a DNS lookup, two TCP connections, a load balancer's choice, a router, a bridge and a namespace."
+/>
+
+## The lab bench
+
+Everything in this chapter runs in one Go 1.27 module, `hops`, and one privileged Linux container. Linux, because the network pieces (namespaces, bridges, `iptables`, `tc`) are Linux kernel features; a container, because Docker Desktop on a Mac or Windows machine runs a real Linux kernel, and `--privileged` lets us build networks inside it without touching anything else.
+
+<ProjectMap
+  root="hops"
+  files={[
+    { path: "go.mod", status: "new", note: "module hops, go 1.27, needs github.com/miekg/dns v1.1.73" },
+    { path: "build.sh", status: "new", note: "builds every cmd as a static Linux binary into bin/" },
+    { path: "cmd/dns/main.go", status: "new", note: "Stop 1: an authoritative DNS server for shop.internal" },
+    { path: "cmd/lookup/main.go", status: "new", note: "Stop 1: Go's resolver, timed" },
+    { path: "cmd/web/main.go", status: "new", note: "the backend service every request is going to" },
+    { path: "cmd/client/main.go", status: "new", note: "Stop 2: an HTTP client that times each phase with httptrace" },
+    { path: "cmd/lb/main.go", status: "new", note: "Stop 3: a layer-7 load balancer with health checks" },
+    { path: "cmd/l4/main.go", status: "new", note: "Stop 3: a layer-4 load balancer, for comparison" },
+    { path: "cmd/load/main.go", status: "new", note: "Stop 3: a load generator that counts who answered, each second" },
+    { path: "exp/", note: "one shell script per experiment in this chapter" }
+  ]}
+  run={["./build.sh", "docker run -d --name lab --privileged -v \"$PWD\":/hops -w /hops netlab sleep infinity", "docker exec lab sh exp/dns-auth.sh"]}
+>
+
+Each experiment is a shell script in `exp/` that runs inside the container and prints the commands it runs, prefixed with `$`, and what they printed. That's what every output block in this chapter is.
+
+</ProjectMap>
+
+The container image is Go 1.27 plus the tools we'll use to watch the network:
+
+```dockerfile title="img/Dockerfile"
+FROM golang:1.27
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    iproute2 iptables tcpdump dnsutils dnsmasq-base curl conntrack procps iputils-ping nftables \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+```text
+$ docker build -t netlab img
+$ ./build.sh
+$ docker run -d --name lab --privileged -v "$PWD":/hops -w /hops netlab sleep infinity
+```
+
+`build.sh` compiles each program in `cmd/` with `CGO_ENABLED=0` inside the `golang:1.27` image, so the binaries in `bin/` are static Linux executables that run in any namespace we make. The machine is an 8-core laptop running Docker Desktop, shared with other work, so timings wobble; where it matters, the text says how much.
+
+## DNS
+
+*Stop 1 of 5.*
+
+Before the client can send a single byte to `shop.internal`, it needs an IP address. Names are for people; the network only routes addresses. The **Domain Name System** turns one into the other, and because every request starts with it, a slow, wrong or stale DNS answer breaks everything after it.
+
+### Step 1: what a lookup really does
+
+<Define term="DNS resolver">
+A **resolver** is the program that finds the answer for you. Your service doesn't do the work itself: it sends one question to the resolver named in `/etc/resolv.conf`, and the resolver (a **recursive** resolver, such as the one in your VPC, your ISP's, or 8.8.8.8) walks the DNS tree on your behalf and caches what it learns. The servers it asks along the way are **authoritative**: each one owns part of the tree and answers only for that part.
+</Define>
+
+The walk is easy to do by hand. `dig` is the standard DNS query tool, and `+norecurse` tells a server "don't look it up for me, just tell me what you know". Here's `go.dev`, resolved the way a recursive resolver does it, starting from one of the 13 root server addresses:
+
+```text
+$ dig @198.41.0.4 go.dev +norecurse   # a.root-servers.net
+dev.			172800	IN	NS	ns-tld1.charlestonroadregistry.com.
+dev.			172800	IN	NS	ns-tld3.charlestonroadregistry.com.
+dev.			172800	IN	NS	ns-tld5.charlestonroadregistry.com.
+dev.			172800	IN	NS	ns-tld2.charlestonroadregistry.com.
+dev.			172800	IN	NS	ns-tld4.charlestonroadregistry.com.
+;; Query time: 136 msec
+
+$ dig @216.239.32.105 go.dev +norecurse   # ns-tld1.charlestonroadregistry.com, a .dev server
+go.dev.			10800	IN	NS	ns-cloud-e3.googledomains.com.
+go.dev.			10800	IN	NS	ns-cloud-e2.googledomains.com.
+go.dev.			10800	IN	NS	ns-cloud-e1.googledomains.com.
+go.dev.			10800	IN	NS	ns-cloud-e4.googledomains.com.
+;; Query time: 114 msec
+
+$ dig @216.239.32.110 go.dev +norecurse   # ns-cloud-e1.googledomains.com, go.dev's own server
+go.dev.			300	IN	A	216.239.38.21
+go.dev.			300	IN	A	216.239.36.21
+go.dev.			300	IN	A	216.239.32.21
+go.dev.			300	IN	A	216.239.34.21
+;; Query time: 111 msec
+```
+
+Three questions, three kinds of answer:
+
+1. The **root** server doesn't know `go.dev`, but it knows who runs `.dev`: five name servers (NS records), which it will vouch for for 172,800 seconds, two days.
+2. A **`.dev` server** doesn't know the address either, but knows who runs `go.dev`: four Google Cloud DNS servers, for 10,800 seconds (three hours).
+3. **`go.dev`'s own server** is authoritative: it answers with four A records (IPv4 addresses), valid for **300 seconds**.
+
+Each hop took 111 to 136 ms from this laptop. A resolver that did this for every request would add a third of a second to each one, which is why every resolver **caches**: it keeps each answer for as long as its **TTL** (time to live, the second column) allows. The root and TLD answers change rarely and have long TTLs, so after the first lookup a resolver usually only has to make the last hop, and usually not even that.
+
+<PacketAnim
+  title="Resolving go.dev from scratch"
+  kicker="recursive resolution"
+  height={44}
+  hops={[
+    { id: "app", label: "your service", sub: "net.Resolver", x: 12, y: 50, kind: "client", role: "reader" },
+    { id: "res", label: "recursive resolver", sub: "caches everything", x: 40, y: 50, kind: "dns", role: "librarian" },
+    { id: "root", label: "a root server", sub: "198.41.0.4", x: 80, y: 16, kind: "dns" },
+    { id: "tld", label: ".dev server", sub: "216.239.32.105", x: 80, y: 50, kind: "dns" },
+    { id: "auth", label: "go.dev's server", sub: "216.239.32.110", x: 80, y: 84, kind: "dns" }
+  ]}
+  links={[
+    { from: "app", to: "res" },
+    { from: "res", to: "root" },
+    { from: "res", to: "tld" },
+    { from: "res", to: "auth" }
+  ]}
+  frames={[
+    { to: "app", tag: "go.dev?", note: "Your Go service needs go.dev's address. It reads /etc/resolv.conf to find which resolver to ask.", pkt: { proto: "UDP · DNS query", body: "A go.dev?" } },
+    { from: "app", to: "res", tag: "A go.dev?", note: "One question to the resolver, over UDP port 53. From here on, the resolver does the work.", pkt: { dst: "the resolver :53", proto: "UDP · DNS query", body: "A go.dev? (recursion desired)" } },
+    { from: "res", to: "root", tag: "A go.dev?", note: "Its cache is empty, so it starts at the top: a root server. It knows every top-level domain's servers, and nothing else.", pkt: { dst: "198.41.0.4:53", proto: "UDP · DNS query", body: "A go.dev?" } },
+    { from: "root", to: "res", tag: "NS .dev", note: "The root refers it down: 'ask .dev's servers', five of them, and it may cache that for two days. 136 ms.", pkt: { src: "198.41.0.4:53", proto: "UDP · referral", body: "dev. NS ns-tld1…5, TTL 172800" } },
+    { from: "res", to: "tld", tag: "A go.dev?", note: "Same question, one level down.", pkt: { dst: "216.239.32.105:53", proto: "UDP · DNS query", body: "A go.dev?" } },
+    { from: "tld", to: "res", tag: "NS go.dev", note: "Another referral: go.dev is run by four Google Cloud DNS servers. Cache for three hours. 114 ms.", pkt: { src: "216.239.32.105:53", proto: "UDP · referral", body: "go.dev. NS ns-cloud-e1…e4, TTL 10800" } },
+    { from: "res", to: "auth", tag: "A go.dev?", note: "Now it asks the server that owns the name.", pkt: { dst: "216.239.32.110:53", proto: "UDP · DNS query", body: "A go.dev?" } },
+    { from: "auth", to: "res", tag: "4 × A", beat: "solution", note: "An authoritative answer: four addresses, valid for 300 seconds. 111 ms.", pkt: { src: "216.239.32.110:53", proto: "UDP · answer (aa)", body: "go.dev. A 216.239.32.21 …, TTL 300" } },
+    { from: "res", to: "app", tag: "4 × A", beat: "solution", say: "cached", note: "The resolver caches all three answers and replies. The next service to ask within 300 seconds gets the answer from memory, with no walk at all.", pkt: { src: "the resolver :53", proto: "UDP · answer", body: "go.dev. A 216.239.32.21 …" } }
+  ]}
+  caption="A recursive resolver walks root → TLD → authoritative once, then answers from its cache until the TTLs run out."
+/>
+
+### Step 2: an authoritative server in Go
+
+Inside a company, names like `shop.internal` or `orders.prod.svc.cluster.local` aren't on the public internet. Some server inside the network is authoritative for them: Route 53 private zones in AWS, Cloud DNS private zones in GCP, CoreDNS in Kubernetes. CoreDNS is written in Go, and so is ours. It uses `github.com/miekg/dns`, the DNS library CoreDNS is built on (v1.1.73; a rewrite is in progress at `codeberg.org/miekg/dns`).
+
+The records come from a flag, turned into a table from name to addresses:
+
+```go noverify title="hops/cmd/dns/main.go · lines 61–73"
+// parse turns "a.shop.internal.=10.0.0.1,10.0.0.2;b.shop.internal.=10.0.0.3"
+// into a table from lower-case name to addresses.
+func parse(s string) map[string][]net.IP {
+	zone := map[string][]net.IP{}
+	for rec := range strings.SplitSeq(s, ";") {
+		name, ips, _ := strings.Cut(rec, "=")
+		name = dns.Fqdn(strings.ToLower(name))
+		for ip := range strings.SplitSeq(ips, ",") {
+			zone[name] = append(zone[name], net.ParseIP(ip))
+		}
+	}
+	return zone
+}
+```
+
+`dns.Fqdn` adds the trailing dot. In DNS every full name ends in `.`, the root: `shop.internal.` is the fully qualified form of `shop.internal`, and that dot will matter in Step 4.
+
+The handler gets every question the server receives:
+
+```go noverify title="hops/cmd/dns/main.go · lines 23–41"
+	var queries atomic.Int64
+	dns.HandleFunc(".", func(w dns.ResponseWriter, req *dns.Msg) {
+		n := queries.Add(1)
+		q := req.Question[0]
+		m := new(dns.Msg)
+		m.SetReply(req)
+		m.Authoritative = true // we own this zone: this answer is the truth
+		ips, ok := zone[strings.ToLower(q.Name)]
+		switch {
+		case !ok:
+			m.Rcode = dns.RcodeNameError // NXDOMAIN: no such name
+		case q.Qtype == dns.TypeA:
+			for _, ip := range ips {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(*ttl)},
+					A:   ip,
+				})
+			}
+		} // any other type (AAAA...) for a name we know: no error, no answers
+```
+
+What to notice:
+
+- `m.SetReply(req)` copies the question and the query's **ID** into the reply. The client matches replies to questions by that 16-bit ID, because UDP has no connection to do it.
+- `m.Authoritative = true` sets the **aa** flag: "I own this name; this is the truth, not something I cached".
+- A name we don't have gets **NXDOMAIN** ("no such domain"). A name we do have, asked for a type we don't have (an IPv6 **AAAA** record, say), gets NOERROR with no answers. Those are different, and resolvers treat them differently.
+
+The rest of the handler says how long "nothing here" may be cached, then logs the query and sends the reply:
+
+```go noverify title="hops/cmd/dns/main.go · lines 42–58"
+		if len(m.Answer) == 0 && dns.IsSubDomain("shop.internal.", q.Name) {
+			// Say who is in charge of the zone, and for how long a cache
+			// may remember "nothing here" (RFC 2308).
+			m.Ns = append(m.Ns, &dns.SOA{
+				Hdr: dns.RR_Header{Name: "shop.internal.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: uint32(*ttl)},
+				Ns:  "ns.shop.internal.", Mbox: "ops.shop.internal.",
+				Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: uint32(*ttl),
+			})
+		}
+		log.Printf("query %d: %s %s from %s: %s, %d answer(s)",
+			n, dns.TypeToString[q.Qtype], q.Name, w.RemoteAddr(), dns.RcodeToString[m.Rcode], len(m.Answer))
+		w.WriteMsg(m)
+	})
+
+	log.Printf("authoritative for shop.internal. on %s (udp), TTL %ds", *addr, *ttl)
+	srv := &dns.Server{Addr: *addr, Net: "udp"}
+	log.Fatal(srv.ListenAndServe())
+```
+
+An empty answer carries the zone's **SOA** (start of authority) record, whose last field tells caches how long they may remember the "no" (RFC 2308). Without it, a cache has to ask again every time. `dns.Server` with `Net: "udp"` reads datagrams on port 53 and calls the handler for each.
+
+Start it, and ask it with `dig`:
+
+```text
+$ dig @127.0.0.1 -p 5300 shop.internal
+
+; <<>> DiG 9.20.29-1~deb13u1-Debian <<>> @127.0.0.1 -p 5300 shop.internal
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 62301
+;; flags: qr aa rd; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+;; WARNING: recursion requested but not available
+
+;; QUESTION SECTION:
+;shop.internal.			IN	A
+
+;; ANSWER SECTION:
+shop.internal.		30	IN	A	10.10.0.2
+
+;; Query time: 1 msec
+;; SERVER: 127.0.0.1#5300(127.0.0.1) (UDP)
+;; MSG SIZE  rcvd: 60
+$ dig @127.0.0.1 -p 5300 nosuch.shop.internal | grep status
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 17015
+$ cat /tmp/dns.log   # the server's log
+2026/09/28 00:10:08 authoritative for shop.internal. on 127.0.0.1:5300 (udp), TTL 30s
+2026/09/28 00:10:09 query 1: A shop.internal. from 127.0.0.1:35607: NOERROR, 1 answer(s)
+2026/09/28 00:10:09 query 2: A nosuch.shop.internal. from 127.0.0.1:35537: NXDOMAIN, 0 answer(s)
+```
+
+`status: NOERROR`, one answer, `10.10.0.2` with a TTL of 30 seconds. The flags say `qr` (this is a reply), `aa` (authoritative) and `rd` (the client asked for recursion, which we don't do, hence dig's warning). The made-up name got **NXDOMAIN**. The server's log shows both questions arriving.
+
+### Step 3: what Go's resolver sends
+
+Now the same question from Go. `net.Resolver` is what `http.Get`, `net.Dial` and every Go client use to turn a host name into addresses:
+
+```go noverify title="hops/cmd/lookup/main.go · lines 19–25"
+	r := &net.Resolver{PreferGo: true} // Go's resolver, not the C library's
+	if *server != "" {
+		r.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, *server)
+		}
+	}
+```
+
+`PreferGo: true` asks for Go's own resolver, written in Go, instead of calling the C library's `getaddrinfo` through cgo. With `CGO_ENABLED=0`, as here, there's no C library to call, so Go's resolver is the only one; with cgo, Go picks one by looking at `/etc/nsswitch.conf` and `/etc/resolv.conf`. You can see which one it picked with `GODEBUG=netdns=go+1` or `netdns=cgo+1`. The `Dial` override sends the queries to our server instead of the one in `/etc/resolv.conf`. Then it looks the name up 100 times, timing each:
+
+```go noverify title="hops/cmd/lookup/main.go · lines 27–37"
+	var total time.Duration
+	for i := range *n {
+		start := time.Now()
+		addrs, err := r.LookupHost(context.Background(), *name)
+		took := time.Since(start)
+		total += took
+		if i < 3 || err != nil {
+			fmt.Printf("lookup %d: %v %v in %v\n", i+1, addrs, err, took.Round(time.Microsecond))
+		}
+	}
+	fmt.Printf("%d lookups, average %v\n", *n, (total / time.Duration(*n)).Round(time.Microsecond))
+```
+
+```text
+$ bin/lookup -server 127.0.0.1:5300 -n 100
+lookup 1: [10.10.0.2] <nil> in 654µs
+lookup 2: [10.10.0.2] <nil> in 186µs
+lookup 3: [10.10.0.2] <nil> in 280µs
+100 lookups, average 126µs
+$ grep -c query /tmp/dns.log   # queries the server has answered so far
+202
+$ tail -4 /tmp/dns.log
+2026/09/28 00:10:09 query 199: A shop.internal. from 127.0.0.1:50643: NOERROR, 1 answer(s)
+2026/09/28 00:10:09 query 200: AAAA shop.internal. from 127.0.0.1:47406: NOERROR, 0 answer(s)
+2026/09/28 00:10:09 query 201: A shop.internal. from 127.0.0.1:48908: NOERROR, 1 answer(s)
+2026/09/28 00:10:09 query 202: AAAA shop.internal. from 127.0.0.1:55107: NOERROR, 0 answer(s)
+```
+
+Two things to notice, and both surprise people:
+
+1. **100 lookups made 200 queries.** `LookupHost` asks for both address families in parallel, an **A** query (IPv4) and an **AAAA** query (IPv6), and waits for both. The server's log alternates A, AAAA, A, AAAA.
+2. **Go doesn't cache.** Every lookup went to the server. Go's resolver reads `/etc/resolv.conf` and `/etc/hosts` (and re-reads them when they change), but it keeps no answers. Caching is the job of the resolver it talks to. If that resolver is far away or slow, every new connection your service opens pays for it.
+
+### Step 4: the search list, and why Kubernetes pods ask five times
+
+`/etc/resolv.conf` can say more than which server to ask. Inside a Kubernetes pod it looks like the one below (with the cluster DNS service's address as the name server; here it's our server on port 53):
+
+```text
+$ cat /etc/resolv.conf   # the shape of a Kubernetes pod's
+nameserver 127.0.0.1
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+`search` lists suffixes to try, so that a pod can say `orders` and reach `orders.default.svc.cluster.local`. `ndots:5` says when to try them **first**: if the name has fewer than five dots, it's treated as a short name and the search list comes first. `shop.internal` has one dot. Watch what that costs:
+
+```text
+$ bin/lookup -name shop.internal -n 100
+lookup 1: [10.10.0.2] <nil> in 5.764ms
+lookup 2: [10.10.0.2] <nil> in 2.084ms
+lookup 3: [10.10.0.2] <nil> in 1.435ms
+100 lookups, average 2.138ms
+# queries that reached the server: 800; the last lookup's:
+query 793: A shop.internal.default.svc.cluster.local. from 127.0.0.1:33303: NXDOMAIN, 0 answer(s)
+query 794: AAAA shop.internal.default.svc.cluster.local. from 127.0.0.1:35579: NXDOMAIN, 0 answer(s)
+query 795: A shop.internal.svc.cluster.local. from 127.0.0.1:33889: NXDOMAIN, 0 answer(s)
+query 796: AAAA shop.internal.svc.cluster.local. from 127.0.0.1:56176: NXDOMAIN, 0 answer(s)
+query 797: A shop.internal.cluster.local. from 127.0.0.1:47588: NXDOMAIN, 0 answer(s)
+query 798: AAAA shop.internal.cluster.local. from 127.0.0.1:42602: NXDOMAIN, 0 answer(s)
+query 799: A shop.internal. from 127.0.0.1:35750: NOERROR, 1 answer(s)
+query 800: AAAA shop.internal. from 127.0.0.1:60353: NOERROR, 0 answer(s)
+$ bin/lookup -name shop.internal. -n 100
+lookup 1: [10.10.0.2] <nil> in 732µs
+lookup 2: [10.10.0.2] <nil> in 951µs
+lookup 3: [10.10.0.2] <nil> in 1.622ms
+100 lookups, average 933µs
+# queries that reached the server: 200; the last lookup's:
+query 999: A shop.internal. from 127.0.0.1:33041: NOERROR, 1 answer(s)
+query 1000: AAAA shop.internal. from 127.0.0.1:46319: NOERROR, 0 answer(s)
+```
+
+**800 queries for 100 lookups**, eight per lookup: three search-list names that don't exist (each asked as A and AAAA, each answered NXDOMAIN), then the real name. With a **trailing dot**, `shop.internal.` is already fully qualified, the search list is skipped, and it's **200 queries**, two per lookup. In this run the average lookup took 2.1 ms against 0.9 ms; in an earlier run, 731 µs against 105 µs. The times move with the machine's load. The query count doesn't: four times as many questions, most of them for names that can't exist.
+
+This is a real production problem. A Go service in Kubernetes calling an external API (`api.stripe.com`, two dots) sends every lookup through the search list first, multiplying the load on the cluster's DNS. The fixes are to write the name with a trailing dot, or to lower `ndots` for the pod with `dnsConfig.options` in its spec.
+
+<QuickCheck
+  question="A Go service with CGO_ENABLED=0 looks up shop.internal 100 times against a server with no cache in front of it. How many queries does the server see?"
+  options={[
+    "1: Go caches the first answer for its TTL",
+    "100: one per lookup",
+    "200: an A and an AAAA query per lookup, and Go keeps no cache",
+    "It depends on the TTL"
+  ]}
+  answer={2}
+  explain="Measured: 100 lookups, 202 queries in the server's log (the other 2 were dig's). Go's resolver asks for IPv4 and IPv6 in parallel and caches nothing."
+/>
+
+### Step 5: caching, and answers that go stale
+
+In production there is almost always a cache between your service and the authoritative server: the VPC resolver in AWS, `systemd-resolved` on many Linux hosts, NodeLocal DNSCache in Kubernetes. We'll put `dnsmasq`, a small caching resolver, on `127.0.0.1:53`, forwarding `shop.internal` to our server, and point `/etc/resolv.conf` at it. Now `lookup` runs without `-server`, exactly as a normal Go program would:
+
+```text
+$ cat /etc/resolv.conf
+nameserver 127.0.0.1
+$ bin/lookup -n 100   # no -server: Go reads /etc/resolv.conf
+lookup 1: [10.10.0.2] <nil> in 1.668ms
+lookup 2: [10.10.0.2] <nil> in 100µs
+lookup 3: [10.10.0.2] <nil> in 84µs
+100 lookups, average 105µs
+$ grep -c query /tmp/dns.log   # queries that reached our server
+2
+$ dig shop.internal +noall +answer
+shop.internal.		30	IN	A	10.10.0.2
+$ dig shop.internal +noall +answer
+shop.internal.		25	IN	A	10.10.0.2
+$ dig shop.internal +noall +answer
+shop.internal.		20	IN	A	10.10.0.2
+```
+
+This time 100 lookups sent **2 queries** to our server: the first A and AAAA. The other 99 lookups were answered from dnsmasq's memory. And the TTL is counting down: 30, then 25, then 20 seconds, five seconds apart. The cache will serve this answer until it reaches zero, and only then ask again.
+
+That's the price of caching. Right after the third `dig`, the script moved `shop.internal` to a new address, `10.10.0.3`, on the authoritative server, and asked every half second which address clients were getting:
+
+```text
+$ kill $DNS; bin/dns -addr 127.0.0.1:5300 -ttl 30 -a 'shop.internal.=10.10.0.3' &   # the record moves
+  0.0s after the change: clients get 10.10.0.2
+ 19.7s after the change: clients get 10.10.0.3
+```
+
+For **19.7 seconds** after the change, clients were still sent to the old address: the 20 seconds of TTL the cached answer had left when the record moved. The authoritative server knew the new address the whole time. Nobody asked it.
+
+This is how DNS failover works, and why it's slow. When a database fails over to a new address, or a service moves, clients follow only once every cache in between has let the old answer expire. The TTL you set is the longest you're willing to wait. Low TTLs (5 to 60 seconds) mean faster failover and more queries; long TTLs mean fewer queries and slow moves. And there's a second, Go-specific delay on top: an `http.Client` that already has keep-alive connections open to the old address keeps using them. It only looks the name up again when it opens a new connection. Stop 2 is about those connections.
+
+<QuickCheck
+  question="A cached answer for shop.internal has 20 seconds of TTL left when the record changes on the authoritative server. When do clients behind that cache get the new address?"
+  options={[
+    "Immediately: the authoritative server notifies caches",
+    "When the cached answer's TTL runs out, about 20 seconds later",
+    "After the original TTL of 30 seconds",
+    "Only after the cache is restarted"
+  ]}
+  answer={1}
+  explain="Measured: the old address was served for 19.7 seconds after the change, the TTL the cached answer had left. DNS has no push: caches only ask again when an answer expires."
+/>
+
+## TCP
+
+*Stop 2 of 5.*
+
+The client has an address. Now it needs a **connection**: HTTP/1.1 and HTTP/2 both run over TCP, and TCP won't carry a byte of your request until both ends have agreed to talk. That agreement costs time, and how often your service pays it is decided by Go's connection pool.
+
+### Step 1: the handshake, in tcpdump
+
+`cmd/web` is the service every request in this chapter is going to. Its main handler says which instance answered, in the body and in an `X-Backend` header:
+
+```go noverify title="hops/cmd/web/main.go · lines 29–33"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", *name)
+		fmt.Fprintf(w, "hello from %s\n", *name)
+	})
+```
+
+To watch a request on the wire, start `web` on port 8080, start `tcpdump` on the loopback interface, and send two requests with `cmd/client` (which we'll look at in Step 2):
+
+```text
+$ bin/client -url http://127.0.0.1:8080/ -n 2
+request 1: reused=false dns=0s        connect=296µs     first byte=1.748ms   total=1.789ms
+request 2: reused=true  dns=0s        connect=0s        first byte=1.025ms   total=1.054ms
+2 requests, 1 new connections, average 1.421ms
+$ tcpdump -i lo -nn -ttttt "tcp port 8080"
+ 00:00:00.000000 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [S], seq 3410627140, win 65495, options [mss 65495,sackOK,TS val 2022925641 ecr 0,nop,wscale 7], length 0
+ 00:00:00.000014 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [S.], seq 1960245724, ack 3410627141, win 65483, options [mss 65495,sackOK,TS val 2022925641 ecr 2022925641,nop,wscale 7], length 0
+ 00:00:00.000055 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [.], ack 1, win 512, options [nop,nop,TS val 2022925642 ecr 2022925641], length 0
+ 00:00:00.000361 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [P.], seq 1:96, ack 1, win 512, options [nop,nop,TS val 2022925642 ecr 2022925641], length 95: HTTP: GET / HTTP/1.1
+ 00:00:00.000402 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [.], ack 96, win 511, options [nop,nop,TS val 2022925642 ecr 2022925642], length 0
+ 00:00:00.000562 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [P.], seq 1:153, ack 96, win 512, options [nop,nop,TS val 2022925642 ecr 2022925642], length 152: HTTP: HTTP/1.1 200 OK
+ 00:00:00.000572 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [.], ack 153, win 511, options [nop,nop,TS val 2022925642 ecr 2022925642], length 0
+ 00:00:00.000953 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [P.], seq 96:191, ack 153, win 512, options [nop,nop,TS val 2022925642 ecr 2022925642], length 95: HTTP: GET / HTTP/1.1
+ 00:00:00.001893 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [P.], seq 153:305, ack 191, win 512, options [nop,nop,TS val 2022925643 ecr 2022925642], length 152: HTTP: HTTP/1.1 200 OK
+ 00:00:00.002292 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [F.], seq 191, ack 305, win 512, options [nop,nop,TS val 2022925644 ecr 2022925643], length 0
+ 00:00:00.002409 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [F.], seq 305, ack 192, win 512, options [nop,nop,TS val 2022925644 ecr 2022925644], length 0
+ 00:00:00.002459 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [.], ack 306, win 512, options [nop,nop,TS val 2022925644 ecr 2022925644], length 0
+```
+
+Twelve packets for two requests. Reading the `Flags` column (`S` is SYN, `.` is ACK, `P` is PUSH, "here's data", `F` is FIN):
+
+1. **`[S]`**, client to server: SYN, "I'd like to talk; my byte numbers start at 3410627140". The options offer a maximum segment size and window scaling.
+2. **`[S.]`**, server to client: SYN-ACK, "fine, mine start at 1960245724, and I acknowledge yours".
+3. **`[.]`**, client to server: ACK. The connection is open. This is the **three-way handshake**, and the client couldn't send its request until it finished: **one full round trip** before the first byte of HTTP.
+4. **`[P.]` length 95**: the request, `GET / HTTP/1.1`. The server ACKs it, then sends **`[P.]` length 152**: the response, headers and body.
+5. The **second request** goes out on the same connection, with no handshake: `seq 96:191` continues where the first left off.
+6. **`[F.]`** both ways: the client closes, the server closes, the last ACK. (The client exited, so the kernel closed its socket.)
+
+`tcpdump` shows sequence numbers relative to the first one (`seq 1:96`), which is easier to read; `-S` shows the real ones. On loopback the handshake takes 55 microseconds and nobody notices. Across a real network, it costs one **round-trip time (RTT)**: under a millisecond inside one data centre, 1 to 2 ms between availability zones, 60 to 150 ms across an ocean.
+
+<PacketAnim
+  title="One connection, two requests"
+  kicker="the TCP handshake"
+  height={30}
+  hops={[
+    { id: "c", label: "client", sub: "127.0.0.1:36666", x: 15, y: 50, kind: "client", role: "reader" },
+    { id: "s", label: "web-1", sub: "127.0.0.1:8080", x: 85, y: 50, kind: "server", role: "operator" }
+  ]}
+  links={[{ from: "c", to: "s" }]}
+  frames={[
+    { from: "c", to: "s", tag: "SYN", note: "The client asks to open a connection. Nothing else can be sent yet.", pkt: { src: "127.0.0.1:36666", dst: "127.0.0.1:8080", proto: "TCP · [S] SYN", body: "nothing: seq 3410627140" }, dump: "00:00:00.000000 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [S], seq 3410627140, win 65495, options [mss 65495,sackOK,TS val 2022925641 ecr 0,nop,wscale 7], length 0" },
+    { from: "s", to: "c", tag: "SYN-ACK", note: "The server agrees, and picks its own starting number. The client has now waited one full round trip.", pkt: { src: "127.0.0.1:8080", dst: "127.0.0.1:36666", proto: "TCP · [S.] SYN-ACK", body: "nothing: seq 1960245724, ack 3410627141" }, dump: "00:00:00.000014 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [S.], seq 1960245724, ack 3410627141, win 65483, options [mss 65495,sackOK,TS val 2022925641 ecr 2022925641,nop,wscale 7], length 0" },
+    { from: "c", to: "s", tag: "ACK", beat: "solution", note: "The client acknowledges. The connection is open: this was the three-way handshake.", pkt: { src: "127.0.0.1:36666", dst: "127.0.0.1:8080", proto: "TCP · [.] ACK", body: "nothing" }, dump: "00:00:00.000055 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [.], ack 1, win 512, options [nop,nop,TS val 2022925642 ecr 2022925641], length 0" },
+    { from: "c", to: "s", tag: "GET /", note: "Only now can the request go: 95 bytes of HTTP.", pkt: { src: "127.0.0.1:36666", dst: "127.0.0.1:8080", proto: "TCP · [P.] data", body: "GET / HTTP/1.1 (95 bytes)" }, dump: "00:00:00.000361 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [P.], seq 1:96, ack 1, win 512, options [nop,nop,TS val 2022925642 ecr 2022925641], length 95: HTTP: GET / HTTP/1.1" },
+    { from: "s", to: "c", tag: "200 OK", note: "The response: 152 bytes, headers and 'hello from web-1'. A second round trip.", pkt: { src: "127.0.0.1:8080", dst: "127.0.0.1:36666", proto: "TCP · [P.] data", body: "HTTP/1.1 200 OK (152 bytes)" }, dump: "00:00:00.000562 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [P.], seq 1:153, ack 96, win 512, options [nop,nop,TS val 2022925642 ecr 2022925642], length 152: HTTP: HTTP/1.1 200 OK" },
+    { from: "c", to: "s", tag: "GET /", beat: "solution", say: "same connection", note: "The second request reuses the open connection: no SYN, no handshake. One round trip instead of two.", pkt: { src: "127.0.0.1:36666", dst: "127.0.0.1:8080", proto: "TCP · [P.] data", body: "GET / HTTP/1.1 (95 bytes)" }, dump: "00:00:00.000953 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [P.], seq 96:191, ack 153, win 512, options [nop,nop,TS val 2022925642 ecr 2022925642], length 95: HTTP: GET / HTTP/1.1" },
+    { from: "s", to: "c", tag: "200 OK", note: "Its response.", pkt: { src: "127.0.0.1:8080", dst: "127.0.0.1:36666", proto: "TCP · [P.] data", body: "HTTP/1.1 200 OK (152 bytes)" }, dump: "00:00:00.001893 IP 127.0.0.1.8080 > 127.0.0.1.36666: Flags [P.], seq 153:305, ack 191, win 512, options [nop,nop,TS val 2022925643 ecr 2022925642], length 152: HTTP: HTTP/1.1 200 OK" },
+    { from: "c", to: "s", tag: "FIN", note: "The client is done and closes. The server closes its side too, and a last ACK ends it.", pkt: { src: "127.0.0.1:36666", dst: "127.0.0.1:8080", proto: "TCP · [F.] FIN", body: "nothing" }, dump: "00:00:00.002292 IP 127.0.0.1.36666 > 127.0.0.1.8080: Flags [F.], seq 191, ack 305, win 512, options [nop,nop,TS val 2022925644 ecr 2022925643], length 0" }
+  ]}
+  caption="The handshake is one round trip spent before any HTTP. A reused connection skips it."
+/>
+
+### Step 2: timing a request with httptrace
+
+`net/http/httptrace` lets a client hook into each phase of a request: when the DNS lookup starts and ends, when the TCP connect starts and ends, whether it got a new connection or a reused one, and when the first byte of the response arrived. `cmd/client` records them:
+
+```go noverify title="hops/cmd/client/main.go · lines 22–46"
+func get(client *http.Client, url string, drain bool) (timing, error) {
+	var t timing
+	var dnsStart, connStart time.Time
+	trace := &httptrace.ClientTrace{
+		DNSStart:     func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
+		DNSDone:      func(httptrace.DNSDoneInfo) { t.dns = time.Since(dnsStart) },
+		ConnectStart: func(_, _ string) { connStart = time.Now() },
+		ConnectDone:  func(_, _ string, _ error) { t.connect = time.Since(connStart) },
+		GotConn:      func(info httptrace.GotConnInfo) { t.reused = info.Reused },
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	start := time.Now()
+	trace.GotFirstResponseByte = func() { t.firstByte = time.Since(start) }
+	resp, err := client.Do(req)
+	if err != nil {
+		return t, err
+	}
+	if drain {
+		io.Copy(io.Discard, resp.Body) // read to the end...
+	}
+	resp.Body.Close() // ...and close, so the connection can be reused
+	t.total = time.Since(start)
+	return t, nil
+}
+```
+
+What to notice:
+
+- `httptrace.WithClientTrace` puts the hooks in the request's context; the `http.Transport` calls them as it goes.
+- `GotConn` reports `Reused`: whether the transport took a connection from its **pool** of idle keep-alive connections, or had to dial a new one.
+- After the response, it reads the body to the end and closes it. Hold on to that; it matters in Step 3.
+
+To make the handshake visible, give loopback a real network's delay. `tc` (traffic control) with the `netem` queueing discipline delays every packet on an interface; 10 ms each way is a 20 ms round trip, about what two regions on the same continent see:
+
+```text
+$ ping -c 3 127.0.0.1 | tail -1
+rtt min/avg/max/mdev = 20.725/21.868/24.066/1.554 ms
+$ bin/client -url http://127.0.0.1:8080/ -n 20 
+request 1: reused=false dns=0s        connect=22.046ms  first byte=44.523ms  total=44.664ms
+request 2: reused=true  dns=0s        connect=0s        first byte=22.009ms  total=22.159ms
+request 3: reused=true  dns=0s        connect=0s        first byte=23.85ms   total=23.966ms
+request 4: reused=true  dns=0s        connect=0s        first byte=25.172ms  total=25.213ms
+20 requests, 1 new connections, average 24.957ms
+$ bin/client -url http://127.0.0.1:8080/ -n 20 -reuse=false
+request 1: reused=false dns=0s        connect=20.825ms  first byte=42.192ms  total=42.319ms
+request 2: reused=false dns=0s        connect=23.787ms  first byte=45.677ms  total=45.744ms
+request 3: reused=false dns=0s        connect=23.531ms  first byte=46.464ms  total=46.566ms
+request 4: reused=false dns=0s        connect=21.959ms  first byte=42.474ms  total=42.574ms
+20 requests, 20 new connections, average 44.351ms
+```
+
+With keep-alive (the default), the first request dialled: **connect 22 ms** (one round trip, the handshake) and first byte at 44.5 ms (a second round trip, the request and response). Every request after that reused the connection, and took **one round trip, about 22 to 25 ms**. Twenty requests averaged **25.0 ms** over **1 connection**.
+
+With `DisableKeepAlives`, every request paid for the handshake: **20 new connections, 44.4 ms on average**, almost twice as long. Nothing else changed: same server, same network, same bytes of HTTP. The difference is one round trip per request. With TLS (HTTPS), a new connection costs another round trip on top for the TLS 1.3 handshake, so reuse matters even more.
+
+### Step 3: how Go's pool loses connections
+
+Go's `http.Transport` keeps connections open between requests and reuses them, as long as you let it. Two common mistakes stop it, both measured here.
+
+**Not reading the body.** A connection can only go back into the pool once the response has been read to the end; until then there are unread bytes in the way of the next response. If you `Close` a body you didn't read, the transport can't reuse the connection and closes it. `/big` returns 256 KB:
+
+```text
+$ bin/client -url http://127.0.0.1:8080/big -n 20 -drain=false
+request 1: reused=false dns=0s        connect=21.732ms  first byte=45.018ms  total=45.079ms
+request 2: reused=false dns=0s        connect=22.894ms  first byte=46.817ms  total=46.885ms
+request 3: reused=false dns=0s        connect=22.12ms   first byte=44.561ms  total=44.604ms
+request 4: reused=false dns=0s        connect=21.196ms  first byte=42.49ms   total=42.528ms
+20 requests, 20 new connections, average 43.74ms
+$ bin/client -url http://127.0.0.1:8080/big -n 20 -drain=true
+request 1: reused=false dns=0s        connect=21.338ms  first byte=45.808ms  total=139.658ms
+request 2: reused=true  dns=0s        connect=0s        first byte=23.235ms  total=93.227ms
+request 3: reused=true  dns=0s        connect=0s        first byte=25.116ms  total=48.428ms
+request 4: reused=true  dns=0s        connect=0s        first byte=23.176ms  total=23.253ms
+20 requests, 1 new connections, average 32.374ms
+```
+
+Without reading the body: **20 requests, 20 new connections**. With `io.Copy(io.Discard, resp.Body)` before `Close`: **1**. (With a tiny body the mistake is hidden: the transport reads a small body along with the headers, so the connection is reused either way. It shows up in production, on the endpoint with the big responses.) Reading the body to the end isn't free, as the slower first requests with `-drain=true` show: 256 KB has to cross a 20 ms link. But it's cheaper than a new connection on every request, and on a real server the bytes arrive anyway.
+
+**A pool too small for your concurrency.** `Transport.MaxIdleConnsPerHost` is how many idle connections the pool keeps per host, and its default, `http.DefaultMaxIdleConnsPerHost`, is **2**. With 20 goroutines sending requests at once, 20 connections are busy; when their requests finish, only 2 fit back in the pool and the other 18 are closed. Then the next 18 requests dial again. The server's count of accepted connections, printed as it shuts down, tells the real story:
+
+```text
+$ bin/client -url http://127.0.0.1:8080/ -c 20 -n 50 -idle 2
+1000 requests, 51 new connections, average 26.05ms
+$ tail -1 /tmp/web.log   # the server, on shutdown
+2026/09/28 00:11:51 web-1: shut down (<nil>), 465 connections accepted in all
+$ bin/client -url http://127.0.0.1:8080/ -c 20 -n 50 -idle 20
+1000 requests, 20 new connections, average 24.886ms
+$ tail -1 /tmp/web.log   # the server, on shutdown
+2026/09/28 00:12:54 web-1: shut down (<nil>), 20 connections accepted in all
+```
+
+Same 1,000 requests from 20 goroutines. With the default pool the server accepted **465 connections**; with `MaxIdleConnsPerHost` set to 20, it accepted **20**. That's 445 extra handshakes, and 445 sockets left in `TIME_WAIT` on the side that closed, which on a busy service is how you run out of ephemeral ports. (The client counted only 51 "new connections" in the first run, fewer than the server's 465, because while a request waits for a connection, the transport both dials a new one and waits for an idle one to come back, and uses whichever is ready first. The extra dialled connection goes into the pool, or, when the pool is full, is closed.)
+
+<UnderTheHood title="Why a connection closes with TIME_WAIT">
+
+The side that sends the first FIN (here, the client when it closes a connection it can't pool) keeps the connection's four-tuple (source address and port, destination address and port) in the **`TIME_WAIT`** state for a while after it closes: 60 seconds on Linux. It's there so that a late, delayed packet from the old connection can't be mistaken for part of a new one that happens to reuse the same four-tuple. A client talking to one server address can only have one connection per local port, and Linux hands out ports from `net.ipv4.ip_local_port_range`, 28,232 of them by default. A client that opens and closes hundreds of connections a second to the same backend can fill that range with `TIME_WAIT` sockets, and then `connect` fails with `EADDRNOTAVAIL`, "cannot assign requested address". The fix is not a kernel setting; it's reusing connections.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="A service sends requests to one backend from 20 goroutines with a default http.Client. Why does the backend see hundreds of new connections for 1,000 requests?"
+  options={[
+    "HTTP/1.1 doesn't support keep-alive",
+    "The Transport keeps at most 2 idle connections per host by default, so 18 of every 20 are closed after each request and redialled",
+    "The backend closes every connection",
+    "DNS returns a new address each time"
+  ]}
+  answer={1}
+  explain="Measured: 465 connections accepted with the default MaxIdleConnsPerHost of 2, and 20 with it set to 20, for the same 1,000 requests."
+/>
+
+## The Load Balancer
+
+*Stop 3 of 5.*
+
+`shop.internal` resolves to one address, `10.10.0.2`, but the shop runs on several servers, so that one can die, or be redeployed, without taking the shop down. The thing listening at that one address and spreading requests across the servers is a **load balancer**. In AWS it's an ALB or an NLB, in Kubernetes an Ingress controller or a Service, and in front of many Go services it's Envoy or nginx. We'll write one in Go, because `net/http/httputil` has the hard part built in, and then break it.
+
+### Step 1: a reverse proxy, round robin
+
+A load balancer that understands HTTP is a **reverse proxy**: it accepts the client's request, sends a copy to a backend, and copies the backend's response back. Each backend gets its own `httputil.ReverseProxy`:
+
+```go noverify title="hops/cmd/lb/main.go · lines 53–71"
+func newBackend(raw string) *backend {
+	u, err := url.Parse(raw)
+	if err != nil {
+		log.Fatal(err)
+	}
+	b := &backend{url: u}
+	b.healthy.Store(true)
+	b.proxy = &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(u)       // send it to this backend
+			pr.SetXForwarded() // and tell it who the client was
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("proxy to %s: %v", u.Host, err)
+			w.WriteHeader(http.StatusBadGateway) // 502
+		},
+	}
+	return b
+}
+```
+
+What to notice:
+
+- `Rewrite` changes the outgoing request before it's sent. `pr.SetURL(u)` points it at the backend (scheme, host, and the path joined onto the backend's). `pr.SetXForwarded()` adds `X-Forwarded-For` (the client's address), `X-Forwarded-Host` and `X-Forwarded-Proto`, because the backend will now see every connection coming from the balancer, not from the client. (`Rewrite` arrived in Go 1.20 as a safer alternative to the older `Director` hook: before it runs, the proxy removes any `X-Forwarded-*` headers the client sent, so a client can't forge them.)
+- `ErrorHandler` runs when the backend can't be reached or the connection fails mid-request. It answers **502 Bad Gateway**: "the server behind me failed".
+
+The pool holds the backends and a counter. The first version of `pick` takes turns from the counter until it finds a healthy backend:
+
+```go noverify title="hops/cmd/lb/main.go · lines 22–39, first version"
+type pool struct {
+	backends []*backend
+	next     atomic.Uint64
+}
+
+// pick returns the next healthy backend in round-robin order, or nil if
+// none is healthy. Skipping a sick backend uses up its turn, so the load
+// stays even across the healthy ones.
+func (p *pool) pick() *backend {
+	n := uint64(len(p.backends))
+	for range n {
+		b := p.backends[(p.next.Add(1)-1)%n]
+		if b.healthy.Load() {
+			return b
+		}
+	}
+	return nil
+}
+```
+
+`atomic.Uint64` because every request runs on its own goroutine: two requests picking at the same moment must get different turns. `ServeHTTP` picks and forwards, or answers **503 Service Unavailable** if nothing is healthy:
+
+```go noverify title="hops/cmd/lb/main.go · lines 44–51"
+func (p *pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b := p.pick()
+	if b == nil {
+		http.Error(w, "no healthy backend", http.StatusServiceUnavailable)
+		return
+	}
+	b.proxy.ServeHTTP(w, r)
+}
+```
+
+`cmd/load` keeps `c` goroutines sending requests for a few seconds and counts, every second, which backend answered (from the `X-Backend` header) and which requests failed, and how:
+
+```go noverify title="hops/cmd/load/main.go · lines 33–60"
+	var wg sync.WaitGroup
+	for range *c {
+		wg.Go(func() {
+			for ctx.Err() == nil {
+				key := ""
+				resp, err := client.Get(*url)
+				switch {
+				case err != nil:
+					key = "client error"
+				case resp.StatusCode != http.StatusOK:
+					key = resp.Status
+				default:
+					key = resp.Header.Get("X-Backend")
+				}
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+				if ctx.Err() != nil {
+					return // cut off by the deadline: not a result
+				}
+				mu.Lock()
+				counts[key]++
+				total[key]++
+				mu.Unlock()
+			}
+		})
+	}
+```
+
+With two `web` instances on ports 8081 and 8082 behind the balancer on port 8000, one worker and then eight:
+
+```text
+$ bin/load -url http://127.0.0.1:8000/ -c 1 -d 3s
+1s      web-1: 2213, web-2: 2213
+2s      web-1: 1668, web-2: 1668
+total   web-1: 6054, web-2: 6054
+$ bin/load -url http://127.0.0.1:8000/ -c 8 -d 3s
+1s      web-1: 6234, web-2: 6235
+2s      web-1: 4490, web-2: 4493
+total   web-1: 15483, web-2: 15483
+```
+
+An exact split: **6,054 and 6,054** with one worker, **15,483 and 15,483** with eight. (The last partial second only shows in the total.) Note the one-worker case: one client, on **one keep-alive connection** to the balancer, and still every other request went to a different backend. The balancer reads each request and decides per request.
+
+### Step 2: layer 4 and layer 7
+
+That's the defining property of a **layer-7** balancer (layer 7 is the application layer, HTTP here): it terminates the client's connection, reads each request, and can route by anything in it, such as the path, a header or a cookie. Our Go balancer, AWS's ALB, Envoy and nginx work this way. The price is that it must parse every request, and it holds two connections per request in flight: one to the client, one to the backend.
+
+A **layer-4** balancer works at the transport layer: it sees TCP connections, not requests. It picks a backend when a connection opens and then passes bytes back and forth without looking at them. AWS's NLB, the Linux kernel's IPVS, and (as Stop 5 shows) a Kubernetes Service work this way. It's small enough to write whole:
+
+```go noverify title="hops/cmd/l4/main.go · lines 24–49"
+	var next atomic.Uint64
+	for {
+		client, err := ln.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		target := backends[(next.Add(1)-1)%uint64(len(backends))] // per connection
+		go pipe(client, target)
+	}
+}
+
+func pipe(client net.Conn, target string) {
+	defer client.Close()
+	server, err := net.Dial("tcp", target)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	defer server.Close()
+	log.Printf("connection %s -> %s", client.RemoteAddr(), target)
+	go func() {
+		io.Copy(server, client) // client to backend, until the client hangs up
+		server.Close()
+	}()
+	io.Copy(client, server) // backend to client
+}
+```
+
+The choice is made **once per connection**, in the accept loop. `pipe` copies both directions until one side hangs up. Now the same two tests through the layer-4 balancer on port 7000:
+
+```text
+$ bin/load -url http://127.0.0.1:7000/ -c 1 -d 3s
+1s      web-1: 5997
+2s      web-1: 6211
+total   web-1: 16518
+$ bin/load -url http://127.0.0.1:7000/ -c 8 -d 3s
+1s      web-1: 4232, web-2: 4130
+2s      web-1: 6224, web-2: 6129
+3s      web-1: 6506, web-2: 6407
+total   web-1: 16962, web-2: 16666
+$ grep -c "> 127.0.0.1:8081" /tmp/l4.log; grep -c "> 127.0.0.1:8082" /tmp/l4.log   # connections per backend
+5
+4
+```
+
+One worker: **every request went to web-1**, 16,518 of them. The worker's keep-alive connection was assigned to web-1 when it opened, and it never closed. Eight workers opened eight connections, split four and four (the log also counts the one connection from the single-worker run), and the requests split roughly by how busy each connection happened to be: **16,962 against 16,666**.
+
+This matters in production. Services that hold long-lived connections (gRPC, which multiplexes all calls over one HTTP/2 connection, or a pool of keep-alive clients) behind a layer-4 balancer don't spread out: a new backend added to the pool gets no traffic until clients reconnect. That's why gRPC load balancing is done by a layer-7 proxy or by the client itself.
+
+<RelationAnim
+  title="What each kind of balancer sees"
+  nodes={[
+    { id: "client", label: "client", sub: "one keep-alive conn", x: 12, y: 50, kind: "cmd" },
+    { id: "l4", label: "layer 4", sub: "sees connections", x: 45, y: 22, kind: "tool" },
+    { id: "l7", label: "layer 7", sub: "sees requests", x: 45, y: 78, kind: "tool" },
+    { id: "w1", label: "web-1", x: 85, y: 22, kind: "value" },
+    { id: "w2", label: "web-2", x: 85, y: 78, kind: "value" }
+  ]}
+  edges={[
+    { from: "client", to: "l4", label: "TCP bytes" },
+    { from: "l4", to: "w1", label: "all 16,518" },
+    { from: "client", to: "l7", label: "GET, GET, GET" },
+    { from: "l7", to: "w1", label: "every other" },
+    { from: "l7", to: "w2", label: "every other" }
+  ]}
+  frames={[
+    { show: ["client"], note: "One client with one keep-alive connection, sending requests as fast as it can." },
+    { show: ["client", "l4", "w1", "w2", "client>l4"], at: "l4", say: "a connection!", note: "A layer-4 balancer sees a TCP connection open. It picks a backend now, once, and from then on only copies bytes." },
+    { show: ["client", "l4", "w1", "w2", "client>l4", "l4>w1"], hot: ["l4>w1"], bad: ["w2"], at: "w1", beat: "problem", note: "Every request on that connection lands on web-1: 16,518 of 16,518. web-2 sits idle until a new connection opens." },
+    { show: ["client", "l7", "w1", "w2", "client>l7"], at: "l7", say: "a request!", note: "A layer-7 balancer ends the client's connection itself and reads each HTTP request." },
+    { show: ["client", "l7", "w1", "w2", "client>l7", "l7>w1", "l7>w2"], hot: ["l7>w1", "l7>w2"], at: "l7", beat: "solution", note: "So it can choose per request: 6,054 each, from one connection. It can also route by path or header, retry, and fail over, which layer 4 can't." }
+  ]}
+  caption="Layer 4 balances connections; layer 7 balances requests."
+/>
+
+### Step 3: a backend dies
+
+Now the reason load balancers exist. With `load` running, the script kills `web-2` with `kill -9` (no warning, no cleanup: what a crashed process or a lost machine looks like) 2.5 seconds in:
+
+```text
+$ bin/lb-v1 -health 0 &   # then, under load, kill -9 web-2 after 2.5 s
+$ bin/load -c 8 -d 6s
+1s      web-1: 9509, web-2: 9509
+2s      web-1: 9093, web-2: 9093
+3s      502 Bad Gateway: 4467, web-1: 8985, web-2: 4517
+4s      502 Bad Gateway: 11406, web-1: 11404
+5s      502 Bad Gateway: 7460, web-1: 7460
+total   502 Bad Gateway: 27928, web-1: 51047, web-2: 23119
+$ grep -c 'proxy to' /tmp/lb.log   # requests the balancer failed
+27932
+$ grep -v 'proxy to' /tmp/lb.log
+2026/09/28 00:13:07 lb on 127.0.0.1:8000 -> http://127.0.0.1:8081,http://127.0.0.1:8082 (health checks every 0s)
+$ grep 'proxy to' /tmp/lb.log | head -1
+2026/09/28 00:13:10 proxy to 127.0.0.1:8082: read tcp 127.0.0.1:53660->127.0.0.1:8082: read: connection reset by peer
+```
+
+The first 502 was a request **in flight** on a connection to web-2 when it died (`connection reset by peer`). After that, every other request still went to web-2, and got `connection refused`: **27,928 failed requests**, half of all traffic, and it would go on forever. The balancer has no idea web-2 is gone.
+
+<Define term="health check">
+A **health check** is a request the balancer sends to each backend on a timer, to an endpoint whose only job is to say whether the instance can take traffic. A backend that fails it is taken out of rotation until it passes again. Real balancers usually wait for several failures in a row before removing a backend, and several successes before adding it back (AWS calls these the unhealthy and healthy thresholds), so that one slow response doesn't flap it.
+</Define>
+
+`web` answers `/healthz` with 200 while it's healthy:
+
+```go noverify title="hops/cmd/web/main.go · lines 44–50"
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if draining.Load() {
+			http.Error(w, "draining", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+	})
+```
+
+And the balancer asks each backend once per interval, with a timeout of half the interval:
+
+```go noverify title="hops/cmd/lb/main.go · lines 73–89"
+// check asks every backend for /healthz each interval and marks it healthy
+// only if it answers 200 within the timeout.
+func (p *pool) check(interval time.Duration) {
+	client := &http.Client{Timeout: interval / 2}
+	for range time.Tick(interval) {
+		for _, b := range p.backends {
+			resp, err := client.Get(b.url.String() + "/healthz")
+			ok := err == nil && resp.StatusCode == http.StatusOK
+			if err == nil {
+				resp.Body.Close()
+			}
+			if b.healthy.Swap(ok) != ok {
+				log.Printf("health: %s is now healthy=%v", b.url.Host, ok)
+			}
+		}
+	}
+}
+```
+
+`Swap` stores the new state and returns the old one, so the log line only appears when a backend changes state. Same experiment, health checks every second:
+
+```text
+$ bin/lb-v1 -health 1s &   # then, under load, kill -9 web-2 after 2.5 s
+$ bin/load -c 8 -d 6s
+1s      web-1: 7510, web-2: 7509
+2s      web-1: 7763, web-2: 7762
+3s      502 Bad Gateway: 5079, 503 Service Unavailable: 1, web-1: 9737, web-2: 4613
+4s      503 Service Unavailable: 36, web-1: 17409
+5s      503 Service Unavailable: 42, web-1: 16992
+6s      503 Service Unavailable: 31, web-1: 15076
+total   502 Bad Gateway: 5079, 503 Service Unavailable: 110, web-1: 74487, web-2: 19884
+$ grep -c 'proxy to' /tmp/lb.log   # requests the balancer failed
+5079
+$ grep -v 'proxy to' /tmp/lb.log
+2026/09/28 00:13:14 lb on 127.0.0.1:8000 -> http://127.0.0.1:8081,http://127.0.0.1:8082 (health checks every 1s)
+2026/09/28 00:13:18 health: 127.0.0.1:8082 is now healthy=false
+$ grep 'proxy to' /tmp/lb.log | head -1
+2026/09/28 00:13:17 proxy to 127.0.0.1:8082: read tcp 127.0.0.1:45464->127.0.0.1:8082: read: connection reset by peer
+```
+
+The 502s stopped: **5,079** of them, all in the second between the kill and the next health check, then none. But something else appeared: **110 responses of 503 Service Unavailable**, which means `pick` returned nil, "no healthy backend", while web-1 was healthy the whole time and answered 74,487 requests.
+
+The bug is in `pick`, and it only shows up under concurrency. Each try takes a fresh turn from the shared counter. With web-2 down, a request that draws an odd number (web-2) tries again, but eight goroutines are drawing at the same time, so its second draw can be odd too. Two misses in a row, and with only two backends `pick` gives up. The fix takes **one** turn per request and spends it on the backends that are up right now:
+
+```go noverify title="hops/cmd/lb/main.go · lines 27–42"
+// pick returns the next healthy backend in round-robin order, or nil if
+// none is healthy. It takes one turn from the counter and spends it on the
+// backends that are up right now, so each healthy backend gets an equal
+// share, and a request never misses a healthy backend.
+func (p *pool) pick() *backend {
+	up := make([]*backend, 0, len(p.backends))
+	for _, b := range p.backends {
+		if b.healthy.Load() {
+			up = append(up, b)
+		}
+	}
+	if len(up) == 0 {
+		return nil
+	}
+	return up[(p.next.Add(1)-1)%uint64(len(up))]
+}
+```
+
+Each call builds the list of healthy backends and uses the counter to index it, so each healthy backend gets an equal share, and a request can't miss when one is up. (The list is a small allocation per request; a balancer with many backends would keep the healthy list up to date in the health checker instead.) Once more:
+
+```text
+$ bin/lb -health 1s &   # then, under load, kill -9 web-2 after 2.5 s
+$ bin/load -c 8 -d 6s
+1s      web-1: 8385, web-2: 8383
+2s      web-1: 6978, web-2: 6979
+3s      502 Bad Gateway: 4815, web-1: 8251, web-2: 3437
+4s      502 Bad Gateway: 4, web-1: 14161
+5s      web-1: 14445
+6s      web-1: 12566
+total   502 Bad Gateway: 4819, web-1: 64790, web-2: 18799
+$ grep -c 'proxy to' /tmp/lb.log   # requests the balancer failed
+4819
+$ grep -v 'proxy to' /tmp/lb.log
+2026/09/28 00:13:21 lb on 127.0.0.1:8000 -> http://127.0.0.1:8081,http://127.0.0.1:8082 (health checks every 1s)
+2026/09/28 00:13:25 health: 127.0.0.1:8082 is now healthy=false
+$ grep 'proxy to' /tmp/lb.log | head -1
+2026/09/28 00:13:24 proxy to 127.0.0.1:8082: dial tcp 127.0.0.1:8082: connect: connection refused
+```
+
+**4,819** 502s, all in the detection window, and **no 503s**. Health checks don't prevent errors; they bound them to the time it takes to notice. A shorter interval notices sooner and costs more health-check traffic; thresholds of several failures notice later but don't overreact.
+
+### Step 4: requests in flight
+
+The requests that failed in that window were a mix: some were in flight at the moment of death, most were sent to the dead backend before the health check noticed. The second kind is avoidable, and so is the first, if the backend is shut down on purpose instead of dying. Every deploy shuts backends down on purpose.
+
+To see in-flight requests clearly, each request now takes 500 ms (`/work?ms=500`), with 8 workers, so four requests are always in flight at web-2. Kill it with `kill -9`:
+
+```text
+$ bin/web -name web-2 -drain 0 &   # then, under load, kill -9 web-2 after 2.5 s
+$ bin/load -url "http://127.0.0.1:8000/work?ms=500" -c 8 -d 7s
+1s      web-1: 4, web-2: 4
+2s      web-1: 8, web-2: 8
+3s      502 Bad Gateway: 15, web-1: 12, web-2: 4
+4s      web-1: 12
+5s      web-1: 16
+6s      web-1: 16
+total   502 Bad Gateway: 15, web-1: 84, web-2: 16
+$ cat /tmp/web2.log
+2026/09/28 00:13:28 web-2 listening on 127.0.0.1:8082
+$ grep -v 'proxy to' /tmp/lb.log; grep 'proxy to' /tmp/lb.log | cut -d' ' -f3- | sort | uniq -c
+2026/09/28 00:13:28 lb on 127.0.0.1:8000 -> http://127.0.0.1:8081,http://127.0.0.1:8082 (health checks every 1s)
+2026/09/28 00:13:32 health: 127.0.0.1:8082 is now healthy=false
+      2 proxy to 127.0.0.1:8082: EOF
+     13 proxy to 127.0.0.1:8082: dial tcp 127.0.0.1:8082: connect: connection refused
+```
+
+**15 requests failed.** Two show the in-flight kill directly, `EOF`: the connection closed before a response came. The other 13 say `connection refused`, and include both new requests sent before the health check noticed, and in-flight ones: when a request on a reused connection fails before any response arrives, Go's `http.Transport` retries it once on a new connection if it's safe to (a GET with no body is), and that retry was refused.
+
+Now a gentler stop. `web` handles `SIGTERM`, the signal Kubernetes, systemd and `docker stop` send first:
+
+```go noverify title="hops/cmd/web/main.go · lines 68–77"
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+	draining.Store(true) // health checks now fail, so the balancer stops sending
+	log.Printf("%s: SIGTERM, failing health checks for %v", *name, *drain)
+	time.Sleep(*drain)
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := srv.Shutdown(shutdown) // stop accepting; wait for requests in flight
+	log.Printf("%s: shut down (%v), %d connections accepted in all", *name, err, conns.Load())
+```
+
+`srv.Shutdown` closes the listener, so no new connections are accepted, closes idle connections, and waits for requests in flight to finish. With `-drain 0` it starts right away:
+
+```text
+$ bin/web -name web-2 -drain 0 &   # then, under load, kill -TERM web-2 after 2.5 s
+$ bin/load -url "http://127.0.0.1:8000/work?ms=500" -c 8 -d 7s
+1s      web-1: 4, web-2: 4
+2s      web-1: 8, web-2: 8
+3s      502 Bad Gateway: 7, web-1: 8, web-2: 8
+4s      web-1: 16
+5s      web-1: 16
+6s      web-1: 16
+7s      web-1: 16
+total   502 Bad Gateway: 7, web-1: 84, web-2: 20
+$ cat /tmp/web2.log
+2026/09/28 00:13:36 web-2 listening on 127.0.0.1:8082
+2026/09/28 00:13:40 web-2: SIGTERM, failing health checks for 0s
+2026/09/28 00:13:40 web-2: shut down (<nil>), 13 connections accepted in all
+$ grep -v 'proxy to' /tmp/lb.log; grep 'proxy to' /tmp/lb.log | cut -d' ' -f3- | sort | uniq -c
+2026/09/28 00:13:36 lb on 127.0.0.1:8000 -> http://127.0.0.1:8081,http://127.0.0.1:8082 (health checks every 1s)
+2026/09/28 00:13:40 health: 127.0.0.1:8082 is now healthy=false
+      7 proxy to 127.0.0.1:8082: dial tcp 127.0.0.1:8082: connect: connection refused
+```
+
+The in-flight requests finished (web-2 answered 20 in all, and shut down cleanly), but **7 requests still failed** with `connection refused`: the balancer didn't know web-2 was leaving, and kept sending it new requests until the next health check. The server stopped accepting before the balancer stopped sending.
+
+The fix is to change the order. On `SIGTERM`, first **fail the health check** (`draining.Store(true)`), keep serving for long enough that the balancer notices and stops sending (a couple of health-check intervals), and only then `Shutdown`:
+
+```text
+$ bin/web -name web-2 -drain 2s &   # then, under load, kill -TERM web-2 after 2.5 s
+$ bin/load -url "http://127.0.0.1:8000/work?ms=500" -c 8 -d 7s
+1s      web-1: 4, web-2: 4
+2s      web-1: 8, web-2: 8
+3s      web-1: 8, web-2: 8
+4s      web-1: 12, web-2: 4
+5s      web-1: 16
+6s      web-1: 16
+total   web-1: 80, web-2: 24
+$ cat /tmp/web2.log
+2026/09/28 00:13:44 web-2 listening on 127.0.0.1:8082
+2026/09/28 00:13:48 web-2: SIGTERM, failing health checks for 2s
+2026/09/28 00:13:50 web-2: shut down (<nil>), 15 connections accepted in all
+$ grep -v 'proxy to' /tmp/lb.log; grep 'proxy to' /tmp/lb.log | cut -d' ' -f3- | sort | uniq -c
+2026/09/28 00:13:44 lb on 127.0.0.1:8000 -> http://127.0.0.1:8081,http://127.0.0.1:8082 (health checks every 1s)
+2026/09/28 00:13:48 health: 127.0.0.1:8082 is now healthy=false
+```
+
+**Zero failed requests.** web-2 announced it was draining at 00:13:48, the balancer marked it unhealthy within the second, the requests already on their way finished, and at 00:13:50 web-2 shut down with nothing in flight. Kubernetes does the same dance with a readiness probe and a `preStop` delay, and AWS target groups with a deregistration delay: stop sending first, then stop serving.
+
+<PacketAnim
+  title="Taking web-2 out without dropping a request"
+  kicker="graceful drain"
+  height={42}
+  role="pilot"
+  hops={[
+    { id: "c", label: "load", sub: "8 workers", x: 10, y: 50, kind: "client", role: "reader" },
+    { id: "lb", label: "lb", sub: "127.0.0.1:8000", x: 42, y: 50, kind: "lb", role: "pilot" },
+    { id: "w1", label: "web-1", sub: ":8081", x: 82, y: 20, kind: "server", role: "operator" },
+    { id: "w2", label: "web-2", sub: ":8082", x: 82, y: 80, kind: "server", role: "operator" }
+  ]}
+  links={[
+    { from: "c", to: "lb" },
+    { from: "lb", to: "w1" },
+    { from: "lb", to: "w2" }
+  ]}
+  frames={[
+    { from: "lb", to: "w2", tag: "GET /work", note: "Both backends are healthy; the balancer alternates. Four slow requests are in flight at web-2 at any moment.", pkt: { src: "127.0.0.1 (lb)", dst: "127.0.0.1:8082", proto: "HTTP", body: "GET /work?ms=500" } },
+    { to: "w2", hot: ["w2"], at: "w2", say: "SIGTERM", note: "The deploy sends SIGTERM to web-2. With -drain 0 it would call Shutdown now and refuse new connections, and the balancer, which doesn't know yet, would get 7 refusals. Instead:", beat: "problem" },
+    { from: "lb", to: "w2", tag: "GET /healthz", bad: ["w2"], at: "w2", say: "503: draining", note: "web-2 fails its health check on purpose, but keeps serving. The in-flight requests carry on.", pkt: { src: "lb health checker", dst: "127.0.0.1:8082", proto: "HTTP", body: "GET /healthz → 503 draining" } },
+    { from: "lb", to: "w1", tag: "GET /work", bad: ["lb>w2"], at: "lb", say: "web-2 healthy=false", note: "Within a second the balancer marks web-2 unhealthy, and every new request goes to web-1.", pkt: { src: "127.0.0.1 (lb)", dst: "127.0.0.1:8081", proto: "HTTP", body: "GET /work?ms=500" } },
+    { from: "w2", to: "lb", tag: "200 OK", at: "w2", note: "Meanwhile web-2 finishes what it had: the last in-flight responses go back.", pkt: { src: "127.0.0.1:8082", dst: "127.0.0.1 (lb)", proto: "HTTP", body: "200 web-2 worked 500 ms" } },
+    { to: "w2", bad: ["w2"], at: "w2", say: "Shutdown()", beat: "solution", note: "After 2 s, Shutdown: nothing is in flight and nothing new is coming. Measured: 0 failed requests, against 15 for kill -9 and 7 for an immediate Shutdown." }
+  ]}
+  caption="Stop sending, then stop serving: fail the health check, wait, then shut down."
+/>
+
+<QuickCheck
+  question="A backend calls srv.Shutdown as soon as it gets SIGTERM, and the balancer health-checks every second. What happens to requests?"
+  options={[
+    "Nothing fails: Shutdown waits for requests in flight",
+    "Requests in flight finish, but new requests the balancer sends before its next health check are refused",
+    "Every request in flight fails",
+    "The balancer retries them automatically"
+  ]}
+  answer={1}
+  explain="Measured: web-2 finished its in-flight requests and shut down cleanly, but 7 new requests got connection refused. Failing the health check first and waiting 2 s before Shutdown brought it to 0."
+/>
+
+## The Private Network
+
+*Stop 4 of 5.*
+
+So far everything ran on one machine's loopback. In a cloud, the balancer and the servers are separate machines in a **VPC** (virtual private cloud): a private network with its own address range, split into **subnets**, with **route tables** that say where packets go, and a **NAT gateway** that lets machines in a private subnet reach the internet without being reachable from it. Those words sound like cloud products, but every one of them is an old Linux networking idea. In this stop we build a small VPC out of them, inside the lab container, one `ip` command at a time.
+
+The plan: a **public subnet** `10.10.0.0/24` for the load balancer, a **private subnet** `10.10.1.0/24` for two app servers, and the container itself as the **router** between them and the NAT gateway to the outside.
+
+<RelationAnim
+  title="The VPC we're about to build"
+  height={58}
+  nodes={[
+    { id: "net", label: "internet", sub: "1.1.1.1", x: 88, y: 14, kind: "tool" },
+    { id: "rt", label: "router + NAT", sub: "the lab container · eth0 172.17.0.2", x: 50, y: 14, kind: "pkg" },
+    { id: "brpub", label: "br-pub", sub: "10.10.0.1/24", x: 22, y: 48, kind: "iface" },
+    { id: "brpriv", label: "br-priv", sub: "10.10.1.1/24", x: 72, y: 48, kind: "iface" },
+    { id: "lb", label: "lb", sub: "10.10.0.2", x: 22, y: 84, kind: "value" },
+    { id: "app1", label: "app1", sub: "10.10.1.10", x: 60, y: 84, kind: "value" },
+    { id: "app2", label: "app2", sub: "10.10.1.11", x: 86, y: 84, kind: "value" }
+  ]}
+  edges={[
+    { from: "app1", to: "brpriv", label: "veth" },
+    { from: "app2", to: "brpriv", label: "veth" },
+    { from: "lb", to: "brpub", label: "veth" },
+    { from: "brpriv", to: "rt", label: "route" },
+    { from: "brpub", to: "rt", label: "route" },
+    { from: "rt", to: "net", label: "SNAT" }
+  ]}
+  frames={[
+    { show: ["app1"], at: "app1", note: "A machine: one network namespace, with its own interfaces, addresses and routes. It can't reach anything yet." },
+    { show: ["app1", "app2", "brpriv", "app1>brpriv", "app2>brpriv"], hot: ["brpriv"], note: "A subnet: a bridge (a virtual switch) and one veth cable per machine. Machines on the same bridge reach each other directly." },
+    { show: ["app1", "app2", "brpriv", "app1>brpriv", "app2>brpriv", "lb", "brpub", "lb>brpub"], note: "A second subnet, for the load balancer. The two bridges aren't connected." },
+    { show: ["app1", "app2", "brpriv", "app1>brpriv", "app2>brpriv", "lb", "brpub", "lb>brpub", "rt", "brpriv>rt", "brpub>rt"], hot: ["rt"], at: "rt", say: "ip_forward=1", note: "A router: the container's own namespace has an address on both bridges, a default route in each machine points at it, and IP forwarding lets it pass packets between them." },
+    { show: ["app1", "app2", "brpriv", "app1>brpriv", "app2>brpriv", "lb", "brpub", "lb>brpub", "rt", "brpriv>rt", "brpub>rt", "net", "rt>net"], hot: ["rt>net"], at: "rt", say: "MASQUERADE", beat: "solution", note: "A NAT gateway: packets from the private subnet leave with the router's address as their source, so replies can find their way back." }
+  ]}
+  caption="Namespaces are the machines, bridges are the subnets, the root namespace is the router, and iptables is the NAT gateway."
+/>
+
+### Step 1: a machine is a network namespace
+
+Chapter 1 gave a process its own network namespace and found it empty. That's our starting point: each "machine" in the VPC is a network namespace. `ip netns add` creates one and gives it a name:
+
+```text
+$ ip netns add app1
+$ ip netns exec app1 ip -br link
+lo               DOWN           00:00:00:00:00:00 <LOOPBACK> 
+tunl0@NONE       DOWN           0.0.0.0 <NOARP> 
+gre0@NONE        DOWN           0.0.0.0 <NOARP> 
+gretap0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+erspan0@NONE     DOWN           00:00:00:00:00:00 <BROADCAST,MULTICAST> 
+ip_vti0@NONE     DOWN           0.0.0.0 <NOARP> 
+ip6_vti0@NONE    DOWN           :: <NOARP> 
+sit0@NONE        DOWN           0.0.0.0 <NOARP> 
+ip6tnl0@NONE     DOWN           :: <NOARP> 
+ip6gre0@NONE     DOWN           :: <NOARP> 
+```
+
+A loopback interface (`lo`), down, and the inert tunnel devices this kernel creates in every new namespace, also down. No addresses, no routes. A process started in this namespace with `ip netns exec app1 …` (a Go service, say) sees exactly this, and nothing of the container's own network.
+
+### Step 2: a subnet is a bridge and some cables
+
+<Define term="veth pair">
+A **veth pair** is two virtual network interfaces joined like the two ends of a cable: a packet sent into one comes out of the other. Put one end in a namespace and the other somewhere else, and you've connected them.
+</Define>
+
+<Define term="bridge">
+A Linux **bridge** is a virtual network switch. Interfaces attached to it (its **ports**) can exchange Ethernet frames with each other. Like a hardware switch, it learns which MAC address lives behind which port by watching traffic, and forwards each frame only to the port it needs to go to.
+</Define>
+
+The private subnet: a bridge with an address (it will be the router's address on this subnet), and for each machine a veth pair with one end, named `eth0`, inside the machine's namespace, and the other end plugged into the bridge:
+
+```text
+$ ip link add br-priv type bridge
+$ ip addr add 10.10.1.1/24 dev br-priv
+$ ip link set br-priv up
+$ ip netns add app2
+$ ip link add veth-app1 type veth peer name eth0 netns app1
+$ ip link set veth-app1 master br-priv up
+$ ip -n app1 addr add 10.10.1.10/24 dev eth0
+$ ip -n app1 link set eth0 up
+$ ip -n app1 link set lo up
+$ ip link add veth-app2 type veth peer name eth0 netns app2
+$ ip link set veth-app2 master br-priv up
+$ ip -n app2 addr add 10.10.1.11/24 dev eth0
+$ ip -n app2 link set eth0 up
+$ ip -n app2 link set lo up
+```
+
+`10.10.1.1/24` means the address `10.10.1.1` on a network whose first 24 bits are fixed: everything from `10.10.1.0` to `10.10.1.255`. That's the subnet's **CIDR block**, exactly what you type when you create a subnet in a VPC. Now look from inside app1:
+
+```text
+$ ip -n app1 -br addr show dev eth0
+eth0@if13        UP             10.10.1.10/24 fe80::18ab:d1ff:fe59:1753/64 
+$ ip -n app1 route
+10.10.1.0/24 dev eth0 proto kernel scope link src 10.10.1.10 
+$ ip netns exec app1 ping -c 2 10.10.1.11
+PING 10.10.1.11 (10.10.1.11) 56(84) bytes of data.
+64 bytes from 10.10.1.11: icmp_seq=1 ttl=64 time=0.197 ms
+64 bytes from 10.10.1.11: icmp_seq=2 ttl=64 time=0.052 ms
+
+--- 10.10.1.11 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1023ms
+rtt min/avg/max/mdev = 0.052/0.124/0.197/0.072 ms
+$ ip -n app1 neigh
+10.10.1.11 dev eth0 lladdr 2e:07:82:2b:dc:3b REACHABLE 
+$ bridge fdb show br br-priv | grep -v permanent
+1a:ab:d1:59:17:53 dev veth-app1 master br-priv 
+2e:07:82:2b:dc:3b dev veth-app2 master br-priv 
+```
+
+app1 has an address, and one route, which the kernel added by itself: `10.10.1.0/24 dev eth0`, "the whole subnet is directly on this cable". So pinging app2 works. Before the first ping could go, app1 had to find app2's MAC address with **ARP** ("who has 10.10.1.11?"), and `ip neigh` shows the answer it cached. The bridge's forwarding table (`bridge fdb`) shows what it learned from the same traffic: which MAC address is behind which veth.
+
+### Step 3: routes between subnets
+
+The public subnet is built the same way, with its own bridge and a namespace for the load balancer. Then, from app1, try to reach it:
+
+```text
+$ ip link add br-pub type bridge
+$ ip addr add 10.10.0.1/24 dev br-pub
+$ ip link set br-pub up
+$ ip netns add lb
+$ ip link add veth-lb type veth peer name eth0 netns lb
+$ ip link set veth-lb master br-pub up
+$ ip -n lb addr add 10.10.0.2/24 dev eth0
+$ ip -n lb link set eth0 up
+$ ip -n lb link set lo up
+$ ip netns exec app1 ping -c 2 -W 1 10.10.0.2
+ping: connect: Network is unreachable
+```
+
+`Network is unreachable`: app1's only route covers `10.10.1.0/24`, and `10.10.0.2` isn't in it. A packet with no matching route isn't sent at all. Every machine needs a **default route**, "anything else, send to the router", pointing at the router's address on its own subnet. In a VPC, that's the `0.0.0.0/0` line of the subnet's route table:
+
+```text
+$ ip -n app1 route add default via 10.10.1.1
+$ ip -n app2 route add default via 10.10.1.1
+$ ip -n lb route add default via 10.10.0.1
+$ sysctl -w net.ipv4.ip_forward=0
+net.ipv4.ip_forward = 0
+$ ip netns exec app1 ping -c 2 -W 1 10.10.0.2
+PING 10.10.0.2 (10.10.0.2) 56(84) bytes of data.
+
+--- 10.10.0.2 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 1062ms
+$ sysctl -w net.ipv4.ip_forward=1
+net.ipv4.ip_forward = 1
+$ ip netns exec app1 ping -c 2 -W 1 10.10.0.2
+PING 10.10.0.2 (10.10.0.2) 56(84) bytes of data.
+64 bytes from 10.10.0.2: icmp_seq=1 ttl=63 time=0.025 ms
+64 bytes from 10.10.0.2: icmp_seq=2 ttl=63 time=0.072 ms
+
+--- 10.10.0.2 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1039ms
+rtt min/avg/max/mdev = 0.025/0.048/0.072/0.023 ms
+```
+
+With routes in place but `ip_forward` set to 0, the ping still failed: the packets reached the router, and the router, being a normal Linux host, dropped packets that weren't addressed to it. `net.ipv4.ip_forward=1` turns it into a router, and the ping went through. Note `ttl=63` in the replies, one less than the 64 Linux starts with: each router a packet crosses decrements its TTL (in IP, "time to live" is a hop count), which is how `traceroute` works.
+
+### Step 4: out to the internet, through NAT
+
+Now app1 tries to reach a real address on the internet, `1.1.1.1`. The container's own routing table sends anything else out of `eth0`, towards Docker's network:
+
+```text
+$ ip route
+default via 172.17.0.1 dev eth0 
+10.10.0.0/24 dev br-pub proto kernel scope link src 10.10.0.1 
+10.10.1.0/24 dev br-priv proto kernel scope link src 10.10.1.1 
+172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.2 
+$ ip netns exec app1 ping -c 3 -W 1 1.1.1.1
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2051ms
+$ cat /tmp/icmp1.txt   # tcpdump -i eth0 icmp, during that ping
+00:16:26.364987 IP 10.10.1.10 > 1.1.1.1: ICMP echo request, id 543, seq 1, length 64
+00:16:27.391495 IP 10.10.1.10 > 1.1.1.1: ICMP echo request, id 543, seq 2, length 64
+00:16:28.416233 IP 10.10.1.10 > 1.1.1.1: ICMP echo request, id 543, seq 3, length 64
+```
+
+**100% packet loss**, and `tcpdump` on the container's `eth0` shows why. The router did forward the pings, but they left with source address `10.10.1.10`. That's a **private address** (the `10.0.0.0/8` range is reserved for private networks, RFC 1918), and nothing outside knows how to route a reply to it. The packets went out; no answer could ever come back.
+
+<Define term="NAT">
+**Network address translation** rewrites addresses in packets as they pass through a router. **Source NAT** (SNAT) replaces the source address of outgoing packets with the router's own public address, and remembers the connection, so that replies to that address can be translated back and sent to the right private machine. **MASQUERADE** is SNAT that uses whatever address the outgoing interface has. This is what a NAT gateway is.
+</Define>
+
+One `iptables` rule: for packets from the private subnet leaving through `eth0`, masquerade:
+
+```text
+$ iptables -t nat -A POSTROUTING -s 10.10.1.0/24 -o eth0 -j MASQUERADE
+$ ip netns exec app1 ping -c 2 -W 2 1.1.1.1
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+64 bytes from 1.1.1.1: icmp_seq=1 ttl=62 time=137 ms
+64 bytes from 1.1.1.1: icmp_seq=2 ttl=62 time=135 ms
+
+--- 1.1.1.1 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1005ms
+rtt min/avg/max/mdev = 134.779/135.690/136.602/0.911 ms
+$ cat /tmp/icmp2.txt   # tcpdump -i eth0 icmp, during that ping
+00:16:30.468069 IP 172.17.0.2 > 1.1.1.1: ICMP echo request, id 549, seq 1, length 64
+00:16:30.604580 IP 1.1.1.1 > 172.17.0.2: ICMP echo reply, id 549, seq 1, length 64
+00:16:31.472737 IP 172.17.0.2 > 1.1.1.1: ICMP echo request, id 549, seq 2, length 64
+00:16:31.607391 IP 1.1.1.1 > 172.17.0.2: ICMP echo reply, id 549, seq 2, length 64
+```
+
+The same ping, and now it works: **135 ms**, to Cloudflare and back. On `eth0` the requests now leave with source **`172.17.0.2`**, the container's own address, and the replies come back to it. The kernel rewrote the source on the way out, and the destination on the way back.
+
+How does it know which private machine a reply belongs to? **conntrack**, the kernel's connection tracking table. Every connection through the NAT gets an entry holding the original addresses and the translated ones:
+
+```text
+$ ip netns exec app1 curl -s -o /dev/null -w '%{http_code} from %{remote_ip}' http://1.1.1.1/; echo
+301 from 1.1.1.1
+$ conntrack -L -p tcp --dport 80
+tcp      6 59 CLOSE_WAIT src=10.10.1.10 dst=1.1.1.1 sport=34324 dport=80 src=1.1.1.1 dst=172.17.0.2 sport=80 dport=34324 [ASSURED] mark=0 use=1
+conntrack v1.4.8 (conntrack-tools): 1 flow entries have been shown.
+$ iptables -t nat -L POSTROUTING -v -n
+Chain POSTROUTING (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+    2   144 MASQUERADE  all  --  *      eth0    10.10.1.0/24         0.0.0.0/0           
+```
+
+Read the conntrack line in two halves. The first half is the connection as app1 sent it: `src=10.10.1.10 dst=1.1.1.1 sport=34324 dport=80`. The second is what a reply must look like: from `1.1.1.1` to **`172.17.0.2`**, port 34324. When a packet matching the second half arrives, the kernel rewrites its destination back to `10.10.1.10` and routes it into the private subnet.
+
+And the rule's counter says **2 packets**, although dozens crossed the NAT. The `nat` table is consulted only for the **first packet of each connection**: two connections here, the ping and the `curl`. Every later packet is translated from the conntrack entry, without looking at the rules. That's also why a NAT gateway has a limit on simultaneous connections: each one is a table entry, and a port on the public address.
+
+<PacketAnim
+  title="A packet from the private subnet, through the NAT gateway"
+  kicker="source NAT"
+  height={40}
+  hops={[
+    { id: "app1", label: "app1", sub: "10.10.1.10", x: 10, y: 50, kind: "pod", role: "operator" },
+    { id: "br", label: "br-priv", sub: "10.10.1.1", x: 34, y: 50, kind: "bridge" },
+    { id: "nat", label: "router + NAT", sub: "eth0 172.17.0.2", x: 60, y: 50, kind: "nat", role: "guard" },
+    { id: "net", label: "1.1.1.1", sub: "the internet", x: 90, y: 50, kind: "internet" }
+  ]}
+  zones={[
+    { id: "priv", label: "private subnet 10.10.1.0/24", x: 1, y: 14, w: 45, h: 74, kind: "private" }
+  ]}
+  links={[
+    { from: "app1", to: "br", label: "veth" },
+    { from: "br", to: "nat" },
+    { from: "nat", to: "net", label: "eth0" }
+  ]}
+  frames={[
+    { from: "app1", to: "br", tag: "ping", note: "app1 pings 1.1.1.1. Not on its subnet, so it goes to the default gateway, 10.10.1.1.", pkt: { src: "10.10.1.10", dst: "1.1.1.1", proto: "ICMP echo request" } },
+    { from: "br", to: "nat", tag: "ping", note: "The router looks up 1.1.1.1: default route, out of eth0.", pkt: { src: "10.10.1.10", dst: "1.1.1.1", proto: "ICMP echo request" } },
+    { from: "nat", to: "net", tag: "ping", lost: true, beat: "problem", note: "Without NAT it leaves with a private source address. It reaches the internet, but no reply can be routed back to 10.10.1.10. 3 sent, 0 received.", pkt: { src: "10.10.1.10", dst: "1.1.1.1", proto: "ICMP echo request" }, dump: "00:16:26.364987 IP 10.10.1.10 > 1.1.1.1: ICMP echo request, id 543, seq 1, length 64" },
+    { to: "nat", tag: "ping", at: "nat", say: "MASQUERADE", note: "Now with the MASQUERADE rule. The first packet of the connection matches it; conntrack records the mapping.", pkt: { src: "10.10.1.10", dst: "1.1.1.1", proto: "ICMP echo request" } },
+    { from: "nat", to: "net", tag: "ping", was: { src: "10.10.1.10" }, note: "The source is rewritten to the router's own address on eth0.", pkt: { src: "172.17.0.2", dst: "1.1.1.1", proto: "ICMP echo request" }, dump: "00:16:30.468069 IP 172.17.0.2 > 1.1.1.1: ICMP echo request, id 549, seq 1, length 64" },
+    { from: "net", to: "nat", tag: "reply", note: "The reply comes back to 172.17.0.2, 137 ms later.", pkt: { src: "1.1.1.1", dst: "172.17.0.2", proto: "ICMP echo reply" }, dump: "00:16:30.604580 IP 1.1.1.1 > 172.17.0.2: ICMP echo reply, id 549, seq 1, length 64" },
+    { from: "nat", to: "app1", tag: "reply", was: { dst: "172.17.0.2" }, beat: "solution", note: "conntrack matches it to the recorded connection and rewrites the destination back to 10.10.1.10. app1 never knew.", pkt: { src: "1.1.1.1", dst: "10.10.1.10", proto: "ICMP echo reply" } }
+  ]}
+  caption="SNAT on the way out, the reverse on the way back, remembered by conntrack."
+/>
+
+Here is the whole VPC vocabulary, next to what we built:
+
+| In a cloud VPC | What it is in Linux | What we ran |
+|---|---|---|
+| Instance, pod, container | A network namespace | `ip netns add app1` |
+| Its network interface (ENI) | One end of a veth pair | `ip link add veth-app1 type veth peer name eth0 netns app1` |
+| Subnet, with its CIDR block | A bridge with an address | `ip link add br-priv type bridge`, `ip addr add 10.10.1.1/24` |
+| Route table, `0.0.0.0/0 → gateway` | A default route | `ip -n app1 route add default via 10.10.1.1` |
+| The VPC router between subnets | IP forwarding | `sysctl -w net.ipv4.ip_forward=1` |
+| NAT gateway | SNAT with connection tracking | `iptables -t nat -A POSTROUTING -s 10.10.1.0/24 -o eth0 -j MASQUERADE` |
+
+A cloud provider's implementation is different underneath (AWS doesn't run a Linux bridge per subnet; it rewrites and encapsulates packets in the hypervisor and the network cards), but the model you configure is the same: addresses, routes, forwarding, translation.
+
+<QuickCheck
+  question="app1 (10.10.1.10) can ping hosts on its own subnet, has a default route to the router, and the router has ip_forward=1, but pings to 1.1.1.1 get no reply. tcpdump on the router's eth0 shows the pings leaving. What's missing?"
+  options={[
+    "A route on app1",
+    "Source NAT: the pings leave with a private source address, so no reply can come back",
+    "A DNS server",
+    "ARP"
+  ]}
+  answer={1}
+  explain="Measured: the pings left eth0 as 10.10.1.10 > 1.1.1.1, and 0 of 3 got replies. After one MASQUERADE rule they left as 172.17.0.2 and both got replies in 135 ms."
+/>
+
+## Into the Pod
+
+*Stop 5 of 5.*
+
+The last hop: from the subnet into the process. This is the part a Kubernetes **CNI plugin** (container network interface) does every time a pod starts, and it's exactly what we did for app1. The reference `bridge` plugin creates a network namespace's veth pair, attaches the host end to a bridge (`cni0`), assigns the pod an address from the node's range, and sets a default route; Docker does the same with `docker0`. So a pod is, network-wise, app1.
+
+### Step 1: a Go service in the namespace, and one packet crossing the bridge
+
+Start `web` inside app1 and app2's namespaces. `ip netns exec` runs a program in a namespace; the program itself is the same static binary as before, and doesn't know or care:
+
+```text
+$ ip netns pids app1
+560
+$ readlink /proc/560/ns/net /proc/self/ns/net
+net:[4026532697]
+net:[4026532566]
+$ ip netns exec lb curl -s http://10.10.1.10:8080/
+hello from web-1
+```
+
+`ip netns pids` lists the processes in app1's namespace: our `web`. Its network namespace (`/proc/PID/ns/net`) is a different kernel object from the container's own, `4026532697` against `4026532566`: the same check chapter 1 used. And the balancer's namespace can reach it across the router.
+
+To watch that request cross, `tcpdump -i any` captures on every interface at once, and `-e` adds the Ethernet header (the MAC addresses). This is the SYN of that `curl`, and everything it caused (tcpdump stopped after 12 packets):
+
+```text
+$ cat /tmp/cross.txt   # tcpdump -i any -e: every interface, with MAC addresses
+00:16:33.576614 veth-lb In  ifindex 16 9e:59:1b:1b:ca:2d ethertype IPv4 (0x0800), length 80: 10.10.0.2.56582 > 10.10.1.10.8080: Flags [S], seq 1047203637, win 64240, options [mss 1460,sackOK,TS val 184363889 ecr 0,nop,wscale 7], length 0
+00:16:33.576636 br-pub In  ifindex 15 9e:59:1b:1b:ca:2d ethertype IPv4 (0x0800), length 80: 10.10.0.2.56582 > 10.10.1.10.8080: Flags [S], seq 1047203637, win 64240, options [mss 1460,sackOK,TS val 184363889 ecr 0,nop,wscale 7], length 0
+00:16:33.576647 br-priv Out ifindex 12 4e:ea:6a:d7:ee:3c ethertype ARP (0x0806), length 48: Request who-has 10.10.1.10 tell 10.10.1.1, length 28
+00:16:33.576648 veth-app2 Out ifindex 14 4e:ea:6a:d7:ee:3c ethertype ARP (0x0806), length 48: Request who-has 10.10.1.10 tell 10.10.1.1, length 28
+00:16:33.576648 veth-app1 Out ifindex 13 4e:ea:6a:d7:ee:3c ethertype ARP (0x0806), length 48: Request who-has 10.10.1.10 tell 10.10.1.1, length 28
+00:16:33.576654 veth-app1 In  ifindex 13 1a:ab:d1:59:17:53 ethertype ARP (0x0806), length 48: Reply 10.10.1.10 is-at 1a:ab:d1:59:17:53, length 28
+00:16:33.576655 br-priv In  ifindex 12 1a:ab:d1:59:17:53 ethertype ARP (0x0806), length 48: Reply 10.10.1.10 is-at 1a:ab:d1:59:17:53, length 28
+00:16:33.576655 br-priv Out ifindex 12 4e:ea:6a:d7:ee:3c ethertype IPv4 (0x0800), length 80: 10.10.0.2.56582 > 10.10.1.10.8080: Flags [S], seq 1047203637, win 64240, options [mss 1460,sackOK,TS val 184363889 ecr 0,nop,wscale 7], length 0
+00:16:33.576655 veth-app1 Out ifindex 13 4e:ea:6a:d7:ee:3c ethertype IPv4 (0x0800), length 80: 10.10.0.2.56582 > 10.10.1.10.8080: Flags [S], seq 1047203637, win 64240, options [mss 1460,sackOK,TS val 184363889 ecr 0,nop,wscale 7], length 0
+00:16:33.576668 veth-app1 In  ifindex 13 1a:ab:d1:59:17:53 ethertype IPv4 (0x0800), length 80: 10.10.1.10.8080 > 10.10.0.2.56582: Flags [S.], seq 2321033864, ack 1047203638, win 65160, options [mss 1460,sackOK,TS val 971947914 ecr 184363889,nop,wscale 7], length 0
+00:16:33.576669 br-priv In  ifindex 12 1a:ab:d1:59:17:53 ethertype IPv4 (0x0800), length 80: 10.10.1.10.8080 > 10.10.0.2.56582: Flags [S.], seq 2321033864, ack 1047203638, win 65160, options [mss 1460,sackOK,TS val 971947914 ecr 184363889,nop,wscale 7], length 0
+00:16:33.576670 br-pub Out ifindex 15 0a:35:68:93:f5:3a ethertype IPv4 (0x0800), length 80: 10.10.1.10.8080 > 10.10.0.2.56582: Flags [S.], seq 2321033864, ack 1047203638, win 65160, options [mss 1460,sackOK,TS val 971947914 ecr 184363889,nop,wscale 7], length 0
+```
+
+Follow the one SYN, `seq 1047203637`:
+
+1. **`veth-lb In`**: it leaves the balancer's namespace through its cable and arrives at the host end.
+2. **`br-pub In`**: the bridge hands it to the router (the root namespace), because it's addressed to the router's MAC: the balancer's default gateway.
+3. The router looks up `10.10.1.10`: on `br-priv`. It doesn't know app1's MAC yet, so it sends an **ARP request** out of `br-priv`, and the bridge floods it to every port, **`veth-app2`** and **`veth-app1`**. Only app1 answers, **`veth-app1 In`**: `10.10.1.10 is-at 1a:ab:d1:59:17:53`.
+4. **`br-priv Out`**, **`veth-app1 Out`**: the SYN goes out, with a new source MAC (`4e:ea:6a:d7:ee:3c`, the router's on this subnet) but the same IP addresses and sequence number. A router rewrites the Ethernet header at every hop; the IP header's addresses stay the same unless NAT changes them.
+5. **`veth-app1 In`**: app1's SYN-ACK, on its way back.
+
+That is how a packet gets into a container: a route to the bridge, ARP for the address, and a veth cable into the namespace, where the kernel's TCP stack in that namespace hands it to the socket our Go program is listening on.
+
+### Step 2: a Service is a few NAT rules
+
+A Kubernetes **Service** gives a set of pods one stable virtual address, the **ClusterIP**, like `10.96.0.10`. Pods come and go and change addresses; the ClusterIP doesn't. Here is the surprising part: that address isn't on any interface anywhere. In its default `iptables` mode, **kube-proxy** implements a Service as NAT rules on every node, which rewrite the destination of any packet for the ClusterIP to one of the pods' addresses. That's **destination NAT** (DNAT), and we can write the same rules by hand:
+
+```text
+$ iptables -t nat -N SVC-SHOP
+$ iptables -t nat -A SVC-SHOP -p tcp -m statistic --mode random --probability 0.5 -j DNAT --to-destination 10.10.1.10:8080
+$ iptables -t nat -A SVC-SHOP -p tcp -j DNAT --to-destination 10.10.1.11:8080
+$ iptables -t nat -A PREROUTING -d 10.96.0.10/32 -p tcp --dport 80 -j SVC-SHOP
+$ ip addr | grep -c 10.96.0.10
+0
+```
+
+A chain, `SVC-SHOP`, with two rules. The first matches half the time (`statistic --mode random --probability 0.5`) and sends the connection to app1; whatever is left goes to app2. kube-proxy writes exactly this pattern, with one rule per pod and the probabilities chosen so each pod gets an equal share (1/3, then 1/2, then the rest, for three pods). A `PREROUTING` rule sends every TCP packet for `10.96.0.10:80` into the chain. And `grep -c` confirms that `10.96.0.10` is on no interface: **0**. Now 1,000 requests to it, each a new `curl` and so a new connection:
+
+```text
+$ for i in $(seq 1000); do ip netns exec lb curl -s -m 2 http://10.96.0.10/; done | sort | uniq -c
+    508 hello from web-1
+    492 hello from web-2
+$ iptables -t nat -L SVC-SHOP -v -n
+Chain SVC-SHOP (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  508 30480 DNAT       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            statistic mode random probability 0.50000000000 to:10.10.1.10:8080
+  492 29520 DNAT       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            to:10.10.1.11:8080
+$ conntrack -L -d 10.96.0.10 2>/dev/null | head -2
+tcp      6 114 TIME_WAIT src=10.10.0.2 dst=10.96.0.10 sport=60600 dport=80 src=10.10.1.11 dst=10.10.0.2 sport=8080 dport=60600 [ASSURED] mark=0 use=1
+tcp      6 115 TIME_WAIT src=10.10.0.2 dst=10.96.0.10 sport=34600 dport=80 src=10.10.1.11 dst=10.10.0.2 sport=8080 dport=34600 [ASSURED] mark=0 use=1
+$ ip netns exec lb bin/load -url http://10.96.0.10/ -c 1 -d 2s
+1s      web-2: 10273
+total   web-2: 19036
+```
+
+**486 to web-1, 514 to web-2**: a random 50/50, as the counters on the two rules confirm packet for packet (the `nat` table, again, sees only each connection's first packet). The conntrack entries show the translation: the balancer connected to `dst=10.96.0.10 dport=80`, and the reply is expected from **`src=10.10.1.11 sport=8080`**, a pod.
+
+And the last line is Stop 3 again. `load` with one worker keeps one keep-alive connection open, and **all 19,036 requests went to web-2**. A Service is a layer-4 balancer: it picks a pod per connection, when the first packet passes through the rules, and conntrack sends the rest of that connection to the same pod.
+
+### Step 3: when the client pod is on the same bridge
+
+One more pod, app3, on the private subnet, calling the Service. It works, split between the two backends as before. Then the script turns off one kernel setting, `net.bridge.bridge-nf-call-iptables`, only in this container's network namespace:
+
+```text
+$ ip netns add app3
+$ ip link add veth-app3 type veth peer name eth0 netns app3
+$ ip link set veth-app3 master br-priv up
+$ ip -n app3 addr add 10.10.1.12/24 dev eth0
+$ ip -n app3 link set eth0 up
+$ ip -n app3 route add default via 10.10.1.1
+$ for i in $(seq 20); do ip netns exec app3 curl -s -m 1 http://10.96.0.10/ || echo failed; done | sort | uniq -c
+      9 hello from web-1
+     11 hello from web-2
+$ sysctl net.bridge.bridge-nf-call-iptables
+net.bridge.bridge-nf-call-iptables = 1
+$ sysctl -w net.bridge.bridge-nf-call-iptables=0
+net.bridge.bridge-nf-call-iptables = 0
+$ for i in $(seq 20); do ip netns exec app3 curl -s -m 1 http://10.96.0.10/ || echo failed; done | sort | uniq -c
+     20 failed
+$ cat /tmp/rst.txt   # tcpdump -i veth-app3 tcp, during one of those curls
+00:17:02.303273 IP 10.10.1.12.41670 > 10.96.0.10.80: Flags [S], seq 835876542, win 64240, options [mss 1460,sackOK,TS val 1939176734 ecr 0,nop,wscale 7], length 0
+00:17:02.303402 IP 10.10.1.11.8080 > 10.10.1.12.41670: Flags [S.], seq 4226960192, ack 835876543, win 65160, options [mss 1460,sackOK,TS val 2702916009 ecr 1939176734,nop,wscale 7], length 0
+00:17:02.303406 IP 10.10.1.12.41670 > 10.10.1.11.8080: Flags [R], seq 835876543, win 0, length 0
+$ sysctl -w net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-iptables = 1
+$ for i in $(seq 20); do ip netns exec app3 curl -s -m 1 http://10.96.0.10/ || echo failed; done | sort | uniq -c
+     12 hello from web-1
+      8 hello from web-2
+```
+
+With the setting off, **20 of 20 requests failed**, and the capture on app3's cable shows exactly how. app3 sent its SYN to `10.96.0.10`. The router DNATed it to `10.10.1.11` and forwarded it onto the bridge. But web-2's reply went **straight back across the bridge** to app3, which is on the same subnet, without passing through the router, so nothing translated it back: app3 received a SYN-ACK from `10.10.1.11`, a machine it had never talked to, and answered it with a reset (`Flags [R]`).
+
+`bridge-nf-call-iptables=1` makes the bridge pass bridged packets through iptables and conntrack too, so the reply is recognised and its source rewritten back to `10.96.0.10`. That's why Kubernetes' installation guides tell you to load the `br_netfilter` module and set this to 1 on every node: without it, a pod calling a Service whose chosen backend is on the same node's bridge fails exactly like this. Setting it back, the requests worked again.
+
+### Step 4: the whole journey
+
+Now all of it at once. A client in the public subnet, with its own `resolv.conf` (`ip netns exec` bind-mounts `/etc/netns/client/resolv.conf` over `/etc/resolv.conf` for processes in that namespace) pointing at our DNS server on the router, `10.10.0.1`. `shop.internal` resolves to the load balancer, `10.10.0.2`, where `cmd/lb` runs in the `lb` namespace in front of app1 and app2. The client sends two requests, and `tcpdump` captures on the client's cable and on each app's cable:
+
+```text
+$ ip netns add client
+$ ip link add veth-client type veth peer name eth0 netns client
+$ ip link set veth-client master br-pub up
+$ ip -n client addr add 10.10.0.100/24 dev eth0
+$ ip -n client link set eth0 up
+$ ip -n client route add default via 10.10.0.1
+$ mkdir -p /etc/netns/client
+$ echo 'nameserver 10.10.0.1' > /etc/netns/client/resolv.conf
+$ ip netns exec client bin/client -url http://shop.internal/ -n 2
+request 1: reused=false dns=4.281ms   connect=520µs     first byte=12.808ms  total=13.023ms
+request 2: reused=true  dns=0s        connect=0s        first byte=1.725ms   total=1.842ms
+2 requests, 1 new connections, average 7.432ms
+$ cat /tmp/journey.txt   # tcpdump on veth-client, veth-app1 and veth-app2, merged by time
+00:17:06.741219 veth-client  ARP, Request who-has 10.10.0.1 tell 10.10.0.100, length 28
+00:17:06.741352 veth-client  ARP, Reply 10.10.0.1 is-at 0a:35:68:93:f5:3a, length 28
+00:17:06.741361 veth-client  IP 10.10.0.100.43674 > 10.10.0.1.53: 49415+ [1au] AAAA? shop.internal. (42)
+00:17:06.741422 veth-client  IP 10.10.0.100.43529 > 10.10.0.1.53: 25672+ [1au] A? shop.internal. (42)
+00:17:06.743374 veth-client  IP 10.10.0.1.53 > 10.10.0.100.43674: 49415*- 0/1/0 (113)
+00:17:06.743433 veth-client  IP 10.10.0.1.53 > 10.10.0.100.43529: 25672*- 1/0/0 A 10.10.0.2 (60)
+00:17:06.743718 veth-client  ARP, Request who-has 10.10.0.2 tell 10.10.0.100, length 28
+00:17:06.743742 veth-client  ARP, Reply 10.10.0.2 is-at 9e:59:1b:1b:ca:2d, length 28
+00:17:06.743744 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [S], seq 3892753623, win 64240, options [mss 1460,sackOK,TS val 425115277 ecr 0,nop,wscale 7], length 0
+00:17:06.743878 veth-client  IP 10.10.0.2.80 > 10.10.0.100.51182: Flags [S.], seq 2166186295, ack 3892753624, win 65160, options [mss 1460,sackOK,TS val 4052542315 ecr 425115277,nop,wscale 7], length 0
+00:17:06.743891 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [.], ack 1, win 502, options [nop,nop,TS val 425115277 ecr 4052542315], length 0
+00:17:06.744532 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [P.], seq 1:95, ack 1, win 502, options [nop,nop,TS val 425115278 ecr 4052542315], length 94: HTTP: GET / HTTP/1.1
+00:17:06.744554 veth-client  IP 10.10.0.2.80 > 10.10.0.100.51182: Flags [.], ack 95, win 509, options [nop,nop,TS val 4052542316 ecr 425115278], length 0
+00:17:06.747288 veth-app1  IP 10.10.0.2.54504 > 10.10.1.10.8080: Flags [S], seq 1008262328, win 64240, options [mss 1460,sackOK,TS val 184397059 ecr 0,nop,wscale 7], length 0
+00:17:06.747328 veth-app1  IP 10.10.1.10.8080 > 10.10.0.2.54504: Flags [S.], seq 1723780878, ack 1008262329, win 65160, options [mss 1460,sackOK,TS val 971981084 ecr 184397059,nop,wscale 7], length 0
+00:17:06.747359 veth-app1  IP 10.10.0.2.54504 > 10.10.1.10.8080: Flags [.], ack 1, win 502, options [nop,nop,TS val 184397059 ecr 971981084], length 0
+00:17:06.747766 veth-app1  IP 10.10.0.2.54504 > 10.10.1.10.8080: Flags [P.], seq 1:185, ack 1, win 502, options [nop,nop,TS val 184397060 ecr 971981084], length 184: HTTP: GET / HTTP/1.1
+00:17:06.747771 veth-app1  IP 10.10.1.10.8080 > 10.10.0.2.54504: Flags [.], ack 185, win 508, options [nop,nop,TS val 971981085 ecr 184397060], length 0
+00:17:06.748369 veth-app1  IP 10.10.1.10.8080 > 10.10.0.2.54504: Flags [P.], seq 1:153, ack 185, win 508, options [nop,nop,TS val 971981085 ecr 184397060], length 152: HTTP: HTTP/1.1 200 OK
+00:17:06.748474 veth-app1  IP 10.10.0.2.54504 > 10.10.1.10.8080: Flags [.], ack 153, win 501, options [nop,nop,TS val 184397060 ecr 971981085], length 0
+00:17:06.750811 veth-client  IP 10.10.0.2.80 > 10.10.0.100.51182: Flags [P.], seq 1:153, ack 95, win 509, options [nop,nop,TS val 4052542322 ecr 425115278], length 152: HTTP: HTTP/1.1 200 OK
+00:17:06.750886 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [.], ack 153, win 501, options [nop,nop,TS val 425115284 ecr 4052542322], length 0
+00:17:06.751295 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [P.], seq 95:189, ack 153, win 501, options [nop,nop,TS val 425115284 ecr 4052542322], length 94: HTTP: GET / HTTP/1.1
+00:17:06.751698 veth-app2  IP 10.10.0.2.36092 > 10.10.1.11.8080: Flags [S], seq 3213537622, win 64240, options [mss 1460,sackOK,TS val 2947730404 ecr 0,nop,wscale 7], length 0
+00:17:06.751719 veth-app2  IP 10.10.1.11.8080 > 10.10.0.2.36092: Flags [S.], seq 759481144, ack 3213537623, win 65160, options [mss 1460,sackOK,TS val 379380089 ecr 2947730404,nop,wscale 7], length 0
+00:17:06.751755 veth-app2  IP 10.10.0.2.36092 > 10.10.1.11.8080: Flags [.], ack 1, win 502, options [nop,nop,TS val 2947730404 ecr 379380089], length 0
+00:17:06.752066 veth-app2  IP 10.10.0.2.36092 > 10.10.1.11.8080: Flags [P.], seq 1:185, ack 1, win 502, options [nop,nop,TS val 2947730404 ecr 379380089], length 184: HTTP: GET / HTTP/1.1
+00:17:06.752072 veth-app2  IP 10.10.1.11.8080 > 10.10.0.2.36092: Flags [.], ack 185, win 508, options [nop,nop,TS val 379380089 ecr 2947730404], length 0
+00:17:06.752581 veth-app2  IP 10.10.1.11.8080 > 10.10.0.2.36092: Flags [P.], seq 1:153, ack 185, win 508, options [nop,nop,TS val 379380090 ecr 2947730404], length 152: HTTP: HTTP/1.1 200 OK
+00:17:06.752633 veth-app2  IP 10.10.0.2.36092 > 10.10.1.11.8080: Flags [.], ack 153, win 501, options [nop,nop,TS val 2947730405 ecr 379380090], length 0
+00:17:06.752852 veth-client  IP 10.10.0.2.80 > 10.10.0.100.51182: Flags [P.], seq 153:305, ack 189, win 509, options [nop,nop,TS val 4052542324 ecr 425115284], length 152: HTTP: HTTP/1.1 200 OK
+00:17:06.754227 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [F.], seq 189, ack 305, win 501, options [nop,nop,TS val 425115287 ecr 4052542324], length 0
+00:17:06.754355 veth-client  IP 10.10.0.2.80 > 10.10.0.100.51182: Flags [F.], seq 305, ack 190, win 509, options [nop,nop,TS val 4052542325 ecr 425115287], length 0
+00:17:06.754376 veth-client  IP 10.10.0.100.51182 > 10.10.0.2.80: Flags [.], ack 306, win 501, options [nop,nop,TS val 425115287 ecr 4052542325], length 0
+```
+
+Every stop of this chapter is in those lines:
+
+1. **ARP** for the default gateway, then **DNS**: two queries in parallel, `A?` and `AAAA?` for `shop.internal.` The flags `*-` mean an authoritative answer: `A 10.10.0.2` for the A query; no answers and one authority record (the SOA) for the AAAA. The client's trace says the lookup took 4.3 ms.
+2. **TCP to the balancer**: SYN, SYN-ACK, ACK, then `GET /`, 94 bytes.
+3. **The balancer's own connection** to web-1 in the private subnet: a new handshake, from `10.10.0.2` port 54504, through the router, then the forwarded request. It's **184 bytes**, not 94, because the proxy added its `X-Forwarded-*` headers. web-1 answers `200 OK`, and the balancer relays it to the client.
+4. **The second request** on the same client connection (no handshake: 1.8 ms in total instead of 13.0 ms). The balancer sends it to **web-2**, round robin, on a new backend connection.
+5. The client closes its connection. The balancer's connections to web-1 and web-2 stay open in its pool for the next requests.
+
+<QuickCheck
+  question="A Kubernetes Service has ClusterIP 10.96.0.10. Which interface on the node has that address?"
+  options={[
+    "The node's eth0",
+    "The cni0 bridge",
+    "A virtual interface kube-proxy creates",
+    "None: in iptables mode, the address exists only in NAT rules that rewrite it to a pod's address"
+  ]}
+  answer={3}
+  explain="Measured: ip addr | grep -c 10.96.0.10 printed 0, and 1,000 connections to it were DNATed to the two pods, 486 and 514."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="What TLS adds" level="easy">
+
+Give `cmd/web` a `-tls` flag that serves HTTPS with a self-signed certificate (generate one at startup with `crypto/x509` and `crypto/ecdsa`, or run `ListenAndServeTLS` with files made by `openssl`), and teach `cmd/client` to skip verification for this test only (`tls.Config{InsecureSkipVerify: true}`). Add `TLSHandshakeStart` and `TLSHandshakeDone` to the trace, run it over the 20 ms loopback, and compare new and reused connections again.
+
+<Solution>
+
+A new HTTPS connection costs one round trip for TCP and, with TLS 1.3, one more for the TLS handshake before the request can go, so expect the first request to take about three round trips (around 60 ms here) and reused ones one round trip, as before. The gap between `-reuse=false` and the default grows accordingly, which is why keeping connections alive matters even more for HTTPS. (With TLS 1.2, the handshake takes two round trips.)
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Retry on another backend" level="medium">
+
+When the balancer can't even connect to a backend (`connection refused`), nothing was sent, so the request can safely go to another backend. Make `cmd/lb` do that: mark the backend unhealthy at once (a **passive** health check) and retry the request on the next healthy one. Rerun the `kill -9` experiment. How many 502s are left?
+
+<Solution>
+
+In `ErrorHandler`, check `errors.Is(err, syscall.ECONNREFUSED)` (or that the error is a `*net.OpError` with `Op == "dial"`). If so, `b.healthy.Store(false)`, pick another backend, and call its `proxy.ServeHTTP(w, r)` if the request has no body, or `r.GetBody` can recreate it. Only the requests that were in flight at the moment of the kill should still fail; the ones sent to the dead backend afterwards are rescued. Don't retry after a request may have reached the backend (a timeout, or a reset mid-response) unless the method is idempotent: a retried POST can charge a card twice. This is what nginx's `proxy_next_upstream` and Envoy's retry policies configure.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Least connections" level="medium">
+
+Round robin assumes every request costs the same. Add a second policy to `cmd/lb`, **least connections**: pick the healthy backend with the fewest requests in flight (an `atomic.Int64` per backend, incremented before `proxy.ServeHTTP` and decremented after). Then start web-2 with a handler that is ten times slower and compare the two policies with `cmd/load`.
+
+<Solution>
+
+With round robin, both backends get the same number of requests, so the slow one builds up a queue and the average latency is dominated by it. With least connections, requests pile up less on the slow backend (it always has more in flight), so the fast one takes most of the traffic. Break ties by round robin, or the first backend in the list gets every request when all are idle. For big pools, "power of two choices" (pick two at random, take the less busy) gets nearly the same result without scanning every backend.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="A client that follows DNS" level="medium">
+
+Run `cmd/client` in a loop against `shop.internal` with a keep-alive connection while you change the record from Stop 1 to point at another server. How long does the client keep talking to the old address? Then set `Transport.IdleConnTimeout` to a few seconds, or close idle connections periodically with `client.CloseIdleConnections()`, and measure again.
+
+<Solution>
+
+As long as the keep-alive connection stays open and busy, the client never looks the name up again, so it can keep using the old address long after the DNS TTL has expired: in a busy loop, indefinitely. Closing idle connections forces a new dial, which does a new lookup. Services that must follow DNS changes (a database failover behind a DNS name, for instance) need both a short TTL and connections that don't live forever: `IdleConnTimeout` for idle ones, and a maximum connection age for busy ones.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={5} title="A second Service, three pods" level="hard">
+
+Add a third pod to the private subnet and a Service `10.96.0.20:80` in front of all three, written the way kube-proxy writes it. What probability must each rule have for an even split? Check with 3,000 connections and the rules' counters. Then call the Service from one of its own pods, and explain what you see.
+
+<Solution>
+
+The rules are tried in order, so the first must match 1/3 of the time, the second 1/2 of what's left, and the last everything else: `--probability 0.33333`, `--probability 0.5`, then no match condition. Expect about 1,000 each. Calling the Service from a pod that is also a backend fails whenever the rule picks that same pod: the packet is DNATed back to its own sender, whose reply never passes back through the NAT. This is **hairpin** traffic; kube-proxy handles it by masquerading packets whose source and destination pod are the same, and the bridge plugin by enabling `hairpin_mode` on the bridge port.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Fair Turns"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="This is the backend picker from the chapter's load balancer. It has three bugs, all measured in Stop 3: when web-2 is down its share goes to web-3 (1,000 against 2,000 instead of 1,500 each), when every backend is down it returns one anyway, and under concurrent use the counter and the health flags race. Make Next return healthy backends round robin with an equal share each, return ErrNoBackend when none is up, and pass the concurrent check, including under -race."
+  starter={`package main
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+// ErrNoBackend is returned by Next when no backend is healthy.
+var ErrNoBackend = errors.New("no healthy backend")
+
+// Backend is one instance behind the balancer.
+type Backend struct {
+	Name    string
+	healthy bool
+}
+
+// Pool is the balancer's list of backends. Next is called by every request
+// goroutine, SetHealthy by the health checker's goroutine, all at once.
+type Pool struct {
+	backends []*Backend
+	next     int
+}
+
+func NewPool(names ...string) *Pool {
+	p := &Pool{}
+	for _, n := range names {
+		p.backends = append(p.backends, &Backend{Name: n, healthy: true})
+	}
+	return p
+}
+
+// SetHealthy records a health-check result. Unknown names are ignored.
+func (p *Pool) SetHealthy(name string, ok bool) {
+	for _, b := range p.backends {
+		if b.Name == name {
+			b.healthy = ok
+		}
+	}
+}
+
+// Next returns the next healthy backend, round robin, or ErrNoBackend.
+// Skipping an unhealthy backend must keep the load even across the rest.
+func (p *Pool) Next() (*Backend, error) {
+	i := p.next
+	p.next++
+	for range len(p.backends) {
+		b := p.backends[i%len(p.backends)]
+		if b.healthy {
+			return b, nil
+		}
+		i++ // try the one after it
+	}
+	return p.backends[0], nil
+}
+
+// ── below this line: do not edit ──
+
+func count(p *Pool, n int) (map[string]int, error) {
+	got := map[string]int{}
+	for range n {
+		b, err := p.Next()
+		if err != nil {
+			return got, err
+		}
+		got[b.Name]++
+	}
+	return got, nil
+}
+
+func main() {
+	ok := true
+	var failMu sync.Mutex
+	fail := func(f string, a ...any) {
+		failMu.Lock()
+		defer failMu.Unlock()
+		fmt.Printf("FAIL "+f+"\\n", a...)
+		ok = false
+	}
+	p := NewPool("web-1", "web-2", "web-3")
+
+	// Check 1: all healthy, strict round robin.
+	var order []string
+	for range 6 {
+		b, err := p.Next()
+		if err != nil {
+			fail("all healthy: Next returned %v", err)
+			break
+		}
+		order = append(order, b.Name)
+	}
+	if fmt.Sprint(order) != "[web-1 web-2 web-3 web-1 web-2 web-3]" {
+		fail("all healthy: order %v, want web-1 web-2 web-3 web-1 web-2 web-3", order)
+	}
+
+	// Check 2: web-2 is down. Its share must be split evenly, not handed to web-3.
+	p.SetHealthy("web-2", false)
+	got, err := count(p, 3000)
+	if err != nil || got["web-1"] != 1500 || got["web-3"] != 1500 || got["web-2"] != 0 {
+		fail("web-2 down, 3000 requests: %v (err %v); want web-1 1500, web-3 1500, web-2 0", got, err)
+	}
+
+	// Check 3: every backend down. The balancer must say so, not pick one anyway.
+	p.SetHealthy("web-1", false)
+	p.SetHealthy("web-3", false)
+	if b, err := p.Next(); !errors.Is(err, ErrNoBackend) || b != nil {
+		fail("all down: Next = %v, %v; want nil, ErrNoBackend", b, err)
+	}
+
+	// Check 4: they come back.
+	for _, n := range []string{"web-1", "web-2", "web-3"} {
+		p.SetHealthy(n, true)
+	}
+	got, err = count(p, 3000)
+	if err != nil || got["web-1"] != 1000 || got["web-2"] != 1000 || got["web-3"] != 1000 {
+		fail("all back up, 3000 requests: %v (err %v); want 1000 each", got, err)
+	}
+
+	// Check 5: web-2 is down again; 9 request goroutines and the health
+	// checker run at once. No request may miss the healthy backends. Run
+	// with -race too.
+	p.SetHealthy("web-2", false)
+	var mu sync.Mutex
+	total := map[string]int{}
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	checker := make(chan struct{})
+	go func() {
+		defer close(checker)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				p.SetHealthy("web-2", false) // the health checker's goroutine
+			}
+		}
+	}()
+	for range 9 {
+		wg.Go(func() {
+			got, err := count(p, 1000)
+			if err != nil {
+				fail("concurrent: %v", err)
+			}
+			mu.Lock()
+			for k, v := range got {
+				total[k] += v
+			}
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	close(stop)
+	<-checker
+	if total["web-1"] != 4500 || total["web-3"] != 4500 || total["web-2"] != 0 {
+		fail("web-2 down, 9 goroutines x 1000 requests: %v; want web-1 4500, web-3 4500", total)
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Checks strict round robin over three healthy backends; 3,000 picks with web-2 down (1,500 each for web-1 and web-3, 0 for web-2); ErrNoBackend with a nil backend when all are down; 1,000 each after they recover; and 9 goroutines × 1,000 picks with web-2 down while a health checker goroutine keeps writing, requiring no errors and exactly 4,500 each. Prints ALL CHECKS PASS."
+  hints={[
+    "Store health in an atomic.Bool and the counter in an atomic.Uint64: Next runs on every request goroutine while SetHealthy runs on the health checker's.",
+    "Don't walk forward from the counter's position until you find a healthy backend: the backend after a dead one then gets two turns. Build the list of healthy backends first, then index it with one turn from the counter.",
+    "Take exactly one turn per call (p.next.Add(1) - 1). Taking a new turn for each try lets another goroutine's turns interleave, and a request can miss every healthy backend: that's the 503 Stop 3 measured."
+  ]}
+  flag="GO{spend_one_turn}"
+>
+
+The same picker as `cmd/lb`, without the network, so it runs anywhere. The checks call `Next` from nine goroutines while another goroutine plays the health checker, which is what a balancer's request handlers and health checks do all day.
+
+</Lab>
+
+<Recap>
+
+- **DNS**: a recursive resolver walks root → TLD → authoritative (111 to 136 ms per hop from this laptop) and caches by TTL. Our Go authoritative server with `miekg/dns` answered `dig` with the `aa` flag. Go's resolver sent **200 queries for 100 lookups** (A and AAAA) and caches nothing; with a Kubernetes-style search list and `ndots:5`, **800**, and with a trailing dot, 200 again. Behind a cache (dnsmasq), 100 lookups sent **2**, and after a record changed, clients got the old address for **19.7 s**: the TTL the cached answer had left.
+- **TCP**: the handshake is one round trip before any HTTP. With a 20 ms round trip, reused connections averaged **25.0 ms** a request and new ones **44.4 ms**. Not reading a 256 KB body cost **20 connections instead of 1**; the default `MaxIdleConnsPerHost` of 2 with 20 goroutines made the server accept **465 connections** instead of 20.
+- **Load balancer**: `httputil.ReverseProxy` with `Rewrite` is a layer-7 balancer: **6,054 / 6,054** from one connection. A layer-4 balancer picks per connection: **16,518 / 0**. A `kill -9` without health checks failed **27,928** requests and kept failing; with checks, **4,819**, all within a second. Taking a new counter turn per try produced **110 false 503s**; one turn per request, none. In-flight requests: `kill -9` lost **15**, an immediate `Shutdown` **7**, failing the health check and waiting 2 s before `Shutdown`, **0**.
+- **Private network**: a namespace is a machine, a bridge and veth pairs are a subnet, default routes and `ip_forward` make a router, and `MASQUERADE` is a NAT gateway: pings to 1.1.1.1 went from **0 of 3** answered to **135 ms**, and conntrack held the mapping. The `nat` table sees only a connection's first packet.
+- **Into the pod**: a packet reaches a container by route, ARP and veth, exactly as a CNI plugin wires it. A Kubernetes Service is DNAT rules for an address on no interface: **486 / 514** over 1,000 connections, and still one pod per connection. With `bridge-nf-call-iptables=0`, a pod on the same bridge failed **20 of 20** calls to the Service, reset by its own un-NATed reply.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: 200 queries", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: a stale answer", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: a pool of 2", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: shutdown order", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the missing NAT", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: where the ClusterIP lives", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: what TLS adds", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: retry on another backend", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: least connections", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: a client that follows DNS", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 5: a second Service, three pods", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab: Fair Turns", captured: false, points: 100 }}
+/>
+
+<Narrator>
+From a name to a pod, every rewrite captured in conntrack and explained. The next time traffic goes missing, you won't guess. You'll look. Guessing is for people without my training.
+</Narrator>

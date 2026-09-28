@@ -57,7 +57,8 @@ export type GopherRole =
   | "browser" // window chrome — the user agent itself, the untrusted leg of a flow
   | "maestro" // baton — main(), the entry point, a dispatcher conducting the rest
   | "reader" // mug — you, the engineer at the keyboard
-  | "smith"; // anvil + hammer — the compiler, linker, stenciling, codegen
+  | "smith" // anvil + hammer — the compiler, linker, stenciling, codegen
+  | "supe"; // cape, epaulettes, chest star, perfect hair — the book's narrator
 
 /* keyword → role. First match wins; order = specificity. */
 const ROLE_KEYWORDS: [RegExp, GopherRole][] = [
@@ -199,6 +200,18 @@ function RoleGear({ role }: { role: GopherRole }) {
           <circle cx="32" cy="1.5" r="1.8" fill="#9fc2ff" />
           <path d="M36.5 4 a6.5 6.5 0 0 0 -9 0" fill="none" stroke="#9fc2ff" strokeWidth="1.3" className="gph-signal" />
           <path d="M39 1.6 a10 10 0 0 0 -14 0" fill="none" stroke="#9fc2ff" strokeWidth="1.1" opacity=".6" className="gph-signal gph-signal-2" />
+        </g>
+      );
+    case "supe": // the narrator: red cape, gold epaulettes, a star on the chest, perfect hair
+      return (
+        <g className="gph-gear gph-supe">
+          <path d="M15 21 L2.5 58 Q9 61.5 14.5 55 Z" fill="#b3202a" stroke="var(--gph-line)" strokeWidth="1.2" />
+          <path d="M49 21 L61.5 58 Q55 61.5 49.5 55 Z" fill="#b3202a" stroke="var(--gph-line)" strokeWidth="1.2" />
+          <path d="M15.5 21.5 Q32 27 48.5 21.5" fill="none" stroke="#b3202a" strokeWidth="2.4" strokeLinecap="round" />
+          <rect x="12.5" y="19.5" width="7" height="3.2" rx="1.4" fill="#e8c35a" />
+          <rect x="44.5" y="19.5" width="7" height="3.2" rx="1.4" fill="#e8c35a" />
+          <path d="M32 42 l1.8 3.7 4 .5 -3 2.8 .8 4 -3.6 -2 -3.6 2 .8 -4 -3 -2.8 4 -.5 z" fill="#e8c35a" stroke="#b08a18" strokeWidth=".8" />
+          <path d="M21 10.5 Q27 1 43.5 7.5 Q35.5 5.8 31 10.2 Q28 7.5 21 10.5 Z" fill="#e8d27a" stroke="#b89b3c" strokeWidth=".8" />
         </g>
       );
     case "leader": // crown

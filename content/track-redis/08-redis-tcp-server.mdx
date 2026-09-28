@@ -1,0 +1,797 @@
+---
+title: "A TCP Server"
+part: "redis"
+order: 8
+type: "course"
+description: "The store goes on the network. A TCP listener, a goroutine per connection, and replies encoded exactly as Redis encodes them: sent the same eight commands, our server and Redis 8.10.2 answered byte for byte the same. Measured on the way: a server that handles one connection at a time left a second client waiting past its 2-second deadline, and sharing the store between connections without a lock crashed the server with 'concurrent map writes' and lost 416 of 1,600 increments."
+prerequisites: ["redis-eviction"]
+---
+
+<HeroCard label="Build Your Own Redis · Lesson 8" title="A TCP Server">
+
+Module 1 built the store, but only Go code in the same program can use it. Real Redis is a **server**: other programs connect to it over the network and send it commands. This lesson puts our store behind a TCP port, so that a separate program can send it `SET` and `GET`, and makes it answer in exactly the bytes real Redis would send back.
+
+Four stops:
+
+1. **Bytes on a connection.** What a client actually sends Redis, and what comes back.
+2. **Listen, accept, handle.** The shape of every Go network server, and why each connection needs its own goroutine.
+3. **Replies, byte for byte.** Encoding answers the way Redis does, checked against Redis itself.
+4. **One store, many clients.** What happens when two connections touch the map at once.
+
+</HeroCard>
+
+<Narrator mood="menacing">
+Today the store goes on the network, where anybody can talk to it. Anybody. At the same time. You'll see what that does to an unguarded map, and you won't like it.
+</Narrator>
+
+<ChapterTabs tabs={["Bytes on a Connection", "Listen, Accept, Handle", "Replies, Byte for Byte", "One Store, Many Clients"]} />
+
+<ProjectMap
+  root="kv"
+  files={[
+    { path: "go.mod" },
+    { path: "store.go" },
+    { path: "lru.go" },
+    { path: "sampled.go" },
+    { path: "store_test.go" },
+    { path: "incr_test.go" },
+    { path: "ttl_test.go" },
+    { path: "lru_test.go" },
+    { path: "server/server.go", status: "new", note: "package server: listen, accept, one goroutine per connection" },
+    { path: "server/commands.go", status: "new", note: "run a command against the store and encode the reply as Redis does" },
+    { path: "server/server_test.go", status: "new", note: "replies match Redis's; many clients at once lose nothing" },
+    { path: "cmd/kv-server/main.go", status: "new", note: "the server program: listens on 127.0.0.1:6380" },
+    { path: "cmd/talk/main.go", status: "new", note: "a tiny client: sends lines, prints the raw reply bytes" },
+    { path: "cmd/twoclients/main.go", status: "new", note: "does a second client get served while the first is idle?" },
+    { path: "cmd/hammer/main.go", status: "new", note: "50 clients × 1,000 INCR on one key" },
+    { path: "cmd/demo/main.go" },
+    { path: "cmd/errs/main.go" },
+    { path: "cmd/wrap/main.go" },
+    { path: "cmd/leak/main.go" },
+    { path: "cmd/hitrate/main.go" },
+    { path: "cmd/mem/main.go" },
+    { path: "session.txt", status: "new", note: "the eight commands both servers are sent, one per line" }
+  ]}
+  run={["go run ./cmd/kv-server", "go run ./cmd/talk < session.txt   # in a second terminal", "go test -race ./server"]}
+>
+
+The network code gets its own package, `kv/server`, in its own folder. It imports `kv` for the store, the same way the programs in `cmd/` do; the store knows nothing about networks.
+
+</ProjectMap>
+
+## Bytes on a Connection
+
+*Stop 1 of 4.*
+
+### Step 1: a connection is a stream of bytes
+
+A **TCP connection** is a two-way pipe of bytes between two programs, usually on different machines. TCP makes sure the bytes arrive complete and in order, and that's all it does: it has no idea where one message ends and the next begins. That's up to the **protocol** the two programs agree on. So before writing a server, we need to know exactly what bytes a Redis client sends and what bytes Redis sends back.
+
+### Step 2: a tool to see them
+
+`cmd/talk` connects to a server, sends each line it reads from standard input, and prints whatever comes back with Go's `%q` verb, which shows invisible characters like carriage return (`\r`) and newline (`\n`) as escapes:
+
+```go noverify title="kv/cmd/talk/main.go · lines 25–44"
+	in := bufio.NewScanner(os.Stdin)
+	buf := make([]byte, 4096)
+	for in.Scan() {
+		fmt.Printf("> %s\n", in.Text())
+		if _, err := conn.Write([]byte(in.Text() + "\r\n")); err != nil {
+			log.Fatal(err)
+		}
+		// Read whatever arrives in the next 200 ms: this tool doesn't parse
+		// replies yet, so it can't know where one ends.
+		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		var reply strings.Builder
+		for {
+			n, err := conn.Read(buf)
+			reply.Write(buf[:n])
+			if err != nil {
+				break
+			}
+		}
+		fmt.Printf("< %q\n", reply.String())
+	}
+```
+
+It can't know where a reply ends (it doesn't understand the protocol yet), so it reads whatever arrives within 200 ms. `net.Dial("tcp", addr)` is the client side of a connection; the value it returns, a `net.Conn`, has `Read` and `Write` methods like a file.
+
+### Step 3: talk to real Redis
+
+Redis accepts **inline commands**: a line of words separated by spaces, ending in `\r\n`, the same thing you'd type in a terminal. Here are eight of them, the lines of `session.txt`, sent to Redis 8.10.2 with `go run ./cmd/talk -addr 127.0.0.1:6399 < session.txt`:
+
+```text
+> PING
+< "+PONG\r\n"
+> SET user:1:name Ada
+< "+OK\r\n"
+> GET user:1:name
+< "$3\r\nAda\r\n"
+> GET nobody
+< "$-1\r\n"
+> INCR visits
+< ":1\r\n"
+> DEL user:1:name
+< ":1\r\n"
+> GET
+< "-ERR wrong number of arguments for 'get' command\r\n"
+> FLY away
+< "-ERR unknown command 'FLY', with args beginning with: 'away' \r\n"
+```
+
+Every reply starts with one character that says what **type** of reply it is, and ends with `\r\n`:
+
+| First byte | Type | Example |
+|---|---|---|
+| `+` | simple string | `+OK` |
+| `-` | error | `-ERR wrong number of arguments for 'get' command` |
+| `:` | integer | `:1` |
+| `$` | bulk string: the length in bytes, then the bytes | `$3\r\nAda` |
+| `$-1` | null: no value | `GET nobody` |
+
+This is **RESP**, the Redis Serialization Protocol. The next lesson covers the half we skipped (how `redis-cli` sends commands); this lesson makes our server give exactly these replies.
+
+<QuickCheck
+  question="Why does a bulk string start with its length ($3) instead of just ending at \r\n?"
+  options={[
+    "To save a byte",
+    "So a value can contain any bytes, including \\r\\n itself: the reader takes exactly that many bytes",
+    "Because Redis values are always short",
+    "Because TCP needs it"
+  ]}
+  answer={1}
+  explain="A length prefix makes values binary-safe. A value holding a newline, or an image, is read correctly because the reader counts bytes instead of looking for a terminator."
+/>
+
+## Listen, Accept, Handle
+
+*Stop 2 of 4.*
+
+### Step 1: the server's shape
+
+Every Go TCP server has the same three parts:
+
+- **Listen**: `net.Listen("tcp", "127.0.0.1:6380")` asks the operating system for a port. From then on, clients can connect to it.
+- **Accept**: `l.Accept()` waits for the next client to connect and returns a `net.Conn` for that one client.
+- **Handle**: read commands from that connection and write replies, until the client hangs up.
+
+The program that starts it all is short:
+
+```go noverify title="kv/cmd/kv-server/main.go"
+// kv-server serves a kv.Store over TCP, speaking Redis's protocol.
+package main
+
+import (
+	"flag"
+	"log"
+	"net"
+
+	"kv"
+	"kv/server"
+)
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:6380", "address to listen on")
+	flag.Parse()
+
+	l, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("listening on %s", l.Addr())
+	log.Fatal(server.New(kv.New()).Serve(l))
+}
+```
+
+### Step 2: the accept loop, first version
+
+The obvious first version accepts a client and handles it, then accepts the next:
+
+```go noverify title="kv/server/server.go · the first version of Serve"
+func (s *Server) Serve(l net.Listener) error {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		s.handle(conn)
+	}
+}
+```
+
+`cmd/twoclients` tests it: client A connects and says nothing (like a real client between commands), then client B sends `PING` and waits up to 2 seconds for an answer:
+
+```go noverify title="kv/cmd/twoclients/main.go · lines 17–37"
+
+	a, err := net.Dial("tcp", *addr) // A: connected, idle
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.Dial("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer b.Close()
+	start := time.Now()
+	fmt.Fprint(b, "PING\r\n")
+	b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	reply, err := bufio.NewReader(b).ReadString('\n')
+	if err != nil {
+		fmt.Printf("B: no reply after %v (%v)\n", time.Since(start).Round(time.Millisecond), err)
+		return
+	}
+	fmt.Printf("B: %q after %v\n", reply, time.Since(start).Round(time.Microsecond))
+```
+
+```text
+B: no reply after 2s (read tcp 127.0.0.1:64512->127.0.0.1:6381: i/o timeout)
+```
+
+**No reply.** The server was inside `handle(A)`, waiting for A to send something, so it never went back to `Accept` to pick up B. One idle client blocks everyone.
+
+### Step 3: a goroutine per connection
+
+The fix is one word:
+
+```go noverify title="kv/server/server.go · lines 24–34"
+// Serve accepts connections on l until l is closed, and serves each one
+// in its own goroutine.
+func (s *Server) Serve(l net.Listener) error {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		go s.handle(conn)
+	}
+}
+```
+
+`go s.handle(conn)` starts `handle` in a new **goroutine** and returns immediately, so the loop is straight back at `Accept`. Each client gets its own goroutine, and a goroutine waiting on a quiet connection costs a few kilobytes of stack and no CPU. The same test:
+
+```text
+B: "+PONG\r\n" after 1.772ms
+```
+
+B's `PING` answered in under 2 ms while A sat idle. This is how Go network servers are normally written, including `net/http`: a goroutine per connection, with the blocking hidden inside simple sequential code.
+
+<RelationAnim
+  title="One loop, or a goroutine per connection"
+  kicker="the accept loop"
+  role="operator"
+  height={56}
+  nodes={[
+    { id: "l", label: "Accept loop", sub: "127.0.0.1:6380", x: 14, y: 50, kind: "tool" },
+    { id: "a", label: "client A", sub: "connected, idle", x: 50, y: 16, kind: "value" },
+    { id: "b", label: "client B", sub: "PING", x: 50, y: 84, kind: "value" },
+    { id: "ga", label: "handle(A)", sub: "goroutine", x: 84, y: 16, kind: "cmd" },
+    { id: "gb", label: "handle(B)", sub: "goroutine", x: 84, y: 84, kind: "cmd" }
+  ]}
+  edges={[
+    { from: "l", to: "a", label: "Accept" },
+    { from: "l", to: "b", label: "Accept" },
+    { from: "a", to: "ga", label: "go" },
+    { from: "b", to: "gb", label: "go" }
+  ]}
+  frames={[
+    { show: ["l"], at: "l", say: "Accept()", note: "The server listens on a port and loops on Accept, which waits for the next client." },
+    { show: ["l", "a", "l>a"], hot: ["a", "l>a"], at: "a", say: "handle(A)", note: "First version: A connects and the loop calls handle(A) itself. handle waits for A's next line, and A is quiet." },
+    { show: ["l", "a", "l>a", "b"], bad: ["b"], at: "b", say: "…", beat: "problem", note: "B connects and sends PING, but the loop is still inside handle(A), so it never calls Accept for B. Measured: no reply after 2 s." },
+    { show: ["l", "a", "l>a", "ga", "a>ga"], hot: ["ga", "a>ga"], at: "ga", say: "waiting on A", note: "Second version: go s.handle(conn). A gets its own goroutine to wait in, and the loop goes straight back to Accept." },
+    { show: ["l", "a", "l>a", "ga", "a>ga", "b", "l>b", "gb", "b>gb"], hot: ["gb", "b>gb", "l>b"], at: "gb", say: "+PONG", beat: "solution", note: "B is accepted and served in its own goroutine while A's goroutine keeps waiting. Measured: +PONG in 1.772 ms." }
+  ]}
+  caption="The loop only accepts. Each connection's waiting happens in its own goroutine."
+/>
+
+### Step 4: reading one command per line
+
+```go noverify title="kv/server/server.go · lines 36–50"
+// handle reads one command per line and writes one reply for each, until
+// the client hangs up.
+func (s *Server) handle(conn net.Conn) {
+	defer conn.Close()
+	lines := bufio.NewScanner(conn)
+	for lines.Scan() {
+		args := strings.Fields(lines.Text())
+		if len(args) == 0 {
+			continue
+		}
+		if _, err := io.WriteString(conn, s.do(args)); err != nil {
+			return
+		}
+	}
+}
+```
+
+`bufio.Scanner` splits the connection's bytes into lines (it drops the `\n`, and `strings.Fields` drops the `\r` along with the spaces). A blank line gives no fields and is skipped, as Redis does. `Scan` returns false when the client hangs up, the loop ends, and `defer conn.Close()` releases the connection. If writing a reply fails, the client has gone, so `handle` returns too.
+
+<QuickCheck
+  question="The first version called s.handle(conn) without go. Why did client B get no reply?"
+  options={[
+    "The port only allows one connection",
+    "The loop was inside handle(A), blocked waiting for A to send a line, so it never called Accept for B",
+    "B's PING was malformed",
+    "TCP queues only one client"
+  ]}
+  answer={1}
+  explain="The OS did queue B's connection, but nothing accepted it. Measured: no reply after 2 s. With go s.handle(conn), B was answered in under 2 ms."
+/>
+
+## Replies, Byte for Byte
+
+*Stop 3 of 4.*
+
+### Step 1: one function per reply type
+
+Each reply type from the table in stop 1 becomes a one-line function:
+
+```go noverify title="kv/server/commands.go · lines 54–59"
+// The reply types a client can tell apart by their first byte.
+func simple(s string) string     { return "+" + s + "\r\n" }
+func errorReply(s string) string { return "-ERR " + s + "\r\n" }
+func integer(n int64) string     { return ":" + strconv.FormatInt(n, 10) + "\r\n" }
+func bulk(s string) string       { return "$" + strconv.Itoa(len(s)) + "\r\n" + s + "\r\n" }
+func null() string               { return "$-1\r\n" }
+```
+
+`bulk` writes `len(s)`, and `len` of a Go string is its length in **bytes**, which is what RESP counts. That matters for any text that isn't plain ASCII. Real Redis, given a Yoruba name:
+
+```text
+> SET user:2:name Ọlá
+< "+OK\r\n"
+> GET user:2:name
+< "$6\r\nỌlá\r\n"
+```
+
+`Ọlá` is three letters but **six bytes** in UTF-8 (`Ọ` takes three, `á` two). A server that counted letters would send `$3`, and the client would read three bytes and then treat the rest of the name as the start of the next reply.
+
+### Step 2: running a command
+
+```go noverify title="kv/server/commands.go · lines 14–52"
+func (s *Server) do(args []string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	name := strings.ToUpper(args[0])
+	switch {
+	case name == "PING" && len(args) == 1:
+		return simple("PONG")
+	case name == "SET" && len(args) == 3:
+		s.store.Set(args[1], args[2])
+		return simple("OK")
+	case name == "GET" && len(args) == 2:
+		v, ok := s.store.Get(args[1])
+		if !ok {
+			return null()
+		}
+		return bulk(v)
+	case name == "DEL" && len(args) >= 2:
+		n := 0
+		for _, k := range args[1:] {
+			if s.store.Del(k) {
+				n++
+			}
+		}
+		return integer(int64(n))
+	case name == "INCR" && len(args) == 2:
+		n, err := s.store.Incr(args[1])
+		switch {
+		case errors.Is(err, kv.ErrNotInteger):
+			return errorReply(kv.ErrNotInteger.Error())
+		case errors.Is(err, kv.ErrOverflow):
+			return errorReply(kv.ErrOverflow.Error())
+		}
+		return integer(n)
+	case name == "PING" || name == "SET" || name == "GET" || name == "DEL" || name == "INCR":
+		return errorReply(fmt.Sprintf("wrong number of arguments for '%s' command", strings.ToLower(name)))
+	}
+	return unknown(args)
+}
+```
+
+`do` upper-cases the command name (Redis accepts `get`, `GET` and `Get`), and each `case` checks the name and the number of arguments together. A known command with the wrong number of arguments falls through to the second-to-last case and gets Redis's exact message; anything else is an unknown command. `INCR` uses lesson 4's sentinel errors with `errors.Is`, and sends their messages, which were copied from Redis in the first place.
+
+### Step 3: checked against Redis
+
+The same eight commands, sent to our server instead:
+
+```text
+> PING
+< "+PONG\r\n"
+> SET user:1:name Ada
+< "+OK\r\n"
+> GET user:1:name
+< "$3\r\nAda\r\n"
+> GET nobody
+< "$-1\r\n"
+> INCR visits
+< ":1\r\n"
+> DEL user:1:name
+< ":1\r\n"
+> GET
+< "-ERR wrong number of arguments for 'get' command\r\n"
+> FLY away
+< "-ERR unknown command 'FLY', with args beginning with: 'away' \r\n"
+```
+
+Compared with Redis's transcript using `diff`, there is no difference at all: every reply, every error message, down to the trailing space after `'away'`. The server's test keeps it that way: the table of commands and Redis's replies is `TestRepliesMatchRedis` in `server/server_test.go`.
+
+```go noverify title="kv/server/server_test.go · lines 13–23"
+// start runs a server on a free port and returns its address.
+func start(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0") // port 0: the OS picks a free one
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go New(kv.New()).Serve(l)
+	return l.Addr().String()
+}
+```
+
+`net.Listen("tcp", "127.0.0.1:0")` asks for port **0**, which means "any free port": the test never collides with a real server, and `l.Addr()` says which port it got.
+
+## One Store, Many Clients
+
+*Stop 4 of 4.*
+
+### Step 1: two goroutines, one map
+
+With a goroutine per connection, two clients' commands can now run **at the same time**, and both reach the same `kv.Store`, which is a Go map. A Go map is not safe for concurrent use: if one goroutine writes while another reads or writes, the map's internal state can be corrupted. Before adding the lock (the `mu` field you may have noticed), here's what happens without it. `cmd/hammer` opens 50 connections that each send `INCR hits` 1,000 times. Against a server with no lock, the server died:
+
+```text
+2026/09/28 00:42:01 listening on 127.0.0.1:6381
+fatal error: concurrent map read and map write
+
+goroutine 5 [running]:
+internal/runtime/maps.fatal({0x1021c213c?, 0x10214c760?})
+	/Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/runtime/panic.go:1195 +0x20
+kv.(*Store).lookup(0x3552f6092040, {0x3552f64014e5, 0x4})
+	/tmp/nolock/kv/store.go:39 +0x64
+kv.(*Store).Incr(0x3552f6092040, {0x3552f64014e5, 0x4})
+	/tmp/nolock/kv/store.go:95 +0x2c
+kv/server.(*Server).do(0x3552f609a0f0, {0x3552f64034e0, 0x2, 0x2})
+	/tmp/nolock/kv/server/commands.go:37 +0x330
+kv/server.(*Server).handle(0x3552f609a0f0, {0x1022ec880, 0x3552f5f7c028})
+	/tmp/nolock/kv/server/server.go:46 +0xf0
+created by kv/server.(*Server).Serve in goroutine 1
+	/tmp/nolock/kv/server/server.go:32 +0x38
+```
+
+`fatal error: concurrent map read and map write`. The Go runtime checks for this and stops the whole program rather than carry on with a damaged map. It's a **fatal error**, not a panic, so `recover` can't catch it. Every client was disconnected:
+
+```text
+2026/09/28 00:42:01 read tcp 127.0.0.1:64671->127.0.0.1:6381: read: connection reset by peer
+2026/09/28 00:42:01 read tcp 127.0.0.1:64655->127.0.0.1:6381: read: connection reset by peer
+exit status 1
+```
+
+### Step 2: the race detector sees it first
+
+The runtime only catches a collision when it happens to land. The **race detector** (`go test -race`) watches every memory access and reports two goroutines touching the same memory without synchronisation even when nothing breaks. `TestConcurrentIncr` runs 8 clients × 200 `INCR`s; against the lock-free server, here is the first of the three reports it printed:
+
+```text
+==================
+WARNING: DATA RACE
+Read at 0x00c00011eb10 by goroutine 19:
+  runtime.mapaccess1_faststr()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/internal/runtime/maps/runtime_faststr.go:114 +0x4c
+  kv.(*Store).lookup()
+      /tmp/nolock/kv/store.go:39 +0x74
+  kv.(*Store).Incr()
+      /tmp/nolock/kv/store.go:95 +0x40
+  kv/server.(*Server).do()
+      /tmp/nolock/kv/server/commands.go:37 +0x414
+  kv/server.(*Server).handle()
+      /tmp/nolock/kv/server/server.go:46 +0x178
+  kv/server.(*Server).Serve.gowrap1()
+      /tmp/nolock/kv/server/server.go:32 +0x40
+
+Previous write at 0x00c00011eb10 by goroutine 25:
+  runtime.mapaccess2_faststr()
+      /Users/abbey/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/internal/runtime/maps/runtime_faststr.go:120 +0x2bc
+  kv.(*Store).Incr()
+      /tmp/nolock/kv/store.go:107 +0x1e0
+  kv/server.(*Server).do()
+      /tmp/nolock/kv/server/commands.go:37 +0x414
+  kv/server.(*Server).handle()
+      /tmp/nolock/kv/server/server.go:46 +0x178
+  kv/server.(*Server).Serve.gowrap1()
+      /tmp/nolock/kv/server/server.go:32 +0x40
+
+Goroutine 19 (running) created at:
+  kv/server.(*Server).Serve()
+      /tmp/nolock/kv/server/server.go:32 +0x34
+  kv/server.start.gowrap1()
+      /tmp/nolock/kv/server/server_test.go:21 +0x40
+
+Goroutine 25 (running) created at:
+  kv/server.(*Server).Serve()
+      /tmp/nolock/kv/server/server.go:32 +0x34
+  kv/server.start.gowrap1()
+      /tmp/nolock/kv/server/server_test.go:21 +0x40
+==================
+```
+
+It names both sides: a read of the map in `lookup` (store.go line 39) by one connection's goroutine, and a write in `Incr` (line 107) by another's, each with the stack that led there. And the end of the run:
+
+```text
+--- FAIL: TestConcurrentIncr (0.06s)
+    server_test.go:85: hits = "1184\r\n", want 1600
+    testing.go:1865: race detected during execution of test
+FAIL
+FAIL	kv/server	0.762s
+FAIL
+```
+
+`hits = 1184`, not 1600: **416 increments were lost**. Two goroutines read the same old value, both added one, and both stored the same result. The server didn't crash this time, and without the test it would have been silently wrong.
+
+### Step 3: one command at a time
+
+The fix for now is a **mutex**, `sync.Mutex`, a lock that only one goroutine can hold at a time:
+
+```go noverify title="kv/server/server.go · lines 14–22"
+// Server serves one store to many clients at once.
+type Server struct {
+	mu    sync.Mutex // one command at a time: kv.Store isn't safe for concurrent use
+	store *kv.Store
+}
+
+func New(store *kv.Store) *Server {
+	return &Server{store: store}
+}
+```
+
+```go noverify title="kv/server/commands.go · lines 12–17"
+// do runs one command and returns its reply, encoded the way Redis
+// encodes it (RESP).
+func (s *Server) do(args []string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+```
+
+Every command locks it first and unlocks it when `do` returns (`defer` runs the unlock even on an early `return`). While one connection's command runs, the others wait at `Lock`. Real Redis gets the same effect differently: it executes all commands on a single thread. With the lock:
+
+```text
+50 clients × 1000 INCR: hits = 50000
+```
+
+```text
+=== RUN   TestRepliesMatchRedis
+--- PASS: TestRepliesMatchRedis (0.00s)
+=== RUN   TestConcurrentIncr
+--- PASS: TestConcurrentIncr (0.03s)
+PASS
+ok  	kv/server	1.708s
+```
+
+All 50,000 increments counted, and the race detector found nothing. One lock around everything is the simplest correct answer, not the fastest: Module 3 measures how much it costs under load and splits it up.
+
+<UnderTheHood title="Why a goroutine per connection is cheap">
+
+A goroutine starts with a small stack (a few kilobytes) that grows only if it needs to, so ten thousand idle connections cost tens of megabytes, not the gigabytes that ten thousand OS threads would. And a goroutine blocked in `conn.Read` doesn't hold a thread: Go's runtime puts every socket in non-blocking mode and registers it with the operating system's event notifier (epoll on Linux, kqueue on macOS). When `Read` would block, the goroutine is parked and its thread runs other goroutines; when the OS reports that the socket is readable, the goroutine is made runnable again. So the code reads like one blocking thread per client, and runs like an event loop.
+
+</UnderTheHood>
+
+<QuickCheck
+  question="Without the mutex, hammer crashed the server and the -race test lost 416 of 1,600 increments. Why were increments lost?"
+  options={[
+    "The network dropped some commands",
+    "Two goroutines read the same old value, each added one, and both stored the same result",
+    "INCR overflowed",
+    "The race detector deleted them"
+  ]}
+  answer={1}
+  explain="A read-modify-write done by two goroutines at once loses one of the updates. The mutex makes each command's read-modify-write happen alone."
+/>
+
+---
+
+## Exercises
+
+<Exercise n={1} title="PING with a message" level="easy">
+
+Real Redis answers `PING hello` with the bulk string `hello`. Add it, and add the case to `TestRepliesMatchRedis` after checking the exact reply with `cmd/talk` against Redis.
+
+<Solution>
+
+Add `case name == "PING" && len(args) == 2: return bulk(args[1])`, above the wrong-arguments case. Redis replies `$5\r\nhello\r\n`; `PING a b` is still the wrong-number-of-arguments error.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="EXPIRE and TTL over the wire" level="medium">
+
+Add `EXPIRE key seconds` and `TTL key` using lesson 6's methods. What should `EXPIRE key abc` reply? Check Redis first.
+
+<Solution>
+
+Parse the seconds with `strconv.Atoi`; on failure Redis replies `-ERR value is not an integer or out of range`. `EXPIRE` returns `:1` if the key existed, `:0` if not; `TTL` returns the seconds left as an integer, or `:-1` / `:-2`. Convert with `int64(ttl / time.Second)` for the positive case, and send -1 and -2 directly.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Too many clients" level="medium">
+
+Limit the server to 100 concurrent connections: the 101st should be accepted and immediately sent `-ERR max number of clients reached`, then closed, as Redis does when it hits `maxclients`.
+
+<Solution>
+
+A buffered channel as a semaphore: `sem := make(chan struct{}, 100)`. In the accept loop, `select { case sem <- struct{}{}: go func() { s.handle(conn); <-sem }() ; default: io.WriteString(conn, "-ERR max number of clients reached\r\n"); conn.Close() }`. The slot is released when `handle` returns.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={4} title="Close idle clients" level="medium">
+
+Redis's `timeout` setting closes a connection that has been idle for that many seconds. Add it with `conn.SetReadDeadline`.
+
+<Solution>
+
+Before each `lines.Scan()`, call `conn.SetReadDeadline(time.Now().Add(idle))`. When the deadline passes, `Scan` returns false with a timeout error, `handle` returns, and the deferred `Close` hangs up. Resetting it before every read makes it an idle timeout rather than a total connection lifetime.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Byte for Byte"
+  archetype="fix-it"
+  difficulty="guided"
+  points={80}
+  hintCost={5}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="This connection handler answers inline commands, but not the way Redis does. Make every reply byte-for-byte Redis's: command names in any case, bulk lengths in bytes (the value is a Yoruba name), the null bulk string for a missing key, DEL counting only keys that existed, and blank lines ignored instead of crashing the connection."
+  starter={`package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+)
+
+// A tiny store: this lab is about the replies, not the storage.
+var data = map[string]string{}
+
+// handle reads one inline command per line and writes one reply for each.
+func handle(conn net.Conn) {
+	defer conn.Close()
+	lines := bufio.NewScanner(conn)
+	for lines.Scan() {
+		args := strings.Fields(lines.Text())
+		io.WriteString(conn, do(args))
+	}
+}
+
+// do must answer exactly as Redis does: command names in any case,
+// bulk strings prefixed with their length in BYTES, a missing key as the
+// null bulk string $-1, and DEL counting only the keys that existed.
+func do(args []string) string {
+	switch args[0] {
+	case "PING":
+		return "+PONG\\r\\n"
+	case "SET":
+		data[args[1]] = args[2]
+		return "+OK\\r\\n"
+	case "GET":
+		v, ok := data[args[1]]
+		if !ok {
+			return "$0\\r\\n\\r\\n"
+		}
+		return "$" + strconv.Itoa(utf8.RuneCountInString(v)) + "\\r\\n" + v + "\\r\\n"
+	case "DEL":
+		for _, k := range args[1:] {
+			delete(data, k)
+		}
+		return ":" + strconv.Itoa(len(args)-1) + "\\r\\n"
+	}
+	return "-ERR unknown command '" + args[0] + "'\\r\\n"
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+
+	client, server := net.Pipe() // an in-memory connection: no network needed
+	go handle(server)
+	r := bufio.NewReader(client)
+	send := func(line string) string {
+		fmt.Fprint(client, line+"\\r\\n")
+		got, err := r.ReadString('\\n')
+		if err != nil {
+			return "(connection closed: " + err.Error() + ")"
+		}
+		if got[0] == '$' && got != "$-1\\r\\n" {
+			n, _ := strconv.Atoi(strings.TrimSpace(got[1:]))
+			body := make([]byte, n+2)
+			io.ReadFull(r, body)
+			got += string(body)
+		}
+		return got
+	}
+
+	for _, c := range []struct{ cmd, want string }{
+		{"PING", "+PONG\\r\\n"},
+		{"ping", "+PONG\\r\\n"},
+		{"SET user:1:name Ọlá", "+OK\\r\\n"},
+		{"get user:1:name", "$6\\r\\nỌlá\\r\\n"},
+		{"GET nobody", "$-1\\r\\n"},
+		{"", ""},
+		{"SET a 1", "+OK\\r\\n"},
+		{"DEL a b c", ":1\\r\\n"},
+		{"PING", "+PONG\\r\\n"},
+	} {
+		if c.cmd == "" {
+			fmt.Fprint(client, "\\r\\n") // a blank line: Redis ignores it
+			continue
+		}
+		if got := send(c.cmd); got != c.want {
+			fail("%s: got %q, want %q", c.cmd, got, c.want)
+			if strings.HasPrefix(got, "(connection closed") {
+				break
+			}
+		}
+	}
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}`}
+  verifier="Talks to handle over net.Pipe, an in-memory connection: PING in two cases, SET and GET of Ọlá (6 bytes), GET of a missing key, a blank line, and DEL of one existing and two missing keys, then PING again to check the connection survived. Prints ALL CHECKS PASS."
+  hints={[
+    "strings.ToUpper(args[0]) before the switch makes get, GET and Get the same command.",
+    "len(v) is the length in bytes, which is what RESP counts; utf8.RuneCountInString counts letters. A missing key is $-1\\r\\n, with no body at all.",
+    "strings.Fields of a blank line is an empty slice, and args[0] then panics and kills the connection: skip it when len(args) == 0. For DEL, count only the keys you actually found."
+  ]}
+  flag="GO{byte_for_byte}"
+>
+
+Each of these bugs was found in a real Redis clone at some point: clients are unforgiving, because they trust the length prefix completely.
+
+</Lab>
+
+<Recap>
+
+- A TCP connection carries bytes, not messages; **RESP** says where each reply starts and ends: `+` simple, `-` error, `:` integer, `$len` bulk, `$-1` null.
+- A Go server: **Listen**, loop on **Accept**, and **handle each connection in its own goroutine**. Measured: handling in the loop left a second client unanswered after 2 s; with `go`, it got `+PONG` in 1.772 ms.
+- Bulk lengths are in **bytes**: `Ọlá` is `$6`. Our replies matched Redis 8.10.2 byte for byte, and a test keeps them that way.
+- Goroutines sharing a map without a lock: `fatal error: concurrent map read and map write`, and under `-race`, 1,184 of 1,600 increments.
+- A `sync.Mutex` around each command fixed both: 50,000 of 50,000, race detector quiet.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: length prefixes", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the blocked accept loop", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: lost increments", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: PING with a message", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 2: EXPIRE and TTL over the wire", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 3: too many clients", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 4: close idle clients", kind: "exercise", points: 15, done: false }
+  ]}
+  flag={{ label: "Lab: Byte for Byte", captured: false, points: 80 }}
+/>
+
+<Narrator>
+Eight commands, answered byte for byte the same as Redis 8.10.2. Before the lock you lost 416 of 1,600 increments and crashed the server. After it, none. The world doesn't reward you for the crashes you prevent. I do.
+</Narrator>
