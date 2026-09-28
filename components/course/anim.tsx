@@ -4638,3 +4638,103 @@ export function LRUAnim({
     </AnimShell>
   );
 }
+
+/* ════════════════════════════════════════════
+   RoundTripAnim — a client, a server and the
+   network between them. Commands cross left to
+   right as chips, replies cross back; a clock
+   counts round trips and the server counts its
+   write calls. One command per trip against a
+   whole pipeline per trip.
+   ════════════════════════════════════════════ */
+export type RoundTripFrame = {
+  note: string;
+  beat?: "problem" | "solution" | "neutral";
+  /** chips crossing client → server in this frame */
+  send?: string[];
+  /** chips crossing server → client in this frame */
+  reply?: string[];
+  /** round trips so far */
+  trips: number;
+  /** the server's write calls so far */
+  writes?: number;
+  /** what the server is doing */
+  server?: string;
+};
+
+export function RoundTripAnim({
+  title,
+  rtt,
+  frames,
+  caption,
+}: {
+  title: string;
+  /** a measured round-trip time to show on the wire, if there is one */
+  rtt?: string;
+  frames: RoundTripFrame[];
+  caption?: string;
+}) {
+  const st = useStepper(frames.length, 2000);
+  const f = frames[st.cur] ?? frames[0];
+  return (
+    <AnimShell
+      title={title}
+      kicker="round trips"
+      note={f.note}
+      beat={f.beat ?? "neutral"}
+      cur={st.cur}
+      total={frames.length}
+      playing={st.playing}
+      speed={st.speed}
+      onSpeed={st.cycleSpeed}
+      onReset={st.reset}
+      onStep={st.step}
+      onToggle={st.toggle}
+      onGo={st.go}
+      caption={caption}
+    >
+      <div className="rtp">
+        <div className="rtp-end">
+          <Gopher role="operator" pose={f.send?.length ? "carry" : f.reply?.length ? "happy" : "idle"} state="active" size={42} title="the client" />
+          <span className="rtp-name">client</span>
+        </div>
+        <div className="rtp-wire" key={st.cur}>
+          <span className="rtp-rtt">{rtt ? `one round trip = ${rtt}` : "one round trip"}</span>
+          {(f.send ?? []).length > 0 && (
+            <div className="rtp-group rtp-out">
+              {f.send!.map((c, i) => (
+                <span key={i} className="rtp-chip">
+                  {c}
+                </span>
+              ))}
+            </div>
+          )}
+          {(f.reply ?? []).length > 0 && (
+            <div className="rtp-group rtp-back">
+              {f.reply!.map((c, i) => (
+                <span key={i} className="rtp-chip rtp-reply">
+                  {c}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="rtp-end">
+          <Gopher role="librarian" pose={f.server ? "carry" : "idle"} state="active" size={42} title="the server" />
+          <span className="rtp-name">server</span>
+          {f.server && <span className="rtp-srv">{f.server}</span>}
+        </div>
+      </div>
+      <div className="rtp-meters">
+        <span className={`rtp-meter ${f.beat === "problem" ? "bad" : f.beat === "solution" ? "good" : ""}`}>
+          round trips <b>{f.trips}</b>
+        </span>
+        {f.writes !== undefined && (
+          <span className="rtp-meter">
+            server write() calls <b>{f.writes}</b>
+          </span>
+        )}
+      </div>
+    </AnimShell>
+  );
+}
