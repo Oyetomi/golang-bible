@@ -53,4 +53,5 @@ func main() {
 	genSPSC()
 	genDispatch()
 	genRebac()
+	genWasmMem()
 }
