@@ -52,4 +52,5 @@ func main() {
 	genTopKFreq()
 	genSPSC()
 	genDispatch()
+	genRebac()
 }
