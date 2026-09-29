@@ -253,6 +253,18 @@ Let's look at how the C program and Go bindings fit together.
 
 Here is an eBPF program that monitors settlement transactions by intercepting IPv4 TCP connections:
 
+<CodeWalk
+  title="The XDP program: filter, then report"
+  steps={[
+    {"lines": "9-16", "note": "The event that will be streamed to Go: source and destination address, port, length and a kernel timestamp. A fixed-size struct, so Go can decode it as bytes.", "pose": "run"},
+    {"lines": "18-30", "note": "Two maps shared with user space. A 16 MB ring buffer carries events to Go. A hash map of up to 10,000 entries is the allow/block list that Go writes and the kernel reads on every packet.", "pose": "guard", "role": "guard"},
+    {"lines": "32-51", "note": "Parse defensively. Every header access is first checked against data_end, because the verifier refuses any program that could read past the packet. Anything that is not IPv4 is passed untouched.", "beat": "problem", "pose": "blocked"},
+    {"lines": "53-59", "note": "Look up the source address in the map. If Go marked it blocked (0), return XDP_DROP: the packet dies in the driver, before the kernel spends anything on it.", "pose": "run"},
+    {"lines": "61-77", "note": "Otherwise reserve a slot in the ring buffer, fill in the event, submit it, and pass the packet on. If the ring buffer is full, pass without an event: telemetry may be lost, traffic must not be.", "beat": "solution", "pose": "happy", "state": "ok"}
+  ]}
+  caption="Tens of lines in the kernel decide, and Go owns the policy by writing to the map."
+>
+
 ```c
 //go:build ignore
 #include <linux/bpf.h>
@@ -333,6 +345,8 @@ int xdp_meridian_filter(struct xdp_md *ctx) {
 char _license[] SEC("license") = "GPL";
 ```
 
+</CodeWalk>
+
 ### 2. Generating Go Bindings
 
 To compile this into Go, you place a `go:generate` directive inside your Go package:
@@ -355,25 +369,31 @@ A code generation tool from the `cilium/ebpf` project that invokes `clang` to co
 
 The **eXpress Data Path (XDP)** is the highest-performance packet processing hook in the Linux kernel. XDP attaches directly to the Network Interface Card (NIC) driver receive ring buffer.
 
-<ExecTimeline
-  title="Packet Pipeline: Linux Standard Path vs XDP Hook"
-  lanes={[
-    { id: "nic", label: "NIC Driver RX" },
-    { id: "xdp", label: "XDP eBPF Hook" },
-    { id: "skb", label: "Kernel Stack (sk_buff)" },
-    { id: "app", label: "Go Application" }
+<RuntimeStage
+  title="Two packets, one NIC: XDP drops the flood before the kernel spends anything on it"
+  kicker="XDP · mechanism, not a benchmark (eBPF needs Linux)"
+  zones={[
+    { id: "nic", label: "NIC RX ring", sub: "frames land here by DMA", x: 16, y: 16, w: 236, h: 200, kind: "queue" },
+    { id: "xdp", label: "XDP eBPF hook", sub: "runs in the driver, before sk_buff exists", x: 262, y: 16, w: 236, h: 200, kind: "cpu" },
+    { id: "drop", label: "XDP_DROP", sub: "nothing allocated, nothing copied", x: 508, y: 16, w: 236, h: 200, kind: "wait" },
+    { id: "skb", label: "kernel stack", sub: "sk_buff, routing, TCP socket backlog", x: 16, y: 236, w: 356, h: 200, kind: "chan" },
+    { id: "app", label: "Go application", sub: "netpoll wakes the reader", x: 388, y: 236, w: 356, h: 200, kind: "exit" }
   ]}
-  steps={[
-    { lane: "nic", label: "DMA Frame", note: "Packet arrives from physical cable into NIC RX ring memory", kind: "recv" },
-    { lane: "xdp", label: "Run eBPF", note: "XDP executes before kernel allocates sk_buff or initializes sockets", kind: "run" },
-    { lane: "xdp", label: "XDP_DROP", note: "Hostile packet dropped immediately — 0 bytes copied to kernel stack", kind: "done" },
-    { lane: "nic", label: "Valid Wire Frame", note: "Next packet: legitimate $10M settlement arrives", kind: "recv" },
-    { lane: "xdp", label: "XDP_PASS", note: "XDP approves packet, passes to Linux kernel stack", kind: "send" },
-    { lane: "skb", label: "Alloc sk_buff", note: "Kernel constructs sk_buff, routes to TCP socket backlog", kind: "run" },
-    { lane: "app", label: "netpoll Read", note: "Go runtime wakes up and reads wire settlement in user space", kind: "recv" }
+  actors={[
+    { id: "bad", label: "SYN flood frame", kind: "value" }, { id: "good", label: "settlement frame", kind: "value" }
   ]}
-  caption="XDP acts as a sub-microsecond in-kernel firewall before packets touch memory-heavy kernel socket buffers."
+  events={[
+    { at: 0, id: "bad", to: "nic", clock: "hostile", note: "A frame from the flood arrives from the cable into the RX ring memory." },
+    { at: 1.6, id: "bad", to: "xdp", state: "running", note: "The XDP program runs first, inside the driver, before the kernel has allocated an sk_buff or looked for a socket." },
+    { at: 3.2, id: "bad", to: "drop", state: "done", beat: "problem", note: "It matches the source against a blocklist and returns XDP_DROP. The frame is discarded having cost a few instructions: no allocation, no copy, no softirq, no socket lookup." },
+    { at: 4.8, id: "good", to: "nic", clock: "legitimate", note: "The next frame is a real wire settlement." },
+    { at: 6.2, id: "good", to: "xdp", state: "running" },
+    { at: 7.4, id: "good", to: "skb", state: "running", beat: "solution", note: "XDP_PASS. Only now does the kernel build an sk_buff and queue the data on the destination TCP socket." },
+    { at: 9.0, id: "good", to: "app", state: "done", beat: "solution", note: "The Go runtime's netpoller sees the socket readable and the goroutine reads the settlement. Without XDP, the flood would have gone through every stage on this path first." }
+  ]}
+  caption="XDP moves the decision to the earliest point the kernel can make it. The packets you are going to refuse never reach the expensive part of the stack."
 />
+
 
 ### XDP Return Actions
 
@@ -608,23 +628,28 @@ Modern eBPF (Linux 5.8+) introduces the **BPF Ring Buffer** (`BPF_MAP_TYPE_RINGB
 A lockless multi-producer single-consumer circular queue allocated in kernel memory and mapped directly into user space via `mmap()`. It provides strictly ordered event delivery, variable-length event records, and zero-copy reservations.
 </Define>
 
-<ExecTimeline
-  title="Zero-Copy BPF Ring Buffer Event Flow"
-  lanes={[
-    { id: "kern", label: "Kernel eBPF Probe" },
-    { id: "ring", label: "Ring Buffer (mmap)" },
-    { id: "go", label: "Go ringbuf.Reader" }
+<RuntimeStage
+  title="One event from probe to Go: the BPF ring buffer"
+  kicker="ringbuf · mechanism, not a benchmark (eBPF needs Linux)"
+  zones={[
+    { id: "kern", label: "kernel eBPF probe", sub: "runs when the traced function fires", x: 16, y: 16, w: 356, h: 200, kind: "cpu" },
+    { id: "ring", label: "ring buffer", sub: "memory shared with user space (mmap)", x: 388, y: 16, w: 356, h: 200, kind: "queue" },
+    { id: "epoll", label: "epoll wakeup", sub: "no polling loop, no spinning", x: 16, y: 236, w: 356, h: 200, kind: "wait" },
+    { id: "go", label: "Go ringbuf.Reader", sub: "decodes the record, emits telemetry", x: 388, y: 236, w: 356, h: 200, kind: "exit" }
   ]}
-  steps={[
-    { lane: "kern", label: "bpf_ringbuf_reserve", note: "Allocates slot directly in shared ring memory (no temp stack copy)", kind: "run" },
-    { lane: "kern", label: "Populate Struct", note: "Writes PID, latency, settlement ID directly into slot", kind: "run" },
-    { lane: "kern", label: "bpf_ringbuf_submit", note: "Commits header and raises kernel epoll notification", kind: "send" },
-    { lane: "ring", label: "Ring Header Update", note: "Consumer tail pointer advances; event is visible in mmap space", kind: "run" },
-    { lane: "go", label: "epoll Wakeup", note: "Go runtime epoll wakes reader without spinning or polling", kind: "recv" },
-    { lane: "go", label: "Decode Record", note: "Reader parses binary struct and emits structured telemetry", kind: "done" }
+  actors={[
+    { id: "ev", label: "settlement event", kind: "value" }
   ]}
-  caption="The BPF ring buffer enables high-frequency telemetry streaming with zero context switch overhead."
+  events={[
+    { at: 0, id: "ev", to: "kern", state: "running", clock: "reserve", note: "bpf_ringbuf_reserve asks for a slot directly in the shared ring, so there is no temporary copy on the tiny BPF stack." },
+    { at: 1.8, id: "ev", to: "ring", state: "running", note: "The probe writes the PID, latency and settlement ID straight into the reserved slot. It is not visible to the reader yet." },
+    { at: 3.6, id: "ev", to: "ring", state: "done", clock: "submit", beat: "solution", note: "bpf_ringbuf_submit commits the record. The producer position moves and the record becomes readable in the same mapped memory the reader has open." },
+    { at: 5.4, id: "ev", to: "epoll", state: "parked", note: "Submit also signals epoll. The Go program was blocked in the runtime's netpoller waiting for exactly this, not burning a core." },
+    { at: 7.2, id: "ev", to: "go", state: "done", beat: "solution", note: "Reader.Read wakes, parses the binary struct from the mapped slot, and hands the event to your code." }
+  ]}
+  caption="Reserve, fill, submit: the event is written once, into memory both sides share, and epoll tells Go when to look."
 />
+
 
 ### Consuming Ring Buffer Events in Go
 
@@ -699,6 +724,18 @@ Let's assemble a complete, production-grade observability engine in Go. This arc
 3. Updates BPF maps at runtime to block abusive IPs.
 4. Streams and aggregates high-frequency telemetry events.
 5. Handles clean teardown on `SIGINT`/`SIGTERM`.
+
+<CodeWalk
+  title="An in-memory model of the map and ring-buffer pipeline"
+  steps={[
+    {"lines": "16-31", "note": "A simulation, since eBPF needs Linux. A mutex-guarded map stands in for the BPF hash map, a buffered channel for the ring buffer, and atomic counters count drops, events and slow settlements.", "pose": "run"},
+    {"lines": "33-45", "note": "BlockIP is the user-space half of the map: parse the address, convert it to a big-endian uint32 key, and store it. In the real program this is a map Update through the cilium/ebpf library.", "pose": "guard", "role": "guard"},
+    {"lines": "47-58", "note": "The simulated XDP hook looks the source up first. A blocked address is counted and dropped, and no event is produced.", "beat": "problem", "pose": "blocked"},
+    {"lines": "60-76", "note": "A passed packet becomes a fixed 40-byte record: timestamp, transfer ID, amount, duration, source IP and status, at fixed offsets. If the ring is full the event is dropped instead of blocking, the same backpressure choice the real ring buffer makes.", "pose": "run"},
+    {"lines": "78-103", "note": "The consumer runs in user space. It decodes each record from the same offsets, and any transfer over 10 ms is counted and printed as a latency spike. The layout must match on both sides byte for byte.", "beat": "solution", "pose": "happy", "state": "ok"}
+  ]}
+  caption="The contract between kernel and Go is a byte layout. Get an offset wrong and every field after it is wrong."
+>
 
 ```go
 package main
@@ -805,6 +842,8 @@ func (oe *ObservabilityEngine) ConsumeTelemetry(ctx context.Context) {
 	}
 }
 ```
+
+</CodeWalk>
 
 ---
 

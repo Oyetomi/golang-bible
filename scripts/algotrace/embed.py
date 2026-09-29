@@ -56,6 +56,17 @@ PLAN = [
     ("jumpfail", "11", "### Classic: Jump Game", "before-code", "And an input where the zero traps us: watch reach stop growing."),
     ("meetingrooms", "11", "### Classic: Meeting Rooms II (minimum rooms)", "before-code", "Starts and ends sorted separately, then swept. Watch a room get reused or a new one opened."),
     ("singlenumber", "11", "### XOR tricks", "before-code", "Watch the bits: equal pairs cancel to 000, leaving the loner."),
+    ("topk", "06", "### K-largest elements", "before-code", "A min-heap of size k. Watch weak values get ignored and the root get evicted."),
+    ("mergek", "06", "### Merge-K sorted arrays", "before-code", "The heap holds exactly one front per list. Watch each pop pull the next value from the same list."),
+    ("runningmedian", "06", "## Running Median", "before-code", "Two heaps facing each other. The medians are always at their roots."),
+    ("koko", "08", "### Classic: Koko eating bananas (minimum eating speed)", "before-code", "The array here is the space of possible ANSWERS. Watch feasibility split it into a too-slow half and a fast-enough half."),
+    ("combsum", "09", "### Combination Sum: reuse allowed", "before-code", "The search tree with pruning: red nodes are branches cut the moment they overshoot."),
+    ("houserobber", "10", "### House robber", "before-code", "At every house, skip or rob. Watch the best-so-far row grow."),
+    ("decodeways", "10", "### Decode ways", "before-code", "Each dp cell adds the cell one back and/or two back. Green shows which."),
+    ("gasstation", "11", "### Classic: Gas Station", "before-code", "Watch the tank go negative, rule out every start before that point, and restart."),
+    ("insertinterval", "11", "### Classic: Insert Interval", "before-code", "Three zones: before, overlapping, after. Watch the new interval absorb what it touches."),
+    ("longestunique", "12", "### The complete loop", "before-code", "The worked interview problem, animated. The light cells are the window; the map is the counts inside it."),
+    ("topkfreq", "12", "### A second pattern demo", "before-code", "Count first, then keep only the k most frequent with a size-k heap."),
 ]
 
 def block(name, intro):

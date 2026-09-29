@@ -28,6 +28,7 @@ export type TraceView =
   | { k: "heap"; label?: string; cells: number[]; marks?: Record<number, Mark> }
   | { k: "graph"; label?: string; states: Record<string, string>; edges?: string[]; at?: string }
   | { k: "tree"; label?: string; nodes: { id: string; label: Cell; parent?: string; state?: string }[]; edgeLabels?: Record<string, string> }
+  | { k: "hex"; label?: string; radius: number; cells: Record<string, string>; dots?: { q: number; r: number; label?: string; state?: string }[] }
   | { k: "grid"; label?: string; rows: Cell[]; cols: Cell[]; cells: Cell[][]; hot?: [number, number]; deps?: [number, number][] }
   | { k: "intervals"; label?: string; lo: number; hi: number; rows: { a: number; b: number; label?: string; state?: Mark }[] }
   | { k: "bits"; label?: string; rows: { label: string; value: number; width: number; marks?: Record<number, Mark> }[] }
@@ -51,13 +52,14 @@ function Label({ text }: { text?: string }) {
 }
 
 function ArrayView({ v }: { v: Extract<TraceView, { k: "array" }> }) {
-  const n = v.cells.length;
+  const cellsA = v.cells ?? [];
+  const n = cellsA.length;
   const ptrs = Object.entries(v.ptrs ?? {});
   return (
     <div className="atr-block">
       <Label text={v.label} />
       <div className="atr-arr" style={{ "--n": n } as CSSProperties}>
-        {v.cells.map((c, i) => (
+        {cellsA.map((c, i) => (
           <span key={i} className={`atr-cell ${v.marks?.[i] ? `m-${v.marks[i]}` : ""}`}>
             <i>{i}</i>
             {String(c)}
@@ -128,7 +130,8 @@ function MapView({ v }: { v: Extract<TraceView, { k: "map" }> }) {
 }
 
 function HeapView({ v }: { v: Extract<TraceView, { k: "heap" }> }) {
-  const n = v.cells.length;
+  const cells = v.cells ?? [];
+  const n = cells.length;
   const depth = n === 0 ? 0 : Math.floor(Math.log2(n)) + 1;
   const W = 300;
   const H = Math.max(60, depth * 52 + 16);
@@ -143,13 +146,13 @@ function HeapView({ v }: { v: Extract<TraceView, { k: "heap" }> }) {
     <div className="atr-block">
       <Label text={v.label ?? "heap: tree view + array view (same data)"} />
       <svg className="atr-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="heap as a tree">
-        {v.cells.map((_, i) => {
+        {cells.map((_, i) => {
           if (i === 0) return null;
           const a = pos(Math.floor((i - 1) / 2));
           const b = pos(i);
           return <line key={`e${i}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y} className="atr-edge" />;
         })}
-        {v.cells.map((c, i) => {
+        {cells.map((c, i) => {
           const p = pos(i);
           return (
             <g key={i} className={`atr-node ${v.marks?.[i] ? `m-${v.marks[i]}` : ""}`}>
@@ -165,7 +168,7 @@ function HeapView({ v }: { v: Extract<TraceView, { k: "heap" }> }) {
         })}
       </svg>
       <div className="atr-arr" style={{ "--n": Math.max(n, 1) } as CSSProperties}>
-        {v.cells.map((c, i) => (
+        {cells.map((c, i) => (
           <span key={i} className={`atr-cell ${v.marks?.[i] ? `m-${v.marks[i]}` : ""}`}>
             <i>{i}</i>
             {String(c)}
@@ -273,6 +276,41 @@ function TreeView({ v }: { v: Extract<TraceView, { k: "tree" }> }) {
           ))}
         </svg>
       </div>
+    </div>
+  );
+}
+
+function HexView({ v }: { v: Extract<TraceView, { k: "hex" }> }) {
+  const R = v.radius;
+  const S = 19; // hex size in px
+  const px = (q: number, r: number) => ({ x: S * Math.sqrt(3) * (q + r / 2), y: S * 1.5 * r });
+  const cells: { q: number; r: number }[] = [];
+  for (let q = -R; q <= R; q++) for (let r = Math.max(-R, -q - R); r <= Math.min(R, -q + R); r++) cells.push({ q, r });
+  const w = S * Math.sqrt(3) * (2 * R + 1) + 8;
+  const h = S * 1.5 * (2 * R) + S * 2 + 8;
+  const pts = (cx: number, cy: number) =>
+    Array.from({ length: 6 }, (_, i) => {
+      const a = (Math.PI / 180) * (60 * i - 30);
+      return `${(cx + (S - 1.5) * Math.cos(a)).toFixed(1)},${(cy + (S - 1.5) * Math.sin(a)).toFixed(1)}`;
+    }).join(" ");
+  return (
+    <div className="atr-block">
+      <Label text={v.label} />
+      <svg className="atr-svg" viewBox={`${-w / 2} ${-h / 2} ${w} ${h}`} style={{ maxWidth: 380 }} role="img" aria-label="hexagonal grid">
+        {cells.map(({ q, r }) => {
+          const { x, y } = px(q, r);
+          return <polygon key={`${q},${r}`} points={pts(x, y)} className={`atr-hx hx-${v.cells[`${q},${r}`] ?? "idle"}`} />;
+        })}
+        {(v.dots ?? []).map((d, i) => {
+          const { x, y } = px(d.q, d.r);
+          return (
+            <g key={i} className={`atr-dot dt-${d.state ?? "idle"}`}>
+              <circle cx={x} cy={y} r={6} />
+              {d.label && <text x={x} y={y - 9} textAnchor="middle">{d.label}</text>}
+            </g>
+          );
+        })}
+      </svg>
     </div>
   );
 }
@@ -436,6 +474,8 @@ export function AlgoTrace({
                 return <GraphView key={i} v={v} nodes={nodes ?? []} edges={edges ?? []} />;
               case "grid":
                 return <GridView key={i} v={v} />;
+              case "hex":
+                return <HexView key={i} v={v} />;
               case "tree":
                 return <TreeView key={i} v={v} />;
               case "intervals":

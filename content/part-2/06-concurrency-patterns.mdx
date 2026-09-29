@@ -130,6 +130,18 @@ FROM generate_series(1::bigint, 45978, 23) AS a,
 ANALYZE;
 ```
 
+<CodeWalk
+  title="hooksink: a customer's endpoint, with a hard in-flight limit"
+  steps={[
+    {"lines": "18-24", "note": "Three flags set the scene: the listen address, the limit of requests in flight before it answers 503, and one account whose endpoint accepts and then never answers. Four atomic counters (in flight, peak, delivered, refused) need no lock because each is one machine word.", "pose": "run"},
+    {"lines": "26-35", "note": "Each request bumps inFlight on entry and drops it on exit with defer. The for loop on the next lines is a lock-free running maximum: retry the compare-and-swap until peak is at least n.", "pose": "guard", "role": "guard"},
+    {"lines": "36-40", "note": "Past the limit it answers 503 straight away. This is what makes the sink honest: a client that fires more than 64 at once gets refused, exactly as many load balancers behave.", "beat": "problem", "pose": "blocked"},
+    {"lines": "41-48", "note": "Under the limit it drains the body and waits 20 to 80 ms, then answers 204. The hang account instead waits on the request's context and never replies, which is the customer whose server went quiet.", "pose": "run"},
+    {"lines": "51-63", "note": "/stats reports delivered, refused and the peak in flight, and /reset zeroes them, so a test can read exactly what its own run did to the server.", "beat": "solution", "pose": "happy", "state": "ok"}
+  ]}
+  caption="A fake customer endpoint with a real limit, so the fan-out chapter can show what too much concurrency does to it."
+>
+
 ```go noverify
 // hooksink receives statement webhooks the way customers' endpoints do:
 // each takes 20 to 80 ms to answer, and like most load balancers it
@@ -196,6 +208,8 @@ func main() {
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 ```
+
+</CodeWalk>
 
 ```text
 $ createdb settlement && psql -d settlement -f seed.sql
@@ -1021,6 +1035,19 @@ There's no mutex anywhere in that file, and `go run -race` stays quiet, because 
 
 An **actor** is confinement with a request protocol: one goroutine owns some state, and everyone else asks it through a channel, sending a reply channel along. The rates cache makes a good example, because it needs to fetch once and then answer many lookups:
 
+<CodeWalk
+  title="RateActor: one goroutine owns the table, everyone else asks it"
+  steps={[
+    { lines: "11-25", note: "The mailbox and the envelope. RateActor holds one channel, inbox — that's the only door in. Each rateReq carries a reply channel: the caller's own return address, made fresh for every request so replies can never cross wires.", pose: "guard", role: "guard" },
+    { lines: "27-31", note: "NewRateActor starts loop as a goroutine and returns immediately. The actor is alive from this point on — it owns table before anyone has asked it anything.", pose: "run" },
+    { lines: "33-56", note: "The whole state lives in one local variable, table, declared inside loop — not a struct field, so nothing outside this goroutine can even see it, let alone touch it without going through inbox.", pose: "guard", role: "guard", state: "ok" },
+    { lines: "39-47", note: "First request with an empty table: fetch. This runs ON the actor's own goroutine, so every other request sent to inbox in the meantime just queues — they aren't dropped, they wait their turn.", beat: "problem", pose: "blocked" },
+    { lines: "58-67", note: "Get is the caller's side. First select: hand the request to the actor, or give up if ctx dies before the actor even accepts it — the actor never sees a request nobody's waiting for.", pose: "run" },
+    { lines: "68-73", note: "Second select: wait for the reply, or bail on ctx again. Because reply is buffered (capacity 1), the actor's send in step 4 never blocks even if we already left — no leak on either side.", beat: "solution", pose: "happy", state: "ok" }
+  ]}
+  caption="Confinement with a mailbox: the loop goroutine is the only reader or writer of table, so nothing here needs a lock — the channel IS the lock."
+>
+
 ```go noverify
 package main
 
@@ -1098,6 +1125,8 @@ func (a *RateActor) Get(ctx context.Context, currency string) (*big.Rat, error) 
 }
 ```
 
+</CodeWalk>
+
 Two details make it safe. The **reply channel is buffered**, so if a caller gives up (its context is done), the actor's reply doesn't block forever. And the actor **selects on its own context**, so it exits when the job does: `goroutines still running: 1` with `-rates actor`.
 
 The actor deduplicates the ECB fetch without any extra code: while it's fetching, other requests simply wait in the channel. The cost is that *every* lookup, all 2,000, goes through one goroutine. Measured, it made no difference to this job:
@@ -1114,6 +1143,16 @@ prod workers=64: 2.09s
 ### Step 3: a mutex
 
 The default cache, `Rates`, is a map with a `sync.Mutex` and singleflight (stop 5). For state that many goroutines read and occasionally write, that's usually the plainest option. How much does each approach cost? A benchmark with 64 goroutines hammering one counter, on the same Mac:
+
+<CodeWalk
+  title="Three ways to count: mutex, atomic, channel"
+  steps={[
+    {"lines": "10-27", "note": "BenchmarkMutex: 64 goroutines each increment a shared map under one sync.Mutex. Correct, and every increment queues behind the lock.", "pose": "blocked", "beat": "problem"},
+    {"lines": "29-41", "note": "BenchmarkAtomic: the counter is one atomic.Int64, so an increment is a single hardware instruction and nothing queues.", "pose": "run"},
+    {"lines": "43-66", "note": "BenchmarkChannel: confinement. Workers send a status on a buffered channel and one goroutine owns the map, so there is no lock and no atomic, at the cost of a channel operation per item.", "beat": "solution", "pose": "guard", "role": "guard", "state": "ok"}
+  ]}
+  caption="Same job, three designs. wg.Go (Go 1.25) starts each worker and tracks it in one call."
+>
 
 ```go noverify
 // Three ways for 64 goroutines to count delivered statements.
@@ -1184,6 +1223,8 @@ func BenchmarkChannel(b *testing.B) {
 }
 ```
 
+</CodeWalk>
+
 ```text
 $ go test -bench . -count 3
 BenchmarkMutex-8     	 9511045	       120.6 ns/op
@@ -1221,6 +1262,18 @@ The fastest work is work you don't do twice, and the fastest wait is one you do 
 ### Step 1: 64 workers, one ECB request
 
 Every worker needs a rate. When the job starts, the cache is empty, so all 64 workers miss at the same moment. Without anything to stop it, each one fetches the ECB file:
+
+<CodeWalk
+  title="Rates.Get: the check, the shared fetch, and the re-check that makes it safe"
+  steps={[
+    { lines: "35-37", note: "table is read under the mutex and copied into a local variable, then the lock is released immediately. The lock's whole job is protecting that one pointer read — nothing slow happens while it's held.", pose: "guard", role: "guard" },
+    { lines: "39", note: "Everything from here down only runs on a cache MISS. Once table is populated, every later Get for the rest of its lifetime returns at line 37 with the lock barely touched, no singleflight involved at all.", beat: "problem", pose: "blocked" },
+    { lines: "41-49", note: "The fetch itself: 64 workers can call Get at nearly the same instant, and group.Do collapses them onto ONE call to fetch — the other 63 block inside Do, not inside fetch, and all 64 get the same result back.", pose: "run" },
+    { lines: "53-55", note: "fetch returned a NEW map on the stack; here is the one moment r.table (the struct field) is actually written, under the lock again. Anyone who read table as nil moments ago will see it on their next Get.", beat: "solution", pose: "happy", state: "ok" },
+    { lines: "65-78", note: "fetch itself does no locking and no singleflight — it doesn't need to, because Do already guarantees only one caller is inside it at a time. It just does the HTTP GET and checks the status before decoding the XML.", pose: "run" }
+  ]}
+  caption="The lock protects the pointer; singleflight protects the network call. Two different problems, two different tools, one cache."
+>
 
 ```go noverify
 package main
@@ -1324,6 +1377,8 @@ func (r *Rates) fetch(ctx context.Context) (map[string]*big.Rat, error) {
 }
 ```
 
+</CodeWalk>
+
 ```text
 $ ./statements -mode pool -workers 64 -singleflight=false
 pool workers=64: 2.38s
@@ -1391,6 +1446,17 @@ func buildStatement(ctx context.Context, db *sql.DB, rates RateSource, a Account
 ### Step 2: futures, two waits at once
 
 Before the job starts sending, a report header might need two independent things: the day's ECB rates, and the total volume of the ledger (a sum over two million rows). One after the other, you wait for both in turn. As **futures**, you start both and then collect them:
+
+<CodeWalk
+  title="async: start two slow calls, then collect both"
+  steps={[
+    {"lines": "20-36", "note": "async starts f in a goroutine and returns a function that waits for the result. The channel is buffered with capacity 1, so the goroutine can always finish its send even if nobody ever collects. sync.OnceValues makes the returned function safe to call more than once.", "pose": "run"},
+    {"lines": "47-61", "note": "Two independent slow calls: an HTTPS GET of the ECB's reference rates, and a SUM over the transactions table. Neither needs the other's answer.", "pose": "guard", "role": "guard"},
+    {"lines": "63-76", "note": "The loop runs each way twice, sequential and concurrent. In the concurrent branch both calls are started first (async), and only then collected, so the two waits overlap.", "beat": "solution", "pose": "happy", "state": "ok"},
+    {"lines": "84-91", "note": "Each part alone, for reference. The concurrent time should land near the slower of the two, not their sum.", "pose": "run"}
+  ]}
+  caption="A future in twelve lines of Go: start now, wait later."
+>
 
 ```go noverify
 // futures starts two independent slow calls, the ECB's reference rates and
@@ -1486,6 +1552,8 @@ func main() {
 	fmt.Printf("volume alone: %4d ms\n", time.Since(t).Milliseconds())
 }
 ```
+
+</CodeWalk>
 
 ```text
 $ go run ./futures

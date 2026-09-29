@@ -7,6 +7,7 @@ import { SpacedRecall } from "@/components/course/spacedrecall";
 import { Golings } from "@/components/course/golings";
 import { CodeWalk } from "@/components/course/CodeWalk";
 import { AlgoTrace } from "@/components/course/AlgoTrace";
+import { RangeLab } from "@/components/course/RangeLab";
 import { RuntimeStage } from "@/components/course/RuntimeStage";
 import { CinemaAnim } from "@/components/course/CinemaAnim";
 import { BankAnim } from "@/components/course/BankAnim";
@@ -96,6 +97,7 @@ export const mdxComponents = {
   RolloutAnim: A.RolloutAnim,
   CodeWalk,
   AlgoTrace,
+  RangeLab,
   RuntimeStage,
   CinemaAnim,
   BankAnim,
