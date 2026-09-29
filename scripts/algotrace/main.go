@@ -54,4 +54,5 @@ func main() {
 	genDispatch()
 	genRebac()
 	genWasmMem()
+	genBatchShed()
 }
