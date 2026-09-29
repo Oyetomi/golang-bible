@@ -28,6 +28,7 @@ export type TraceView =
   | { k: "heap"; label?: string; cells: number[]; marks?: Record<number, Mark> }
   | { k: "graph"; label?: string; states: Record<string, string>; edges?: string[]; at?: string }
   | { k: "tree"; label?: string; nodes: { id: string; label: Cell; parent?: string; state?: string }[]; edgeLabels?: Record<string, string> }
+  | { k: "hex"; label?: string; radius: number; cells: Record<string, string>; dots?: { q: number; r: number; label?: string; state?: string }[] }
   | { k: "grid"; label?: string; rows: Cell[]; cols: Cell[]; cells: Cell[][]; hot?: [number, number]; deps?: [number, number][] }
   | { k: "intervals"; label?: string; lo: number; hi: number; rows: { a: number; b: number; label?: string; state?: Mark }[] }
   | { k: "bits"; label?: string; rows: { label: string; value: number; width: number; marks?: Record<number, Mark> }[] }
@@ -279,6 +280,41 @@ function TreeView({ v }: { v: Extract<TraceView, { k: "tree" }> }) {
   );
 }
 
+function HexView({ v }: { v: Extract<TraceView, { k: "hex" }> }) {
+  const R = v.radius;
+  const S = 19; // hex size in px
+  const px = (q: number, r: number) => ({ x: S * Math.sqrt(3) * (q + r / 2), y: S * 1.5 * r });
+  const cells: { q: number; r: number }[] = [];
+  for (let q = -R; q <= R; q++) for (let r = Math.max(-R, -q - R); r <= Math.min(R, -q + R); r++) cells.push({ q, r });
+  const w = S * Math.sqrt(3) * (2 * R + 1) + 8;
+  const h = S * 1.5 * (2 * R) + S * 2 + 8;
+  const pts = (cx: number, cy: number) =>
+    Array.from({ length: 6 }, (_, i) => {
+      const a = (Math.PI / 180) * (60 * i - 30);
+      return `${(cx + (S - 1.5) * Math.cos(a)).toFixed(1)},${(cy + (S - 1.5) * Math.sin(a)).toFixed(1)}`;
+    }).join(" ");
+  return (
+    <div className="atr-block">
+      <Label text={v.label} />
+      <svg className="atr-svg" viewBox={`${-w / 2} ${-h / 2} ${w} ${h}`} style={{ maxWidth: 380 }} role="img" aria-label="hexagonal grid">
+        {cells.map(({ q, r }) => {
+          const { x, y } = px(q, r);
+          return <polygon key={`${q},${r}`} points={pts(x, y)} className={`atr-hx hx-${v.cells[`${q},${r}`] ?? "idle"}`} />;
+        })}
+        {(v.dots ?? []).map((d, i) => {
+          const { x, y } = px(d.q, d.r);
+          return (
+            <g key={i} className={`atr-dot dt-${d.state ?? "idle"}`}>
+              <circle cx={x} cy={y} r={6} />
+              {d.label && <text x={x} y={y - 9} textAnchor="middle">{d.label}</text>}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 function GridView({ v }: { v: Extract<TraceView, { k: "grid" }> }) {
   const isDep = (r: number, c: number) => v.deps?.some(([a, b]) => a === r && b === c);
   const isHot = (r: number, c: number) => v.hot && v.hot[0] === r && v.hot[1] === c;
@@ -438,6 +474,8 @@ export function AlgoTrace({
                 return <GraphView key={i} v={v} nodes={nodes ?? []} edges={edges ?? []} />;
               case "grid":
                 return <GridView key={i} v={v} />;
+              case "hex":
+                return <HexView key={i} v={v} />;
               case "tree":
                 return <TreeView key={i} v={v} />;
               case "intervals":
