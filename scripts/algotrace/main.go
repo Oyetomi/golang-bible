@@ -50,4 +50,5 @@ func main() {
 	genInsertInterval()
 	genLongestUnique()
 	genTopKFreq()
+	genSPSC()
 }
