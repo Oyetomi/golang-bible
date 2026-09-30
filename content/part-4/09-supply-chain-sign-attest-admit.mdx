@@ -1,0 +1,819 @@
+---
+title: "Supply Chain: Sign It, Attest It, Refuse the Rest"
+part: 4
+order: 9
+type: "course"
+description: "Making the cluster run only what you built: a container image builder in Go that produces the same digest every time (three builds, two directories, one digest), signatures made with cosign and checked by 100 lines of Go using only the registry API and crypto/ecdsa (cross-checked against cosign verify), an SBOM of 8 components attested in a DSSE envelope and verified in Go, and a validating admission webhook on a kind cluster (Kubernetes 1.37.0) that refused a tag, an unsigned image, a replayed signature and a forged one, and admitted the signed digest in 4 ms. Found on the way: an image whose config lacks its layer's diff ID pushes fine and then cannot be pulled, a valid signature copied onto another image is rejected only because the verifier checks which digest it vouches for, and with failurePolicy Fail a webhook that is down refuses every pod."
+prerequisites: ["capstone-ledger-to-production"]
+---
+
+<HeroCard label="Part 4 · Chapter 9" title="Supply Chain: Sign It, Attest It, Refuse the Rest">
+
+Every chapter so far has been about running your code well. This one is about a question that comes first: **is the thing that's running the thing you built?** Between `go build` and a pod there is a registry, a CI system, a tag someone can move, and a dependency tree of code you never read. Any of them can put something else where your image should be, and Kubernetes will start it without a question.
+
+The defence has three parts, and this chapter builds each one on a real cluster: **build reproducibly** so an image's identity is something you can recompute, **sign and attest** so the registry's contents come with proof of who made them and what's inside, and **verify at admission** so the cluster refuses anything without that proof.
+
+Five stops:
+
+1. **Building the same way twice.** An image builder in Go whose output digest never changes.
+2. **A tag is a promise.** Why a tag can't be trusted and a digest can.
+3. **Signing.** cosign signs; 100 lines of Go check the signature, and three fakes fail.
+4. **What's inside the box.** An SBOM, attested and verified.
+5. **The gate.** An admission webhook that admits one image in five.
+
+Everything here is defensive: it protects your own pipeline, and every "attack" is a local image in a local registry that we build ourselves.
+
+</HeroCard>
+
+<Narrator>
+Your cluster will happily run whatever a registry hands it, provided the name is right. Names, as I've noticed, are the cheapest thing in the world to fake. Today you stop trusting names. I'd say it's a relief. For you, anyway. I've never trusted anyone.
+</Narrator>
+
+<ChapterTabs tabs={["Building the Same Way Twice", "A Tag Is a Promise", "Signing", "What's Inside the Box", "The Gate"]} />
+
+<ProjectMap
+  root="p4c09"
+  files={[
+    { path: "go.mod", status: "new", note: "go-containerregistry v0.22.1, client_golang, k8s.io/api" },
+    { path: "app/main.go", status: "new", note: "ledger-api: the program we ship (one real dependency, so the SBOM has content)" },
+    { path: "cmd/build/main.go", status: "new", note: "the reproducible image builder: go build, one layer, fixed timestamps, push" },
+    { path: "verify/verify.go", status: "new", note: "checks a cosign signature with the registry API and crypto/ecdsa" },
+    { path: "verify/attestation.go", status: "new", note: "checks a DSSE-signed attestation and reads the in-toto statement" },
+    { path: "cmd/verify/main.go", status: "new", note: "the command line for both checks" },
+    { path: "cmd/replay/main.go", status: "new", note: "the attacker: copies one image's signature onto another" },
+    { path: "cmd/webhook/main.go", status: "new", note: "the admission webhook: pinned by digest and signed, or refused" },
+    { path: "cmd/certs/main.go", status: "new", note: "a throwaway CA and serving certificate for the webhook" },
+    { path: "deploy/policy.yaml", status: "new", note: "the webhook's Deployment and Service, and the enforced namespace" },
+    { path: "deploy/webhook-config.yaml.tmpl", status: "new", note: "tells the API server to call the webhook for pods in that namespace" },
+    { path: "run.sh", status: "new", note: "stops 1 to 4, with output" },
+    { path: "cluster.sh", status: "new", note: "stop 5: five images, one namespace" }
+  ]}
+  run={["docker run -d -p 127.0.0.1:5001:5000 --name registry registry:2", "kind create cluster --name supply --config kind-config.yaml", "cosign generate-key-pair", "./deploy.sh", "./run.sh", "./cluster.sh"]}
+>
+
+A local registry (`registry:2`) on `localhost:5001`, a kind cluster (Kubernetes 1.37.0) that pulls from it, cosign v2.6.5 for signing, and CycloneDX's `cyclonedx-gomod` v1.12.0 for the SBOM. Signing uses a local key pair, so nothing here talks to the internet. Keyless signing (Fulcio and Rekor) is discussed under the hood but not run.
+
+</ProjectMap>
+
+## Building the Same Way Twice
+
+*Stop 1 of 5.*
+
+### Step 1: why the build must be repeatable
+
+A signature says "this exact image was approved". That's only useful if you can also say **what should be in it**. If two builds of the same source give different images, the only thing you can compare is the registry's word. If they give the *same* image, the digest becomes a fact anyone can recompute: build it yourself, and you should get the digest that was signed.
+
+Docker images are not reproducible by default: every layer records timestamps, and the image config records when it was made. So the builder here doesn't use a Dockerfile. It builds the image directly in Go, choosing every byte, and keeping out everything that varies between runs.
+
+### Step 2: the binary
+
+`go build` is close to reproducible on its own. Three settings finish the job: `-trimpath` removes the build machine's directories from the binary, `-buildvcs=false` stops Go stamping the git state of whoever built it, and no C compiler is involved (`CGO_ENABLED=0`).
+
+```go noverify title="cmd/build/main.go · lines 36–49"
+	// 1. The binary. -trimpath removes the build machine's paths,
+	// -buildvcs=false stops it stamping the git state, and CGO off keeps the
+	// C toolchain out of the result.
+	bin := os.TempDir() + "/" + *entry
+	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-ldflags=-s -w -X main.greeting="+*msg, "-o", bin, *pkg)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatal(err)
+	}
+	data, err := os.ReadFile(bin)
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+### Step 3: the layer
+
+A layer is a tar file. The tar format records a modification time and an owner for every file, so those are set to constants: time zero and root.
+
+```go noverify title="cmd/build/main.go · lines 51–61"
+	// 2. One layer: a tar with a single file and nothing that varies
+	// between runs: no timestamps, no owner names.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	tw.WriteHeader(&tar.Header{Name: *entry, Mode: 0o755, Size: int64(len(data)), ModTime: time.Unix(0, 0), Uid: 0, Gid: 0, Format: tar.FormatPAX})
+	tw.Write(data)
+	tw.Close()
+	layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(buf.Bytes())), nil })
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+### Step 4: the image, and a bug that only a cluster finds
+
+The image has no base: one layer, an entrypoint, and a creation time that is the Unix epoch instead of "now".
+
+```go noverify title="cmd/build/main.go · lines 63–82"
+	// 3. The image: no base, that layer, an entrypoint, and a creation time
+	// that is a constant instead of "now".
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Start from the config the layer produced: it holds the layer's
+	// diff ID, and an image whose config lacks it cannot be unpacked.
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.Architecture = runtime.GOARCH
+	cfg.OS = "linux"
+	cfg.Created = v1.Time{Time: time.Unix(0, 0)}
+	cfg.Config.Entrypoint = []string{"/" + *entry}
+	img, err = mutate.ConfigFile(img, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+The comment on lines 69 and 70 is there because of what the first version did. It built the config from scratch:
+
+```go title="the first version, which is wrong"
+img, _ = mutate.ConfigFile(img, &v1.ConfigFile{Architecture: runtime.GOARCH, OS: "linux", ... })
+```
+
+It pushed without a complaint, and the registry accepted it. Then the cluster tried to run it:
+
+```text title="kubectl describe pod · measured"
+Failed to pull image "localhost:5001/webhook:1.0": failed to pull and unpack image:
+number of layers and diffIDs don't match: 1 != 0
+```
+
+An image config lists the **diff ID** (the hash of the uncompressed content) of every layer, and the runtime uses them to unpack. A config with none is a perfectly valid JSON document and a registry stores it happily; only a runtime notices. The fix is to start from the config the layer produced, which already has the diff ID, and change only the fields we mean to.
+
+```go noverify title="cmd/build/main.go · lines 84–93"
+	r, err := name.ParseReference(*ref)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := remote.Write(r, img, remote.WithAuthFromKeychain(authn.DefaultKeychain)); err != nil {
+		log.Fatal(err)
+	}
+	digest, _ := img.Digest()
+	fmt.Printf("pushed %s@%s\n", r.Context().Name(), digest)
+}
+```
+
+### Step 5: does it hold?
+
+Three builds: two in a row, and a third from a copy of the source in a different directory. Then a build with one input changed (a string set at link time):
+
+```text title="./run.sh · measured"
+build 1:    sha256:4e3d451daba36d1bd03b0e94189a9a3085aceef609b3fe7793fc678f1fd36899
+build 2:    sha256:4e3d451daba36d1bd03b0e94189a9a3085aceef609b3fe7793fc678f1fd36899
+other dir:  sha256:4e3d451daba36d1bd03b0e94189a9a3085aceef609b3fe7793fc678f1fd36899
+one changed input: sha256:1407d8306ae483bce00dc2c59260d0d83660f1bbc91957e1253dd6fc651ea574
+```
+
+Same source, same digest, wherever it's built. A different input, a different digest. That's what makes the rest of the chapter possible: the digest **is** the image. Two limits are worth knowing: the digest depends on the Go toolchain version too (pin it in CI), and reproducibility across different CPU architectures isn't a thing, because the machine code differs; there's one digest per platform.
+
+## A Tag Is a Promise
+
+*Stop 2 of 5.*
+
+A registry name has two parts that look alike and are nothing alike. `ledger-api:1.0` is a **tag**: a label the registry keeps pointing at some image, which the registry's owner can change at any time. `ledger-api@sha256:4e3d...` is a **digest**: the hash of the image's manifest, so it names exactly one image, forever. Here is a tag moving, in the same registry, a moment apart:
+
+```text title="./run.sh · measured"
+demo:stable -> sha256:235276df56b0cd0ff68e540edf51f73c9b71859c7d636e0ab0c1b2065309b152
+demo:stable -> sha256:5257364cd6264f6ab38d5d624d70258ee48f7a002d53aa98bc0d38d65c96c96f  (same tag, moved)
+```
+
+Nothing about a `:stable` reference tells you the content changed. Two consequences run through the rest of the chapter. A deployment that says `:stable` runs different code after the next pull, with no change in your repository. And a signature on "the image `:stable` pointed at when I signed" proves nothing about the image it points at now. So signatures are made over digests, policies demand digests, and the tag is only for humans.
+
+<RuntimeStage
+  title="The same tag, two different images, and only the digest tells them apart"
+  kicker="registry · measured with two pushes to demo:stable"
+  zones={[
+    { id: "reg", label: "registry: demo:stable", sub: "a label the owner can move", x: 16, y: 16, w: 356, h: 200, kind: "queue" },
+    { id: "one", label: "image 235276df56b0", sub: "what the tag pointed to first", x: 388, y: 16, w: 356, h: 200, kind: "cpu" },
+    { id: "two", label: "image 5257364cd626", sub: "what it points to now", x: 16, y: 236, w: 356, h: 200, kind: "wait" },
+    { id: "pod", label: "a pod that says demo:stable", sub: "runs whichever one it finds", x: 388, y: 236, w: 356, h: 200, kind: "exit" }
+  ]}
+  actors={[
+    { id: "tag", label: "demo:stable", kind: "value" }, { id: "d1", label: "sha256:2352…", kind: "value" }, { id: "d2", label: "sha256:5257…", kind: "value" }, { id: "p", label: "pod", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "tag", to: "reg", clock: "push 1", note: "demo:stable is pushed. The registry stores an image and a tag pointing at it." },
+    { at: 1.4, id: "d1", to: "one", state: "running", note: "The tag resolves to sha256:2352…. This digest is a hash of the manifest: it can name only this image." },
+    { at: 3.2, id: "d2", to: "two", state: "running", clock: "push 2", beat: "problem", note: "Someone (a colleague, a compromised CI job, an attacker with push access) pushes a different image to the same tag. The registry accepts it: moving a tag is a normal operation." },
+    { at: 4.8, id: "tag", to: "two", state: "running", beat: "problem", note: "The tag now resolves to sha256:5257…. The old image is still there, unchanged, but nothing that says :stable will find it." },
+    { at: 6.4, id: "p", to: "pod", state: "running", beat: "problem", note: "A pod that says demo:stable pulls whatever the tag points at when it starts. Same manifest in git, different code in production." },
+    { at: 8.0, id: "d1", to: "pod", state: "done", beat: "solution", note: "A pod that says demo@sha256:2352… can only ever get the first image, or nothing. That's the reference a policy can trust, and the only kind a signature can be attached to." }
+  ]}
+  caption="A tag is a pointer someone else controls. A digest is a hash of the content, so it cannot be moved."
+/>
+
+## Signing
+
+*Stop 3 of 5.*
+
+### Step 1: what a signature is, in a registry
+
+`cosign sign` doesn't change the image. It builds a small extra artifact and pushes it next to it, under a tag made from the image's digest. Signing the image above and listing the repository's tags shows it:
+
+```text title="curl localhost:5001/v2/ledger-api/tags/list · measured"
+{"name":"ledger-api","tags":["1.0","sha256-4e3d451daba3....sig", ...]}
+```
+
+The `.sig` artifact has one layer, the **payload**: a JSON document that says which digest is being vouched for. The signature itself is a base64 ECDSA signature over that document, kept in an annotation on the layer.
+
+```json title="the signed payload · measured"
+{"critical":{"identity":{"docker-reference":"localhost:5001/ledger-api"},
+ "image":{"docker-manifest-digest":"sha256:4e3d451daba36d1bd03b0e94189a9a3085aceef609b3fe7793fc678f1fd36899"},
+ "type":"cosign container image signature"},"optional":null}
+```
+
+Read that once more: **the signature covers the payload, and the payload names the digest**. The registry link (the `.sig` tag) is only a convenient place to look for it. Whether a signature really vouches for *this* image is a property of what's inside the payload, and that turns out to matter.
+
+### Step 2: verifying in Go
+
+cosign can verify, but the check is small enough to write out, and writing it out is the way to learn what it does. The verifier needs the public key that `cosign generate-key-pair` wrote, and the shape of the payload:
+
+```go noverify title="verify/verify.go · lines 26–34"
+// payload is the "simple signing" document that cosign signs. The only
+// field that matters to us is the digest it vouches for.
+type payload struct {
+	Critical struct {
+		Image struct {
+			DockerManifestDigest string `json:"docker-manifest-digest"`
+		} `json:"image"`
+	} `json:"critical"`
+}
+```
+
+Then the check itself. It looks up the `.sig` artifact for the digest, and for each signature layer it does three things, in this order: decode the signature; check it against a hash of the payload with the trusted public key; and only then read the payload and demand that the digest inside it is the digest we asked about.
+
+```go noverify title="verify/verify.go · lines 59–77"
+// Image reports nil only if the image at repo@digest has at least one
+// signature that verifies under pub AND that names exactly this digest.
+func Image(repo, digest string, pub *ecdsa.PublicKey) error {
+	sigRef, err := name.ParseReference(repo+":"+SignatureTag(digest), name.Insecure)
+	if err != nil {
+		return err
+	}
+	img, err := remote.Image(sigRef)
+	if err != nil {
+		return fmt.Errorf("no signature found: %w", err)
+	}
+	manifest, err := img.Manifest()
+	if err != nil {
+		return err
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		return err
+	}
+```
+
+```go noverify title="verify/verify.go · lines 78–110"
+	for i, desc := range manifest.Layers {
+		sigB64, ok := desc.Annotations[signatureAnnotation]
+		if !ok {
+			continue
+		}
+		sig, err := base64.StdEncoding.DecodeString(sigB64)
+		if err != nil {
+			continue
+		}
+		rc, err := layers[i].Uncompressed()
+		if err != nil {
+			return err
+		}
+		body, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(body)
+		if !ecdsa.VerifyASN1(pub, sum[:], sig) {
+			continue // not signed by this key
+		}
+		var p payload
+		if err := json.Unmarshal(body, &p); err != nil {
+			continue
+		}
+		if p.Critical.Image.DockerManifestDigest != digest {
+			return fmt.Errorf("signature is valid but vouches for %s, not %s", p.Critical.Image.DockerManifestDigest, digest)
+		}
+		return nil
+	}
+	return errors.New("no signature verifies under this key")
+}
+```
+
+The order matters. A payload is parsed only **after** its signature has checked out, because parsing attacker-controlled data before authenticating it is how verifiers get attacked. And the digest comparison at the end is the line that makes the whole thing meaningful.
+
+### Step 3: it agrees with cosign
+
+```text title="./run.sh · measured"
+VERIFIED: signed by the holder of cosign.pub
+cosign verify: OK
+```
+
+The Go code and `cosign verify --key cosign.pub` agree on a good image. The interesting part is what they refuse.
+
+### Step 4: three images that must not verify
+
+Each of these is a way someone might try to get an image accepted, and each is built for real in the local registry.
+
+```text title="./run.sh · measured"
+unsigned:
+REJECT: no signature found: GET http://localhost:5001/v2/ledger-api/manifests/sha256-07c443b9....sig: MANIFEST_UNKNOWN
+replayed signature:
+REJECT: signature is valid but vouches for sha256:4e3d451daba3..., not sha256:764011cfff54...
+signed with someone else's key:
+REJECT: no signature verifies under this key
+```
+
+The first is the plain case: nobody signed it. The third is an attacker who signs their own image with their own key: the signature is perfectly valid, just not from a key we trust.
+
+The second is the subtle one. The attacker has no key, but has seen a genuine signature for the good image, and wants it to vouch for a different image. The registry gives them a place to try: they copy the good image's `.sig` artifact onto the tag for the bad image's digest. That's what `cmd/replay` does, in about twenty lines. The registry accepts the copy, the signature verifies under our key, and a verifier that only asked "is there a valid signature at the `.sig` tag?" would say yes. Ours checks the **digest inside the payload**, and refuses.
+
+<RuntimeStage
+  title="A stolen signature copied onto another image, and why it fails"
+  kicker="replay attack · measured in the local registry"
+  zones={[
+    { id: "good", label: "image 4e3d451daba3", sub: "signed by us, .sig tag exists", x: 16, y: 16, w: 356, h: 200, kind: "exit" },
+    { id: "atk", label: "the attacker", sub: "has the good image's signature, no key", x: 388, y: 16, w: 356, h: 200, kind: "wait" },
+    { id: "bad", label: "image 764011cfff54", sub: "the attacker's own build", x: 16, y: 236, w: 356, h: 200, kind: "cpu" },
+    { id: "ver", label: "the verifier", sub: "checks key, then the digest inside", x: 388, y: 236, w: 356, h: 200, kind: "chan" }
+  ]}
+  actors={[
+    { id: "sig", label: "signature + payload", kind: "value" }, { id: "copy", label: "copied .sig tag", kind: "value" }, { id: "ans", label: "REJECT", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "sig", to: "good", state: "done", clock: "the original", note: "cosign sign made a signature over a payload that names sha256:4e3d…. It is genuine, and it verifies under our public key." },
+    { at: 1.8, id: "sig", to: "atk", state: "running", clock: "replay", beat: "problem", note: "The attacker reads the .sig artifact from the good image's tag. Registries are readable, and a signature is not a secret." },
+    { at: 3.4, id: "copy", to: "bad", state: "running", beat: "problem", note: "cmd/replay writes it to the tag for sha256:7640…. Now the bad image has a .sig artifact with a valid signature." },
+    { at: 5.2, id: "copy", to: "ver", state: "running", clock: "verify", note: "The verifier fetches it, checks the ECDSA signature over the payload with our key: valid." },
+    { at: 6.8, id: "ans", to: "ver", state: "parked", beat: "solution", note: "Then it reads the payload: the digest inside is sha256:4e3d…, not the sha256:7640… we were asked about. REJECT: signature is valid but vouches for a different image." },
+    { at: 8.6, id: "ans", to: "bad", state: "parked", beat: "solution", note: "The bad image stays unsigned as far as any check that reads the payload is concerned." }
+  ]}
+  caption="A valid signature is not enough. It has to vouch for the exact digest being run."
+/>
+
+## What's Inside the Box
+
+*Stop 4 of 5.*
+
+### Step 1: an SBOM
+
+A signature says who approved an image. It doesn't say what's in it. When a vulnerability is announced in some library, "which of our images contain it?" needs an answer in minutes, and an image is opaque. A **software bill of materials** (SBOM) is the list of components an artifact was built from. For a Go program, `cyclonedx-gomod` reads the module graph the binary was linked from and writes it in the CycloneDX format:
+
+```text title="cyclonedx-gomod app -main app -json · measured"
+CycloneDX 1.6, 8 components:
+  github.com/beorn7/perks@v1.0.1
+  github.com/cespare/xxhash/v2@v2.3.0
+  github.com/munnerz/goautoneg@v0.0.0-20191010083416-a7dc8b61c822
+  github.com/prometheus/client_golang@v1.24.1
+  github.com/prometheus/client_model@v0.6.2
+  github.com/prometheus/common@v0.70.1
+  golang.org/x/sys@v0.47.0
+  google.golang.org/protobuf@v1.36.12-0.20260120151049-f2248ac996af
+```
+
+(The app has one direct dependency, the Prometheus client. The other seven are what it drags in. Nobody chose them; all of them are in your binary.) An SBOM is only worth trusting if it's tied to the image it describes, and that's what an attestation does.
+
+### Step 2: attesting
+
+An **attestation** is a signed statement about an artifact. The format is an **in-toto statement**: a *subject* (the image, by digest), a *predicate type* (what kind of claim, here `https://cyclonedx.org/bom`), and the predicate (the SBOM). It travels in a **DSSE envelope**: the statement's bytes, their type, and a signature. `cosign attest` makes and pushes it, under a `.att` tag.
+
+```bash title="run.sh"
+cosign attest --key cosign.key --type cyclonedx --predicate sbom.json localhost:5001/ledger-api@$GOOD
+```
+
+### Step 3: verifying it in Go
+
+The envelope's signature is *not* over the statement's bytes directly. DSSE signs a "pre-authentication encoding": the payload type and lengths, then the payload. Signing the type along with the payload stops a signature made for one kind of document from being replayed as another.
+
+```go noverify title="verify/attestation.go · lines 39–44"
+// pae is DSSE's "pre-authentication encoding": what is actually signed.
+// Signing the type together with the payload stops a signature made for
+// one kind of document from being replayed as another.
+func pae(payloadType string, payload []byte) []byte {
+	return []byte(fmt.Sprintf("DSSEv1 %d %s %d %s", len(payloadType), payloadType, len(payload), payload))
+}
+```
+
+The verifier decodes each envelope, checks the signature over that encoding, and only then parses the statement. Then it does the same digest check as before: the statement's **subject** has to be the image we're asking about, or a valid SBOM for some other image could be attached to this one.
+
+```go noverify title="verify/attestation.go · lines 72–99"
+		var env envelope
+		if json.Unmarshal(raw, &env) != nil {
+			continue
+		}
+		payload, err := base64.StdEncoding.DecodeString(env.Payload)
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(pae(env.PayloadType, payload))
+		verified := false
+		for _, s := range env.Signatures {
+			sig, err := base64.StdEncoding.DecodeString(s.Sig)
+			if err == nil && ecdsa.VerifyASN1(pub, sum[:], sig) {
+				verified = true
+			}
+		}
+		if !verified {
+			continue
+		}
+		var st Statement
+		if json.Unmarshal(payload, &st) != nil {
+			continue
+		}
+		if len(st.Subject) != 1 || "sha256:"+st.Subject[0].Digest["sha256"] != digest {
+			return nil, fmt.Errorf("attestation is validly signed but is about a different image")
+		}
+		out = append(out, st)
+	}
+```
+
+```text title="go run ./cmd/verify -sbom · measured"
+VERIFIED: signed by the holder of cosign.pub
+ATTESTED: https://cyclonedx.org/bom, about sha256:4e3d451daba3, 8 components:
+```
+
+The eight components printed are read out of the signed statement, not out of a file on someone's laptop. When the advisory arrives, this is the query: for every image in the registry, verify its attestation and search the components.
+
+## The Gate
+
+*Stop 5 of 5.*
+
+Signing and attesting are promises. Nothing enforces them until the cluster is willing to say no. Kubernetes has a place for that: **admission control**. When something creates a pod, the API server, after authenticating the request and before storing anything, can call out to a **validating admission webhook**: an HTTPS service you run, which gets the object and answers allowed or denied. (Appendix 43 builds a webhook for a custom resource; this one guards a built-in kind.)
+
+### Step 1: the decision
+
+The webhook receives an `AdmissionReview`, reads the pod out of it, and checks **every** image in it: init containers, containers and ephemeral containers, because a pod that hides its bad image in an init container is still running it. Two rules, and the first is a precondition of the second: the image must be pinned by digest, and the signature at that digest must verify.
+
+```go noverify title="cmd/webhook/main.go · lines 67–96"
+// decide checks every image in the pod. One bad image denies the pod.
+func decide(req *admissionv1.AdmissionRequest, pub *ecdsa.PublicKey, from, to string) (bool, string) {
+	var pod corev1.Pod
+	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
+		return false, "cannot read the pod: " + err.Error()
+	}
+	var images []string
+	for _, c := range pod.Spec.InitContainers {
+		images = append(images, c.Image)
+	}
+	for _, c := range pod.Spec.Containers {
+		images = append(images, c.Image)
+	}
+	for _, c := range pod.Spec.EphemeralContainers {
+		images = append(images, c.Image)
+	}
+	for _, image := range images {
+		repo, digest, pinned := strings.Cut(image, "@")
+		if !pinned {
+			return false, fmt.Sprintf("%s is not pinned by digest: a tag can be moved to different content", image)
+		}
+		if from != "" && strings.HasPrefix(repo, from) {
+			repo = to + strings.TrimPrefix(repo, from)
+		}
+		if err := verify.Image(repo, digest, pub); err != nil {
+			return false, fmt.Sprintf("%s: %v", image, err)
+		}
+	}
+	return true, fmt.Sprintf("%d image(s) pinned and signed", len(images))
+}
+```
+
+One detail: `from` and `to` rewrite the registry's address. The pod's image says `localhost:5001` (which is how the node's runtime reaches the registry), but from inside the webhook's pod that address means the webhook itself. The webhook reaches the same registry as `registry:5000` over the Docker network.
+
+### Step 2: the server
+
+The handler decodes the review, calls `decide`, logs the verdict and how long it took, and answers with the same UID the request had. Getting the UID wrong makes the API server ignore the answer.
+
+```go noverify title="cmd/webhook/main.go · lines 38–57"
+	http.HandleFunc("POST /validate", func(w http.ResponseWriter, r *http.Request) {
+		var review admissionv1.AdmissionReview
+		if err := json.NewDecoder(r.Body).Decode(&review); err != nil || review.Request == nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		start := time.Now()
+		allowed, reason := decide(review.Request, pub, from, to)
+		log.Printf("%-6s %s/%s: %s (%v)", verdict(allowed), review.Request.Namespace, review.Request.Name, reason, time.Since(start).Round(time.Millisecond))
+
+		resp := &admissionv1.AdmissionResponse{UID: review.Request.UID, Allowed: allowed}
+		if !allowed {
+			resp.Result = &metav1.Status{Message: reason}
+		}
+		review.Response, review.Request = resp, nil
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(review)
+	})
+	log.Println("image-policy webhook on :8443")
+	log.Fatal(http.ListenAndServeTLS(":8443", "/etc/tls/tls.crt", "/etc/tls/tls.key", nil))
+```
+
+### Step 3: telling the API server about it
+
+The API server calls webhooks over HTTPS and must trust the certificate, so `cmd/certs` makes a throwaway CA and a serving certificate for `image-policy.default.svc`, and the CA certificate goes into the configuration as `caBundle`. Two settings in the configuration are decisions, not plumbing:
+
+```yaml title="deploy/webhook-config.yaml.tmpl"
+    failurePolicy: Fail          # if the webhook is down, pods are refused, not waved through
+    namespaceSelector:
+      matchLabels: {verify-images: enabled}
+```
+
+`namespaceSelector` scopes the policy to namespaces that opt in, which is how you avoid a policy that blocks the cluster's own components on the day you install it. `failurePolicy: Fail` says what to do when the webhook can't be reached. We come back to it below.
+
+### Step 4: five images, one namespace
+
+Five images, tried in the `prod` namespace, where the policy applies: the good signed image by tag, an image that was never signed, the replayed signature, the image signed by another key, and the good image by digest.
+
+```text title="./cluster.sh · measured"
+-- by-tag: localhost:5001/ledger-api:1.0
+denied: localhost:5001/ledger-api:1.0 is not pinned by digest: a tag can be moved to different content
+
+-- unsigned: localhost:5001/ledger-api@sha256:07c443b9...
+denied: ...: no signature found: GET http://registry:5000/v2/ledger-api/manifests/sha256-07c443b9....sig
+
+-- replayed: localhost:5001/ledger-api@sha256:764011cf...
+denied: ...: signature is valid but vouches for sha256:4e3d451daba3..., not sha256:764011cf...
+
+-- forged: localhost:5001/ledger-api@sha256:3077ef80...
+denied: ...: no signature verifies under this key
+
+-- good: localhost:5001/ledger-api@sha256:4e3d451daba3...
+pod/good created
+pod/good condition met
+```
+
+Four refused, one admitted, and the admitted pod became Ready: the image the builder made runs. The webhook's own log has the verdicts and the price of the check:
+
+```text title="kubectl logs deploy/image-policy · measured"
+DENY   prod/by-tag: ... is not pinned by digest ... (0s)
+DENY   prod/unsigned: ... no signature found ... (18ms)
+DENY   prod/replayed: ... vouches for sha256:4e3d451daba3 ... (7ms)
+DENY   prod/forged: ... no signature verifies under this key (7ms)
+ALLOW  prod/good: 1 image(s) pinned and signed (4ms)
+```
+
+Between 4 and 18 milliseconds for a check that involves a registry round trip and a signature verification. That's the cost added to every pod creation in an enforced namespace.
+
+<RuntimeStage
+  title="A pod is created: the API server asks the webhook, the webhook asks the registry"
+  kicker="admission · measured on kind, Kubernetes 1.37.0"
+  zones={[
+    { id: "api", label: "API server", sub: "authenticated, not yet stored", x: 16, y: 16, w: 236, h: 200, kind: "cpu" },
+    { id: "hook", label: "image-policy webhook", sub: "pinned? then signed by our key?", x: 262, y: 16, w: 236, h: 200, kind: "chan" },
+    { id: "reg", label: "registry", sub: "the .sig artifact for the digest", x: 508, y: 16, w: 236, h: 200, kind: "queue" },
+    { id: "no", label: "denied: nothing is stored", sub: "kubectl prints the reason", x: 16, y: 236, w: 356, h: 200, kind: "wait" },
+    { id: "yes", label: "allowed: the pod is stored and scheduled", sub: "4 ms in the measured run", x: 388, y: 236, w: 356, h: 200, kind: "exit" }
+  ]}
+  actors={[
+    { id: "tag", label: "pod: image :1.0", kind: "value" }, { id: "evil", label: "pod: forged image", kind: "value" }, { id: "good", label: "pod: signed digest", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "tag", to: "api", state: "running", clock: "by tag", note: "kubectl run with localhost:5001/ledger-api:1.0. The API server authenticates it, then calls the webhook before storing anything." },
+    { at: 1.4, id: "tag", to: "hook", state: "running", note: "The webhook reads the image: no @sha256. There is nothing to verify, because a tag isn't a fact." },
+    { at: 2.8, id: "tag", to: "no", state: "parked", beat: "problem", note: "DENY, in under a millisecond, without even asking the registry: 'not pinned by digest'." },
+    { at: 4.0, id: "evil", to: "api", state: "running", clock: "forged", note: "A pinned image, signed with someone else's key." },
+    { at: 5.2, id: "evil", to: "hook", state: "running" },
+    { at: 6.2, id: "evil", to: "reg", state: "running", note: "The webhook fetches the .sig artifact. It exists, and the signature is a real one." },
+    { at: 7.6, id: "evil", to: "no", state: "parked", beat: "problem", note: "It doesn't verify under our public key: DENY 'no signature verifies under this key', 7 ms." },
+    { at: 9.0, id: "good", to: "api", state: "running", clock: "signed", note: "The pinned image we signed." },
+    { at: 10.2, id: "good", to: "hook", state: "running" }, { at: 11.0, id: "good", to: "reg", state: "running" },
+    { at: 12.4, id: "good", to: "yes", state: "done", beat: "solution", note: "The signature verifies and names this digest: ALLOW in 4 ms. Only now is the pod stored and scheduled, and the kubelet pulls the image by digest." }
+  ]}
+  caption="The check happens before the pod exists. A refused pod is never stored, never scheduled, and never pulls a byte."
+/>
+
+### Step 5: two things that surprise you
+
+**A Deployment doesn't fail where you'd look.** `kubectl create deployment` succeeded with the bad image, and nothing looked wrong until:
+
+```text title="kubectl -n prod get deploy web · measured"
+web    0/1     0            0           4s
+```
+
+The webhook denies the *pod*, and pods aren't created by you: the ReplicaSet controller creates them. The denial appears where that controller reports its failure:
+
+```text title="kubectl -n prod describe rs · measured"
+ReplicaFailure   True    FailedCreate
+Warning  FailedCreate  0s (x10 over 4s)  replicaset-controller  Error creating: admission webhook "image-policy.example.com" denied the request: ...
+```
+
+The controller retries, and keeps being refused. Anyone deploying learns about the policy from `describe`, not from `apply`, so an alert on `FailedCreate` is part of running this.
+
+**Fail closed means what it says.** With `failurePolicy: Fail`, the webhook being unreachable must not become "allow". To see it, scale the webhook to zero and try to create the *good* pod:
+
+```text title="webhook down · measured"
+Error from server (InternalError): Internal error occurred: failed calling webhook "image-policy.example.com":
+failed to call webhook: Post "https://image-policy.default.svc:443/validate?timeout=10s": dial tcp ...: connect: connection refused
+```
+
+Every pod in the enforced namespace is refused until the webhook is back, including good ones (once it's scaled back up, the same pod was admitted). That's the right default for a security control, and it's why the webhook needs replicas, a PodDisruptionBudget and a namespace scope that excludes the things it depends on. The alternative, `Ignore`, turns an outage of the policy into no policy at all.
+
+<QuickCheck
+  question="An attacker copies a valid signature from your signed image onto the signature tag of their own image. Which check stops it?"
+  options={[
+    "Checking that the signature verifies under your public key",
+    "Checking that the digest inside the signed payload equals the digest being run",
+    "Checking that the .sig tag exists",
+    "Nothing: registries are trusted"
+  ]}
+  answer={1}
+  explain="The copied signature is valid under your key, so the first check passes. It vouches for a different digest, so only comparing the payload's digest with the requested one refuses it."
+/>
+
+<QuickCheck
+  question="Why must the policy require a digest, not just a valid signature on the image the tag points to?"
+  options={[
+    "Digests are shorter to type",
+    "A tag can be moved after the signature was made, so a signature about 'the current :stable' proves nothing about the next pull",
+    "Signatures can only be stored under digests",
+    "Kubernetes ignores tags"
+  ]}
+  answer={1}
+  explain="A tag is a pointer the registry owner can change. Pinning by digest means the pod can only ever get the content that was signed."
+/>
+
+<QuickCheck
+  question="The webhook is unreachable and its failurePolicy is Fail. What happens to a request to create a pod in an enforced namespace?"
+  options={[
+    "It is allowed, because nothing denied it",
+    "It is refused with an internal error until the webhook is back",
+    "It waits indefinitely",
+    "It is checked by the API server itself"
+  ]}
+  answer={1}
+  explain="Fail means an unreachable webhook counts as a denial. Ignore would let everything through, which makes the policy optional whenever it is down."
+/>
+
+<UnderTheHood title="Keys, keyless signing, and what this chapter did not do">
+
+**The key is the whole system.** This chapter signs with a key pair on a laptop. Whoever holds `cosign.key` can make any image pass, and nothing here says how the key is protected, rotated or revoked. A real setup keeps it in a KMS or hardware token, or avoids long-lived keys entirely.
+
+**Keyless signing** (cosign's default) is the alternative the sigstore project built: the signer proves who they are with an identity token (a GitHub Actions job, for example), a certificate authority called Fulcio issues a certificate valid for a few minutes, and the signature is recorded in a public transparency log, Rekor. Verification then checks *identity* ("was this signed by the release workflow of this repository?") instead of a key. It removes the key you'd have to guard and adds services you'd have to trust or run. This chapter didn't run it, and it's what the `sigstore-go` library is for.
+
+**What the webhook doesn't check.** It doesn't require an SBOM attestation, it doesn't look at *who* signed beyond the key, and it doesn't check the `docker-reference` in the payload. It doesn't scan for vulnerabilities. Each of those is a rule you'd add to `decide`, and the exercises add two.
+
+**Provenance.** Beyond an SBOM there is a **SLSA provenance** attestation: a signed statement of *how* the image was built (which source commit, which builder, which inputs). Together with reproducible builds it lets a verifier rebuild the source and compare digests. The reproducibility in stop 1 is the property that makes that check possible.
+
+**A signature is not a safety certificate.** It says an image came from someone holding the key, unmodified. A signed image can still contain a bug or a backdoor its author put there. Supply chain security narrows who can put something in your cluster; it doesn't tell you the something is good.
+
+</UnderTheHood>
+
+## Exercises
+
+<Exercise n={1} title="Require the SBOM" level="medium">
+
+Extend `decide` so a pod is admitted only if its image also has a verified CycloneDX attestation with at least one component. Which two functions do you call, and what should the denial say for an image with a signature but no attestation?
+
+<Solution>
+
+After `verify.Image` passes, call `verify.Attestation(repo, digest, pub)` and require it to return at least one statement whose `PredicateType` is `https://cyclonedx.org/bom` and whose predicate has a non-empty `components` list. The denial should name what is missing: `"...: signed, but no SBOM attestation"`, so that the person who sees it in `describe rs` knows which step of the pipeline to fix. It doubles the registry calls per image, so consider caching results by digest: a digest never changes, so a verified digest can be remembered.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="Which registry" level="easy">
+
+The webhook admits a signed image from any registry. Add a flag so that it only admits images whose repository starts with an allowed prefix. Why do that when the signature already proves who made the image?
+
+<Solution>
+
+Check `strings.HasPrefix(repo, allowed)` before verifying. The signature proves the image was signed by your key, not where it was pulled from; restricting registries limits the blast radius of a mistake (someone signing an image from a public registry they hadn't reviewed) and gives you one place to reason about availability and access control. Do the prefix check on the name the pod uses, before any rewriting.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Rebuild in CI" level="hard">
+
+Sketch a CI job that builds the image, compares the digest with a second build on a different runner, signs only if they match, and pushes the signature. What does it prove that a single build and a signature don't?
+
+<Solution>
+
+Build twice on two runners with `cmd/build` (pinning the Go version), compare the printed digests, fail if they differ, then `cosign sign --key <KMS key> repo@digest`. A single build plus a signature proves the image is the one your builder made. Two independent builds that agree prove something stronger: that the image is a pure function of the source, so a compromise of one builder that inserts something would show up as a mismatch. It doesn't help if both builders are compromised the same way, or if the source itself is malicious.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Admit Only What Was Signed"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={10}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Admit approves any image that has a valid signature, and approves everything else too, because it falls through to an allow. It also ignores which digest the signature vouches for and accepts tags. Fix it so an image is admitted only if it is pinned by digest and at least one signature is valid AND vouches for exactly that digest, and every denial gives a reason."
+  starter={`package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Signature is one signature found for an image, already checked by the
+// cryptography: Valid says it verifies under a key we trust, and Digest is
+// the image digest its signed payload vouches for.
+type Signature struct {
+	Valid  bool
+	Digest string
+}
+
+// Admit decides whether a pod may run image. The rules:
+//   - the image must be pinned by digest ("repo@sha256:..."): a tag can be
+//     moved, so a signature on "what the tag pointed to once" proves nothing;
+//   - at least one signature must be Valid AND vouch for exactly the
+//     digest in the image reference;
+//   - anything else is denied, with a reason.
+func Admit(image string, sigs []Signature) (bool, string) {
+	for _, s := range sigs {
+		if s.Valid {
+			return true, "signed"
+		}
+	}
+	return true, "no signature required"
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	const good, other = "sha256:aaaa", "sha256:bbbb"
+	check := func(name, image string, sigs []Signature, want bool) {
+		defer func() {
+			if p := recover(); p != nil {
+				fail("%s: panic: %v", name, p)
+			}
+		}()
+		got, reason := Admit(image, sigs)
+		if got != want {
+			fail("%s: admitted=%v (%q), want %v", name, got, reason, want)
+		}
+		if !got && strings.TrimSpace(reason) == "" {
+			fail("%s: a denial must give a reason", name)
+		}
+	}
+
+	check("a tag, even with a valid signature", "reg/app:1.0", []Signature{{true, good}}, false)
+	check("pinned but unsigned", "reg/app@"+good, nil, false)
+	check("signature vouches for a different digest", "reg/app@"+good, []Signature{{true, other}}, false)
+	check("signature from a key we don't trust", "reg/app@"+good, []Signature{{false, good}}, false)
+	check("pinned and signed", "reg/app@"+good, []Signature{{true, good}}, true)
+	check("one bad signature and one good one", "reg/app@"+good, []Signature{{false, good}, {true, good}}, true)
+	check("a valid signature for another image, a bad one for this", "reg/app@"+good, []Signature{{true, other}, {false, good}}, false)
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}
+`}
+  verifier="Checks Admit on a tag with a valid signature, on a pinned image with no signature, with a signature for a different digest, with a signature from an untrusted key, on a pinned and signed image, with one bad and one good signature, and with a valid signature for another image plus a bad one for this image. Prints ALL CHECKS PASS."
+  hints={[
+    "Split the image at '@': no '@' means a tag, which is denied whatever the signatures say.",
+    "A signature counts only if s.Valid is true AND s.Digest equals the digest from the image reference.",
+    "The default at the end of the function is denial: return false with a reason if no signature qualified."
+  ]}
+  flag="GO{admit_only_what_was_signed}"
+>
+
+This is the webhook's `decide` and `verify.Image` boiled down to the decision itself, with the same three mistakes real verifiers have made.
+
+</Lab>
+
+<Recap>
+
+- **A digest is an identity, a tag is a pointer.** Measured: `demo:stable` moved from `sha256:2352…` to `sha256:5257…` with a normal push. Signatures and policies therefore work on digests.
+- A **reproducible build** makes the digest recomputable: fixed timestamps, owners, `-trimpath`, no VCS stamp. Three builds (two directories) gave one digest, and one changed input gave another. The first version's config lacked the layer's **diff ID**, which pushed fine and then failed to pull.
+- A **cosign signature** is a signed payload naming a digest, stored beside the image. About 100 lines of Go verify it with the registry API and `crypto/ecdsa`, agreeing with `cosign verify`, and refusing an unsigned image, a **replayed** signature (valid, but vouching for another digest) and one from another key.
+- An **SBOM** attested in a **DSSE envelope** is a signed, queryable list of what's in an image: 8 components here. Verification checks the signature over DSSE's encoding and that the statement's subject is this image.
+- An **admission webhook** refuses pods before they exist: a tag, an unsigned image, a replayed signature and a forged one were denied, the signed digest admitted in 4 ms (checks took 4 to 18 ms). A Deployment fails quietly in the ReplicaSet's events, and with `failurePolicy: Fail` a webhook that is down refuses every pod.
+- The **key** is the weak point: signing with a laptop key protects only as well as the key does. Keyless signing, provenance and vulnerability scanning are what come next.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: the copied signature", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: why a digest", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the webhook is down", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: require the SBOM", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2: which registry", kind: "exercise", points: 10, done: false },
+    { label: "Exercise 3: rebuild in CI", kind: "exercise", points: 20, done: false }
+  ]}
+  flag={{ label: "Lab: Admit Only What Was Signed", captured: false, points: 100 }}
+/>
+
+<Narrator>
+Four fakes turned away, one honest image admitted, and the whole decision took four milliseconds. Somewhere a bouncer is taking notes. You now trust digests, distrust tags, and treat every signature as a claim to be read, not a hall pass. Congratulations: you've become suspicious. It suits you.
+</Narrator>
