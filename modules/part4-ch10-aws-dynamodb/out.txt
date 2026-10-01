@@ -1,0 +1,113 @@
+# go go1.27.0  aws-sdk-go-v2 v1.47.1  service/dynamodb v1.70.0  attributevalue v1.21.8  expression v1.9.8
+# localstack 3.8.1
+
+=== design ===
+1. Entry with Memo empty (omitempty) and time.Time:
+  amount   N    -2500
+  at       S    "2026-10-01T09:30:00Z"
+  pk       S    "ACCT#alice"
+  sk       S    "ENT#20261001T093000.000000000Z#tx-001"
+  txid     S    "tx-001"
+
+2. Account2{Balance: 0} with `omitempty`, Memo "" and nil Tags:
+  memo     S    ""
+  pk       S    "ACCT#bob"
+  sk       S    "ACCT"
+  tags     NULL
+
+3. condition `balance >= 0` on the stored zero-balance account -> ccf=true
+
+4. PutItem with pk = "":
+   operation error DynamoDB: PutItem, https response error StatusCode: 400, RequestID: e60bb854-31c8-4b20-9f67-e1bf6fdfd4b0, api error ValidationException: One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk
+
+5. PutItem with memo = "" (non-key): err=<nil>
+
+6. round trip of Account2{Balance: 0}: Balance=0, attribute present in item: false
+
+=== debit ===
+50 goroutines each debit 10 from an account holding 300 (demand 500, so 30 can succeed)
+
+conditional UpdateItem
+  trial 1: ok=30 rejected=20  paid out=300  balance fell by=300  final=   0  unrecorded debits=0
+  trial 2: ok=30 rejected=20  paid out=300  balance fell by=300  final=   0  unrecorded debits=0
+  trial 3: ok=30 rejected=20  paid out=300  balance fell by=300  final=   0  unrecorded debits=0
+
+naive read-then-write
+  trial 1: ok=50 rejected= 0  paid out=500  balance fell by= 20  final= 280  unrecorded debits=48
+  trial 2: ok=50 rejected= 0  paid out=500  balance fell by= 20  final= 280  unrecorded debits=48
+  trial 3: ok=50 rejected= 0  paid out=500  balance fell by= 20  final= 280  unrecorded debits=48
+
+
+=== transfer ===
+  state start:
+    alice balance=1000 version=1 entries=[]
+    bob   balance= 200 version=1 entries=[]
+
+A. alice -> bob 300, txid=tx-1, token=tok-1
+  -> committed
+  state after A:
+    alice balance= 700 version=2 entries=[tx-1:-300]
+    bob   balance= 500 version=2 entries=[tx-1:+300]
+
+B. the same call again (a retry after a timeout), same token tok-1
+  -> committed
+  state after B (unchanged: the token made the retry a no-op):
+    alice balance= 700 version=2 entries=[tx-1:-300]
+    bob   balance= 500 version=2 entries=[tx-1:+300]
+
+C. same token tok-1 but amount 999 (a different request)
+  -> IdempotentParameterMismatchException (code=IdempotentParameterMismatchException, message="")
+
+D. new token tok-2, SAME txid tx-1 (client forgot the token, kept the business id)
+  -> TransactionCanceledException; cancellation reasons, one per item in request order:
+     [0] debit from code=None                  
+     [1] credit to  code=None                  
+     [2] entry from code=ConditionalCheckFailed msg="The conditional request failed"
+     [3] entry to   code=ConditionalCheckFailed msg="The conditional request failed"
+  state after D (unchanged: the entry's attribute_not_exists condition refused the duplicate):
+    alice balance= 700 version=2 entries=[tx-1:-300]
+    bob   balance= 500 version=2 entries=[tx-1:+300]
+
+E. new token tok-3, NEW txid tx-2 (a genuinely new transfer)
+  -> committed
+  state after E:
+    alice balance= 400 version=3 entries=[tx-1:-300 tx-2:-300]
+    bob   balance= 800 version=3 entries=[tx-1:+300 tx-2:+300]
+
+F. alice -> bob 5000 (alice has 400): debit condition fails
+  -> TransactionCanceledException; cancellation reasons, one per item in request order:
+     [0] debit from code=ConditionalCheckFailed msg="The conditional request failed" item.balance=400
+     [1] credit to  code=None                  
+     [2] entry from code=None                  
+     [3] entry to   code=None                  
+  state after F (nothing moved, no entries written):
+    alice balance= 400 version=3 entries=[tx-1:-300 tx-2:-300]
+    bob   balance= 800 version=3 entries=[tx-1:+300 tx-2:+300]
+
+G. alice -> zed 50 (zed does not exist): credit condition fails
+  -> TransactionCanceledException; cancellation reasons, one per item in request order:
+     [0] debit from code=None                  
+     [1] credit to  code=ConditionalCheckFailed msg="The conditional request failed"
+     [2] entry from code=None                  
+     [3] entry to   code=None                  
+  state after G (alice was NOT debited even though her own condition passed):
+    alice balance= 400 version=3 entries=[tx-1:-300 tx-2:-300]
+    bob   balance= 800 version=3 entries=[tx-1:+300 tx-2:+300]
+
+=== optimistic ===
+20 writers each +5 on balance 1000, guarded by `version = :v`
+final balance=1100 (expected 1100), version=21 (expected 21), total retries after a conflict=100
+
+=== query ===
+loaded 5970 items: alice has 1200 entries, 19 other accounts have 250 each
+
+  page  1: 100 items, LastEvaluatedKey={pk:ACCT#alice sk:ENT#20260101T000139.000000000Z#tx-alice-0099}
+  page  2: 100 items, LastEvaluatedKey={pk:ACCT#alice sk:ENT#20260101T000319.000000000Z#tx-alice-0199}
+  page 13:   0 items, LastEvaluatedKey=nil
+Query, Limit=100: 13 pages, 1200 entries, scanned=1200, consumed=18.0 RCU, 116ms
+  entries returned in sort-key (time) order: true; first=2026-01-01T00:00:00Z last=2026-01-01T00:19:59Z
+
+Query newest 10 (ScanIndexForward=false, Limit=10): returned=10 scanned=10 consumed=0.5 RCU, 4ms
+
+Query, no Limit:  1 page(s), 1200 entries, scanned=1200, consumed=15.5 RCU, 36ms
+Scan + filter:    1 page(s), 1200 entries returned, scanned=5970, consumed=80.0 RCU, 69ms

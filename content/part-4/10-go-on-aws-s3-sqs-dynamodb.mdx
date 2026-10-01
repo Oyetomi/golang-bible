@@ -1,0 +1,1426 @@
+---
+title: "Go on AWS: S3, SQS and DynamoDB"
+part: 4
+order: 10
+type: "course"
+description: "The three AWS services most Go backends touch first, driven from Go with AWS SDK v2 against a local AWS (LocalStack community 3.8.1, since the latest image now refuses to start without a paid token): S3 (a credential chain you can read, a 26 MB multipart upload that round-tripped its sha256 ten times, a typed-error surprise on HeadObject), SQS (long polling made 1 request where short polling made 191, a crashed consumer's message came back after 5.4 to 6 seconds, a poison message reached the dead-letter queue after 3 receives, and a duplicate delivery credited an account 5,000 instead of 2,500 until a dedup key stopped it) and DynamoDB (50 concurrent debits: the conditional write accepted exactly 30 and left 0, the naive read-then-write paid out 500 from a balance of 300; a four-item transaction with cancellation reasons by index; Query read 1,200 items for 15.5 read units where Scan read 5,970 for 80). Not run against real AWS: presigned-URL enforcement, throttling and real latency, each flagged where it matters."
+prerequisites: ["capstone-ledger-to-production"]
+---
+
+<HeroCard label="Part 4 · Chapter 10" title="Go on AWS: S3, SQS and DynamoDB">
+
+Read enough Go job listings and one pattern shows up whatever the company: the Go runs on a cloud, and the cloud is usually AWS. Part 4 has so far built the layers under your service (containers, Linux, networks, Kubernetes, SRE, delivery). This chapter builds the layer next to it: the managed services your service calls.
+
+Three of them, because between them they cover most of what a backend asks a cloud for: **S3** to keep files, **SQS** to hand work to another process, **DynamoDB** to keep records that must scale and stay correct. The same ledger domain as Part 3 runs through all three, and every claim comes from a program you can run.
+
+You do not need an AWS account. The programs run against a local AWS emulator, and the chapter is blunt about what that proves and what it can't.
+
+Four stops:
+
+1. **A local AWS.** What we run, and why it is an older version than you'd expect.
+2. **S3.** Credentials, objects, presigned URLs, multipart uploads, errors and retries.
+3. **SQS.** Polling, the visibility timeout, dead letters, duplicates and a clean shutdown.
+4. **DynamoDB.** Table design, conditional writes, transactions, pagination and optimistic locking.
+
+</HeroCard>
+
+<Narrator>
+Every Go job listing says "AWS" somewhere, usually between "Kubernetes" and "a passion for ownership". Today you find out what the word actually involves: three services, one SDK, and a fake cloud on your laptop that lies in four specific ways. I'll tell you which four. I'm generous like that.
+</Narrator>
+
+<ChapterTabs tabs={["A Local AWS", "S3", "SQS", "DynamoDB"]} />
+
+<ProjectMap
+  root="p4c10"
+  files={[
+    { path: "s3/awsx/awsx.go", status: "new", note: "one client constructor: default credential chain, path-style addressing" },
+    { path: "s3/cmd/", status: "new", note: "client, objects, presign, multipart, errs: one small program per experiment" },
+    { path: "sqs/sqs/", status: "new", note: "a counting client, Receive/Delete helpers, a dedup set and a bounded worker pool" },
+    { path: "sqs/cmd/", status: "new", note: "polling, redeliver, dlq, idem, worker" },
+    { path: "dynamodb/ddb/", status: "new", note: "table model, Debit, Transfer, optimistic adjust" },
+    { path: "dynamodb/cmd/", status: "new", note: "design, debit, transfer, query, optimistic" },
+    { path: "*/run.sh", status: "new", note: "every output block in this chapter, regenerated into out.txt" }
+  ]}
+  run={["docker run -d -p 127.0.0.1:4566:4566 -e SERVICES=s3,sqs,dynamodb,iam,sts localstack/localstack:3.8", "cd s3 && ./run.sh", "cd sqs && ./run.sh", "cd dynamodb && ./run.sh"]}
+>
+
+Three Go modules, one per service, each with the same shape: small `cmd/` programs and a `run.sh` that reproduces the chapter's output. SDK versions: `aws-sdk-go-v2` v1.47.1, `service/s3` v1.114.0, `service/sqs` v1.52.1, `service/dynamodb` v1.70.0, `smithy-go` v1.28. Everything ran on Go 1.27.0.
+
+</ProjectMap>
+
+## A Local AWS
+
+*Stop 1 of 4.*
+
+Real AWS costs money, needs an account and is slow to reset. **LocalStack** is an emulator: one container that answers the AWS APIs on `localhost:4566`, so the SDK talks to it exactly as it would to the real thing. The Go code does not change. Only an environment variable does: `AWS_ENDPOINT_URL=http://127.0.0.1:4566`.
+
+```bash title="the local cloud"
+docker run -d --name localstack -p 127.0.0.1:4566:4566 \
+  -e SERVICES=s3,sqs,dynamodb,iam,sts localstack/localstack:3.8
+```
+
+Note the version. When this chapter was written, the `latest` LocalStack image printed *"License activation failed"* and quit: recent versions require an account and an auth token. The pinned 3.8 community image still runs without one, so every output below is from **LocalStack 3.8.1**. That matters for what you can believe:
+
+- **It speaks the API, not the enforcement.** Requests that real AWS would reject (a tampered presigned URL, a policy violation) are often accepted here. The chapter says so wherever it bites.
+- **Timing is the emulator's, not AWS's.** Latencies and rates here are for comparing one design against another on the same machine, never for quoting.
+- **Real AWS adds failure modes this chapter cannot show**: throttling, regional outages, eventual consistency in places. The programs are written to handle them (typed errors, retries), but those paths are only exercised where we could force them.
+
+Every resource the programs create has a prefix and is deleted when the program ends, because a shared emulator accumulates debris.
+
+## S3
+
+*Stop 2 of 4.*
+
+### Step 1: Build a client, and see where its credentials came from
+
+The SDK is a set of small modules: `config` loads settings, `service/s3` is the client, and the rest is plumbing. `config.LoadDefaultConfig` is the entry point. It builds an `aws.Config` by walking a fixed order of sources. For credentials that order is the **default credential chain**:
+
+1. environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+2. the shared files `~/.aws/credentials` and `~/.aws/config` (profile chosen by `AWS_PROFILE`)
+3. web identity, SSO or container credentials, when configured
+4. the EC2 instance metadata service (IMDS), which is how code running on AWS gets a role without any secret in the image
+
+The point of the chain is that the same binary runs on your laptop, in CI and on AWS, and you change the environment, not the code.
+
+The endpoint works the same way. The SDK reads `AWS_ENDPOINT_URL` (or per service, `AWS_ENDPOINT_URL_S3`) by itself, so the code never mentions LocalStack. The old `EndpointResolverWithOptions` is deprecated; if you must set an endpoint in code, the replacement is the `BaseEndpoint` field on `s3.Options`. The one S3-specific thing set in code is `UsePathStyle`: real S3 addresses `bucket.s3.amazonaws.com/key`, which needs wildcard DNS, so LocalStack wants `host:4566/bucket/key`.
+
+```go noverify title="awsx/awsx.go · lines 16–27"
+func New(ctx context.Context, opts ...func(*config.LoadOptions) error) (*s3.Client, aws.Config, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, cfg, err
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// LocalStack serves buckets at http://host:4566/bucket/key, not
+		// http://bucket.host:4566/key. Harmless against real AWS.
+		o.UsePathStyle = true
+	})
+	return client, cfg, nil
+}
+```
+
+The probe asks the config for a credential and prints its `Source`:
+
+```go noverify title="cmd/client/main.go · lines 29–35"
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		fmt.Println("credentials:      NONE FOUND ->", err)
+		os.Exit(1)
+	}
+	fmt.Println("credential source:", creds.Source)
+	fmt.Println("access key id:    ", creds.AccessKeyID)
+```
+
+Three runs, three different outcomes. The first has keys in the environment. The second has no keys but a shared credentials file with profile `lab`. The third has nothing, so the chain ends at IMDS (switched off with `AWS_EC2_METADATA_DISABLED`; otherwise it waits on a link-local address that is not there):
+
+```text
+region:           us-east-1
+base endpoint:    http://127.0.0.1:4566
+credential source: EnvConfigCredentials
+access key id:     test
+ListBuckets ok, s3sec- buckets: 0
+```
+
+```text
+region:           us-east-1
+base endpoint:    http://127.0.0.1:4566
+credential source: SharedConfigCredentials: /var/folders/y2/g_9fflnj6nx6lscmpnqr_yww0000gn/T/tmp.kqQx5mbV95
+access key id:     fromfile
+ListBuckets ok, s3sec- buckets: 0
+```
+
+```text
+region:           us-east-1
+base endpoint:    http://127.0.0.1:4566
+credentials:      NONE FOUND -> failed to refresh cached credentials, no EC2 IMDS role found, operation error ec2imds: GetMetadata, access disabled to EC2 IMDS via client option, or "AWS_EC2_METADATA_DISABLED" environment variable
+exit status 1
+```
+
+In 1c, `LoadDefaultConfig` itself succeeded: credentials are resolved lazily, on the first call that needs them, so a missing credential shows up as an error from the first request, not at startup.
+
+### Step 2: Upload, download, list
+
+`PutObject` takes any `io.Reader`. `GetObject` returns `Body`, a live network stream that you must close.
+
+```text
+created bucket s3sec-objects
+PutObject   etag="5ab7855d6939e12fc08bce5dab6731f4" bytes=24
+HeadObject  size=24 type=text/plain metadata=map[author:abbey]
+GetObject   "hello from the Go Bible\n"
+ListObjectsV2 key=notes/hello.txt size=24
+deleted object and bucket
+```
+
+### Step 3: A presigned GET URL, fetched with plain net/http
+
+A presigned URL is a request signed ahead of time, with the signature moved into the query string. Whoever holds the URL can make exactly that request until it expires, with no credentials of their own. The SDK exposes this as `s3.NewPresignClient`. The consumer is an ordinary HTTP client:
+
+```go noverify title="cmd/presign/main.go · lines 26–40"
+func fetch(label, url string) {
+	resp, err := http.Get(url) // no SDK, no credentials: the URL is the credential
+	if err != nil {
+		fmt.Printf("%-9s transport error: %v\n", label, err)
+		return
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	text := strings.TrimSpace(string(b))
+	if len(text) > 90 {
+		text = text[:90] + "..."
+	}
+	fmt.Printf("%-9s HTTP %d  %s\n", label, resp.StatusCode, strings.ReplaceAll(text, "\n", " "))
+}
+
+```
+
+```go noverify title="cmd/presign/main.go · lines 59–63"
+	ps := s3.NewPresignClient(client)
+	req, err := ps.PresignGetObject(ctx,
+		&s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)},
+		s3.WithPresignExpires(2*time.Second))
+	must(err)
+```
+
+```text
+anon      HTTP 200  quarterly numbers: private
+method: GET
+url base: http://127.0.0.1:4566/s3sec-presign/secret/report.txt
+  param: X-Amz-Algorithm=AWS4-HMAC-SHA256
+  param: X-Amz-Checksum-Mode=ENABLED
+  param: X-Amz-Credential=test%2F20261001%2Fus-east-1%2Fs3%2Faws4_request
+  param: X-Amz-Date=20261001T011213Z
+  param: X-Amz-Expires=2
+  param: X-Amz-SignedHeaders=host
+  param: x-id=GetObject
+  param: X-Amz-Signature=b8ee731e97f4...
+signature for report.txt: b8ee731e97f4...
+signature for other.txt:  bfe7acc1a56a...
+valid     HTTP 200  quarterly numbers: private
+tampered  HTTP 404  <?xml version='1.0' encoding='utf-8'?> <Error><Code>NoSuchKey</Code><Message>The specified...
+expired   HTTP 200  quarterly numbers: private
+```
+
+What to read in this output:
+
+- the URL carries `X-Amz-Expires=2` (seconds), `X-Amz-SignedHeaders=host` and a signature;
+- presigning a different key gives a completely different signature. The signature is an HMAC over the canonical request (method, path, query, host), so it cannot be moved onto another URL.
+
+**What LocalStack did not do.** The `anon` request succeeded on a private bucket. The `tampered` URL failed only because `other.txt` does not exist (404 `NoSuchKey`, not a signature error). The `expired` request, made 3 seconds after a 2-second URL, still returned 200. LocalStack community 3.8 does not validate presigned signatures or expiry by default. Real S3 answers 403 for the anonymous request, for a signature replayed on another key, and (`Request has expired`) after expiry. We could not verify that 403 behaviour here, so read that sentence as AWS documentation, not as measured output.
+
+### Step 4: Multipart upload of a 25 MB object
+
+A single `PutObject` is capped at 5 GB and cannot resume. The multipart API splits an object into parts (5 MiB minimum, except the last), uploads them independently and in parallel, then stitches them with `CompleteMultipartUpload`. The transfer manager does all of that: it switches to multipart above a size threshold, runs `Concurrency` workers, and aborts the upload on failure so orphaned parts do not accumulate.
+
+The test object is 26,337,857 bytes of `crypto/rand` data (25 MiB plus 123,457 bytes, so the last part is short). Its sha256 is computed locally, without the SDK, and compared after every download.
+
+```go noverify title="cmd/multipart/main.go · lines 91–130"
+	for _, conc := range []int{1, 8} {
+		tm := transfermanager.New(client, func(o *transfermanager.Options) {
+			o.PartSizeBytes = partSize
+			o.Concurrency = conc
+		})
+		var ups, dls []time.Duration
+		var parts int
+		var etag string
+		for run := 0; run < 5; run++ {
+			key := fmt.Sprintf("big-c%d-r%d.bin", conc, run)
+			keys = append(keys, key)
+			src, err := os.Open(f.Name())
+			must(err)
+			t0 := time.Now()
+			out, err := tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(key), Body: src})
+			must(err)
+			ups = append(ups, time.Since(t0))
+			src.Close()
+			parts, etag = len(out.CompletedParts), aws.ToString(out.ETag)
+
+			dst, err := os.CreateTemp("", "s3sec-dl-*.bin")
+			must(err)
+			t0 = time.Now()
+			_, err = tm.DownloadObject(ctx, &transfermanager.DownloadObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(key), WriterAt: dst})
+			must(err)
+			dls = append(dls, time.Since(t0))
+			dst.Close()
+			if got := sum(dst.Name()); got != want {
+				fmt.Println("CHECKSUM MISMATCH", key)
+				os.Exit(1)
+			}
+			os.Remove(dst.Name())
+		}
+		fmt.Printf("\nconcurrency=%d part=%dMiB  parts uploaded=%d  etag=%s\n", conc, partSize>>20, parts, etag)
+		fmt.Printf("  upload   median of 5: %v   (all: %v)\n", med(ups), round(ups))
+		fmt.Printf("  download median of 5: %v   (all: %v)\n", med(dls), round(dls))
+		fmt.Printf("  sha256 of all 5 downloads == local file: true\n")
+	}
+```
+
+```text
+injected delay per request: 0s
+local file: 26337857 bytes, sha256=f01f0273c5c32936...
+
+concurrency=1 part=5MiB  parts uploaded=6  etag="cb7e681338a6ddf2d55bec3eec4bb4e7-6"
+  upload   median of 5: 274ms   (all: [305ms 267ms 285ms 252ms 274ms])
+  download median of 5: 197ms   (all: [212ms 183ms 194ms 218ms 197ms])
+  sha256 of all 5 downloads == local file: true
+
+concurrency=8 part=5MiB  parts uploaded=6  etag="cb7e681338a6ddf2d55bec3eec4bb4e7-6"
+  upload   median of 5: 208ms   (all: [444ms 208ms 189ms 188ms 282ms])
+  download median of 5: 218ms   (all: [441ms 218ms 176ms 208ms 295ms])
+  sha256 of all 5 downloads == local file: true
+stderr:       60 lines, distinct messages:  60 WARN Skipped validation of multipart checksum.
+```
+
+- 26,337,857 bytes in 5 MiB parts is 6 parts, and the ETag ends in `-6`, which is how you recognise a multipart object.
+- All 10 round trips (5 per concurrency setting) matched the original sha256.
+- Timing, honestly: loopback to a container is too fast for parallelism to matter much. Median upload went from 274 ms (1 worker) to 208 ms (8 workers); download did not improve (197 ms vs 218 ms); one 8-worker upload took 444 ms. Samples in this environment swing by 2x between runs because LocalStack shares the machine with other containers. To model a network, `-rtt` injects a fixed 40 ms before every HTTP request. That is a simulation, and the output says so:
+
+```go noverify title="cmd/multipart/main.go · lines 36–44"
+type delayed struct {
+	d    time.Duration
+	next http.RoundTripper
+}
+
+func (t delayed) RoundTrip(r *http.Request) (*http.Response, error) {
+	time.Sleep(t.d)
+	return t.next.RoundTrip(r)
+}
+```
+
+```text
+injected delay per request: 40ms
+local file: 26337857 bytes, sha256=1bd148727414dfe0...
+
+concurrency=1 part=5MiB  parts uploaded=6  etag="799e348420c0743273e65efb69769aac-6"
+  upload   median of 5: 612ms   (all: [663ms 672ms 602ms 600ms 612ms])
+  download median of 5: 444ms   (all: [594ms 505ms 444ms 425ms 441ms])
+  sha256 of all 5 downloads == local file: true
+
+concurrency=8 part=5MiB  parts uploaded=6  etag="799e348420c0743273e65efb69769aac-6"
+  upload   median of 5: 305ms   (all: [355ms 302ms 304ms 333ms 305ms])
+  download median of 5: 298ms   (all: [399ms 298ms 261ms 310ms 273ms])
+  sha256 of all 5 downloads == local file: true
+stderr:       60 lines, distinct messages:  60 WARN Skipped validation of multipart checksum.
+```
+
+With 40 ms per request, 1 worker uploaded in 612 ms and 8 workers in 305 ms; downloads were 444 ms vs 298 ms. That is the realistic shape: concurrency hides latency, it does not add bandwidth. It is not 8x because 6 parts means at most 6 are in flight, and the final `CompleteMultipartUpload` is serial.
+
+The 60 stderr lines per run are the SDK's logger saying `Skipped validation of multipart checksum.` Each download of a multipart object prints one per part (10 downloads x 6 parts). The uploader attaches a CRC32 per part, a composite value that cannot be compared with a whole-object checksum, so the SDK says it is not checking end to end. That is why this chapter compares sha256 itself.
+
+### Step 5: Errors and retries
+
+Every service error is a typed value that also satisfies `smithy.APIError`. Use `errors.As`, never string matching:
+
+```go noverify title="cmd/errs/main.go · lines 55–79"
+
+	// 1. Missing key: GetObject returns the typed *types.NoSuchKey.
+	_, err = client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("nope")})
+	var nsk *types.NoSuchKey
+	fmt.Println("GetObject missing key")
+	fmt.Println("  errors.As(*types.NoSuchKey):", errors.As(err, &nsk))
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		fmt.Printf("  smithy.APIError code=%q message=%q fault=%v\n", ae.ErrorCode(), ae.ErrorMessage(), ae.ErrorFault())
+	}
+
+	// 2. HeadObject on a missing key: no body to parse -> NOT NoSuchKey.
+	_, err = client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("nope")})
+	fmt.Println("HeadObject missing key")
+	fmt.Println("  errors.As(*types.NoSuchKey):", errors.As(err, &nsk))
+	fmt.Println("  errors.As(*types.NotFound): ", func() bool { var nf *types.NotFound; return errors.As(err, &nf) }())
+	if errors.As(err, &ae) {
+		fmt.Printf("  smithy.APIError code=%q\n", ae.ErrorCode())
+	}
+
+	// 3. Missing bucket.
+	_, err = client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String("s3sec-no-such-bucket")})
+	var nsb *types.NoSuchBucket
+	fmt.Println("ListObjectsV2 missing bucket")
+	fmt.Println("  errors.As(*types.NoSuchBucket):", errors.As(err, &nsb))
+```
+
+```text
+GetObject missing key
+  errors.As(*types.NoSuchKey): true
+  smithy.APIError code="NoSuchKey" message="The specified key does not exist." fault=client
+HeadObject missing key
+  errors.As(*types.NoSuchKey): false
+  errors.As(*types.NotFound):  true
+  smithy.APIError code="NotFound"
+ListObjectsV2 missing bucket
+  errors.As(*types.NoSuchBucket): true
+default retryer: MaxAttempts()=3 MaxBackoff default=20s
+server fails first 2 requests -> HTTP calls made=3
+  result: success
+server fails first 5 requests -> HTTP calls made=3
+  result: error: operation error S3: ListObjectsV2, exceeded maximum number of attempts, 3, https response error StatusCode: 503, RequestID: , HostID: , api error Serv...
+  errors.As(*retry.MaxAttemptsError): true, attempts = 3
+```
+
+**The surprise.** `HeadObject` on a missing key does not give you `*types.NoSuchKey`. A HEAD response has no body, so the SDK has no XML error code to parse, only the status, and the error is `*types.NotFound` (code `"NotFound"`). Code that checks `NoSuchKey` around a `HeadObject` never matches and treats a missing file as a hard failure. The fix is to check both types, or branch on `ae.ErrorCode()` being `NoSuchKey` or `NotFound`.
+
+The second half of the output shows the default retryer. `retry.NewStandard()` is what the SDK installs: 3 attempts in total (not 3 retries), exponential backoff with jitter capped at 20 s, and a client-side token bucket that stops retrying when the service is failing broadly. A custom `http.RoundTripper` that returns 503 for the first n requests shows it: fail twice and the third call succeeds (3 HTTP calls); fail five times and you get `*retry.MaxAttemptsError` with `Attempt == 3`, still only 3 HTTP calls. To change the budget use `config.WithRetryMaxAttempts(5)`.
+
+<RuntimeStage
+  title="A 26 MB upload in six parts, and a checksum that has to survive the trip"
+  kicker="S3 multipart · measured on LocalStack 3.8.1"
+  zones={[
+    { id: "file", label: "the local file", sub: "26,337,857 bytes, sha256 computed locally", x: 16, y: 16, w: 236, h: 200, kind: "plain" },
+    { id: "tm", label: "transfer manager", sub: "5 MiB parts, Concurrency workers", x: 262, y: 16, w: 236, h: 200, kind: "cpu" },
+    { id: "s3", label: "S3", sub: "6 parts, then CompleteMultipartUpload", x: 508, y: 16, w: 236, h: 200, kind: "queue" },
+    { id: "back", label: "downloaded again", sub: "sha256 compared, 10 of 10 matched", x: 16, y: 236, w: 356, h: 200, kind: "exit" },
+    { id: "slow", label: "one worker vs eight, 40 ms per request", sub: "upload 612 ms vs 305 ms", x: 388, y: 236, w: 356, h: 200, kind: "chan" }
+  ]}
+  actors={[
+    { id: "p1", label: "part 1", kind: "value" }, { id: "p2", label: "part 2", kind: "value" }, { id: "p3", label: "part 3", kind: "value" }, { id: "p6", label: "part 6 (short)", kind: "value" }, { id: "obj", label: "object, etag …-6", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "p1", to: "file", clock: "split", note: "A single PutObject is capped at 5 GB and cannot resume. Above a size threshold the transfer manager cuts the file into 5 MiB parts instead." },
+    { at: 0.1, id: "p2", to: "file" }, { at: 0.2, id: "p3", to: "file" }, { at: 0.3, id: "p6", to: "file", note: "26,337,857 bytes is five full parts and a short sixth." },
+    { at: 1.8, id: "p1", to: "tm", state: "running", note: "Concurrency workers upload parts independently and in parallel. A failed upload is aborted so orphaned parts don't pile up on the bucket." },
+    { at: 1.9, id: "p2", to: "tm", state: "running" }, { at: 2.0, id: "p3", to: "tm", state: "running" },
+    { at: 3.6, id: "p1", to: "s3", state: "running" }, { at: 3.7, id: "p2", to: "s3", state: "running" }, { at: 3.8, id: "p3", to: "s3", state: "running" }, { at: 3.9, id: "p6", to: "s3", state: "running" },
+    { at: 5.4, id: "obj", to: "s3", state: "done", beat: "solution", note: "CompleteMultipartUpload stitches the parts. The ETag ends in -6, which is how you recognise a multipart object." },
+    { at: 7.0, id: "obj", to: "back", state: "done", beat: "solution", note: "Download, hash, compare with the local sha256: all 10 round trips matched. The SDK itself only logs 'Skipped validation of multipart checksum', so the chapter checks end to end itself." },
+    { at: 8.6, id: "p1", to: "slow", state: "done", note: "With 40 ms injected per request, 1 worker uploaded in 612 ms and 8 workers in 305 ms. Concurrency hides latency. It is not 8x faster because six parts means at most six are in flight." }
+  ]}
+  caption="Multipart splits one big request into small independent ones. The proof that nothing was damaged is your own hash, compared after the trip."
+/>
+
+<QuickCheck
+  question="The SDK finds credentials by walking a fixed list of sources. You have AWS_ACCESS_KEY_ID set in the environment and a ~/.aws/credentials file with a different key for AWS_PROFILE=reader. Which key does your program use?"
+  options={[
+    "The profile's, because AWS_PROFILE is explicit",
+    "The environment variable's: environment variables come first in the chain",
+    "Whichever was set most recently",
+    "It fails with an ambiguity error"
+  ]}
+  answer={1}
+  explain="The default chain tries environment variables first, then web identity, then the shared files. The later chapter on identity measures this exact case: the key from the environment won even with AWS_PROFILE set."
+/>
+
+<QuickCheck
+  question="You call HeadObject on a key that doesn't exist and check errors.As(err, &noSuchKey) for *types.NoSuchKey. What happens?"
+  options={[
+    "It matches, as with GetObject",
+    "It never matches: a HEAD response has no body, so the error is *types.NotFound",
+    "It panics",
+    "It returns nil error"
+  ]}
+  answer={1}
+  explain="Measured on this chapter's run: GetObject gives NoSuchKey, HeadObject gives NotFound. Code that only checks NoSuchKey treats a missing file as a hard failure."
+/>
+
+## SQS
+
+*Stop 3 of 4.*
+
+### Step 1: pay for the wait once, not every 100 ms
+
+An SQS queue is a pull system: nothing is pushed to you. A consumer calls `ReceiveMessage`, and by default (`WaitTimeSeconds=0`, *short polling*) the call answers immediately, empty or not. A loop around it is a meter running: every empty answer is a billed request that returned nothing. With `WaitTimeSeconds` up to 20 (*long polling*) the server parks the request until a message arrives or the wait expires, so an idle consumer costs one call per 20 s and a busy one still gets its message the instant it lands.
+
+Every program shares one tiny client that wraps the HTTP transport and counts real requests, so the numbers below are API calls, not guesses.
+
+```go noverify title="sqs/client.go · lines 105–117"
+// Receive polls once. wait is WaitTimeSeconds: 0 = short poll, >0 = long poll.
+func Receive(ctx context.Context, cl *awssqs.Client, url string, max, wait int32) ([]types.Message, error) {
+	out, err := cl.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
+		QueueUrl:                    aws.String(url),
+		MaxNumberOfMessages:         max,
+		WaitTimeSeconds:             wait,
+		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Messages, nil
+}
+```
+
+`cmd/polling` polls an empty queue for 20 s each way (the short-poll loop sleeps 100 ms between calls; a loop with no pause would only make more calls), then parks a long poll, sends a message 3 s later and times the delivery.
+
+```text title="out.txt · Step 1"
+short poll (wait=0, 100ms pause):   191 empty receives,   191 HTTP calls in 20.1s
+long poll  (wait=20):                 1 empty receives,     1 HTTP calls in 20.0s
+long poll parked, message sent -> received after 9 ms
+```
+
+191 requests against 1, and the parked poll still delivered in 9 ms. On real AWS the 191 would be on your bill (and a tight loop would be thousands). Long polling is the default you want.
+
+### Step 2: at-least-once is not a slogan, it is the visibility timeout
+
+When a consumer receives a message, SQS does not remove it. It *hides* it for the queue's visibility timeout and waits for `DeleteMessage`. If the delete never comes, because the process crashed, was OOM-killed or lost its network, the timeout expires and the message becomes visible again for the next consumer. That is the whole mechanism behind "at-least-once": the broker prefers delivering a message twice to losing it once. Exactly-once is something *you* build on top (Step 4).
+
+To make it real, `cmd/redeliver` creates a queue with `VisibilityTimeout=5`, sends a payment, and starts a *child process* (consumer A) that receives it and calls `os.Exit(1)` before deleting. The parent, consumer B, long-polls and times the reappearance from the instant A received.
+
+```go noverify title="cmd/redeliver/main.go · lines 73–84"
+// crash is consumer A: receive, begin work, die. No Delete, no cleanup.
+func crash(ctx context.Context, cl *awssqs.Client, url string) {
+	msgs, err := sqs.Receive(ctx, cl, url, 1, 5)
+	if err != nil || len(msgs) == 0 {
+		fmt.Println("consumer A: nothing received", err)
+		os.Exit(2)
+	}
+	fmt.Printf("RECEIVED %d %s\n", time.Now().UnixNano(), *msgs[0].MessageId)
+	fmt.Printf("consumer A: got %s (ReceiveCount=%s), crashing before delete\n",
+		*msgs[0].Body, msgs[0].Attributes["ApproximateReceiveCount"])
+	os.Exit(1)
+}
+```
+
+Three runs:
+
+```text title="out.txt · Step 2"
+-- run 1
+RECEIVED 1790816990648108000 627e367c-1aa4-4ee8-b2cb-f49d1a34dfbe
+consumer A: got {"payment_id":"p-100","account":"acct-7","amount_minor":99900,"currency":"USD"} (ReceiveCount=1), crashing before delete
+consumer A exited: exit status 1
+consumer B received it: same MessageId=true ReceiveCount=2 body={"payment_id":"p-100","account":"acct-7","amount_minor":99900,"currency":"USD"}
+redelivered 5.38s after consumer A received it (queue VisibilityTimeout=5s)
+after B deletes: visible=0 in-flight=0
+-- run 2
+(...)
+redelivered 5.96s after consumer A received it (queue VisibilityTimeout=5s)
+-- run 3
+(...)
+redelivered 5.95s after consumer A received it (queue VisibilityTimeout=5s)
+```
+
+(Runs 2 and 3 are abbreviated here to the measured line; the full text is in `out.txt`.) Same `MessageId`, `ReceiveCount` went 1 to 2, and the message came back 5.38 s, 5.96 s and 5.95 s after receipt for a 5 s timeout. The timeout is a floor, not a promise: LocalStack's reaper evidently ticks about once a second, so expect the delay to be the timeout plus up to roughly a second. Consequence for design: set the visibility timeout longer than your worst-case handler time, or the message reappears while you are still working on it and a *second* consumer processes it concurrently. Nothing crashed, and you still got a duplicate.
+
+### Step 3: a message that can never succeed needs somewhere to go
+
+Redelivery has a nasty edge: a *poison* message (here a payment in a currency the ledger cannot book) fails on every attempt, so it loops forever, burning receives and hiding the real work behind retries. The fix is a *dead-letter queue* (DLQ): give the main queue a redrive policy with `maxReceiveCount`, and once a message has been received that many times without a delete, SQS moves it to the DLQ for a human to inspect.
+
+```go noverify title="cmd/dlq/main.go · lines 22–32"
+	dlq, _ := sqs.CreateQueue(ctx, cl, "dlq-dead", nil)
+	arn, _ := sqs.QueueARN(ctx, cl, dlq)
+	redrive, _ := json.Marshal(map[string]any{"deadLetterTargetArn": arn, "maxReceiveCount": 3})
+	main, err := sqs.CreateQueue(ctx, cl, "dlq-main", map[string]string{
+		"VisibilityTimeout": "2",
+		"RedrivePolicy":     string(redrive),
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("redrive policy: %s\n", redrive)
+```
+
+The consumer simply fails the poison message and does not delete it (visibility timeout 2 s):
+
+```text title="out.txt · Step 3"
+redrive policy: {"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:sqssec-dlq-dead","maxReceiveCount":3}
+t+ 0.0s p-good    ReceiveCount=1 ok, deleted
+t+ 0.0s p-poison  ReceiveCount=1 FAILED (unknown currency): not deleting
+t+ 2.2s p-poison  ReceiveCount=2 FAILED (unknown currency): not deleting
+t+ 5.2s p-poison  ReceiveCount=3 FAILED (unknown currency): not deleting
+main queue: visible=0 in-flight=0
+DLQ holds: {"payment_id":"p-poison","account":"acct-2","amount_minor":-1,"currency":"???"} (ReceiveCount on DLQ=4)
+```
+
+The healthy payment was unaffected. The poison got exactly three attempts, then left the main queue (visible=0, in-flight=0) and landed in the DLQ. Note `ReceiveCount on DLQ=4`: the count is carried across, and the move happens when a 4th receive would exceed the limit, not right after the 3rd failure. A DLQ is only useful if something watches it: alarm on its depth, and keep its retention longer than the main queue's.
+
+### Step 4: assume duplicates, then shut down without losing any
+
+Steps 2 and 3 prove duplicates are normal: crashes, timeouts and producer retries all produce them. So the handler must be *idempotent*: applying the same payment twice must change the ledger once. The standard tool is a dedup key (here `payment_id`, chosen by the producer, not the SQS `MessageId`, which differs per send). A producer that retried after a timeout sent two messages with distinct `MessageId`s and one `payment_id`:
+
+```go noverify title="cmd/idem/main.go · lines 46–56"
+			if idempotent {
+				if dd.Seen(ev.PaymentID) {
+					fmt.Printf("  skip duplicate %s (MessageId %.8s)\n", ev.PaymentID, *m.MessageId)
+					return nil // already handled: delete without touching the ledger
+				}
+				if !dd.Begin(ev.PaymentID) {
+					// the twin is mid-flight: do NOT delete, in case it fails
+					return errors.New("same payment in flight, retry later")
+				}
+				defer dd.Done(ev.PaymentID)
+			}
+```
+
+```text title="out.txt · Step 4a"
+handler with dedup key = false
+  credit p-dup-false +2500 (MessageId 09a07e10)
+  credit p-dup-false +2500 (MessageId 39a072b2)
+  queue left: visible=0 in-flight=0
+  => 2 messages delivered, ledger credited 2 time(s), acct-9 balance = 5000 (should be 2500)
+handler with dedup key = true
+  credit p-dup-true +2500 (MessageId 771a59f5)
+  skip duplicate p-dup-true (MessageId 93a6570f)
+  queue left: visible=0 in-flight=0
+  => 2 messages delivered, ledger credited 1 time(s), acct-9 balance = 2500 (should be 2500)
+```
+
+Without the key the account is credited 5000 instead of 2500. With it, the second delivery is acknowledged (deleted) and skipped.
+
+The dedup set here is a file (`sqs/dedup.go`) so it survives a restart. **A real system would not use a file.** The dedup record and the money movement must commit atomically: in the Part 3 ledger that is a unique constraint on `payment_id` inside the same Postgres transaction as the balance change (`INSERT ... ON CONFLICT DO NOTHING`), or a DynamoDB conditional `PutItem`. With a file, a crash between "credit" and "mark done" still double-credits.
+
+Now the worker pool. Two rules make shutdown safe. First, bound concurrency by reserving a slot *before* receiving, so you never hold messages you cannot start (an idle in-flight message burns its visibility timeout). Second, on SIGTERM stop *receiving* but let handlers and their deletes run on a context that the signal does not cancel (`context.WithoutCancel`).
+
+```go noverify title="sqs/worker.go · lines 32–83"
+func (p *Pool) Run(ctx context.Context) {
+	slots := make(chan struct{}, p.Concurrency)
+	var wg sync.WaitGroup
+	// Work runs on its own context: cancelling ctx stops *receiving*, never
+	// the handlers or their deletes.
+	work := context.WithoutCancel(ctx)
+	for ctx.Err() == nil {
+		// Reserve a slot first, so we never receive more than we can start.
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		n := 1
+		for n < 10 && n < p.Concurrency {
+			select {
+			case slots <- struct{}{}:
+				n++
+				continue
+			default:
+			}
+			break
+		}
+		msgs, err := Receive(ctx, p.Client, p.URL, int32(n), p.Wait)
+		for i := len(msgs); i < n; i++ {
+			<-slots // give back slots we did not use
+		}
+		if err != nil {
+			continue // ctx cancelled mid-poll, or a transient error: loop re-checks ctx
+		}
+		for _, m := range msgs {
+			p.Stats.Received.Add(1)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { <-slots }()
+				if err := p.Handle(work, m); err != nil {
+					p.Stats.Failed.Add(1) // no delete: SQS redelivers after the visibility timeout
+					return
+				}
+				p.Stats.Processed.Add(1)
+				if err := Delete(work, p.Client, p.URL, m); err == nil {
+					p.Stats.Deleted.Add(1)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+```
+
+Signal handling is `signal.NotifyContext` for SIGTERM/SIGINT in `cmd/worker/main.go` (line 26). The experiment: send 40 payments (ids `p-001`..`p-040`, amounts 100..4000 minor units), start worker `w1` (4 in flight, each handler sleeps 400 ms to stand in for the ledger write), `kill -TERM` it 1.5 s in, then start `w2` to drain what is left.
+
+```text title="out.txt · Step 4b"
+sent 40 payments
+queue depth: visible=40 in-flight=0
+[w1] started, concurrency=4
+[w1] shutdown signal: received=8, finished=4, in flight right now=4; draining
+[w1] exited cleanly: received=8 processed=8 failed=0 deleted=8
+queue depth: visible=32 in-flight=0
+-- restart: worker w2 drains the rest
+[w2] started, concurrency=4
+[w2] shutdown signal: received=32, finished=32, in flight right now=0; draining
+[w2] exited cleanly: received=32 processed=32 failed=0 deleted=32
+queue depth: visible=0 in-flight=0
+sent=40
+ledger lines=40 unique payment_ids=40
+ledger total (minor units)=82000 expected=82000
+```
+
+At the signal, 4 messages were mid-handler; w1 finished all 4 and deleted them before exiting, and nothing was left in flight (`in-flight=0`, so no message was stranded for a visibility timeout). Tally: sent 40, processed 8+32=40, deleted 8+32=40, ledger lines 40 with 40 unique ids, total 82000 = 100 x (1+...+40). No loss, no duplicate. (w2's own "shutdown signal" line is its 12 s `-for` timer firing, which goes through the same graceful path.)
+
+Last thing to remember for production: the grace period. Kubernetes sends SIGTERM and SIGKILLs after `terminationGracePeriodSeconds` (30 s by default), so the slowest handler plus one long-poll wait must fit inside it, or the "graceful" path is cut short and you are back to Step 2, which is safe only because the handler is idempotent.
+
+<RuntimeStage
+  title="A consumer dies holding a message, and SQS gives it to someone else"
+  kicker="SQS · visibility timeout 5 s · measured, three runs"
+  zones={[
+    { id: "q", label: "the queue", sub: "message p-100, visibility timeout 5 s", x: 16, y: 16, w: 236, h: 200, kind: "queue" },
+    { id: "a", label: "consumer A", sub: "receives, then os.Exit(1) before Delete", x: 262, y: 16, w: 236, h: 200, kind: "cpu" },
+    { id: "hidden", label: "in flight: hidden from everyone", sub: "ReceiveCount = 1", x: 508, y: 16, w: 236, h: 200, kind: "wait" },
+    { id: "b", label: "consumer B", sub: "long-polling", x: 16, y: 236, w: 356, h: 200, kind: "chan" },
+    { id: "done", label: "same MessageId, ReceiveCount = 2", sub: "back after 5.38 s, 5.96 s and 5.95 s", x: 388, y: 236, w: 356, h: 200, kind: "exit" }
+  ]}
+  actors={[
+    { id: "m", label: "p-100: 99900 USD", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "m", to: "q", clock: "send", note: "A payment event is sent. SQS stores it durably." },
+    { at: 1.6, id: "m", to: "a", state: "running", note: "Consumer A receives it. SQS does not delete anything on receive: it only hides the message for the visibility timeout." },
+    { at: 3.0, id: "m", to: "hidden", state: "parked", beat: "problem", note: "A crashes before calling DeleteMessage (an OOM kill, a lost network, here a plain os.Exit(1)). The message is invisible to everyone while the timer runs." },
+    { at: 5.0, id: "m", to: "q", state: "running", clock: "5.4 s", note: "The timeout expires and the message becomes visible again. The delay is the timeout plus up to about a second here, because the emulator's reaper ticks roughly once a second." },
+    { at: 6.6, id: "m", to: "b", state: "running", note: "Consumer B receives it: same MessageId, ReceiveCount 2. At-least-once is exactly this: the broker prefers delivering twice to losing it once." },
+    { at: 8.2, id: "m", to: "done", state: "done", beat: "solution", note: "B deletes it. The design consequence: a visibility timeout shorter than your slowest handler hands a still-running message to a second consumer, with nothing crashed." }
+  ]}
+  caption="'At-least-once' is not a slogan. It is a timer: receive hides a message, and only a delete makes it go away."
+/>
+
+<QuickCheck
+  question="A handler takes up to 40 seconds. The queue's visibility timeout is 30 seconds. What happens to a message that takes 35 seconds to process?"
+  options={[
+    "Nothing: SQS waits for the delete",
+    "It becomes visible again at 30 s and a second consumer can receive and process it while the first is still working",
+    "It goes straight to the dead-letter queue",
+    "SQS extends the timeout automatically"
+  ]}
+  answer={1}
+  explain="The timeout is a deadline, not a lock. Set it above the worst-case handler time, or extend it with ChangeMessageVisibility, or you get concurrent duplicates without a single crash."
+/>
+
+<QuickCheck
+  question="Why must the dedup key come from the producer (payment_id) rather than SQS's MessageId?"
+  options={[
+    "MessageIds are too long",
+    "A producer that retried after a timeout sent two messages, which get two different MessageIds but are the same payment",
+    "MessageIds change on every receive",
+    "SQS doesn't expose MessageIds"
+  ]}
+  answer={1}
+  explain="Measured in Step 4: two messages with distinct MessageIds and one payment_id credited the account twice (5,000 instead of 2,500) until the handler deduplicated on payment_id."
+/>
+
+## DynamoDB
+
+*Stop 4 of 4.*
+
+### Step 1: Design the table around the questions you will ask
+
+DynamoDB stores items in partitions chosen by hashing the **partition key**; inside a partition, items are kept sorted by the **sort key**. You cannot join, and you cannot cheaply ask a question the key does not answer. So you do not design tables from entities; you design from access patterns. Ours are: "get one account", "list one account's entries, newest first or in pages", "move money between two accounts".
+
+One table, two item types sharing a partition. The account is `pk=ACCT#id, sk=ACCT`. Each entry is `pk=ACCT#id, sk=ENT#<timestamp>#<txid>`. Because the timestamp is zero-padded and fixed width, lexicographic sort order equals time order, and "all entries of one account" is a single-partition Query with `begins_with(sk, "ENT#")`. The balance lives on the account item so a debit touches exactly one item.
+
+```go noverify title="ddb/model.go · lines 9–45"
+//
+//	pk = ACCT#<id>   sk = ACCT                      the account (balance lives here)
+//	pk = ACCT#<id>   sk = ENT#<RFC3339Nano>#<txid>  one ledger entry, sorted by time
+//
+// "All entries of one account, newest first" is then a single-partition Query.
+
+type Account struct {
+	PK      string `dynamodbav:"pk"`
+	SK      string `dynamodbav:"sk"`
+	Owner   string `dynamodbav:"owner"`
+	Balance int64  `dynamodbav:"balance"` // minor units (kobo/cents), never float
+	Version int64  `dynamodbav:"version"`
+}
+
+type Entry struct {
+	PK     string    `dynamodbav:"pk"`
+	SK     string    `dynamodbav:"sk"`
+	Amount int64     `dynamodbav:"amount"` // signed: debit < 0
+	TxID   string    `dynamodbav:"txid"`
+	At     time.Time `dynamodbav:"at"`
+	Memo   string    `dynamodbav:"memo,omitempty"`
+}
+
+func AcctPK(id string) string { return "ACCT#" + id }
+
+func AccountKey(id string) map[string]any { return map[string]any{"pk": AcctPK(id), "sk": "ACCT"} }
+
+func NewAccount(id, owner string, balance int64) Account {
+	return Account{PK: AcctPK(id), SK: "ACCT", Owner: owner, Balance: balance, Version: 1}
+}
+
+func NewEntry(acct string, amount int64, txid string, at time.Time) Entry {
+	return Entry{
+		PK: AcctPK(acct), SK: fmt.Sprintf("ENT#%s#%s", at.UTC().Format("20060102T150405.000000000Z"), txid),
+		Amount: amount, TxID: txid, At: at.UTC(),
+	}
+}
+```
+
+Table creation is on-demand billing with two string key attributes (only key attributes are declared; everything else is schemaless):
+
+```go noverify title="ddb/client.go · lines 31–50"
+	return d
+}
+
+// CreateTable makes a single-table ledger: string pk + string sk, on-demand.
+func CreateTable(ctx context.Context, c *dynamodb.Client, name string) error {
+	_, err := c.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(name),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	var inUse *types.ResourceInUseException
+	if errors.As(err, &inUse) {
+		return nil
+```
+
+### Step 2: Marshal structs with attributevalue, and meet the zero-value pitfalls
+
+`attributevalue.MarshalMap` turns a struct into `map[string]types.AttributeValue` using `dynamodbav` tags. Money is `int64` minor units (a DynamoDB number is a decimal string on the wire, so no float rounding games). `time.Time` is stored as an RFC 3339 string. The program below marshals on purpose into the traps:
+
+```go noverify title="cmd/design/main.go · lines 41–48"
+// Account2 is the naive struct: omitempty on the balance.
+type Account2 struct {
+	PK      string   `dynamodbav:"pk"`
+	SK      string   `dynamodbav:"sk"`
+	Balance int64    `dynamodbav:"balance,omitempty"`
+	Memo    string   `dynamodbav:"memo"`
+	Tags    []string `dynamodbav:"tags"`
+}
+```
+
+```text title="out.txt · design"
+1. Entry with Memo empty (omitempty) and time.Time:
+  amount   N    -2500
+  at       S    "2026-10-01T09:30:00Z"
+  pk       S    "ACCT#alice"
+  sk       S    "ENT#20261001T093000.000000000Z#tx-001"
+  txid     S    "tx-001"
+
+2. Account2{Balance: 0} with `omitempty`, Memo "" and nil Tags:
+  memo     S    ""
+  pk       S    "ACCT#bob"
+  sk       S    "ACCT"
+  tags     NULL
+
+3. condition `balance >= 0` on the stored zero-balance account -> ccf=true
+
+4. PutItem with pk = "":
+   operation error DynamoDB: PutItem, https response error StatusCode: 400, RequestID: e60bb854-31c8-4b20-9f67-e1bf6fdfd4b0, api error ValidationException: One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk
+
+5. PutItem with memo = "" (non-key): err=<nil>
+
+6. round trip of Account2{Balance: 0}: Balance=0, attribute present in item: false
+```
+
+What each numbered block taught:
+
+1. `omitempty` on `Memo` dropped the attribute entirely, and `time.Time` became a string.
+2. Without `omitempty`, an empty string is stored as `S ""` (allowed for non-key attributes since 2020, block 5) and a nil slice is stored as `NULL`, not as an empty list. Reading it back gives a nil slice again, but any other client that expects a list will break.
+3. The dangerous one: `Balance` tagged `dynamodbav:"balance,omitempty"` silently deletes a zero balance. Block 6 confirms the attribute is absent after a round trip. A condition on a missing attribute evaluates false, so `balance >= 0` fails on an account that was supposed to hold exactly zero. Never put `omitempty` on a number that is meaningfully zero.
+4. An empty string in a key attribute is a hard `ValidationException` (block 4). Validate IDs before they become keys.
+
+### Step 3: Conditional writes are the concurrency primitive
+
+DynamoDB has no locks you can take and no multi-statement session. What it has is a check-and-write that happens atomically on the server: `ConditionExpression`. A debit that must not overdraw is "subtract if `balance >= :amt`", expressed as one `UpdateItem`. The condition and the write cannot be separated by another request.
+
+```go noverify title="ddb/ops.go · lines 28–51"
+
+// Debit subtracts amt atomically, inside DynamoDB, only if balance >= amt.
+// The check and the write are ONE operation on the server: nothing can
+// interleave between them.
+func Debit(ctx context.Context, c *dynamodb.Client, table, id string, amt int64) error {
+	cond := expression.Name("balance").GreaterThanEqual(expression.Value(amt))
+	upd := expression.Set(expression.Name("balance"), expression.Name("balance").Minus(expression.Value(amt))).
+		Add(expression.Name("version"), expression.Value(1))
+	expr, err := expression.NewBuilder().WithCondition(cond).WithUpdate(upd).Build()
+	if err != nil {
+		return err
+	}
+	_, err = c.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table), Key: key(id),
+		ConditionExpression:       expr.Condition(),
+		UpdateExpression:          expr.Update(),
+		ExpressionAttributeNames:  expr.Names(),
+		ExpressionAttributeValues: expr.Values(),
+	})
+	if IsConditionFailed(err) {
+		return ErrInsufficient
+	}
+	return err
+}
+```
+
+Failure comes back as `*types.ConditionalCheckFailedException`. The SDK wraps errors, so match with `errors.As`, never a type assertion or string compare (`IsConditionFailed` in ops.go lines 17-22).
+
+The naive version reads the item, checks in Go, then writes the new absolute value. Even with `ConsistentRead: true`, the read is correct only at the instant it happened:
+
+```go noverify title="ddb/ops.go · lines 62–80"
+// NaiveDebit is what you write first: read, check in Go, write the new value.
+// The check is correct at the moment of the read and stale by the time of the write.
+func NaiveDebit(ctx context.Context, c *dynamodb.Client, table, id string, amt int64) error {
+	a, err := GetAccount(ctx, c, table, id, true) // even a strongly consistent read doesn't help
+	if err != nil {
+		return err
+	}
+	if a.Balance < amt {
+		return ErrInsufficient
+	}
+	_, err = c.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table), Key: key(id),
+		UpdateExpression:          aws.String("SET balance = :b"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":b": &types.AttributeValueMemberN{Value: itoa(a.Balance - amt)}},
+	})
+	return err
+}
+
+// AdjustOptimistic is read-modify-write made safe by a version attribute:
+```
+
+The experiment: 50 goroutines released together, each debiting 10 from a balance of 300. Only 30 can legitimately succeed.
+
+```go noverify title="cmd/debit/main.go · lines 41–70"
+		for trial := 1; trial <= 3; trial++ {
+			reset(ctx, c)
+			var ok, rejected, other atomic.Int64
+			var wg sync.WaitGroup
+			gate := make(chan struct{})
+			for i := 0; i < workers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-gate // release all goroutines together
+					switch err := mode.fn(ctx, c, table, "alice", amt); {
+					case err == nil:
+						ok.Add(1)
+					case errors.Is(err, ddb.ErrInsufficient):
+						rejected.Add(1)
+					default:
+						other.Add(1)
+						fmt.Println("  unexpected:", err)
+					}
+				}()
+			}
+			close(gate)
+			wg.Wait()
+			a, err := ddb.GetAccount(ctx, c, table, "alice", true)
+			check(err)
+			paid := ok.Load() * amt
+			fmt.Printf("  trial %d: ok=%2d rejected=%2d  paid out=%3d  balance fell by=%3d  final=%4d  unrecorded debits=%d\n",
+				trial, ok.Load(), rejected.Load(), paid, int64(start)-a.Balance, a.Balance, (paid-(int64(start)-a.Balance))/amt)
+		}
+		fmt.Println()
+```
+
+```text title="out.txt · debit"
+50 goroutines each debit 10 from an account holding 300 (demand 500, so 30 can succeed)
+
+conditional UpdateItem
+  trial 1: ok=30 rejected=20  paid out=300  balance fell by=300  final=   0  unrecorded debits=0
+  trial 2: ok=30 rejected=20  paid out=300  balance fell by=300  final=   0  unrecorded debits=0
+  trial 3: ok=30 rejected=20  paid out=300  balance fell by=300  final=   0  unrecorded debits=0
+
+naive read-then-write
+  trial 1: ok=50 rejected= 0  paid out=500  balance fell by= 20  final= 280  unrecorded debits=48
+  trial 2: ok=50 rejected= 0  paid out=500  balance fell by= 20  final= 280  unrecorded debits=48
+  trial 3: ok=50 rejected= 0  paid out=500  balance fell by= 20  final= 280  unrecorded debits=48
+```
+
+The conditional version accepted exactly 30 and rejected exactly 20 with `ConditionalCheckFailedException` in all three trials, and the balance ended at exactly 0, never negative. The naive version "paid out" 500 against a balance of 300 and the balance only fell by 20. It is a pure lost update: each goroutine read 300, wrote 290, and the writes overwrote each other, so only a couple of the 50 debits left any trace.
+
+### Step 4: TransactWriteItems for a transfer
+
+A transfer touches two accounts, so one conditional update is not enough. `TransactWriteItems` commits up to 100 writes (the documented limit; I did not test it) across items, all or nothing. Ours has four: guarded debit, guarded credit (`attribute_exists(pk)`, so money cannot be sent to a typo), and one ledger entry per side with `attribute_not_exists(pk)`.
+
+```go noverify title="ddb/ops.go · lines 108–135"
+// (guarded: the account must exist), and one ledger entry per side. All four
+// writes commit or none do. token makes a retry of the same call a no-op.
+func Transfer(ctx context.Context, c *dynamodb.Client, table, from, to string, amt int64, txid, token string, at time.Time) error {
+	debit := &types.Update{
+		TableName: aws.String(table), Key: key(from),
+		ConditionExpression:                 aws.String("balance >= :amt"),
+		UpdateExpression:                    aws.String("SET balance = balance - :amt ADD version :one"),
+		ExpressionAttributeValues:           amtVals(amt),
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}
+	credit := &types.Update{
+		TableName: aws.String(table), Key: key(to),
+		ConditionExpression:       aws.String("attribute_exists(pk)"),
+		UpdateExpression:          aws.String("SET balance = balance + :amt ADD version :one"),
+		ExpressionAttributeValues: amtVals(amt),
+	}
+	eFrom, _ := attributevalue.MarshalMap(NewEntry(from, -amt, txid, at))
+	eTo, _ := attributevalue.MarshalMap(NewEntry(to, amt, txid, at))
+	_, err := c.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		ClientRequestToken: aws.String(token),
+		TransactItems: []types.TransactWriteItem{
+			{Update: debit}, {Update: credit},
+			{Put: &types.Put{TableName: aws.String(table), Item: eFrom, ConditionExpression: aws.String("attribute_not_exists(pk)")}},
+			{Put: &types.Put{TableName: aws.String(table), Item: eTo, ConditionExpression: aws.String("attribute_not_exists(pk)")}},
+		},
+	})
+	return err
+}
+```
+
+When a transaction is cancelled, you get `*types.TransactionCanceledException` whose `CancellationReasons` has one element per request item, in order. Setting `ReturnValuesOnConditionCheckFailure: ALL_OLD` on the debit also returns the item that failed the check, so you can report the balance without another read. The program walks seven scenarios (A to G):
+
+```go noverify title="cmd/transfer/main.go · lines 63–93"
+func step(title string, err error) {
+	fmt.Printf("\n%s\n", title)
+	if err == nil {
+		fmt.Println("  -> committed")
+		return
+	}
+	var tc *types.TransactionCanceledException
+	var mm *types.IdempotentParameterMismatchException
+	switch {
+	case errors.As(err, &tc):
+		fmt.Println("  -> TransactionCanceledException; cancellation reasons, one per item in request order:")
+		names := []string{"debit from", "credit to", "entry from", "entry to"}
+		for i, r := range tc.CancellationReasons {
+			fmt.Printf("     [%d] %-10s code=%-22s", i, names[i], aws.ToString(r.Code))
+			if r.Message != nil {
+				fmt.Printf(" msg=%q", aws.ToString(r.Message))
+			}
+			if len(r.Item) > 0 {
+				var a ddb.Account
+				if attributevalue.UnmarshalMap(r.Item, &a) == nil {
+					fmt.Printf(" item.balance=%d", a.Balance)
+				}
+			}
+			fmt.Println()
+		}
+	case errors.As(err, &mm):
+		fmt.Printf("  -> IdempotentParameterMismatchException (code=%s, message=%q)\n", mm.ErrorCode(), strings.TrimSpace(mm.ErrorMessage()))
+	default:
+		fmt.Println("  -> other error:", err)
+	}
+}
+```
+
+```text title="out.txt · transfer"
+  state start:
+    alice balance=1000 version=1 entries=[]
+    bob   balance= 200 version=1 entries=[]
+
+A. alice -> bob 300, txid=tx-1, token=tok-1
+  -> committed
+  state after A:
+    alice balance= 700 version=2 entries=[tx-1:-300]
+    bob   balance= 500 version=2 entries=[tx-1:+300]
+
+B. the same call again (a retry after a timeout), same token tok-1
+  -> committed
+  state after B (unchanged: the token made the retry a no-op):
+    alice balance= 700 version=2 entries=[tx-1:-300]
+    bob   balance= 500 version=2 entries=[tx-1:+300]
+
+C. same token tok-1 but amount 999 (a different request)
+  -> IdempotentParameterMismatchException (code=IdempotentParameterMismatchException, message="")
+
+D. new token tok-2, SAME txid tx-1 (client forgot the token, kept the business id)
+  -> TransactionCanceledException; cancellation reasons, one per item in request order:
+     [0] debit from code=None                  
+     [1] credit to  code=None                  
+     [2] entry from code=ConditionalCheckFailed msg="The conditional request failed"
+     [3] entry to   code=ConditionalCheckFailed msg="The conditional request failed"
+  state after D (unchanged: the entry's attribute_not_exists condition refused the duplicate):
+    alice balance= 700 version=2 entries=[tx-1:-300]
+    bob   balance= 500 version=2 entries=[tx-1:+300]
+
+E. new token tok-3, NEW txid tx-2 (a genuinely new transfer)
+  -> committed
+  state after E:
+    alice balance= 400 version=3 entries=[tx-1:-300 tx-2:-300]
+    bob   balance= 800 version=3 entries=[tx-1:+300 tx-2:+300]
+
+F. alice -> bob 5000 (alice has 400): debit condition fails
+  -> TransactionCanceledException; cancellation reasons, one per item in request order:
+     [0] debit from code=ConditionalCheckFailed msg="The conditional request failed" item.balance=400
+     [1] credit to  code=None                  
+     [2] entry from code=None                  
+     [3] entry to   code=None                  
+  state after F (nothing moved, no entries written):
+    alice balance= 400 version=3 entries=[tx-1:-300 tx-2:-300]
+    bob   balance= 800 version=3 entries=[tx-1:+300 tx-2:+300]
+
+G. alice -> zed 50 (zed does not exist): credit condition fails
+  -> TransactionCanceledException; cancellation reasons, one per item in request order:
+     [0] debit from code=None                  
+     [1] credit to  code=ConditionalCheckFailed msg="The conditional request failed"
+     [2] entry from code=None                  
+     [3] entry to   code=None                  
+  state after G (alice was NOT debited even though her own condition passed):
+    alice balance= 400 version=3 entries=[tx-1:-300 tx-2:-300]
+    bob   balance= 800 version=3 entries=[tx-1:+300 tx-2:+300]
+```
+
+Reading it:
+
+- **A**: both balances move, both entries exist, and both versions went to 2 in one commit.
+- **B** is the idempotency token at work. The first call may have succeeded and the response was lost, so the client retries with the *same* `ClientRequestToken`. The call returns success and nothing is applied twice. Tokens are remembered for ten minutes in real DynamoDB; I could not test the expiry here.
+- **C**: the same token with different parameters is an error (`IdempotentParameterMismatchException`), so a token cannot be reused for a different transfer.
+- **D** is the second line of defence. If a client loses its token but keeps its business id (`txid`), the entry `Put` with `attribute_not_exists` makes the whole transaction cancel, with reasons 2 and 3 failing. Use both: the token handles the short retry window, the deterministic entry key handles everything after it.
+- **F, G**: one failing condition cancels all four writes. In G alice's own debit condition passed (reason `None`), yet she was not debited because the credit's check failed. Atomicity is the point.
+
+### Step 5: Query, pagination, and why Scan is a trap
+
+A Query reads one partition, in sort order, and charges only for what it reads. A response is capped at 1 MB or at your `Limit`, whichever comes first. If there is more, `LastEvaluatedKey` is non-nil and you pass it back as `ExclusiveStartKey`. The loop is the whole API:
+
+```go noverify title="cmd/query/main.go · lines 38–70"
+	// 1. Paginated Query, 100 per page.
+	var all []ddb.Entry
+	var startKey map[string]types.AttributeValue
+	pages, scanned := 0, int32(0)
+	var cu float64
+	t0 := time.Now()
+	for {
+		out, err := c.Query(ctx, &dynamodb.QueryInput{
+			TableName: aws.String(table), Limit: aws.Int32(100), ExclusiveStartKey: startKey,
+			KeyConditionExpression:    aws.String("pk = :p AND begins_with(sk, :e)"),
+			ExpressionAttributeValues: vals, ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		})
+		check(err)
+		var es []ddb.Entry
+		check(attributevalue.UnmarshalListOfMaps(out.Items, &es))
+		all = append(all, es...)
+		pages++
+		scanned += out.ScannedCount
+		cu += aws.ToFloat64(out.ConsumedCapacity.CapacityUnits)
+		if pages <= 2 || out.LastEvaluatedKey == nil {
+			fmt.Printf("  page %2d: %3d items, LastEvaluatedKey=%v\n", pages, len(es), keyStr(out.LastEvaluatedKey))
+		}
+		if startKey = out.LastEvaluatedKey; startKey == nil {
+			break
+		}
+	}
+	fmt.Printf("Query, Limit=100: %d pages, %d entries, scanned=%d, consumed=%.1f RCU, %v\n", pages, len(all), scanned, cu, time.Since(t0).Round(time.Millisecond))
+	ordered := true
+	for i := 1; i < len(all); i++ {
+		ordered = ordered && all[i-1].SK < all[i].SK
+	}
+	fmt.Printf("  entries returned in sort-key (time) order: %v; first=%s last=%s\n\n", ordered, all[0].At.Format(time.RFC3339), all[len(all)-1].At.Format(time.RFC3339))
+
+```
+
+A Scan reads every item in the table and applies `FilterExpression` *after* reading. The filter shrinks what you receive, not what you read or pay for. We load 5,970 items (alice: 1,200 entries, 19 other accounts: 250 each) and fetch alice's 1,200 two ways:
+
+```go noverify title="cmd/query/main.go · lines 103–122"
+	// 4. Scan with a filter for the same 1,200 entries.
+	t0 = time.Now()
+	pages, scanned, cu, got = 0, 0, 0, 0
+	startKey = nil
+	for {
+		out, err := c.Scan(ctx, &dynamodb.ScanInput{
+			TableName: aws.String(table), ExclusiveStartKey: startKey,
+			FilterExpression:          aws.String("pk = :p AND begins_with(sk, :e)"),
+			ExpressionAttributeValues: vals, ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		})
+		check(err)
+		pages++
+		got += len(out.Items)
+		scanned += out.ScannedCount
+		cu += aws.ToFloat64(out.ConsumedCapacity.CapacityUnits)
+		if startKey = out.LastEvaluatedKey; startKey == nil {
+			break
+		}
+	}
+	fmt.Printf("Scan + filter:    %d page(s), %d entries returned, scanned=%d, consumed=%.1f RCU, %v\n", pages, got, scanned, cu, time.Since(t0).Round(time.Millisecond))
+```
+
+```text title="out.txt · query"
+loaded 5970 items: alice has 1200 entries, 19 other accounts have 250 each
+
+  page  1: 100 items, LastEvaluatedKey={pk:ACCT#alice sk:ENT#20260101T000139.000000000Z#tx-alice-0099}
+  page  2: 100 items, LastEvaluatedKey={pk:ACCT#alice sk:ENT#20260101T000319.000000000Z#tx-alice-0199}
+  page 13:   0 items, LastEvaluatedKey=nil
+Query, Limit=100: 13 pages, 1200 entries, scanned=1200, consumed=18.0 RCU, 116ms
+  entries returned in sort-key (time) order: true; first=2026-01-01T00:00:00Z last=2026-01-01T00:19:59Z
+
+Query newest 10 (ScanIndexForward=false, Limit=10): returned=10 scanned=10 consumed=0.5 RCU, 4ms
+
+Query, no Limit:  1 page(s), 1200 entries, scanned=1200, consumed=15.5 RCU, 36ms
+Scan + filter:    1 page(s), 1200 entries returned, scanned=5970, consumed=80.0 RCU, 69ms
+```
+
+Observations from this run:
+
+- Query with `Limit=100` walked 13 pages for 1,200 entries. The 13th page is empty with a nil `LastEvaluatedKey`: when the count is an exact multiple of `Limit`, DynamoDB cannot know it was the end until it looks. Do not treat an empty page as an error.
+- Entries came back in time order with no sorting code, because the sort key does the work.
+- "Newest 10" is `ScanIndexForward=false, Limit=10`: 10 items scanned, 0.5 RCU, instead of reading the history.
+- Query read exactly the 1,200 items it returned (15.5 RCU unpaged; 18.0 summed across 13 small pages, since each page rounds up). The Scan read all 5,970 items to return the same 1,200 and consumed 80.0 RCU, about 5 times more. Wall times (69 ms vs 36 ms) point the same way, but that is LocalStack on a laptop; do not quote it as DynamoDB latency. The gap grows with every account the table gains, while a Query stays the same size forever. That is why Scan is a trap: it is fine in a test with 20 rows and an outage in production.
+
+### Step 6: Optimistic locking with a version attribute
+
+When you must read, compute in Go, and write (for example, applying a fee schedule), use the version as a compare-and-swap: write only if `version` is still what you read, and retry on `ConditionalCheckFailedException`.
+
+```go noverify title="ddb/ops.go · lines 82–106"
+// It returns how many times it had to retry.
+func AdjustOptimistic(ctx context.Context, c *dynamodb.Client, table, id string, delta int64) (retries int, err error) {
+	for {
+		a, err := GetAccount(ctx, c, table, id, true)
+		if err != nil {
+			return retries, err
+		}
+		_, err = c.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(table), Key: key(id),
+			ConditionExpression: aws.String("version = :v"),
+			UpdateExpression:    aws.String("SET balance = :b, version = :n"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":v": &types.AttributeValueMemberN{Value: itoa(a.Version)},
+				":b": &types.AttributeValueMemberN{Value: itoa(a.Balance + delta)},
+				":n": &types.AttributeValueMemberN{Value: itoa(a.Version + 1)},
+			},
+		})
+		if IsConditionFailed(err) {
+			retries++
+			continue
+		}
+		return retries, err
+	}
+}
+
+```
+
+Twenty writers each add 5 to one account:
+
+```go noverify title="cmd/optimistic/main.go · lines 30–45"
+	const writers = 20
+	var retries atomic.Int64
+	var wg sync.WaitGroup
+	gate := make(chan struct{})
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-gate
+			r, err := ddb.AdjustOptimistic(ctx, c, table, "alice", 5)
+			check(err)
+			retries.Add(int64(r))
+		}()
+	}
+	close(gate)
+	wg.Wait()
+```
+
+```text title="out.txt · optimistic"
+20 writers each +5 on balance 1000, guarded by `version = :v`
+final balance=1100 (expected 1100), version=21 (expected 21), total retries after a conflict=100
+```
+
+No update was lost: the final balance is exactly 1000 + 20 x 5 and the version advanced exactly once per success. The cost is retries, which are contention made visible. If you see many, the item is hot and you should use the atomic `SET balance = balance + :d` form from Step 3 instead. Reserve versioning for logic that cannot be expressed as an update expression.
+
+<RuntimeStage
+  title="50 goroutines debit 10 from a balance of 300: check inside the write, or check outside it"
+  kicker="DynamoDB conditional writes · measured, three trials each"
+  zones={[
+    { id: "go", label: "50 goroutines, released together", sub: "demand 500 against a balance of 300", x: 16, y: 16, w: 236, h: 200, kind: "plain" },
+    { id: "cond", label: "UpdateItem with a condition", sub: "balance >= :amt, checked inside the write", x: 262, y: 16, w: 236, h: 200, kind: "chan" },
+    { id: "naive", label: "read, check in Go, write the new total", sub: "the check is stale by the time of the write", x: 508, y: 16, w: 236, h: 200, kind: "cpu" },
+    { id: "good", label: "30 accepted, 20 rejected, final balance 0", sub: "identical in all three trials", x: 16, y: 236, w: 356, h: 200, kind: "exit" },
+    { id: "bad", label: "50 'accepted', 500 paid out, balance fell by 20", sub: "48 debits left no trace", x: 388, y: 236, w: 356, h: 200, kind: "wait" }
+  ]}
+  actors={[
+    { id: "d1", label: "debit 10", kind: "value" }, { id: "d2", label: "debit 10", kind: "value" }, { id: "d3", label: "debit 10", kind: "value" }, { id: "d4", label: "debit 10", kind: "value" }
+  ]}
+  events={[
+    { at: 0, id: "d1", to: "go", clock: "race" },
+    { at: 0.1, id: "d2", to: "go" }, { at: 0.2, id: "d3", to: "go" }, { at: 0.3, id: "d4", to: "go", note: "Fifty goroutines wait on a gate and are released at once, so they genuinely overlap." },
+    { at: 1.8, id: "d1", to: "cond", state: "running", note: "Version A: ONE UpdateItem that says 'subtract 10 if balance >= 10'. The check and the write are a single operation on the server. Nothing can interleave between them." },
+    { at: 1.9, id: "d2", to: "cond", state: "running" },
+    { at: 3.6, id: "d1", to: "good", state: "done", beat: "solution", note: "The first 30 succeed. The remaining 20 get ConditionalCheckFailedException and are turned into 'insufficient funds'. The balance ends at exactly 0, never negative, the same in all three trials." },
+    { at: 4.8, id: "d3", to: "naive", state: "running", note: "Version B: GetItem, check 'balance >= 10' in Go, then write balance-10 as an absolute value. Even a strongly consistent read is only correct at the instant it happened." },
+    { at: 4.9, id: "d4", to: "naive", state: "running", beat: "problem" },
+    { at: 6.8, id: "d3", to: "bad", state: "parked", beat: "problem", note: "Every goroutine read 300, every one wrote 290, and the writes overwrote each other. All 50 reported success, 500 was 'paid out' against 300, and the balance fell by only 20. A lost update, with no error anywhere." }
+  ]}
+  caption="DynamoDB has no locks you can take. What it gives you is a check that happens inside the write, and that is the whole concurrency story."
+/>
+
+<QuickCheck
+  question="A Go struct field is tagged `dynamodbav:&quot;balance,omitempty&quot;`. An account is created with a balance of 0. What is stored?"
+  options={[
+    "balance = 0",
+    "Nothing: the attribute is omitted, and a later condition like balance >= 0 fails on a missing attribute",
+    "balance = NULL",
+    "An error from the SDK"
+  ]}
+  answer={1}
+  explain="omitempty drops zero values, including a meaningful 0. The chapter's round trip shows the attribute absent, and a condition on a missing attribute evaluates false."
+/>
+
+<QuickCheck
+  question="A Scan with a FilterExpression returns the 1,200 items you want out of a 5,970-item table. How much do you pay for?"
+  options={[
+    "1,200 items: the filter happens before the read",
+    "All 5,970: a filter only shrinks what you receive, not what is read",
+    "Half the table",
+    "It depends on the partition key"
+  ]}
+  answer={1}
+  explain="Measured: Query read exactly 1,200 items for 15.5 read capacity units, Scan read 5,970 for 80. The gap widens with every account the table gains."
+/>
+
+<UnderTheHood title="Where a local AWS stops telling the truth">
+
+Everything above ran against an emulator, and it is worth being exact about where that ends.
+
+**It did not enforce signatures or expiry.** A presigned URL for a private bucket returned 200 to an anonymous request, a URL for a different key failed only because that key does not exist, and a URL used after its 2-second expiry still worked. Real S3 refuses all three with a 403. The chapter's S3 stop reports what LocalStack did; the 403 behaviour is from the AWS documentation, not measured here.
+
+**It did not throttle.** DynamoDB on-demand tables and SQS can both return throttling errors under load on real AWS. The default retryer in the SDK handles some of them (3 attempts, exponential backoff with jitter, measured above against a server we made fail on purpose), but we couldn't provoke the real thing.
+
+**Timings are the emulator's.** Query was faster than Scan here and read far fewer items; both facts hold on AWS, but the milliseconds don't carry over. Compare designs, don't quote numbers.
+
+**What the local run is good for.** It checks that your code uses the API correctly: that you handle the typed errors, that your condition expressions are valid, that your consumer deletes what it should and only that. That's most of what goes wrong in practice, and it is what the programs in this chapter verified.
+
+**One finding about re-running.** DynamoDB remembers a transaction's `ClientRequestToken` for ten minutes, even across a deleted and re-created table. The first version of the transfer program used a fixed token, and running it a second time within ten minutes turned its first transaction into a silent no-op. The fix was a token that includes a per-run ID. In production this is the feature: a retry with the same token must be harmless. In a demo it is a trap.
+
+</UnderTheHood>
+
+## Exercises
+
+<Exercise n={1} title="Shorten a visibility timeout" level="medium">
+
+A queue has VisibilityTimeout=30. Your handler occasionally takes 45 seconds. List two different ways to stop the message being delivered to a second consumer, and say which you'd choose.
+
+<Solution>
+
+Raise the queue's VisibilityTimeout above the worst-case handler time (say 120 s), or have the handler call `ChangeMessageVisibility` to extend the timeout while it works (a heartbeat). A larger timeout is simplest but delays redelivery after a real crash by that much. The heartbeat keeps recovery fast but needs a goroutine per in-flight message and handling for the case where the extension itself fails. For handlers whose time is bounded, raise the timeout; for handlers whose time varies widely, heartbeat. In both cases the handler must still be idempotent, because neither removes duplicates entirely.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={2} title="A hot account" level="hard">
+
+The optimistic-locking program had 20 writers on one item and needed about 100 retries. Rewrite the update so it needs none, and say when you could not.
+
+<Solution>
+
+Use the atomic form: `SET balance = balance + :d` in a single `UpdateItem`, which DynamoDB applies server-side with no read first. Two concurrent adds both land. You can't use it when the new value depends on logic you must run in Go over the old value (applying a tiered fee schedule, for instance), or when the update needs a cross-item invariant; there, keep the version attribute and accept retries, or move that logic into a transaction with conditions on every item involved.
+
+</Solution>
+
+</Exercise>
+
+<Exercise n={3} title="Add the dead-letter alarm" level="easy">
+
+The DLQ in the SQS stop is only useful if someone looks at it. What would you alarm on, and what retention should the DLQ have compared with the main queue?
+
+<Solution>
+
+Alarm on the DLQ's `ApproximateNumberOfMessagesVisible` being above 0 for a few minutes (any message there means a payment failed three times and a human must look). Give the DLQ a longer retention than the main queue (for example 14 days against 4): messages keep their original enqueue timestamp, so a DLQ with the same retention can expire a message almost as soon as it arrives, taking the evidence with it.
+
+</Solution>
+
+</Exercise>
+
+---
+
+## The Lab
+
+<Lab
+  title="Apply Once, Delete Only When Done"
+  archetype="fix-it"
+  difficulty="guided"
+  points={100}
+  hintCost={10}
+  verify="self-check"
+  expect="ALL CHECKS PASS"
+  objective="Decide applies every delivery to the ledger and deletes it, whatever happened. A duplicate of an applied payment is applied again (the account is credited twice), and a failing payment is deleted, so SQS never retries it and the dead-letter queue never sees it. Fix it: apply a payment at most once, acknowledge a duplicate by deleting it without touching the ledger, and leave a failure undeleted so SQS redelivers it."
+  starter={`package main
+
+import "fmt"
+
+// Delivery is one message handed to the consumer by SQS.
+type Delivery struct {
+	PaymentID    string
+	ReceiveCount int
+}
+
+// Outcome says what the consumer must do with a delivery.
+type Outcome struct {
+	Apply  bool   // change the ledger now
+	Delete bool   // tell SQS we are done with this message
+	Reason string // always filled in
+}
+
+// Decide is the heart of an at-least-once consumer.
+//
+//   - seen holds the payment IDs already applied to the ledger.
+//   - handlerErr is nil if applying the payment would succeed, non-nil if
+//     it would fail (for example, an unknown currency).
+//
+// Rules: a payment is applied at most once, however often SQS delivers it.
+// A duplicate of an applied payment is acknowledged (deleted) without
+// touching the ledger. A failure is NOT deleted, so SQS redelivers it and,
+// after maxReceive tries, moves it to the dead-letter queue. Never delete a
+// message whose payment was not applied and is not already applied.
+func Decide(d Delivery, seen map[string]bool, handlerErr error, maxReceive int) Outcome {
+	if handlerErr != nil {
+		return Outcome{Apply: true, Delete: true, Reason: "handled"}
+	}
+	return Outcome{Apply: true, Delete: true, Reason: "handled"}
+}
+
+// ── below this line: do not edit ──
+
+func main() {
+	ok := true
+	fail := func(f string, a ...any) { fmt.Printf("FAIL "+f+"\\n", a...); ok = false }
+	boom := fmt.Errorf("unknown currency")
+	check := func(name string, d Delivery, seen map[string]bool, err error, want Outcome) {
+		defer func() {
+			if p := recover(); p != nil {
+				fail("%s: panic: %v", name, p)
+			}
+		}()
+		got := Decide(d, seen, err, 3)
+		if got.Apply != want.Apply || got.Delete != want.Delete {
+			fail("%s: apply=%v delete=%v, want apply=%v delete=%v", name, got.Apply, got.Delete, want.Apply, want.Delete)
+		}
+		if got.Reason == "" {
+			fail("%s: the outcome needs a reason", name)
+		}
+	}
+
+	check("a first delivery that works", Delivery{"p-1", 1}, map[string]bool{}, nil, Outcome{Apply: true, Delete: true})
+	check("a duplicate of an applied payment", Delivery{"p-1", 2}, map[string]bool{"p-1": true}, nil, Outcome{Apply: false, Delete: true})
+	check("a duplicate that would now fail is still just a duplicate", Delivery{"p-1", 2}, map[string]bool{"p-1": true}, boom, Outcome{Apply: false, Delete: true})
+	check("a failing first delivery is left for redelivery", Delivery{"p-2", 1}, map[string]bool{}, boom, Outcome{Apply: false, Delete: false})
+	check("a failing second delivery is left for redelivery", Delivery{"p-2", 2}, map[string]bool{}, boom, Outcome{Apply: false, Delete: false})
+	check("the last allowed attempt still fails: leave it, the DLQ takes it", Delivery{"p-2", 3}, map[string]bool{}, boom, Outcome{Apply: false, Delete: false})
+	check("an unrelated payment is unaffected", Delivery{"p-3", 1}, map[string]bool{"p-1": true}, nil, Outcome{Apply: true, Delete: true})
+
+	if ok {
+		fmt.Println("ALL CHECKS PASS")
+	}
+}
+`}
+  verifier="Checks Decide on a first delivery that works, on a duplicate of an applied payment (including one that would now fail), on failing first, second and last-allowed deliveries, and on an unrelated payment. Prints ALL CHECKS PASS."
+  hints={[
+    "Check the dedup set first: if the payment was already applied, the answer is Apply false, Delete true, whether or not applying it would fail now.",
+    "A failure is the one case where you must NOT delete: Apply false, Delete false. SQS redelivers it after the visibility timeout and moves it to the dead-letter queue after maxReceive tries.",
+    "Only a fresh payment that succeeds is Apply true, Delete true. Fill in Reason in every case."
+  ]}
+  flag="GO{apply_once_delete_when_done}"
+>
+
+This is the handler's decision from the SQS stop, with the two mistakes that produced 5,000 instead of 2,500 and a poison message nobody ever saw.
+
+</Lab>
+
+<Recap>
+
+- **Local AWS** is an emulator on `localhost:4566`; the code is identical, only `AWS_ENDPOINT_URL` changes. The latest LocalStack image now needs a token, so this chapter ran on community **3.8.1**. It speaks the API but doesn't enforce signatures, expiry or throttling.
+- **S3:** the credential chain reads environment, then shared files, then IMDS. A 26 MB multipart upload split into **6 parts**, round-tripped its sha256 **10 of 10** times, and with 40 ms per request 8 workers took **305 ms against 612 ms**. `HeadObject` on a missing key gives `NotFound`, not `NoSuchKey`.
+- **SQS:** long polling made **1 request where short polling made 191** in 20 s idle. A crashed consumer's message came back **5.4 to 6 s** after a 5 s timeout. A poison message got ReceiveCount 1, 2, 3 and then moved to the **dead-letter queue**. Without a dedup key a duplicate credited **5,000 instead of 2,500**. After SIGTERM mid-batch, **40 sent, 40 processed, 40 deleted**.
+- **DynamoDB:** 50 concurrent debits on a balance of 300: the conditional write accepted exactly **30** and ended at **0**; read-then-write "paid out" **500**. `TransactWriteItems` is all-or-nothing with per-item cancellation reasons. **Query** read 1,200 items for **15.5** read units; **Scan** read 5,970 for **80**. Twenty optimistic writers landed exactly 1,100.
+- **Idempotency is the common thread:** an SQS dedup key, a DynamoDB request token, a deterministic ledger-entry key. And a local pass never proves a permission, which the next chapter measures.
+
+</Recap>
+
+<Scoreboard
+  streak={3}
+  items={[
+    { label: "Quick check: the credential chain", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: HeadObject errors", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: slow handlers", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: the dedup key", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: omitempty", kind: "quiz", points: 10, done: false },
+    { label: "Quick check: Scan and filters", kind: "quiz", points: 10, done: false },
+    { label: "Exercise 1: shorten a visibility timeout", kind: "exercise", points: 15, done: false },
+    { label: "Exercise 2: a hot account", kind: "exercise", points: 20, done: false },
+    { label: "Exercise 3: the dead-letter alarm", kind: "exercise", points: 10, done: false }
+  ]}
+  flag={{ label: "Lab: Apply Once, Delete Only When Done", captured: false, points: 100 }}
+/>
+
+<Narrator>
+Fifty goroutines, a balance of three hundred, and a naive version that paid out five hundred and reported success fifty times. If I ever sound smug about reading before writing, remember that a stale read took a bank apart in about three milliseconds. I wasn't smug. I was right. There's a difference, and it's mostly the timing.
+</Narrator>
